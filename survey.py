@@ -125,16 +125,33 @@ def enrich(rows):
     return rows
 
 
-def scan(serial, settle=DEFAULT_SETTLE):
-    """触发一次真扫描并取结果。手机侧扫描约 4-6 秒一轮。"""
-    A.shell(serial, "cmd wifi start-scan")
-    time.sleep(settle)
-    rc, txt = A.shell(serial, "cmd wifi list-scan-results")
-    if rc != 0 or "BSSID" not in txt:
-        return {"ok": False, "err": txt.strip()[:120]}
-    rows = enrich(parse(txt))
-    rows.sort(key=lambda r: -r["rssi"])
-    return {"ok": True, "aps": rows}
+def _merge(groups):
+    """多轮结果按 BSSID 合并：同一 AP 取最强信号那轮。单轮扫描会漏 AP，
+    两轮取并集比一轮稳定得多，代价只是多等几秒。"""
+    best = {}
+    for rows in groups:
+        for r in rows:
+            old = best.get(r["bssid"])
+            if old is None or r["rssi"] > old["rssi"]:
+                best[r["bssid"]] = r
+    return sorted(best.values(), key=lambda r: -r["rssi"])
+
+
+def scan(serial, settle=DEFAULT_SETTLE, rounds=1):
+    """触发真扫描并取结果。手机侧扫描约 4-6 秒一轮；rounds>1 时取并集。"""
+    groups = []
+    err = ""
+    for i in range(max(1, rounds)):
+        A.shell(serial, "cmd wifi start-scan")
+        time.sleep(settle)
+        rc, txt = A.shell(serial, "cmd wifi list-scan-results")
+        if rc != 0 or "BSSID" not in txt:
+            err = txt.strip()[:120]
+            continue
+        groups.append(parse(txt))
+    if not groups:
+        return {"ok": False, "err": err}
+    return {"ok": True, "aps": enrich(_merge(groups))}
 
 
 def format_table(rows):
@@ -192,7 +209,15 @@ def _selftest():
     # ⑦ 距离只是量级
     assert distance_hint(-40) == "同一房间" and distance_hint(-90) == "很远"
 
-    print("survey \u81ea\u6d4b\uff1a7 \u9879\u5168\u8fc7")
+    # ⑧ 多轮并集：同 BSSID 取最强那轮，重复不留两份
+    m = _merge([
+        [{"bssid": "A", "rssi": -80}, {"bssid": "B", "rssi": -50}],
+        [{"bssid": "A", "rssi": -60}, {"bssid": "C", "rssi": -70}],
+    ])
+    assert [r["bssid"] for r in m] == ["B", "A", "C"], m     # 按信号强弱排
+    assert [r["rssi"] for r in m] == [-50, -60, -70]
+
+    print("survey \u81ea\u6d4b\uff1a8 \u9879\u5168\u8fc7")
 
 
 def main(argv=None):

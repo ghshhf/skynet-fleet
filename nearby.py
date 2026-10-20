@@ -4,12 +4,17 @@
 手机的射频没被占，能看见二十几个邻居网络。反过来，手机只看得到无线层的
 AP 名，看不到谁在哪台 IP 上、开了什么端口。两边拼起来才是「身边有什么」。
 
-    python nearby.py            # 两层都跑
+每次跑完留一份指纹在 ~/.fleet/nearby_last.json，下次自动比对，谁进来了、
+谁走了，一眼能看见——扫描的价值不在「这一刻有什么」，在「变化」。
+
+    python nearby.py            # 两层都跑，并与上次比对
     python nearby.py --lan      # 只 IP 层
     python nearby.py --wifi     # 只无线层
     python nearby.py --json     # 机器可读
+    python nearby.py --no-save  # 不留指纹（只读探测）
 """
 import json
+import os
 import sys
 import time
 from collections import Counter
@@ -17,6 +22,8 @@ from collections import Counter
 import android_device as A
 import survey as V
 import sweep as S
+
+HIST = os.path.join(os.path.expanduser("~"), ".fleet", "nearby_hist.json")
 
 
 def run(with_lan=True, with_wifi=True):
@@ -32,6 +39,10 @@ def run(with_lan=True, with_wifi=True):
             "cameras": sum(v for k, v in kinds.items() if "摄像" in str(k)),
             "profile": r.get("profile") or [],
             "elapsed": r.get("elapsed"),
+            "devices": [{"ip": d.get("ip"), "mac": d.get("mac") or "",
+                         "category": d.get("category") or "",
+                         "category_cn": d.get("category_cn") or "",
+                         "vendor": d.get("vendor") or ""} for d in devs],
         }
         if not devs:
             out["notes"].append("IP 层没扫到设备（网卡断了？）")
@@ -41,7 +52,7 @@ def run(with_lan=True, with_wifi=True):
             out["wifi"] = {"ok": False, "err": d.get("err")}
             out["notes"].append("手机接不上，无线层缺失")
         else:
-            g = V.scan(d["serial"])
+            g = V.scan(d["serial"], rounds=3)   # 一轮会漏 AP，多轮取并集才稳
             if g.get("ok"):
                 out["wifi"] = {"ok": True, "aps": g["aps"], "summary": V.summary(g["aps"])}
             else:
@@ -50,7 +61,142 @@ def run(with_lan=True, with_wifi=True):
     return out
 
 
-def report(out):
+def fingerprint(out):
+    """只抽会变的部分：谁在（IP / BSSID）以及它是什么。"""
+    fp = {"at": out.get("at") or 0, "lan": {}, "wifi": {}}
+    lan = out.get("lan") or {}
+    for d in lan.get("devices") or []:
+        if d.get("ip"):
+            fp["lan"][d["ip"]] = {"mac": d.get("mac") or "",
+                                  "kind": d.get("category_cn") or d.get("category") or ""}
+    wifi = out.get("wifi") or {}
+    for a in wifi.get("aps") or []:
+        if a.get("bssid"):
+            fp["wifi"][a["bssid"]] = {"ssid": a.get("ssid") or "",
+                                      "kind": a.get("kind") or "",
+                                      "rssi": a.get("rssi")}
+    return fp
+
+
+WINDOW = 5          # 看最近几次：手机单次扫描抖动很大，只比上一份会把抖动当进出
+FRINGE = -80        # 弱于这个值的 AP 在墙外/几十米外，信号本身就在噪底上下浮
+
+
+def _near(rec):
+    """信号够得着才算「在场」。拿不到 rssi 时按够得着算，不冤枉人。"""
+    r = (rec or {}).get("rssi")
+    return r is None or r >= FRINGE
+
+
+def trend(hist, cur, window=WINDOW):
+    """按「最近 window 次里出现过几次」判存续，而不是只比上一份。
+
+    手机的 WiFi 扫描一轮只听得见一部分 AP（实测连扫三次分别 17/21/19 个，
+    两次相邻完整扫描只有 20 个 BSSID 重合），拿它和上一份硬要比，得出的
+    「新出现/消失」全是噪声。两处降噪：
+      ① 计数：只有最近 window 次每次都在的才算「一直在」，只有这次才见的才算「新的」；
+      ② 卡信号：-80dBm 以下的远场 AP 本来就在噪底上漂，进出无意义，只报个数。
+    """
+    hist = [h for h in (hist or []) if isinstance(h, dict)][-window:]
+    t = {"runs": len(hist), "window": window,
+         "lan": {"solid": [], "new": [], "lost": []},
+         "wifi": {"solid": [], "new": [], "lost": [], "fringe": 0},
+         "age": (cur.get("at") or 0) - (hist[-1].get("at") or 0) if hist else 0}
+    if not hist:
+        return t
+    n = len(hist)
+    for layer in ("lan", "wifi"):
+        cur_map = cur.get(layer) or {}
+        trackable = {k for k, v in cur_map.items() if _near(v)}
+        if layer == "wifi":
+            t["wifi"]["fringe"] = len(cur_map) - len(trackable)
+        seen = {k: 0 for k in trackable}
+        for h in hist:
+            hm = h.get(layer) or {}
+            for k in trackable:
+                if k in hm and _near(hm[k]):
+                    seen[k] += 1
+        for k, c in seen.items():
+            if c == 0:
+                t[layer]["new"].append({"key": k, **cur_map[k]})
+            elif c == n:
+                t[layer]["solid"].append({"key": k, **cur_map[k]})
+        for k in set().union(*[set((h.get(layer) or {})) for h in hist]):
+            if k in trackable:
+                continue
+            if k in cur_map:                      # 还在，只是退到远场 → 不算走
+                continue
+            # 只有「最近 window 次里每次都在、且每次都够得着」的才算真消失
+            if all(k in (h.get(layer) or {}) and _near(h[layer][k]) for h in hist):
+                t[layer]["lost"].append({"key": k, **hist[-1][layer][k]})
+        if layer == "wifi":     # 同一 BSSID 可能被多次统计，去重后按名字排
+            for kind in ("new", "lost", "solid"):
+                uniq = {x["key"]: x for x in t[layer][kind]}
+                t[layer][kind] = sorted(uniq.values(),
+                                        key=lambda x: x.get("ssid") or "~")
+    t["changed"] = any(t[l]["new"] or t[l]["lost"] for l in ("lan", "wifi"))
+    return t
+
+
+def load_hist():
+    try:
+        with open(HIST, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("runs") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def save_hist(hist, fp, keep=12):
+    runs = ([h for h in hist if isinstance(h, dict)] + [fp])[-keep:]
+    os.makedirs(os.path.dirname(HIST), exist_ok=True)
+    with open(HIST, "w", encoding="utf-8") as f:
+        json.dump({"runs": runs}, f, ensure_ascii=False)
+    return HIST
+
+
+def _ago(sec):
+    sec = max(int(sec or 0), 0)          # 时钟回拨时不许出现「-5 分钟前」
+    if sec < 60:
+        return f"{sec} 秒"
+    if sec < 3600:
+        return f"{sec // 60} 分钟"
+    if sec < 86400:
+        return f"{sec // 3600} 小时"
+    return f"{sec // 86400} 天"
+
+
+def _trend_lines(t):
+    if not t or not t.get("runs"):
+        return []
+    n = t["runs"]
+    lines = ["",
+             f"【存续】按最近 {n} 次扫描算（本次距上次 {_ago(t['age'])}）："]
+    lan, wifi = t["lan"], t["wifi"]
+    if lan["solid"] or lan["new"] or lan["lost"] or wifi["solid"]:
+        lines.append(f"  · IP 层：一直在 {len(lan['solid'])} 台"
+                     + (f"，这次才见 {len(lan['new'])} 台" if lan["new"] else "")
+                     + (f"，连续几次不见 {len(lan['lost'])} 台" if lan["lost"] else ""))
+    lines.append(f"  · 无线层：一直在 {len(wifi['solid'])} 个"
+                 + (f"，这次才见 {len(wifi['new'])} 个" if wifi["new"] else "")
+                 + (f"，连续几次不见 {len(wifi['lost'])} 个" if wifi["lost"] else ""))
+    if wifi.get("fringe"):
+        lines.append(f"  （另有 {wifi['fringe']} 个弱于 {FRINGE}dBm 的远场 AP，"
+                     "信号在噪底上漂，不参与进出判断）")
+    if wifi["new"]:
+        lines.append("  新见到的：" + "、".join(
+            (x.get("ssid") or "(隐藏)") + f"（{x['key'][:8]}…）" for x in wifi["new"][:6]))
+    if wifi["lost"]:
+        lines.append("  不见了的：" + "、".join(
+            (x.get("ssid") or "(隐藏)") for x in wifi["lost"][:6]))
+    if lan["new"]:
+        lines.append("  新 IP：" + "、".join(x["key"] for x in lan["new"][:8]))
+    if not t["changed"]:
+        lines.append("  （没有真的进出，都是扫描抖动范围内）")
+    return lines
+
+
+def report(out, t=None):
     lines = []
     lan, wifi = out.get("lan"), out.get("wifi")
 
@@ -88,6 +234,7 @@ def report(out):
 
     if out.get("notes"):
         lines.append("\n注意：" + "；".join(out["notes"]))
+    lines.extend(_trend_lines(t))
     return "\n".join(lines)
 
 
@@ -127,16 +274,86 @@ def _selftest():
     t4 = report({"at": 0, "lan": None, "wifi": None, "notes": ["IP 层没扫到设备（网卡断了？）"]})
     assert "网卡断了" in t4
 
-    print("nearby 自测：4 项全过")
+    # ⑤ 指纹只留会变的东西：没 ip / 没 bssid 的条目要丢掉
+    fp = fingerprint({"at": 100, "lan": {"devices": [
+        {"ip": "192.168.0.5", "mac": "aa:bb", "category": "camera", "category_cn": "摄像头"},
+        {"ip": "", "mac": "cc:dd"},                       # 没有 ip 的残缺条目
+    ]}, "wifi": {"aps": [
+        {"bssid": "aa:11:22:33:44:55", "ssid": "X", "kind": "家电"},
+        {"bssid": "", "ssid": "Y", "kind": "光猫"},
+    ]}})
+    assert list(fp["lan"]) == ["192.168.0.5"] and fp["lan"]["192.168.0.5"]["kind"] == "摄像头"
+    assert list(fp["wifi"]) == ["aa:11:22:33:44:55"]
+
+    # ⑥ 存续：一直在的、只有这次才见的、连着几次都不在的，三类要分清
+    h1 = {"at": 100, "lan": {"192.168.0.9": {"kind": "pc"}},
+          "wifi": {"B1": {"ssid": "常在的", "kind": "光猫"}}}
+    h2 = {"at": 130, "lan": {"192.168.0.9": {"kind": "pc"}},
+          "wifi": {"B1": {"ssid": "常在的", "kind": "光猫"}}}
+    cur = {"at": 160, "lan": {"192.168.0.9": {"kind": "pc"},
+                              "192.168.0.100": {"kind": "摄像头"}},
+           "wifi": {"B1": {"ssid": "常在的", "kind": "光猫"},
+                    "B2": {"ssid": "刚冒出来", "kind": "路由器"}}}
+    g = trend([h1, h2], cur)
+    assert [x["key"] for x in g["lan"]["solid"]] == ["192.168.0.9"]
+    assert [x["key"] for x in g["lan"]["new"]] == ["192.168.0.100"]
+    assert [x["key"] for x in g["wifi"]["solid"]] == ["B1"]
+    assert [x["key"] for x in g["wifi"]["new"]] == ["B2"]
+    assert g["lan"]["lost"] == [] and g["wifi"]["lost"] == []
+    assert g["changed"] is True and g["age"] == 30   # 距上一次（不是第一次）
+
+    # ⑦ 抖动不算消失：历史上只缺过某一次，就不能报「走了」
+    j1 = {"at": 100, "lan": {}, "wifi": {"B1": {"ssid": "老网络"}}}
+    j2 = {"at": 120, "lan": {}, "wifi": {}}              # 这次抖没了
+    j3 = {"at": 140, "lan": {}, "wifi": {"B1": {"ssid": "老网络"}}}
+    g2 = trend([j1, j2, j3], {"at": 160, "lan": {}, "wifi": {}})
+    assert g2["wifi"]["lost"] == [], g2["wifi"]["lost"]
+
+    # ⑧ 连着几次都在、这次没有 —— 才叫真的走了
+    g3 = trend([j1, {"at": 140, "lan": {}, "wifi": {"B1": {"ssid": "老网络"}}}],
+               {"at": 160, "lan": {}, "wifi": {}})
+    assert [x["ssid"] for x in g3["wifi"]["lost"]] == ["老网络"]
+
+    # ⑨ 没有历史时不给结论，也不许编出时间差
+    assert trend([], {"at": 9, "lan": {}, "wifi": {}})["runs"] == 0
+    assert _trend_lines(None) == [] and _trend_lines({"runs": 0}) == []
+
+    # ⑩ 「没有真的进出」要明说，不能让人以为漏打印了
+    same = {"at": 160, "lan": {"192.168.0.9": {}}, "wifi": {"B1": {"ssid": "常在的"}}}
+    g4 = trend([{"at": 140, "lan": {"192.168.0.9": {}}, "wifi": {"B1": {"ssid": "常在的"}}}], same)
+    assert g4["changed"] is False
+    assert any("抖动" in x for x in _trend_lines(g4))
+
+    # ⑪ 远场 AP 不参与进出判断：-85dBm 的墙外网络本来就在噪底上漂
+    f1 = {"at": 100, "lan": {}, "wifi": {"B9": {"ssid": "墙外的", "rssi": -88}}}
+    fc = {"at": 160, "lan": {}, "wifi": {"B9": {"ssid": "墙外的", "rssi": -86},
+                                         "B8": {"ssid": "刚扫到的远场", "rssi": -90}}}
+    g5 = trend([f1], fc)
+    assert g5["wifi"]["fringe"] == 2, g5["wifi"]["fringe"]
+    assert g5["wifi"]["new"] == [] and g5["wifi"]["lost"] == []
+    assert g5["changed"] is False
+    # 退到远场也算还在，不许报「走了」
+    g6 = trend([{"at": 100, "lan": {}, "wifi": {"B9": {"ssid": "墙外的", "rssi": -70}}}],
+               {"at": 160, "lan": {}, "wifi": {"B9": {"ssid": "墙外的", "rssi": -88}}})
+    assert g6["wifi"]["lost"] == []
+
+    print("nearby 自测：11 项全过")
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     out = run(with_lan="--wifi" not in argv, with_wifi="--lan" not in argv)
+    fp = fingerprint(out)
+    g = None
+    if "--no-save" not in argv:
+        hist = load_hist()
+        g = trend(hist, fp) if hist else None   # 没有历史就不编造「没变」
+        save_hist(hist, fp)
     if "--json" in argv:
+        out["trend"] = g
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
-    print(report(out))
+    print(report(out, g))
     return 0
 
 
