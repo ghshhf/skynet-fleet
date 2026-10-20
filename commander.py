@@ -22,6 +22,7 @@ import time
 
 import common
 import memory as mem_mod
+import policies
 
 REGISTRY = common.LockedDict()          # name -> {sock, token, platform, info, capabilities, last_hb}
 PENDING = {}                             # msg id -> {ev, slot}
@@ -34,6 +35,8 @@ _QUEUE_LK = threading.Lock()
 
 TOKENS = {}                              # token -> {node, purpose, exp}
 _TOKEN_LK = threading.Lock()
+
+DEGRADED = set()                         # 被策略降级的节点（掉线后不再参与路由）
 
 CTX = None                               # SharedContext（懒初始化）
 SELF_TEST = False
@@ -96,8 +99,36 @@ def send_to_node(name, msg, timeout=30):
     return {"ok": True, **slot}
 
 
+def _apply_hits(name, hits):
+    """执行策略引擎产出的动作（引擎只判断，副作用集中在这里，便于审计）。"""
+    for rname, act in hits:
+        a = act.get("action")
+        args = act.get("args") or {}
+        if a == "mark_degraded":
+            DEGRADED.add(name)
+            print(f"  [策略:{rname}] {name} 已降级，后续路由跳过", flush=True)
+        elif a == "notify":
+            print(f"  [策略:{rname}] {args.get('text', '')}", flush=True)
+        elif a == "probe":
+            print(f"  [策略:{rname}] {name} 心跳超时 -> 探测（不急于判死）", flush=True)
+        elif a == "cleanup":
+            print(f"  [策略:{rname}] 清理临时节点凭据（下机不留痕）", flush=True)
+        elif a == "prefer_gpu":
+            continue                      # 查询型动作，由 pick_node 消费
+        else:
+            print(f"  [策略:{rname}] 未实现动作 {a}", flush=True)
+
+
+def _fire(event, name=""):
+    """触发一个事件，返回动作列表（同时执行副作用）。"""
+    hits = policies.eval_event(event)
+    _apply_hits(name, hits)
+    return hits
+
+
 def _drop_node(name):
     REGISTRY.with_lock(lambda d: d.pop(name, None))
+    _fire({"event": "node_offline", "node": name}, name)
 
 
 def _enqueue(name, cmd):
@@ -300,15 +331,24 @@ def _cmd_token(name):
     print(f"  卸载/停止时：install_windows.py --uninstall --name {name} --token {tok}")
 
 
-def pick_node(cap="compute", prefer_gpu=False):
+def pick_node(cap="compute", prefer_gpu=False, task=""):
     """共享算力路由（§九 dev_pick）：选「谁能干」的节点。
-    优先满足 cap；prefer_gpu 时优先有 GPU 的；否则选内存最大。"""
+
+    「要不要优先 GPU」不写死在代码里——交给策略层按任务类型判断（compute_pick 事件）。
+    被策略降级（DEGRADED）的节点不参与路由。
+    """
+    if not prefer_gpu and task:
+        for rname, act in policies.eval_event({"event": "compute_pick", "task": task}):
+            if act.get("action") == "prefer_gpu":
+                prefer_gpu = bool((act.get("args") or {}).get("on", True))
+                print(f"  [策略:{rname}] 任务属重活 -> 优先 GPU 节点", flush=True)
+
     nodes = REGISTRY.with_lock(lambda d: list(d.items()))
 
     def _can(v):
         return cap in v.get("capabilities", [])
 
-    cands = [(k, v) for k, v in nodes if _can(v)]
+    cands = [(k, v) for k, v in nodes if _can(v) and k not in DEGRADED]
     if not cands:
         return None
     if prefer_gpu:
@@ -332,9 +372,9 @@ def _cmd_compute(prompt, model=None, prefer_gpu=False):
     if hit.get("ok"):
         print(f"  ✓ 算力池缓存命中（{ck}）：{hit['val'][:80]}")
         return
-    target = pick_node("compute", prefer_gpu)
+    target = pick_node("compute", prefer_gpu, task=prompt)
     if not target:
-        print("  无具备 compute 能力的在线节点（留待接入电脑/盒子）。")
+        _fire({"event": "compute_pool_empty"})
         return
     r = send_to_node(target, {"t": common.COMPUTE, "prompt": prompt, "model": model})
     if not r.get("ok"):
@@ -347,7 +387,34 @@ def _cmd_compute(prompt, model=None, prefer_gpu=False):
 
 def _compute_nodes():
     return REGISTRY.with_lock(lambda d: [(k, v) for k, v in d.items()
-                                         if "compute" in v.get("capabilities", [])])
+                                         if "compute" in v.get("capabilities", [])
+                                         and k not in DEGRADED])
+
+
+def _cmd_policy():
+    """列出当前生效策略（数据，不是代码分支）。"""
+    rules = policies.load_rules()
+    print(f"  生效策略 {len(rules)} 条（FLEET_POLICY={policies.DEFAULT_POLICY or '内置默认'}）")
+    for r in sorted(rules, key=lambda x: -x.get("priority", 0)):
+        when = r.get("when") or {}
+        acts = ",".join(a.get("action", "?") for a in r.get("then", []))
+        print(f"  p{r.get('priority', 0):<3} {r.get('name', '?'):22} on={when.get('event', '*'):18} -> {acts}")
+
+
+def _cmd_policy_eval(js):
+    """手动评估一个事件（dry-run，不改任何节点状态）。"""
+    import json as _json
+    try:
+        ev = _json.loads(js)
+    except ValueError as e:
+        print(f"  事件 JSON 解析失败: {e}")
+        return
+    hits = policies.eval_event(ev)
+    if not hits:
+        print("  （无规则命中）")
+        return
+    for rname, act in hits:
+        print(f"  {rname} -> {act.get('action')} {act.get('args') or ''}")
 
 
 def _cmd_computepool():
@@ -495,7 +562,7 @@ def repl():
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
-    print("      | quit")
+    print("      | policy | policy_eval <事件JSON> | quit")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -571,6 +638,11 @@ def repl():
                 _cmd_rules_rollback(int(rest))
             else:
                 print("  用法: rules_rollback <版本号>")
+        elif op == "policy":
+            _cmd_policy()
+        elif op == "policy_eval":
+            if rest:
+                _cmd_policy_eval(rest)
         else:
             print("  未知命令")
 
@@ -650,8 +722,16 @@ def self_test(host, port, password):
     print("\n=== 配对设备一次性令牌（卸载闸门 ②）===", flush=True)
     _cmd_token("PC-A")
 
+    print("\n=== 策略层（判断外置为数据，代码里不写 if/else 分支）===", flush=True)
+    _cmd_policy()
+    _cmd_policy_eval('{"event":"compute_pick","task":"微调一个LoRA"}')
+    _cmd_policy_eval('{"event":"hb_stale","age":120}')
+    _cmd_policy_eval('{"event":"compute_pick","task":"写个快排"}')
+    print("  说明：策略只产出动作，副作用由控制面统一执行 -> 可 dry-run、可单测、改策略不改代码。", flush=True)
+
     print("\n=== 共享算力路由（§九 dev_pick：选「谁能干」的节点跑重活）===", flush=True)
-    _cmd_compute("帮我写段按修改时间排序的 Python", prefer_gpu=True)
+    _cmd_compute("帮我写段按修改时间排序的 Python")     # 普通任务：策略不要求占 GPU
+    _cmd_compute("帮我微调一个 LoRA 训练脚本")          # 重活：策略自动转 prefer_gpu
     print("\n=== 共享算力池：批量分发 + 跨设备结果缓存 ===", flush=True)
     _cmd_computepool()
     _cmd_computemap("解释什么是注意力机制;用一句话总结Transformer;给个快速排序的Python", prefer_gpu=True)

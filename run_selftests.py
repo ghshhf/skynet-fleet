@@ -21,6 +21,7 @@ CASES = [
     ("ui_automation", ["ui_automation.py", "--selftest"], os.path.join(HERE, "ui_automation"), 30),
     ("rules_relay", ["rules_relay.py", "--selftest"], os.path.join(HERE, "ui_automation"), 30),
     ("rule_engine", ["rule_engine.py", "--selftest"], os.path.join(HERE, "rfc", "rule-engine"), 30),
+    ("policies", ["policies.py", "--selftest"], HERE, 30),
 ]
 
 
