@@ -25,8 +25,8 @@ jobs:
           python -m pip install pyinstaller textual rich prompt_toolkit
 
       - name: 冒烟（先证明界面自己能起来，再谈打包）
-        # 无设备的 CI 上探测可能拿不到东西，不让它挡住构建
-        continue-on-error: true
+        # CI 的控制台是 cp1252，中文 print 会当场 UnicodeEncodeError：
+        # 这是推上来才暴露的坑，本地 UTF-8 永远绿，所以它必须挡构建
         run: python -m fleet.tui --smoke
 
       - name: 打包 fleet-tui.exe
@@ -36,6 +36,7 @@ jobs:
           fleet_tui.py
 
       - name: 冒烟打包产物
+        # onefile 冷启动要先解压，等不够会误判成坏了，所以只报不挡
         continue-on-error: true
         run: dist\fleet-tui.exe --smoke
 

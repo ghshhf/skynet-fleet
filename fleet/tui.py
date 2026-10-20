@@ -336,7 +336,22 @@ def _smoke():
     return 1 if fails else 0
 
 
+def _safe_stdout():
+    """让中文输出在任何 Windows 控制台上都不会炸。
+
+    CI 的 windows runner 控制台是 cp1252，print 一句「渲染 4 块」会当场抛
+    UnicodeEncodeError（charmap cannot encode），门禁就红了——而本机是 UTF-8，
+    本地跑永远绿，只有推上去才暴露。
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:          # 不是 TextIOWrapper（比如被 Textual 接管了）
+            pass
+
+
 def main(argv=None):
+    _safe_stdout()
     ap = argparse.ArgumentParser(prog="fleet-tui")
     ap.add_argument("--interval", type=float, default=20.0, help="设备事件探测间隔秒")
     ap.add_argument("--shot", default="", help="不进交互：把界面导出成 SVG（给人看长什么样）")
