@@ -211,6 +211,9 @@ def _enqueue(name, cmd):
     with _QUEUE_LK:
         OFFLINE_QUEUE.setdefault(name, []).append({"id": _next_id("q"), "cmd": cmd})
         queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
+    # 排队就是一笔没闭环的账：节点上线补发后才消（_replay_queue 里 resolve）
+    _journal().log("task", name, f"节点离线，已排队：{cmd}",
+                   topic=_followups().queue_topic(name, cmd))
 
 
 def _replay_queue(name, sock=None):
@@ -242,6 +245,10 @@ def _replay_queue(name, sock=None):
             queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
         return
     print(f"[*] 节点 {name} 上线，重放 {len(q)} 条离线命令", flush=True)
+    # 补发成功 = 这笔账清了（闭环留痕，她不再追问）
+    for it in q:
+        _followups().resolve(_journal(), _her()[0],
+                             _followups().queue_topic(name, it.get("cmd", "")))
 
 
 def _restore_queue():
@@ -369,9 +376,13 @@ def _route_capability_request(name, m, conn):
         common.send_msg(conn, {"t": common.CAP_GRANT, "cap": cap,
                                 "session_min": 30, "token": os.urandom(6).hex()})
         print(f"      ✓ 已授权 {cap}（限 30min）", flush=True)
+        _followups().resolve(_journal(), _her()[0], _followups().her_topic(cap))
     else:
         common.send_msg(conn, {"t": common.CAP_DENY, "cap": cap, "reason": "用户拒绝"})
         print(f"      ✗ 已拒绝；她的执念+1", flush=True)
+        # 被拒 = 她欠一次「还想用」：留一笔 her 账，她过会儿会自己起话
+        _journal().log("her", name, f"想用 {cap}：{reason}（被拒绝）",
+                       topic=_followups().her_topic(cap))
 
 
 def serve(host, port, password):
@@ -599,9 +610,13 @@ def _cmd_policy_eval(js):
 PERSONA = None
 _PROACTIVE = None
 _RECALL = None
+_FOLLOWUPS = None
+JOURNAL = None
 _LAST_TICK = [0.0]                       # 心跳节流（秒）
 PERSONA_PATH = os.environ.get(
     "FLEET_PERSONA", os.path.join(os.path.dirname(os.path.abspath(__file__)), "persona_state.json"))
+JOURNAL_PATH = os.environ.get(
+    "FLEET_JOURNAL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleet_journal.db"))
 
 
 def _her():
@@ -621,6 +636,24 @@ def _recall():
         import recall as r
         _RECALL = r
     return _RECALL
+
+
+def _followups():
+    """「她会跟进」：从对话流水抽未闭环项（延迟导入）。"""
+    global _FOLLOWUPS
+    if _FOLLOWUPS is None:
+        import followups as f
+        _FOLLOWUPS = f
+    return _FOLLOWUPS
+
+
+def _journal():
+    """对话流水（append-only，敏感信息打码）。没有它，「提取未完成任务」是无米之炊。"""
+    global JOURNAL
+    if JOURNAL is None:
+        import journal as jmod
+        JOURNAL = jmod.Journal(JOURNAL_PATH)
+    return JOURNAL
 
 
 HER_SYSTEM_TMPL = ("你是{name}，性格{trait}，口癖「{catch}」。"
@@ -651,8 +684,8 @@ def _her_compose(hint):
 def _persona_tick(min_interval=60.0):
     """她的主动性心跳：产生一个念头 -> 过频控/静默/重要度三道刹车 -> 说或不说。
 
-    念头优先级：记得的往事 > 执念 > 打招呼。有往事时她带出**库里原文**，
-    没接模型就用模板句（只拼接原文），绝不编造记忆。
+    念头优先级：**没闭环的账 > 记得的往事 > 执念 > 打招呼**。前者是她「起话题」，
+    中者是「接回忆」；两者都只引用流水/库里的原文，没接模型就用模板句，绝不编造。
     不说话不是失败：念头会记进 L3（pending_thought），她没消失，只是在忍。
     """
     st, eng = _her()
@@ -661,10 +694,15 @@ def _persona_tick(min_interval=60.0):
         return None
     _LAST_TICK[0] = now
 
+    fu = _followups().pick(_journal(), st, now=now)
     rcall = _recall()
     mems = rcall.pick(_ctx(), st, now=now)
     obs = st.data.get("obsessions") or []
-    if mems:
+    if fu:
+        text = _followups().template_line(fu, st.data.get("catchphrase", ""))
+        hint = _followups().prompt_hint(fu) + "\n" + text
+        imp = 0.75                                   # 欠账比寒暄重要，但仍过频控/静默
+    elif mems:
         text = rcall.template_line(mems, st.data.get("catchphrase", ""))
         hint = rcall.prompt_hint(mems) + "\n" + text
         imp = 0.7                                    # 往事比寒暄重要，但仍过频控/静默
@@ -686,6 +724,10 @@ def _persona_tick(min_interval=60.0):
     text = _her_compose(hint) or text                # 接上真模型就她来说，否则模板兜底
     print(f"[她] {text}", flush=True)
     _ctx().put("her", "last_thought", text)          # 跨设备：手机上也知道她刚说了啥
+    _journal().log("her", "her", text)               # 她的话也进流水（追问的证据链上游）
+    if fu:
+        fu[0]["said"] = text                         # 记她实际说的话，不是模板
+        _followups().mark_asked(st, _journal(), fu, now=now)   # 追问记账：24h 内不重复
     if mems:
         rcall.mark_recalled(st, _ctx(), mems, now=now)   # 说过就记账，N 天内不重复
     return text
@@ -708,6 +750,45 @@ def _cmd_her():
     mems = _recall().candidates(_ctx())
     lr = _ctx().get("her", "last_recall")
     print(f"  记得的往事 {len(mems)} 件" + (f"（最近提过: {lr['val']}）" if lr.get("ok") else ""))
+    pend = _followups().extract(_journal())
+    print(f"  没闭环的账 {len(pend)} 笔（her_followups 看明细）")
+
+
+def _cmd_her_followups():
+    """列出 24h 内没闭环的事——「她该起的话题」清单，人可核对。"""
+    items = _followups().extract(_journal())
+    if not items:
+        print("  （没有未闭环的事：流水里 24h 窗口内没有开着的账）")
+        return
+    for it in items:
+        print(f"  [{it['when']}|{it['kind']}|x{it['count']}] {it['topic']}")
+        print(f"      流水 #{it['evidence_id']}：{it['body']}")
+    print("  用法: done <topic> 标记这件事已完成（清了账，她就不再追问）")
+
+
+def _cmd_done(topic):
+    """人工闭环：有些事是在系统外做完的（你手动备份完了），得有个口子告诉系统。"""
+    if not topic:
+        print("  用法: done <topic>（topic 见 her_followups）")
+        return
+    n = _followups().resolve(_journal(), _her()[0], topic)
+    if n:
+        print(f"  已闭环「{topic}」（清掉 {n} 条开着的记录）")
+    else:
+        print(f"  「{topic}」没有开着的记录")
+
+
+def _cmd_journal(n=20):
+    """回看最近的对话流水（她起话题的依据都在这里）。"""
+    rows = _journal().recent(limit=n)
+    if not rows:
+        print("  （流水还是空的）")
+        return
+    for r in rows:
+        mark = "○" if r["status"] == "open" else "●"
+        t = time.strftime("%m-%d %H:%M", time.localtime(r["ts"]))
+        topic = f" @{r['topic']}" if r["topic"] else ""
+        print(f"  {mark} #{r['id']:<4} {t} {r['kind']:4} {r['actor']}{topic}: {r['body']}")
 
 
 def _cmd_her_memory():
@@ -733,6 +814,7 @@ def _cmd_her_say(text):
     said = _her_compose(text) or text
     print(f"[她] {said}", flush=True)
     _ctx().put("her", "last_thought", said)
+    _journal().log("her", "her", said)
 
 
 def _cmd_computepool():
@@ -883,9 +965,12 @@ def _cmd_intent(text):
     """
     import orchestrator as orch
     nodes = REGISTRY.with_lock(lambda d: list(d.keys()))
+    topic = _followups().task_topic(text)
     plan = orch.parse_intent(text, nodes=nodes, pick=lambda cap: pick_node(cap, task=text))
     if not plan:
         print("  没解析出计划（试试：巡检 / 备份 / 对 PC-A 执行 hostname）")
+        # 解析不出计划也是一笔账：她回头可以问「要不要换个说法」
+        _journal().log("task", "commander", f"意图没解析出计划：{text}", topic=topic)
         return
     print(f"  计划 {len(plan)} 步：")
     for s in plan:
@@ -903,6 +988,13 @@ def _cmd_intent(text):
     res = orch.run_plan(plan, _exec, _log)
     state = "成功" if res["ok"] else f"失败于 {res.get('failed')}"
     print(f"  结果: {state}；已完成 {res.get('done')}；回滚 {res.get('rolled_back')}")
+    if res["ok"]:
+        _followups().resolve(_journal(), _her()[0], topic)      # 成了 -> 账清了
+    else:
+        # 失败要留一笔账：她 24h 内可能起话问「还作数吗」
+        _journal().log("task", "commander",
+                       f"意图失败于 {res.get('failed')}，已完成 {res.get('done')}：{text}",
+                       topic=topic)
 
 
 def repl():
@@ -911,7 +1003,9 @@ def repl():
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
     print("      | enroll <节点> [有效期秒] | enroll_list | enroll_revoke <节点>   # 扫码入网（离线验签）")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
-    print("      | policy | policy_eval <事件JSON> | her | her_memory | her_say <文本> | intent <一句话> | quit")
+    print("      | policy | policy_eval <事件JSON> | her | her_memory | her_followups | her_say <文本> | intent <一句话> | quit")
+    print("      | done <topic>   # 告诉系统这件事做完了（清账，她不再追问）")
+    print("      | journal [n]    # 回看对话流水（她起话题的依据）")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -919,6 +1013,8 @@ def repl():
             break
         if not line:
             continue
+        # 你说的话也进流水：她起话题时要能引用「你昨天说过什么」
+        _journal().log("user", "user", line)
         op, rest = (line.split(" ", 1) + ["", ""])[:2]
         op = op.lower()
         if op == "quit":
@@ -1006,6 +1102,12 @@ def repl():
             _cmd_her()
         elif op == "her_memory":
             _cmd_her_memory()
+        elif op == "her_followups":
+            _cmd_her_followups()
+        elif op == "done":
+            _cmd_done(rest.strip())
+        elif op == "journal":
+            _cmd_journal(int(rest) if rest.strip().isdigit() else 20)
         elif op == "her_say":
             if rest:
                 _cmd_her_say(rest)
@@ -1018,19 +1120,20 @@ def repl():
 
 def self_test(host, port, password):
     """本地回路自检：起服务 + 多节点，证明身体 Phase 0–4 + 她授权闭环 + 反向推送。"""
-    global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER
+    global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH
     SELF_TEST = True
     os.environ["FLEET_CTX"] = ":memory:"
     # 自检不碰 ~/.fleet 下的真实密钥：给本进程一份固定测试密钥
     os.environ["FLEET_ENROLL_SECRET"] = "commander-selftest-secret"
     import tempfile
-    # 自检用临时文件，绝不污染仓库里的规则库/队列/人格态/入网账本
+    # 自检用临时文件，绝不污染仓库里的规则库/队列/人格态/入网账本/对话流水
     tdir = tempfile.gettempdir()
     RULES_PATH = os.path.join(tdir, f"fleet_rules_st_{os.getpid()}.json")
     QUEUE_PATH = os.path.join(tdir, f"fleet_queue_st_{os.getpid()}.json")
     PERSONA_PATH = os.path.join(tdir, f"fleet_persona_st_{os.getpid()}.json")
     ENROLL_LEDGER = os.path.join(tdir, f"fleet_enroll_st_{os.getpid()}.json")
-    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER):
+    JOURNAL_PATH = os.path.join(tdir, f"fleet_journal_st_{os.getpid()}.db")
+    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH):
         if os.path.exists(_p):
             os.remove(_p)
     import node_agent
@@ -1197,6 +1300,10 @@ def self_test(host, port, password):
     _cmd_her()
 
     print("\n=== 她记得（隔日 + 换设备，能主动带出昨天的具体事）===", flush=True)
+    # 隔离变量：前面的离线队列演示欠下了账（那是下面一段的测试对象），
+    # 先闭环掉，否则这段测的就是「未完成项」而不是「回忆」。
+    for _t in [r["topic"] for r in _journal().open_topics(now=time.time())]:
+        _followups().resolve(_journal(), _her()[0], _t)
     rcall = _recall()
     _now = time.time()
     # 造一条「昨天」的往事 + 一条「刚发生」的噪声，证明只回忆隔日的、不当场复读
@@ -1215,6 +1322,30 @@ def self_test(host, port, password):
     assert "game_lastnight" not in [m["key"] for m in _again], _again
     print(f"  跨设备可见 last_recall = {(_ctx().get('her', 'last_recall') or {}).get('val')!r}",
           flush=True)
+
+    print("\n=== 她会跟进没完成的事（24h 对话流水 -> 主动起话头）===", flush=True)
+    # 一笔两小时前失败的意图（同一 topic 试了两次，应合并成一件）
+    _topic = _followups().task_topic("备份")
+    _journal().log("task", "PC-A", "意图『备份』失败：type 不存在的文件", topic=_topic,
+                   ts=time.time() - 2 * 3600)
+    _journal().log("task", "PC-A", "意图『备份』又失败：磁盘满", topic=_topic,
+                   ts=time.time() - 1 * 3600)
+    _cmd_her_followups()
+    _items = _followups().pick(_journal(), _her()[0])
+    print(f"  可起的账 {len(_items)} 件（同一 topic 两次失败应合并成 1 件）", flush=True)
+    assert len(_items) == 1 and _items[0]["count"] == 2, _items
+    _PROACTIVE.sent_times = []            # 同上：本段只验证「起话」，频控已在别段验证
+    _said2 = _persona_tick(min_interval=0)
+    print(f"  她起的话 = {_said2!r}", flush=True)
+    assert _said2 and "备份" in _said2, _said2
+    _reask = _followups().pick(_journal(), _her()[0])
+    print(f"  立刻再起同一笔 = {bool(_reask)}（应为 False：24h 内不重复追问）", flush=True)
+    assert not _reask, _reask
+    _cmd_done(_topic)                     # 人告诉系统这事做完了 -> 账清了
+    _left = _followups().extract(_journal())
+    print(f"  闭环后剩余未完成项 = {len(_left)}（这笔不再出现）", flush=True)
+    assert all(i["topic"] != _topic for i in _left), _left
+    _cmd_journal(6)
 
     print("\n=== 共享算力路由（§九 dev_pick：选「谁能干」的节点跑重活）===", flush=True)
     _cmd_compute("帮我写段按修改时间排序的 Python")     # 普通任务：策略不要求占 GPU
