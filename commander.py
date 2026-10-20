@@ -25,6 +25,7 @@ import capabilities
 import common
 import llm
 import memory as mem_mod
+import orchestrator
 
 REGISTRY = common.LockedDict()          # name -> {sock, token, platform, info, capabilities, last_hb}
 PENDING = {}                             # msg id -> {ev, slot}
@@ -346,6 +347,41 @@ def _cmd_broadcast(cmd):
         _cmd_exec(n, cmd)
 
 
+def _exec_raw(name, cmd):
+    """给编排用的原样执行（返回结构化结果，不打印），与 _cmd_exec 的展示解耦。"""
+    return send_to_node(name, {"t": common.EXEC, "cmd": cmd})
+
+
+def _cmd_intent(text, dry=False):
+    """统一意图编排：一个意图 -> 多步计划（带依赖）-> 执行 -> 失败回滚。"""
+    nodes = REGISTRY.with_lock(
+        lambda d: [k for k, v in d.items() if "exec" in v.get("capabilities", [])])
+    plan = orchestrator.parse_intent(text, nodes=nodes, pick=lambda c: pick_node(c))
+    if not plan:
+        print("  未能解析成计划。示例：对编队做一次巡检 / 备份资料 / 对 PC-A 执行 whoami")
+        return
+    print(f"  意图「{text}」-> {len(plan)} 步计划：")
+    for s in plan:
+        dep = f"  依赖[{','.join(s['after'])}]" if s.get("after") else ""
+        print(f"    {s['id']:8} {s['cap']}@{s.get('node')}  {s['args'].get('cmd', '')}{dep}")
+    if dry:
+        return
+
+    def _log(kind, s, r):
+        mark = {"ok": "✓", "fail": "✗", "rollback": "↩"}.get(kind, "·")
+        note = r.get("out", "").strip() or r.get("err", "")
+        print(f"    {mark} {s['id']}: {note}")
+
+    res = orchestrator.run_plan(plan, _exec_raw, _log)
+    if res["ok"]:
+        print(f"  ✓ 计划完成（{len(res['done'])} 步）")
+        audit.log("intent.run", intent=text, ok=True, steps=res["done"])
+    else:
+        print(f"  ✗ 第 {res['failed']} 步失败，已回滚 {res['rolled_back']}（{res['err']}）")
+        audit.log("intent.run", intent=text, ok=False, failed=res["failed"],
+                  rolled_back=res["rolled_back"])
+
+
 def _ctx_put(ns, key, val):
     print("  ", _ctx().put(ns, key, val))
 
@@ -647,6 +683,7 @@ def repl():
     print("      | ai [small|4b|gpu] <提示词> | ainodes | aihelp   # 远程 AI 即服务（瘦客户端调她）")
     print("      | audit [n]   # 看控制面审计流水（谁在什么时候调了什么）")
     print("      | caps | can <能力>   # 能力自描述：看编队能做什么、怎么调（编排发现面）")
+    print("      | plan <意图> | intent <意图>   # 统一意图编排：多步+依赖+失败回滚（plan 为演练）")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -719,6 +756,12 @@ def repl():
         elif op == "can":
             if rest:
                 _cmd_can(rest)
+        elif op == "plan":
+            if rest:
+                _cmd_intent(rest, dry=True)
+        elif op == "intent":
+            if rest:
+                _cmd_intent(rest)
         elif op == "audit":
             _cmd_audit(int(rest) if rest.isdigit() else 20)
         else:
@@ -771,6 +814,22 @@ def self_test(host, port, password):
     _cmd_caps()
     _cmd_can("exec")
 
+    print("\n=== 统一意图编排（一个意图 -> 多步 + 依赖 + 失败回滚）===", flush=True)
+    _cmd_intent("对编队做一次巡检")
+    print("\n  -- 故意让后一步落到掉线设备，验证「已完成的步」按逆序回滚 --", flush=True)
+    bad = [
+        {"id": "p1", "desc": "第一步", "cap": "exec", "node": "PC-A",
+         "args": {"cmd": "echo 第一步完成"},
+         "rollback": {"cap": "exec", "node": "PC-A", "args": {"cmd": "echo 回滚:第一步已撤销"}}},
+        {"id": "p2", "desc": "第二步落到掉线设备", "cap": "exec", "node": "PC-Nope",
+         "args": {"cmd": "echo x"}, "after": ["p1"]},
+    ]
+    res = orchestrator.run_plan(
+        bad, _exec_raw,
+        lambda k, s, r: print(f"    {'↩' if k == 'rollback' else ('✓' if k == 'ok' else '✗')}"
+                              f" {s['id']}: {r.get('out', '').strip() or r.get('err', '')}"))
+    print(f"  计划结果: ok={res['ok']} failed={res['failed']} rolled_back={res['rolled_back']}")
+
     print("\n=== L3 共享上下文（跨设备记忆，海马体）===", flush=True)
     _ctx_search("her", "昨晚")
     _ctx_get("her", "game_lastnight")
@@ -821,7 +880,7 @@ def self_test(host, port, password):
     print("\n=== 控制面审计（统一调用面留痕，可观测/可追责）===", flush=True)
     _cmd_audit(12)
 
-    print("\n=== 自检通过：L0/L1/L2/L3 + 她（授权+人格运行时）+ 反向推送 + 共享算力 + 远程 AI 即服务(流式) + 审计 ===", flush=True)
+    print("\n=== 自检通过：L0/L1/L2/L3 + 她（授权+人格运行时）+ 反向推送 + 共享算力 + 远程 AI 即服务(流式) + 能力自描述 + 意图编排/回滚 + 审计 ===", flush=True)
     os._exit(0)
 
 
