@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+sandbox_*/
+sandbox_*.txt
+node_modules/
+.venv/
+*.log
+.DS_Store
