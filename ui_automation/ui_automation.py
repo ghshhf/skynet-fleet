@@ -129,6 +129,12 @@ def skip_ad(serial, package, rules, rounds=6, interval=0.8, use_vision=False):
         xml, err = dump_nodes(serial)
         if not xml:
             log.append(f"[{i}] dump 失败: {err}")
+            # 无设备/设备离线属硬失败：后续轮次必然同样失败，立即返回，不空转
+            low = (err or "").lower()
+            if any(k in low for k in ("no devices", "not found", "device offline",
+                                      "unauthorized", "more than one device")):
+                log.append("（无可用设备，提前结束）")
+                return False, log
             time.sleep(interval)
             continue
         nodes, perr = parse_nodes(xml)

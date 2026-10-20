@@ -260,6 +260,10 @@ def _do_ui_skip(s, m, skip_fn=None):
     无 adb / 无设备时返回 ok=False + err，不崩。
     """
     mid = m.get("id")
+    # 规则来源：控制面下发的规则库版本 > 本节点内置默认（离线兜底，保证无控制面也能跑）
+    ver = m.get("rules_version")
+    head = f"规则来源=控制面 v{ver}" if ver else "规则来源=节点内置默认"
+    log = []
     try:
         if skip_fn is None:
             ua_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_automation")
@@ -268,14 +272,16 @@ def _do_ui_skip(s, m, skip_fn=None):
             import ui_automation as _ua
             skip_fn = _ua.skip_ad
         rules = m.get("rules") or _DEFAULT_UI_RULES
+        head += f"（{len(rules)} 条）"
         ok, log = skip_fn(m.get("serial"), m.get("package", ""), rules,
                           rounds=int(m.get("rounds", 6)),
                           use_vision=bool(m.get("use_vision", False)))
         common.send_msg(s, {"t": common.UI_SKIP_RESULT, "id": mid, "ok": bool(ok),
-                            "log": list(log)[-20:], "err": ""})
+                            "log": [head] + list(log)[-19:], "err": "",
+                            "rules_version": ver or 0})
     except Exception as e:
         common.send_msg(s, {"t": common.UI_SKIP_RESULT, "id": mid, "ok": False,
-                            "log": [], "err": str(e)})
+                            "log": [head], "err": str(e), "rules_version": ver or 0})
 
 
 def _selftest():
@@ -286,7 +292,18 @@ def _selftest():
                 (True, ["hit 跳过"]))
     msgs = _read_msgs(s)
     assert msgs and msgs[0]["t"] == common.UI_SKIP_RESULT and msgs[0]["ok"] is True, msgs
-    assert msgs[0]["id"] == "u1" and msgs[0]["log"] == ["hit 跳过"], msgs
+    assert msgs[0]["id"] == "u1", msgs
+    assert msgs[0]["log"][0].startswith("规则来源="), msgs   # 首行固定为规则来源
+    assert msgs[0]["log"][-1] == "hit 跳过", msgs
+
+    # 控制面下发规则版本时，回执要能证明「用的是哪一版规则」
+    s3 = _FakeSock()
+    _do_ui_skip(s3, {"id": "u3", "package": "com.x", "rules_version": 7,
+                     "rules": [{"packageName": "*", "triggers": [{"name": "跳过", "text": ["跳过"]}]}]},
+                skip_fn=lambda serial, pkg, rules, rounds=6, use_vision=False:
+                (True, ["hit 跳过"]))
+    m3 = _read_msgs(s3)[0]
+    assert m3["rules_version"] == 7 and "v7" in m3["log"][0], m3
 
     s2 = _FakeSock()
 

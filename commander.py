@@ -38,6 +38,12 @@ _TOKEN_LK = threading.Lock()
 CTX = None                               # SharedContext（懒初始化）
 SELF_TEST = False
 
+# adskip 规则库（control-plane 侧唯一权威，节点不再各自维护规则）
+RULES_PATH = os.environ.get(
+    "FLEET_RULES",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_automation", "adskip_rules.json"))
+_RULES_MOD = None
+
 
 def _ctx():
     global CTX
@@ -146,7 +152,8 @@ def _handle_node(conn, password):
             t = m.get("t")
             if t == common.HEARTBEAT:
                 REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("last_hb", time.time()))
-            elif t in (common.EXEC_RESULT, common.PUSH_RESULT, common.PULL_RESULT, common.COMPUTE_RESULT):
+            elif t in (common.EXEC_RESULT, common.PUSH_RESULT, common.PULL_RESULT,
+                       common.COMPUTE_RESULT, common.UI_SKIP_RESULT):
                 _resolve_pending(m.get("id"), m)
             elif t == common.CAPABILITIES:
                 REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("capabilities", m.get("caps", [])))
@@ -396,14 +403,89 @@ def _cmd_queue(name):
     print(f"  {name} 离线队列: {len(q)} 条" + ("" if not q else " -> " + ", ".join(c['cmd'] for c in q)))
 
 
+def _rules():
+    """惰性加载 rules_relay（ui_automation 目录里的规则库）。"""
+    global _RULES_MOD
+    if _RULES_MOD is None:
+        ua_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_automation")
+        if ua_dir not in sys.path:
+            sys.path.insert(0, ua_dir)
+        import rules_relay
+        _RULES_MOD = rules_relay
+    return _RULES_MOD
+
+
+def build_ui_payload(package, use_vision=False, rounds=6, version=None):
+    """组装 UI_SKIP 载荷：自动带上规则库当前（或指定）版本。
+
+    节点侧不再各自维护规则副本——规则是编队共享资产，改一次全设备生效。
+    规则库为空时不带 rules，节点退回内置默认（离线可用性优先）。
+    """
+    rl = _rules()
+    vers = rl.list_versions(RULES_PATH)
+    ver = version if version is not None else (vers[0][0] if vers else 0)
+    rules = rl.get(ver, path=RULES_PATH) if ver else None
+    p = {"t": common.UI_SKIP, "package": package or "", "use_vision": bool(use_vision),
+         "rounds": int(rounds), "rules_version": ver or 0}
+    if rules:
+        p["rules"] = rules
+    return p
+
+
+def _cmd_rules_list():
+    rl = _rules()
+    vers = rl.list_versions(RULES_PATH)
+    cur = vers[0][0] if vers else 0
+    print(f"  规则库 {RULES_PATH}")
+    if not vers:
+        print("  （空，节点将用内置默认规则）")
+        return
+    for v, ts, note in vers:
+        mark = " ← 当前" if v == cur else ""
+        print(f"  v{v}\t{time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))}\t{note}{mark}")
+
+
+def _cmd_rules_get(version=None):
+    rl = _rules()
+    r = rl.get(version, path=RULES_PATH)
+    if r is None:
+        print("  无此版本规则")
+        return
+    import json as _json
+    print(_json.dumps(r, ensure_ascii=False, indent=2))
+
+
+def _cmd_rules_put(path, note=""):
+    rl = _rules()
+    import json as _json
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rules = _json.load(f)
+        v = rl.put(rules, note or f"import {os.path.basename(path)}", path=RULES_PATH)
+        print(f"  已发布规则 v{v}（{len(rules)} 条）—— 下次 ui 命令自动携带")
+    except Exception as e:
+        print(f"  发布失败: {e}")
+
+
+def _cmd_rules_rollback(version):
+    rl = _rules()
+    try:
+        v = rl.rollback(version, path=RULES_PATH)
+        print(f"  已回滚到 v{version} 的内容，生成新版本 v{v}（历史保留）")
+    except Exception as e:
+        print(f"  回滚失败: {e}")
+
+
 def _cmd_ui(node, package, use_vision=False, rounds=6):
     """UI 自动化：让节点在挂载的 Android 设备上按规则跳过广告（源自李跳跳拆解）。"""
-    r = send_to_node(node, {"t": common.UI_SKIP, "package": package,
-                            "use_vision": use_vision, "rounds": rounds})
+    payload = build_ui_payload(package, use_vision, rounds)
+    r = send_to_node(node, payload)
     if "log" not in r:          # 无 log = 传输层失败（不在线/超时/发送失败）
         print(f"  失败: {r.get('err')}")
         return
-    print(f"  → {node}: {'已跳过' if r.get('ok') else '未命中'}（{package or '*'}）")
+    ver = payload.get("rules_version") or 0
+    src = f"规则库 v{ver}" if ver else "节点内置默认"
+    print(f"  → {node}: {'已跳过' if r.get('ok') else '未命中/无设备'}（{package or '*'}，{src}）")
     for line in (r.get("log") or [])[-8:]:
         print("   ", line)
 
@@ -412,7 +494,8 @@ def repl():
     print("cmd> nodes | exec <节点> <命令> | broadcast <命令> | push <节点> <文件> | pull <节点> <远程> [输出]")
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
-    print("      | ui <节点> <包名|*> [--vision] | quit")
+    print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
+    print("      | quit")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -475,6 +558,19 @@ def repl():
             sp = rest.split()
             if len(sp) >= 2:
                 _cmd_ui(sp[0], sp[1], use_vision="--vision" in sp[2:])
+        elif op == "rules":
+            _cmd_rules_list()
+        elif op == "rules_get":
+            _cmd_rules_get(int(rest) if rest.strip().isdigit() else None)
+        elif op == "rules_put":
+            sp = rest.split(" ", 1)
+            if sp and sp[0]:
+                _cmd_rules_put(sp[0], sp[1] if len(sp) > 1 else "")
+        elif op == "rules_rollback":
+            if rest.strip().isdigit():
+                _cmd_rules_rollback(int(rest))
+            else:
+                print("  用法: rules_rollback <版本号>")
         else:
             print("  未知命令")
 
@@ -532,6 +628,24 @@ def self_test(host, port, password):
     local = open("node_agent.py", "rb").read()
     print(f"  bootstrap 分发 node_agent.py: {len(b)}B，与本地一致={b == local}")
     srv.shutdown()
+
+    print("\n=== adskip 规则库 → ui 能力（规则=编队共享资产，改一次全端生效）===", flush=True)
+    global RULES_PATH
+    import json as _json
+    import tempfile
+    RULES_PATH = os.path.join(tempfile.gettempdir(), f"fleet_rules_st_{os.getpid()}.json")
+    if os.path.exists(RULES_PATH):
+        os.remove(RULES_PATH)
+    seed_path = RULES_PATH + ".seed.json"
+    with open(seed_path, "w", encoding="utf-8") as f:
+        _json.dump([{"packageName": "*", "triggers": [
+            {"name": "跳过", "action": "click", "text": ["跳过", "跳过广告"],
+             "textRegex": r"跳过|skip|关闭"}]}], f, ensure_ascii=False)
+    _cmd_rules_put(seed_path, "自检初版")
+    _cmd_rules_list()
+    _cmd_ui("Her-Phone", "com.demo.app")      # 无 adb：应回「规则来源=控制面 v1」，证明规则已下发
+    _cmd_rules_rollback(1)
+    print(f"  回滚后当前版本 = {_rules().list_versions(RULES_PATH)[0][0]}（应为 2，历史保留）")
 
     print("\n=== 配对设备一次性令牌（卸载闸门 ②）===", flush=True)
     _cmd_token("PC-A")

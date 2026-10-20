@@ -14,3 +14,5 @@ fleet_context.db
 fleet_context.db-journal
 persona_state.json
 models/
+ui_automation/adskip_rules.json
+ui_automation/adskip_rules.json.tmp
