@@ -22,15 +22,17 @@
   总日志（输出页）永远收一份；论文的活额外喂给「论文」页、联网的活额外喂给
   「联网」页，这两屏才是长任务时人真正盯着的地方。
 
-  标签页（顶部横排，仿网页）：设备 / 联网(netforce) / 论文 / 输出 / 结果。
+  标签页（顶部横排，仿网页）：设备 / 联网(netforce) / 论文 / AI / 输出 / 结果。
   「论文」页上半行显示今日论文数与来源分布，下面是全屏 RichLog，web.papers
-  跑起来这一屏就一行行长出来；「联网」页左侧站群表、右侧收获流。
+  跑起来这一屏就一行行长出来；「联网」页左侧站群表、右侧收获流；
+  「AI」页顶部列可用免费后端、下方全屏对话流，提问框回车即向所有后端并发提问。
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import re
+import shlex
 import sys
 import time
 
@@ -79,6 +81,9 @@ TabbedContent { height: 100%; }
 TabPane { padding: 0; }
 #pane_dev, #pane_web { layout: horizontal; }
 #pane_paper { layout: vertical; }
+#pane_ai { layout: vertical; }
+#ailine { height: 1; padding: 0 1; color: #8b949e; background: #161b22; }
+#ailog { height: 1fr; }
 #devices { width: 34; }
 #caps { width: 1fr; }
 #sites { width: 56; }
@@ -105,6 +110,7 @@ class FleetTUI(App):
         ("ctrl+d", "focus_devices", "设备"),
         ("ctrl+w", "focus_web", "联网"),
         ("ctrl+p", "focus_papers", "论文"),
+        ("ctrl+a", "focus_ai", "AI"),
         ("ctrl+b", "toggle_live", "直播"),
         ("ctrl+r", "refresh", "重新探测"),
         ("ctrl+c", "stop_job", "叫停"),
@@ -166,6 +172,14 @@ class FleetTUI(App):
                     yield DataTable(id="papers", zebra_stripes=True)
                     yield RichLog(id="paperlog", wrap=True,
                                   highlight=False, markup=False)
+            with TabPane("AI", id="pane_ai"):
+                with Vertical():
+                    yield Static("AI 页：在下方输入框提问，回车即向所有免费后端并发提问",
+                                 id="ailine")
+                    yield RichLog(id="ailog", wrap=True,
+                                  highlight=False, markup=False)
+                    yield Input(placeholder="问 AI（回车即向所有免费后端并发提问；多后端按 [id] 同屏）",
+                                id="aiprompt")
             with TabPane("输出", id="pane_log"):
                 yield RichLog(id="log", wrap=True, highlight=False, markup=False)
             with TabPane("结果", id="pane_res"):
@@ -265,6 +279,8 @@ class FleetTUI(App):
             return self.query_one("#paperlog", RichLog)
         if self._job_cap.startswith("web."):
             return self.query_one("#weblog", RichLog)
+        if self._job_cap.startswith("ai."):
+            return self.query_one("#ailog", RichLog)
         return None
 
     def _absorb(self, line):
@@ -337,6 +353,7 @@ class FleetTUI(App):
     def _paint_all(self, rows, sites, papers):
         self._paint_devices(rows)
         self._paint_web(sites, papers)
+        self._paint_ai()
 
     def _paint_devices(self, rows):
         t = self.query_one("#devices", DataTable)
@@ -403,6 +420,26 @@ class FleetTUI(App):
             head.append(f"　抓取中：已出 {self._job_lines} 行", style="bold #d29922")
         self.query_one("#paperline", Static).update(head)
 
+    def _paint_ai(self):
+        """AI 页顶上那一句：现在有哪些免费后端可用。"""
+        t = self.query_one("#ailine", Static)
+        try:
+            res = self.shell.reg.call("ai.list")
+        except Exception as e:
+            t.update(Text(f"AI 后端读取失败：{e}", style="#f85149"))
+            return
+        if not res.ok:
+            t.update(Text(f"AI：{res.err}", style="#f85149"))
+            return
+        bs = res.data.get("backends", [])
+        if not bs:
+            t.update(Text("AI：无可用后端（联网用 pollinations 免key，或设 FLEET_LLM_URL）",
+                          style="#8b949e"))
+            return
+        ids = " / ".join(b["id"] for b in bs)
+        t.update(Text(f"AI 后端 {len(bs)} 个：{ids}　（下方输入框提问，回车即问所有后端）",
+                      style="bold #58a6ff"))
+
     def _paint_results(self):
         t = self.query_one("#results", DataTable)
         t.clear(columns=True)
@@ -439,6 +476,16 @@ class FleetTUI(App):
     # ---------------- 执行 ----------------
 
     def on_input_submitted(self, ev):
+        # AI 页的提问框：把输入转成 ai.chat，复用同一套流式管道
+        if ev.input.id == "aiprompt":
+            prompt = (ev.value or "").strip()
+            ev.input.value = ""
+            if not prompt:
+                return
+            self._hist.append(prompt)
+            self._hi = len(self._hist)
+            self._submit(f"ai.chat --prompt {shlex.quote(prompt)}")
+            return
         line = (ev.value or "").strip()
         ev.input.value = ""
         if not line:
@@ -466,7 +513,7 @@ class FleetTUI(App):
     def _run(self, line, confirm=False):
         # 联网作业才亮进度条：别的活都是一瞬间，画条出来反而晃眼
         head = (line.split() or [""])[0]
-        self._job_cap = head if head.startswith("web.") else ""
+        self._job_cap = head if (head.startswith("web.") or head.startswith("ai.")) else ""
         self._job_done = self._job_total = self._job_steps = 0
         self._job_lines = 0
         self._job_t0 = time.time()
@@ -506,6 +553,8 @@ class FleetTUI(App):
             self.query_one("#paperlog", RichLog).write(txt)
         elif cap.startswith("web."):
             self.query_one("#weblog", RichLog).write(txt)
+        elif cap.startswith("ai."):
+            self.query_one("#ailog", RichLog).write(txt)
 
     # ---------------- 选中即填 ----------------
 
@@ -580,6 +629,10 @@ class FleetTUI(App):
         self.query_one("TabbedContent", TabbedContent).active = "pane_paper"
         self.query_one("#paperlog", RichLog).focus()
 
+    def action_focus_ai(self):
+        self.query_one("TabbedContent", TabbedContent).active = "pane_ai"
+        self.query_one("#aiprompt", Input).focus()
+
     def action_toggle_live(self):
         """直播开关：长任务要不要逐行往外长。
 
@@ -608,7 +661,8 @@ class FleetTUI(App):
 
 # ---------------------------------------------------------------- 门禁 / 出图
 
-SMOKE_CMDS = ("devices", "caps", "pc.state", "web.status", "web.sites", "transports")
+SMOKE_CMDS = ("devices", "caps", "pc.state", "web.status", "web.sites",
+              "ai.list", "transports")
 
 
 async def _headless(run_cmds=(), wait=2.5):
@@ -622,7 +676,7 @@ async def _headless(run_cmds=(), wait=2.5):
         return app
 
 
-PANES = ("pane_dev", "pane_web", "pane_paper", "pane_log", "pane_res")
+PANES = ("pane_dev", "pane_web", "pane_paper", "pane_ai", "pane_log", "pane_res")
 
 
 def _shot(path, size=(150, 40), pane="pane_dev"):

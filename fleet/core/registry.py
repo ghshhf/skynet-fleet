@@ -55,6 +55,10 @@ class Capability:
     destructive: bool = False      # 不可逆（删、格式化、发射）——闸门要双确认
     check: object = None           # check_fn(registry, device) -> (bool, reason)
     note: str = ""
+    approval: str = "auto"         # 审批档（学 Cherry 的 builtinToolPolicyRegistry）：
+                                    #   auto —— 默认，按现有闸门走
+                                    #   ask  —— 即便非副作用也要人确认（闸门 level=2）
+                                    #   deny —— 永远拒绝（fail-closed，数据文件改不了）
 
     def __post_init__(self):
         """把 params 一律归一成元组。
@@ -78,6 +82,7 @@ class Capability:
                 "params": [p.as_dict() for p in self.params],
                 "side_effect": self.side_effect, "destructive": self.destructive,
                 "note": self.note,
+                "approval": self.approval,
                 "domain": self.name.split(".", 1)[0]}
 
 
@@ -272,12 +277,20 @@ class Registry:
         if not ok:
             return self._failure(cap_name, reason, device)
 
-        if cap.side_effect:
+        # 审批档（学 Cherry 的 builtinToolPolicyRegistry）：书写在代码层，
+        # 数据文件改不了——deny 永远拒绝，ask 即便非副作用也要人确认。
+        if cap.approval == "deny":
+            return R.DeviceResult.denied(
+                cap_name, "该能力被审批档设为 deny（fail-closed，数据文件无法覆盖）",
+                device=dev.name)
+        needs_approval = cap.side_effect or cap.approval == "ask"
+        if needs_approval:
             g = gate or self.gate
-            level = 2 if cap.destructive else 1
+            # ask 档即便不是副作用也要人确认；destructive 一律双确认
+            level = 2 if (cap.destructive or cap.approval == "ask") else 1
             if g is None:
                 return R.DeviceResult.denied(
-                    cap_name, "动手能力需要闸门（没注入 gate 一律拒绝）", device=dev.name)
+                    cap_name, "需要审批闸门（没注入 gate 一律拒绝）", device=dev.name)
             try:
                 d = g(cap, dev, args, level)
             except Exception as e:
@@ -393,7 +406,8 @@ def _selftest():
     reg = Registry(path="", ttl=0)
     reg.register(Capability("probe.echo", "回声", params=(Param("x", "int"),)))
     reg.register(Capability("probe.write", "写一下", side_effect=True))
-    reg.add(Fake("f:up", True, caps=("probe.echo", "probe.write", "probe.burn")))
+    reg.add(Fake("f:up", True, caps=("probe.echo", "probe.write", "probe.burn",
+                                     "probe.locked", "probe.askme")))
     reg.add(Fake("f:down", False, caps=("probe.echo",)))
 
     # ① 正常调用 + 指定设备
@@ -441,6 +455,16 @@ def _selftest():
     reg.register(Capability("probe.burn", "烧掉", side_effect=True, destructive=True))
     reg.call("probe.burn", "f:up", {"yes": True}, gate=gate)
     assert seen["level"] == 2, seen
+
+    # ⑧b 审批档 deny：永远拒绝（fail-closed），数据文件盖不了
+    reg.register(Capability("probe.locked", "锁死", approval="deny"))
+    r = reg.call("probe.locked", "f:up", {}, gate=gate)
+    assert r.code == R.DENIED, r
+    # ⑧c 审批档 ask：即便非副作用也要闸门确认；闸门放行才过
+    reg.register(Capability("probe.askme", "要确认", approval="ask"))
+    r = reg.call("probe.askme", "f:up", {}, gate=gate)
+    assert r.code == R.DENIED and seen["level"] == 2, r
+    assert reg.call("probe.askme", "f:up", {"yes": True}, gate=gate).ok
 
     # ⑨ adapter 抛异常 → error，不传染
     r = reg.call("probe.echo", "f:up", {"boom": 1})
@@ -495,7 +519,7 @@ def _selftest():
 
     # ⑭ stats 给状态栏用
     st = reg.stats()
-    assert st["devices"] == 2 and st["online"] == 1 and st["caps"] == 3, st
+    assert st["devices"] == 2 and st["online"] == 1 and st["caps"] == 5, st
 
     # ⑮ 没声明参数的能力，自动从根目录 capabilities 基线继承
     if CAPSPEC is not None:
