@@ -16,6 +16,7 @@
 """
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -150,11 +151,17 @@ def probe(b, timeout=8):
             return False, f"{type(e).__name__}: {e}"
 
 
-def chat(b, prompt, system="", on_token=None, max_tokens=512, timeout=60):
+def chat(b, prompt, system="", on_token=None, max_tokens=2048, timeout=120):
     """流式对话：逐 token 调 on_token(text)；返回完整文本。
 
     SSE 解析做了容错（Cherry 专门 patch 过 SDK 来容忍残缺流片段）——遇到
     解析不出的行就跳过，绝不整段丢；[DONE] 正常收尾。
+
+    timeout 默认 120s（本地网关 + 512 max_tokens 时 60s 偏紧，实测撞过）。
+    流中途超时不会丢已收到的内容——见 _chat_stream。
+
+    🔴 max_tokens 默认 2048：推理模型会先烧一段 token 思考再吐正文，
+    预算给小了会 finish_reason=length 且正文 0 字符（实测 300 必空、1024 起正常）。
     """
     return _chat_stream(b, prompt, system, on_token, max_tokens, timeout)
 
@@ -180,25 +187,63 @@ def _chat_stream(b, prompt, system, on_token, max_tokens, timeout):
         body = e.read().decode("utf-8", "replace")[:200]
         raise RuntimeError(f"HTTP {e.code}: {body}")
     full = []
-    for raw in resp:
-        line = raw.decode("utf-8", "replace").strip()
-        if not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data == "[DONE]":
-            break
+    finish = None
+    # 🔴 流中途超时/断开：**已经收到的内容不许丢**。上游偶发卡死（实测本地网关
+    # 8 次里撞到 1 次 timeout），原实现让异常直接冲出函数，full 里的半截回答
+    # 全部作废，用户只看到一句「出错」——其实答案已经写了一半。
+    stalled = None
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue                        # 容错：残缺片段跳过
+            # 有的端点末尾发一个 choices:[] 的 usage chunk —— 跳过，别越界
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            fr = choices[0].get("finish_reason")
+            if fr:
+                finish = fr
+            # 只取正文 content；reasoning 是模型内部思考，不进答案流
+            delta = (choices[0].get("delta") or {}).get("content")
+            if delta:
+                full.append(delta)
+                if on_token:
+                    on_token(delta)
+    except (socket.timeout, TimeoutError) as e:
+        stalled = f"读取超时（{timeout}s 内上游没再发数据）: {e}"
+    except urllib.error.URLError as e:
+        stalled = f"连接中断: {e}"
+    except OSError as e:
+        stalled = f"连接中断: {e}"
+    finally:
         try:
-            obj = json.loads(data)
-        except json.JSONDecodeError:
-            continue                        # 容错：残缺片段跳过
-        # 有的端点末尾发一个 choices:[] 的 usage chunk —— 跳过，别越界
-        choices = obj.get("choices") or []
-        if not choices:
-            continue
-        # 只取正文 content；reasoning 是模型内部思考，不进答案流
-        delta = (choices[0].get("delta") or {}).get("content")
-        if delta:
-            full.append(delta)
-            if on_token:
-                on_token(delta)
-    return "".join(full)
+            resp.close()
+        except Exception:
+            pass
+    text = "".join(full)
+    if stalled:
+        if text.strip():
+            # 有半截答案：给出去，并在末尾标一句「上游卡住了」——半截真话比空话有用
+            return text + f"\n\n[流被中断] {stalled}（以上是中断前收到的内容）"
+        # 一个字都没有：这不是「模型没话说」，是链路死了——必须报原因，不能交空串
+        raise RuntimeError(f"{stalled}；上游一个字都没给")
+    if not text.strip() and finish == "length":
+        # 🔴 空回的真因（2026-10-21 实测抓到的）：**推理模型把 max_tokens 预算
+        # 全烧在 reasoning 上了，正文一个字没吐就被截断**。
+        # 证据：minimax-m3.1-flash 带 system prompt 时 max_tokens=300 → finish_reason=length
+        # 且正文 0 字符；同样参数 1024/2048 → finish_reason=stop，正文正常。
+        # 所以「空回」不是上游抽风，是**预算不够**——这时给一句「上游临时抽风」是
+        # 误导，会把人引到错误的排查方向上（重试没用，加预算才有用）。
+        raise RuntimeError(
+            f"预算被推理烧光：max_tokens={max_tokens} 不够这个推理模型思考，"
+            f"正文被截断（finish_reason=length）。加大 max_tokens 再试"
+            f"（本项目建议 ≥1024）。")
+    return text

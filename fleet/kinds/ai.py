@@ -19,6 +19,14 @@ import time
 from .. import ai_backends as AB
 from ..core import BaseDevice, DeviceResult as R
 
+# 🔴 默认 max_tokens 为什么是 2048（2026-10-21 实测抓到的坑）：
+#   minimax-m3.1-flash 这类**推理模型**会先花一大截 token 思考，再吐正文。
+#   带 system prompt 时 max_tokens=300 → finish_reason=length、正文 0 字符
+#   （界面看着像「模型没话说」，其实是预算被推理烧光）；
+#   同样参数 1024/2048 → finish_reason=stop，正文正常。
+#   原默认 512 正好落在「够不着正文」的区间里 ⇒ 默认给 2048。
+DEFAULT_MAX_TOKENS = 2048
+
 
 class AI(BaseDevice):
     kind = "ai"
@@ -81,7 +89,7 @@ class AI(BaseDevice):
         b = bs[0]
         try:
             text = AB.chat(b, prompt, system=args.get("system") or "",
-                           max_tokens=int(args.get("max_tokens") or 512))
+                           max_tokens=int(args.get("max_tokens") or DEFAULT_MAX_TOKENS))
         except Exception as e:
             return R.error("ai.complete", f"{b['id']} 出错: {e}",
                            device=self.name, via=self.via)
@@ -104,7 +112,7 @@ class AI(BaseDevice):
             return R.unavailable("ai.chat", "没有可用后端",
                                  device=self.name, via=self.via)
         on_line = args.get("_on_line")
-        mt = int(args.get("max_tokens") or 512)
+        mt = int(args.get("max_tokens") or DEFAULT_MAX_TOKENS)
         system = args.get("system") or ""
         results = {}
 
