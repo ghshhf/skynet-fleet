@@ -20,9 +20,16 @@
   - **她 P4 能力请求 + 授权门**：她的节点发 `cap_req` → 路由到用户批准 → `cap_grant` 限时会话（拒绝则执念+1）。人格/训练交手机（不在此仓库训）。
   - **反向推送 bootstrap（第三原则）**：中心起迷你 HTTP 分发几 KB bootstrap + 工具箱，loopback 字节校验一致。
   - **共享算力池（§九 dev_pick）**：节点上报 CPU/GPU/模型；Commander 按「谁能干」路由计算任务；`computemap` 批量分发多节点聚合；结果进共享上下文缓存，全编队复用（更加一步共享）。
+  - **算力接真推理**：`compute_runner` 走 `llm.py` 三后端（`FLEET_LLM_CMD` 命令行 / `FLEET_LLM_URL` OpenAI 兼容端点 / placeholder 占位降级），改环境变量即切换，业务代码零改动——**弱设备不装模型，算力集中在有脑的节点**。
   - **`ui_automation` 节点能力（源自李跳跳拆解）**：节点挂 Android 设备后用 adb 拉节点树 → 规则匹配（含 `textRegex` 抗文案漂移）→ `input tap`；匹配不到且标了 `needVision` 时走 AI 视觉兜底。控制面 `ui <节点> <包名> [--vision]`。
-  - **一键自测门禁**：`run_selftests.py` 串起 commander / node_agent / install_windows / ui_automation / rule_engine 五项离线自测。
-- **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、临时节点（网吧）会话注入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）。
+  - **adskip 规则库版本化**：规则是编队共享资产（`rules` / `rules_put` / `rules_rollback`），控制面持有唯一权威版本，`ui` 命令自动带上当前版本下发；节点回执首行标注「规则来源=控制面 vN」可直接验证。补的正是李跳跳「作者停更规则即废」的命门。
+  - **策略层（判断外置为数据）**：`policies.py` 复用规则引擎，掉线降级 / 心跳探测判死 / 重活优先 GPU / 临时节点下机清理 / 算力池空提示全是 JSON 规则，**代码里不写 if/else 分支**；`policy_eval` 可 dry-run。
+  - **心跳看门狗**：`scan_stale` 纯函数 + 5s 轮询，90s 探测、180s 判死摘除——把「时间」变成事件喂给策略，否则策略就是空壳。
+  - **离线队列持久化**：排队命令落盘（原子替换），控制面重启自动恢复，「上线自动补」这个承诺才不是假的。
+  - **她 P3 人格心跳**：主动性 tick 接入看门狗，过**频控(≤2/h) / 静默时段 / 重要度**三道刹车；说了写 `last_thought`，不说写 `pending_thought`（她在忍，不是消失了）。接上 `llm.py` 后由模型自己开口，未接时模板兜底、绝不伪造模型输出。
+  - **临时节点下机即清**：节点上报 `session=True` 后断开，自动触发 `session_end` 策略（清理凭据、不留痕），与场所合规清理互补。
+  - **一键自测门禁**：`run_selftests.py` 串起 **10 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / compute_runner / queue_store / persona）。
+- **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动。
 
 自测命令（全部离线，不碰真机、不需联网）：
 
@@ -66,12 +73,15 @@ skynet-fleet/
 ├── install_windows.py   # Windows L1 常驻安装器（零依赖，SYSTEM 计划任务 + 密码/令牌双闸）
 ├── memory.py            # L3 共享上下文（SQLite+FTS5，逐条可删）
 ├── persona.py           # 她脚手架（人格态/心念tick频控/能力请求门/红线）
+├── policies.py          # 策略层：掉线/心跳/算力/会话 的判断外置为 JSON 规则
+├── queue_store.py       # 离线队列持久化（控制面重启不丢）
+├── llm.py               # 本地推理适配层（CMD/URL/placeholder 三后端，改环境变量即切换）
 ├── bootstrap.py         # 第三原则反向推送：中心分发 bootstrap + 工具箱
-├── compute_runner.py    # 共享算力：节点侧本地推理接口（真实模型接入位）
+├── compute_runner.py    # 共享算力：节点侧推理（走 llm.py 多后端）
 ├── platform_android.py  # Android 节点入网（adb 反向推送）
 ├── platform_apple.py    # Apple 桥接（macOS SSH / iOS 屏共 半可达）
 ├── platform_router.py   # 路由器/OpenWrt 节点（常开中枢候选）
-├── run_selftests.py     # 一键离线自测门禁（五项目）
+├── run_selftests.py     # 一键离线自测门禁（十项）
 ├── ui_automation/       # ui_automation 节点能力（李跳跳抽象：adb 节点树+规则+点击+视觉兜底）
 ├── rfc/
 │   ├── remote-ai-service/   # RFC：远程 AI 即服务（瘦客户端）
@@ -103,7 +113,16 @@ ctx_put her key 值         # 写共享上下文（跨设备记忆）
 compute 帮我写段代码        # 路由到算力节点跑重活（她三段式 ③）
 computemap a;b;c          # 批量分发多算力节点聚合
 computepool               # 看算力池
+ui Her-Phone com.xx.app   # 让节点按规则库当前版本跳广告（--vision 走视觉兜底）
+rules / rules_put <文件>  # 规则库：看版本 / 发布会自动带版本下发
+rules_rollback 1          # 回滚（生成新版本，历史保留）
+policy / policy_eval '{...}'  # 看生效策略 / dry-run 一个事件
+her / her_say 你在干嘛     # 看她的状态 / 让她现在说一句（走频控刹车）
 cap / token ...           # 她能力授权 / 配对设备令牌
+
+# 4) 算力接真模型（任一节点设了即可，改环境变量即切换，代码零改动）
+set FLEET_LLM_CMD=ollama run qwen3:4b
+set FLEET_LLM_URL=http://127.0.0.1:8080
 ```
 
 > 真部署须收紧 exec 白名单并走 Tailscale；当前白名单仅含演示命令。
@@ -113,14 +132,16 @@ cap / token ...           # 她能力授权 / 配对设备令牌
 ## 路线图（分支线）
 
 ```
-决策分叉 ── 持久化深度 ── L1 SYSTEM 服务 ✓(已建+自测) ── L2 内核驱动（延后）
+决策分叉 ── 持久化深度 ── L1 SYSTEM 服务 ✓(已建+自测) ── L2 内核驱动（延后，用户定调回 L1）
            └─ 平台 ── Windows ✓(本期) ── Linux / Android / Apple / 路由（适配器已写，延后真机）
-           └─ 节点性质 ── 常驻 ✓ ── 临时(网吧会话注入)（延后）
+           └─ 节点性质 ── 常驻 ✓ ── 临时(网吧) ✓(session_end 下机即清) ── 真机验证（延后）
            └─ 认证 ── 密码 ✓ + 配对设备一次性令牌 ✓ ── 手机扫码入网（延后）
            └─ 推送 ── 反向推送 ✓(bootstrap+文件) ── 手机 adb 真推（延后）
-           └─ 调用 ── 单点 exec ✓ + broadcast 扇出 ✓ + 共享算力路由 ✓ ── 统一意图编排（延后）
+           └─ 调用 ── 单点 exec ✓ + broadcast 扇出 ✓ + 共享算力路由 ✓ + 真推理 ✓ ── 统一意图编排（延后）
            └─ 上下文 ── L3 共享 ✓(已建+自测) ── 与她记忆深绑（延后训练）
-           └─ 她 ── P4 授权门 ✓(脚手架) ── SFT 人格训练(交手机)（延后）
+           └─ 可靠性 ── 心跳看门狗 ✓ + 策略层 ✓ + 队列持久化 ✓ ── 多控制面仲裁（延后）
+           └─ 她 ── P3 人格心跳 ✓ + P4 授权门 ✓ + 接真模型开口 ✓ ── SFT 人格训练(交手机)（延后）
+           └─ 规则 ── 版本化规则库 ✓ + 无障碍跳广告 ✓ ── 社区规则中继（延后）
 ```
 
 ---
