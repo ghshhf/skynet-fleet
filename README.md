@@ -34,7 +34,8 @@
   - **exec 白名单收紧**：三层拒绝——① base 不在白名单 ② 参数含 shell 元字符（`& | ; < > \` $` 换行），因为节点侧 `shell=True`，`echo ok & del x` 这种 base 是 echo 却能干任何事的组合是白名单最大的洞 ③ **解释器默认禁止**（`python/powershell/cmd/bash` 等于任意代码执行，要跑脚本须显式 `FLEET_ALLOW_INTERPRETER=1`）。拒绝理由分类型回执给人看，不再只给 `rc=-1`。
   - **扫码入网（`enroll.py`）**：手机出示一张二维码载荷，设备扫一下即可入网，不用在新机器上敲密码。载荷是 `fleet://enroll?p=...`（约 230 字符），**可离线验签**（HMAC-SHA256 + 共享密钥，不联网、不回调控制面）、**一次性**（兑换落本地账本，截图外流也只是废纸）、**有时效**（默认 10 分钟）、**绑节点**（A 的载荷装不成 B），且**不含用户密码**——装完节点用随机 PSK 认证，明文密码不再写进计划任务参数。载荷寿命与节点凭据寿命**分开**：码 10 分钟过期，PSK 长期有效（否则一重启就失联），撤销走 `enroll_revoke`。REPL：`enroll <节点> [有效期秒]` / `enroll_list` / `enroll_revoke <节点>`；安装侧 `install_windows.py --enroll "<uri>" [--dry-run]`。
   - **分权（`accounts.py`）**：账号是「人」，节点是「设备」，两维分开。**主号唯一**——能发令、能发码、能增删分号、能看全部；**分号只能被控**——没有发令权，只能看到自己名下节点（过滤在控制面做，不在客户端做，否则改个脚本就绕过了）。闸门顺序刻意是**先分权、再仲裁**：分号即使占了领袖位也拒，因为没有权限跟谁是领袖无关；两道闸失败语义也不同（分权是安全、拒绝即拒绝；仲裁是协同、状态文件坏了就放行）。令牌自带角色与过期时间，并带权限版本 `pv`——**吊销分号后旧令牌立刻作废**，不等自然过期。**授权码**（用户要的「密码生成器 / 扫码同步权限」）是**同一枚一次性码的两种呈现**：终端里念 6 位短码，手机上画二维码；6 位用去掉 0/O/1/I 的 32 字母表（≈10 亿组合）+ 5 分钟寿命 + 一次性；二维码载荷 `fleet://grant?p=…` 用账本自带密钥签 HMAC，**伪造载荷在查账本之前就被拒**。与入网码刻意分开：入网码离线验签（装设备时可能没网），授权码必须中心验（改权限不能交给客户端自己认）。**诚实边界**：没有找回密码——主号忘了只能删账本重建（会连带吊销所有分号），因为找回通道本身就是后门。
-  - **一键自测门禁**：`run_selftests.py` 串起 **17 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / accounts / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups）。
+  - **主动发现（`discovery.py`）**：不问「你是谁」，自己看、自己猜、自己归类。三条路互补——**组播询问**（SSDP M-SEARCH + mDNS 手写 DNS 解析，设备自己举手报名，信息最准）、**邻居表 + OUI**（读 arp/ip neigh，零打扰，靠 MAC 前三字节查厂商）、**特征端口组合**（单端口只能投票，`9000+554+23+8080` 这种**招牌组合**才定案）。实测在真实局域网上认出了具体型号：`HIKVISION DS-2CD2T10FD-I3`（6 台，连序列号都有）、`TPOS/1.0.0 UPnP/1.0 YLWR1200G易展版`（TP-Link 路由）。三条铁律写在代码里：只在本网段活动（跨网段直接拒）、只对 ARP 表里已存在的 IP 敲端口（不做全网段暴力扫描）、**发现 != 入网**（结果只进发现账本，要成为节点仍需在设备上装 agent 并入网）。**踩过的坑**（都是真实误判，已修）：① 9000 端口曾被当成「编队节点」——它同时是 Portainer/海康 SDK 端口，等于把陌生人当自己人；② `192.168.0.255` 广播地址曾被列为设备；③ 一台开 554 的 Windows 电脑曾被判成摄像头，而它的 mDNS 明明写着 `Microsoft-Windows + iVCam`——**设备自报的身份永远压过端口投票**；④ 多网卡机器不显式绑网卡发组播，一个响应都收不到；⑤ 隐私随机 MAC（本地管理位=1）查 OUI 必然为空，不能当「厂商缺失」。
+  - **一键自测门禁**：`run_selftests.py` 串起 **18 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / discovery / accounts / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups）。
 - **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动、手机端二维码渲染（载荷已可生成与离线验签，缺的只是把它画成图）。
 
 自测命令（全部离线，不碰真机、不需联网）：
@@ -86,6 +87,7 @@ skynet-fleet/
 ├── policies.py          # 策略层：掉线/心跳/算力/会话 的判断外置为 JSON 规则
 ├── arbiter.py           # 多控制面仲裁：全编队只有一个领袖能发令（待机面只读）
 ├── accounts.py          # 分权：主号/分号 + 一次性授权码（短码与二维码同一枚）
+├── discovery.py         # 主动发现：SSDP/mDNS/邻居表/端口组合 -> 认设备类别与型号
 ├── queue_store.py       # 离线队列持久化（控制面重启不丢）
 ├── llm.py               # 本地推理适配层（CMD/URL/placeholder 三后端，改环境变量即切换）
 ├── bootstrap.py         # 第三原则反向推送：中心分发 bootstrap + 工具箱

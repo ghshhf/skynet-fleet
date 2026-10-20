@@ -15,6 +15,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import json
 import os
 import socket
 import sys
@@ -61,6 +62,11 @@ RULES_PATH = os.environ.get(
     "FLEET_RULES",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_automation", "adskip_rules.json"))
 _RULES_MOD = None
+
+# 发现账本：局域网里「看见过」的设备。**不等于入网**，只是记下来供人过目。
+DISCOVERY_PATH = os.environ.get(
+    "FLEET_DISCOVERY_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "discovered.json"))
 
 # ---- 多控制面仲裁（一个意图绝不割裂）----
 # 全编队只有一个领袖控制面能发令；其它待机（只读 REPL），领袖死了备用自动接管。
@@ -262,7 +268,7 @@ def start_watchdog(**kw):
 
 GATED_OPS = ("exec", "broadcast", "push", "pull", "compute", "computemap", "ui",
              "rules_put", "rules_rollback", "enroll", "enroll_revoke", "token",
-             "intent", "cap批准")
+             "intent", "cap批准", "discover")
 
 
 def _gate(op, role=None):
@@ -1101,6 +1107,30 @@ def _cmd_ui(node, package, use_vision=False, rounds=6):
         print("   ", line)
 
 
+def _cmd_discover(save=True, do_ports=True):
+    """主动发现局域网设备：自己不报名也要把它们找出来。
+
+    三条路：组播询问（SSDP/mDNS，设备自报型号最准）+ 邻居表/OUI（零打扰）
+    + 特征端口组合（海康 9000+554+23+8080 这类招牌组合）。
+    铁律：**只探测、不入网**。发现结果进账本，要变成节点仍需在设备上装 agent 并入网。
+    """
+    if not _gate("discover"):
+        return None
+    import discovery as disc
+    print("  扫描中（组播 + 邻居表 + 端口指纹）…", flush=True)
+    r = disc.discover(do_ports=do_ports)
+    print(disc.format_table(r))
+    if save:
+        try:
+            with open(DISCOVERY_PATH, "w", encoding="utf-8") as f:
+                json.dump(r, f, ensure_ascii=False, indent=2)
+            print(f"  已记入发现账本 {DISCOVERY_PATH}（{r.get('count', 0)} 台）")
+        except OSError as e:
+            print(f"  账本写入失败: {e}")
+    print("  发现 != 入网：这些设备只是「看见了」，要纳入编队得在它上面装 agent 再 enroll。")
+    return r
+
+
 def _cmd_intent(text):
     """统一意图编排（L2 本命位）：一句话 -> 多步计划 -> 带依赖执行 -> 失败逆序回滚。
 
@@ -1150,6 +1180,7 @@ def repl():
     print("      | enroll <节点> [有效期秒] | enroll_list | enroll_revoke <节点>   # 扫码入网（离线验签）")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
     print("      | policy | policy_eval <事件JSON> | her | her_memory | her_followups | her_say <文本> | intent <一句话> | quit")
+    print("      | discover [--no-ports]  # 自己扫局域网、自己认设备（只探测不入网）")
     print("      | done <topic>   # 告诉系统这件事做完了（清账，她不再追问）")
     print("      | journal [n]    # 回看对话流水（她起话题的依据）")
     print("      | arbiter        # 多控制面仲裁：谁是领袖、本机是领袖还是待机")
@@ -1227,6 +1258,8 @@ def repl():
             sp = rest.split()
             if len(sp) >= 2:
                 _cmd_ui(sp[0], sp[1], use_vision="--vision" in sp[2:])
+        elif op == "discover":
+            _cmd_discover(do_ports="--no-ports" not in rest.split())
         elif op == "rules":
             _cmd_rules_list()
         elif op == "rules_get":
