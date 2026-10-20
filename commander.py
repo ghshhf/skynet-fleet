@@ -40,6 +40,7 @@ TOKENS = {}                              # token -> {node, purpose, exp}
 _TOKEN_LK = threading.Lock()
 
 DEGRADED = set()                         # 被策略降级的节点（掉线后不再参与路由）
+DEBUG = bool(os.environ.get("FLEET_DEBUG"))   # FLEET_DEBUG=1：打印通信收发与超时
 
 CTX = None                               # SharedContext（懒初始化）
 SELF_TEST = False
@@ -81,14 +82,23 @@ def _resolve_pending(mid, payload):
 
 
 def send_to_node(name, msg, timeout=30):
+    t0 = time.time()
     node = REGISTRY.with_lock(lambda d: d.get(name))
     if not node:
         return {"ok": False, "err": f"节点 {name} 不在线", "offline": True}
     mid = msg.get("id") or _next_id("m")
     msg["id"] = mid
     ev = _store_pending(mid)
+    if DEBUG:
+        try:
+            _fd = node["sock"].fileno()
+        except OSError:
+            _fd = "closed"
+        print(f"[dbg] -> {name} {msg.get('t')} mid={mid} fd={_fd}", flush=True)
     try:
         common.send_msg(node["sock"], msg)
+        if DEBUG:
+            print(f"[dbg] .. 已写出 {name} mid={mid} ({time.time()-t0:.2f}s)", flush=True)
     except OSError as e:
         with _PENDING_LK:
             PENDING.pop(mid, None)
@@ -96,6 +106,8 @@ def send_to_node(name, msg, timeout=30):
     if not ev.wait(timeout):
         with _PENDING_LK:
             PENDING.pop(mid, None)
+        if DEBUG:
+            print(f"[dbg] {name} {msg.get('t')} mid={mid} 超时 {time.time() - t0:.1f}s", flush=True)
         return {"ok": False, "err": "等待节点回执超时"}
     with _PENDING_LK:
         slot = PENDING.pop(mid, {"slot": {}})["slot"]
@@ -192,15 +204,35 @@ def _enqueue(name, cmd):
         queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
 
 
-def _replay_queue(name):
-    """节点上线时，把排队命令重放过去（透明上下线）。"""
+def _replay_queue(name, sock=None):
+    """节点上线时把排队命令补发过去（透明上下线）。
+
+    关键：**不能等回执**。重放在 `_handle_node` 的读循环启动之前执行，
+    若在此同步等回执就会把读循环堵死（回执到了没人读），每次上线白等 30 秒，
+    期间该节点所有回执全部丢失。重放是「补发」，回执由节点各自执行后异步产生。
+    """
     with _QUEUE_LK:
         q = OFFLINE_QUEUE.pop(name, [])
         if q:
             queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
-    if q:
-        send_to_node(name, {"t": common.QUEUE, "cmds": q})
-        print(f"[*] 节点 {name} 上线，重放 {len(q)} 条离线命令", flush=True)
+    if not q:
+        return
+    if sock is None:
+        sock = REGISTRY.with_lock(lambda d: (d.get(name) or {}).get("sock"))
+    if sock is None:
+        # 节点已走：任务塞回队列，下次上线再补
+        with _QUEUE_LK:
+            OFFLINE_QUEUE.setdefault(name, []).extend(q)
+            queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
+        return
+    try:
+        common.send_msg(sock, {"t": common.QUEUE, "cmds": q})
+    except OSError:
+        with _QUEUE_LK:
+            OFFLINE_QUEUE.setdefault(name, []).extend(q)
+            queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
+        return
+    print(f"[*] 节点 {name} 上线，重放 {len(q)} 条离线命令", flush=True)
 
 
 def _restore_queue():
@@ -243,7 +275,12 @@ def _handle_node(conn, password):
             "last_hb": time.time(),
         }))
         print(f"[+] 节点上线: {name} ({reg.get('platform')}) caps={reg.get('capabilities')}", flush=True)
-        _replay_queue(name)  # 上线即补离线任务
+        if DEBUG:
+            try:
+                print(f"[dbg] 注册 {name} fd={conn.fileno()}", flush=True)
+            except OSError:
+                pass
+        _replay_queue(name, conn)  # 上线即补离线任务（不阻塞读循环）
         while True:
             m = common.recv_msg(conn)
             if m is None:
@@ -253,6 +290,8 @@ def _handle_node(conn, password):
                 REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("last_hb", time.time()))
             elif t in (common.EXEC_RESULT, common.PUSH_RESULT, common.PULL_RESULT,
                        common.COMPUTE_RESULT, common.UI_SKIP_RESULT):
+                if DEBUG:
+                    print(f"[dbg] <- {name} {t} id={m.get('id')}", flush=True)
                 _resolve_pending(m.get("id"), m)
             elif t == common.CAPABILITIES:
                 REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("capabilities", m.get("caps", [])))
@@ -728,12 +767,42 @@ def _cmd_ui(node, package, use_vision=False, rounds=6):
         print("   ", line)
 
 
+def _cmd_intent(text):
+    """统一意图编排（L2 本命位）：一句话 -> 多步计划 -> 带依赖执行 -> 失败逆序回滚。
+
+    与 broadcast 的区别：扇出是「一条命令发多台」，编排是「一个意图拆多步、步间有依赖，
+    某步失败就把已完成的步按逆序补偿」——这才叫一个系统在动。
+    """
+    import orchestrator as orch
+    nodes = REGISTRY.with_lock(lambda d: list(d.keys()))
+    plan = orch.parse_intent(text, nodes=nodes, pick=lambda cap: pick_node(cap, task=text))
+    if not plan:
+        print("  没解析出计划（试试：巡检 / 备份 / 对 PC-A 执行 hostname）")
+        return
+    print(f"  计划 {len(plan)} 步：")
+    for s in plan:
+        dep = f"  after={s['after']}" if s.get("after") else ""
+        print(f"    {s['id']:10} {s['desc']:18} node={s.get('node')}{dep}")
+
+    def _exec(node, cmd):
+        return send_to_node(node, {"t": common.EXEC, "cmd": cmd})
+
+    def _log(kind, step, r):
+        mark = {"ok": "✓", "fail": "✗", "rollback": "↩"}.get(kind, "·")
+        body = (r.get("out") or r.get("err") or "").strip().replace("\n", " ")[:60]
+        print(f"    {mark} {step['id']}: {body}  [rc={r.get('rc')} ok={r.get('ok')}]")
+
+    res = orch.run_plan(plan, _exec, _log)
+    state = "成功" if res["ok"] else f"失败于 {res.get('failed')}"
+    print(f"  结果: {state}；已完成 {res.get('done')}；回滚 {res.get('rolled_back')}")
+
+
 def repl():
     print("cmd> nodes | exec <节点> <命令> | broadcast <命令> | push <节点> <文件> | pull <节点> <远程> [输出]")
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
-    print("      | policy | policy_eval <事件JSON> | her | her_say <文本> | quit")
+    print("      | policy | policy_eval <事件JSON> | her | her_say <文本> | intent <一句话> | quit")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -819,6 +888,9 @@ def repl():
         elif op == "her_say":
             if rest:
                 _cmd_her_say(rest)
+        elif op == "intent":
+            if rest:
+                _cmd_intent(rest)
         else:
             print("  未知命令")
 
@@ -839,6 +911,12 @@ def self_test(host, port, password):
             os.remove(_p)
     import node_agent
     import bootstrap as boot
+    if DEBUG:
+        # 调试用：周期 dump 所有线程栈，定位「帧已写出但节点没收到」这类卡死
+        import faulthandler
+        _fh = open(os.path.join(tdir, f"fleet_stacks_{os.getpid()}.txt"), "a", encoding="utf-8")
+        faulthandler.dump_traceback_later(45, repeat=True, file=_fh)
+        print(f"[dbg] 线程栈会写到 {_fh.name}", flush=True)
     threading.Thread(target=serve, args=(host, port, password), daemon=True).start()
     time.sleep(0.4)
 
@@ -959,6 +1037,21 @@ def self_test(host, port, password):
     print("\n=== 共享算力池：批量分发 + 跨设备结果缓存 ===", flush=True)
     _cmd_computepool()
     _cmd_computemap("解释什么是注意力机制;用一句话总结Transformer;给个快速排序的Python", prefer_gpu=True)
+
+    print("\n=== 统一意图编排（一句话 -> 多步带依赖 -> 失败逆序回滚）===", flush=True)
+    _cmd_intent("巡检")
+    import orchestrator as _orch
+    bad = [{"id": "a", "desc": "先做一步", "cap": "exec", "node": "PC-A",
+            "args": {"cmd": "echo step-a"},
+            "rollback": {"cap": "exec", "node": "PC-A", "args": {"cmd": "echo 已回滚 a"}}},
+           {"id": "b", "desc": "故意失败", "cap": "exec", "node": "PC-A",
+            "args": {"cmd": "type 不存在的文件_xyz.txt"}, "after": ["a"]}]
+    res = _orch.run_plan(bad, lambda n, c: send_to_node(n, {"t": common.EXEC, "cmd": c}),
+                         lambda k, s, r: print(
+                             f"    [{k}] {s['id']} rc={r.get('rc')} ok={r.get('ok')} "
+                             f"err={(r.get('err') or '')[:40]!r}", flush=True))
+    print(f"  故意失败计划 -> failed={res['failed']} 回滚={res['rolled_back']}"
+          f"（回滚非空=补偿到位）", flush=True)
 
     print("\n=== 自检通过：L0/L1/L2/L3 + 她授权 + 反向推送 + 共享算力 均工作 ===", flush=True)
     os._exit(0)

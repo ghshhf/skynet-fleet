@@ -20,6 +20,8 @@ import time
 
 import common
 
+_DEBUG = bool(os.environ.get("FLEET_DEBUG"))
+
 PENDING = {}
 _PENDING_LK = threading.Lock()
 _ID = threading.Lock()
@@ -134,7 +136,15 @@ def _session(host, port, name, password, platform, caps, sandbox, cap_req,
                 break
             if m is None:
                 break
-            _dispatch(s, m, name, sandbox)
+            if _DEBUG:
+                print(f"[nd:{name}] 收到 t={m.get('t')} id={m.get('id')}", flush=True)
+            try:
+                _dispatch(s, m, name, sandbox)
+            except Exception as e:
+                # 单条消息处理失败不许杀死整条连接：否则会话变僵尸——
+                # 对端还以为在线（sendall 成功），实际再没人 recv，表现为「永远等到超时」。
+                print(f"[{name}] 处理 {m.get('t')} 出错: {e}", flush=True)
+        stop.set()      # 读线程结束 = 会话结束，让主循环退出并触发重连（自愈）
 
     th = threading.Thread(target=_read, daemon=True)
     th.start()
@@ -201,8 +211,13 @@ def _do_exec(s, m):
         common.send_msg(s, {"t": common.EXEC_RESULT, "id": mid, "rc": -1,
                             "out": "", "err": f"命令不在白名单: {cmd.split(' ',1)[0]}"})
         return
+    t0 = time.time()
+    if _DEBUG:
+        print(f"[nd] exec 收到 id={mid} cmd={cmd!r}", flush=True)
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)
+        if _DEBUG:
+            print(f"[nd] exec 完成 id={mid} rc={r.returncode} 用时{time.time()-t0:.1f}s", flush=True)
         common.send_msg(s, {"t": common.EXEC_RESULT, "id": mid,
                             "rc": r.returncode, "out": _decode(r.stdout), "err": _decode(r.stderr)})
     except subprocess.TimeoutExpired:

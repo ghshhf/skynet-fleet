@@ -64,10 +64,31 @@ EXEC_ALLOWLIST = {
 }
 
 
+_SEND_LOCKS = {}
+_SEND_LK = threading.Lock()
+
+
+def _lock_for(sock):
+    """每条连接一把写锁。
+
+    为什么必须有：心跳线程与执行线程会并发往**同一个 socket** 写。若不加锁，
+    两个帧的「长度头 + 载荷」会交错，对端解析随即错位——表现为随机的
+    「等待节点回执超时」，甚至整条连接后续全废。这类 bug 偶发、难复现，
+    却会让所有超时判定（心跳判死、编排回滚）建立在假信号上。
+    """
+    key = id(sock)
+    with _SEND_LK:
+        lk = _SEND_LOCKS.get(key)
+        if lk is None:
+            lk = _SEND_LOCKS[key] = threading.Lock()
+        return lk
+
+
 def send_msg(sock, obj):
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    sock.sendall(struct.pack(">I", len(payload)))
-    sock.sendall(payload)
+    frame = struct.pack(">I", len(payload)) + payload
+    with _lock_for(sock):
+        sock.sendall(frame)          # 一次写入整帧，不留半帧窗口
 
 
 def recv_msg(sock):
