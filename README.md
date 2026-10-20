@@ -33,7 +33,8 @@
   - **多控制面仲裁（`arbiter.py`）**：全编队**只有一个领袖控制面能发令**，其它待机——否则两台机器各发各的，状态立刻分叉、她在备用面批的权限主面不认，「一个意图扇出所有设备」就破了产。选举=共享状态文件里的声明（rank 高者优先 → 先声明者 → id 全序），领袖每 15s 续期、45s 不续期即让位；待机面 REPL 仍可看（nodes/her/journal），但 exec/broadcast/compute/ui/intent/enroll 等**发令类命令一律拒绝并点名领袖是谁**；正常退出主动让位，备用立即接管（不等 TTL）。单机常态零配置（一张声明即成领袖）。**诚实边界**：仲裁是协同不是安全边界，跨机器共享盘仍有极小写窗口。
   - **exec 白名单收紧**：三层拒绝——① base 不在白名单 ② 参数含 shell 元字符（`& | ; < > \` $` 换行），因为节点侧 `shell=True`，`echo ok & del x` 这种 base 是 echo 却能干任何事的组合是白名单最大的洞 ③ **解释器默认禁止**（`python/powershell/cmd/bash` 等于任意代码执行，要跑脚本须显式 `FLEET_ALLOW_INTERPRETER=1`）。拒绝理由分类型回执给人看，不再只给 `rc=-1`。
   - **扫码入网（`enroll.py`）**：手机出示一张二维码载荷，设备扫一下即可入网，不用在新机器上敲密码。载荷是 `fleet://enroll?p=...`（约 230 字符），**可离线验签**（HMAC-SHA256 + 共享密钥，不联网、不回调控制面）、**一次性**（兑换落本地账本，截图外流也只是废纸）、**有时效**（默认 10 分钟）、**绑节点**（A 的载荷装不成 B），且**不含用户密码**——装完节点用随机 PSK 认证，明文密码不再写进计划任务参数。载荷寿命与节点凭据寿命**分开**：码 10 分钟过期，PSK 长期有效（否则一重启就失联），撤销走 `enroll_revoke`。REPL：`enroll <节点> [有效期秒]` / `enroll_list` / `enroll_revoke <节点>`；安装侧 `install_windows.py --enroll "<uri>" [--dry-run]`。
-  - **一键自测门禁**：`run_selftests.py` 串起 **16 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups）。
+  - **分权（`accounts.py`）**：账号是「人」，节点是「设备」，两维分开。**主号唯一**——能发令、能发码、能增删分号、能看全部；**分号只能被控**——没有发令权，只能看到自己名下节点（过滤在控制面做，不在客户端做，否则改个脚本就绕过了）。闸门顺序刻意是**先分权、再仲裁**：分号即使占了领袖位也拒，因为没有权限跟谁是领袖无关；两道闸失败语义也不同（分权是安全、拒绝即拒绝；仲裁是协同、状态文件坏了就放行）。令牌自带角色与过期时间，并带权限版本 `pv`——**吊销分号后旧令牌立刻作废**，不等自然过期。**授权码**（用户要的「密码生成器 / 扫码同步权限」）是**同一枚一次性码的两种呈现**：终端里念 6 位短码，手机上画二维码；6 位用去掉 0/O/1/I 的 32 字母表（≈10 亿组合）+ 5 分钟寿命 + 一次性；二维码载荷 `fleet://grant?p=…` 用账本自带密钥签 HMAC，**伪造载荷在查账本之前就被拒**。与入网码刻意分开：入网码离线验签（装设备时可能没网），授权码必须中心验（改权限不能交给客户端自己认）。**诚实边界**：没有找回密码——主号忘了只能删账本重建（会连带吊销所有分号），因为找回通道本身就是后门。
+  - **一键自测门禁**：`run_selftests.py` 串起 **17 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / accounts / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups）。
 - **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动、手机端二维码渲染（载荷已可生成与离线验签，缺的只是把它画成图）。
 
 自测命令（全部离线，不碰真机、不需联网）：
@@ -84,6 +85,7 @@ skynet-fleet/
 ├── enroll.py            # 扫码入网：一次性入网载荷（离线验签/绑节点/不含密码）
 ├── policies.py          # 策略层：掉线/心跳/算力/会话 的判断外置为 JSON 规则
 ├── arbiter.py           # 多控制面仲裁：全编队只有一个领袖能发令（待机面只读）
+├── accounts.py          # 分权：主号/分号 + 一次性授权码（短码与二维码同一枚）
 ├── queue_store.py       # 离线队列持久化（控制面重启不丢）
 ├── llm.py               # 本地推理适配层（CMD/URL/placeholder 三后端，改环境变量即切换）
 ├── bootstrap.py         # 第三原则反向推送：中心分发 bootstrap + 工具箱
