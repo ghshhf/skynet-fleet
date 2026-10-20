@@ -19,6 +19,7 @@
     python android_device.py cap           # 探测两档能力
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -111,6 +112,83 @@ def pick_serial(prefer_wireless=True):
     return ds[0]["serial"]
 
 
+# ---------------------------------------------------------------- 自动接入
+#
+# 无线调试的端口每次开关都会换，adb 掉线后那条 IP:port 记录就没了。所以接入要
+# 能自己找回：现成的 → 上次成功的 → mDNS 广播里现找。缓存只是"首猜"，不是依赖。
+
+TARGET_CACHE = os.path.join(os.path.expanduser("~"), ".fleet", "android_target.json")
+
+
+def _cache_load():
+    try:
+        with open(TARGET_CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_save(data):
+    try:
+        os.makedirs(os.path.dirname(TARGET_CACHE), exist_ok=True)
+        tmp = TARGET_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TARGET_CACHE)
+    except OSError:
+        pass
+
+
+def mdns_adb_targets(timeout=8):
+    """从 adb 的 mDNS 发现里捞 adb 服务条目。"""
+    rc, txt = _run("", ["mdns", "services"], timeout=timeout)
+    out = []
+    for line in txt.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] in ("_adb-tls-connect._tcp", "_adb._tcp"):
+            out.append({"name": parts[0], "service": parts[1], "addr": parts[2]})
+    return out
+
+
+def alive(serial, timeout=15):
+    rc, txt = shell(serial, "echo ok", timeout=timeout)
+    return rc == 0 and "ok" in txt
+
+
+def attach(serial="", force_rescan=False):
+    """自动接入，掉线自愈。返回 {ok, serial, via}。"""
+    tried = []
+    if serial and alive(serial):
+        _cache_save({"serial": serial})
+        return {"ok": True, "serial": serial, "via": "explicit"}
+
+    cur = pick_serial()
+    if cur and not force_rescan and alive(cur):
+        _cache_save({"serial": cur})
+        return {"ok": True, "serial": cur, "via": "current"}
+
+    cached = _cache_load().get("serial", "")
+    if cached and cached != cur:
+        tried.append(cached)
+        _run("", ["connect", cached])
+        if alive(cached):
+            _cache_save({"serial": cached})
+            return {"ok": True, "serial": cached, "via": "cache"}
+
+    for t in mdns_adb_targets():
+        for target in (t["name"], t["addr"]):
+            if target in tried:
+                continue
+            tried.append(target)
+            _run("", ["connect", target])
+            if alive(target):
+                _cache_save({"serial": target, "addr": t["addr"]})
+                return {"ok": True, "serial": target, "addr": t["addr"], "via": "mdns"}
+
+    return {"ok": False, "err": "找不到设备（手机需开着无线调试且同一网段）",
+            "tried": tried}
+
+
 def pair(addr, code, timeout=45):
     rc, txt = _run("", ["pair", addr, str(code)], timeout=timeout)
     return {"ok": rc == 0 and "Successfully paired" in txt, "out": txt.strip()}
@@ -127,7 +205,40 @@ def disconnect(addr):
 
 
 def shell(serial, cmd, timeout=60):
+    """执行一条 shell 命令。过红线检查，见 guard()。"""
+    why = guard(cmd)
+    if why:
+        return 1, f"[红线拦截] {why}"
     return _run(serial, ["shell", cmd], timeout=timeout)
+
+
+# 用户红线（2026-10-20 明确）：①不许断网——这台手机既从本机热点上网，又给另一台
+# 笔记本开热点，网一断两头都废；②不许卸载软件。写成代码拦截，不靠记性。
+
+_FORBID_NET_WRITE = (
+    "settings put global airplane_mode_on",
+    "settings put secure wifi_", "settings put global wifi_",
+    "svc wifi", "svc data",
+    "cmd wifi", "cmd connectivity", "cmd telephony",
+    "am broadcast -a android.net.wifi",
+    "ifconfig wlan", "ip link set wlan",
+)
+_FORBID_REMOVE = (
+    "pm uninstall", "pm clear", "pm disable", "pm disable-user",
+    "pm uninstall-system-updates", "rm -rf /data/app",
+)
+
+
+def guard(cmd):
+    """返回拒绝理由；允许则返回空串。"""
+    low = cmd.lower()
+    for pat in _FORBID_NET_WRITE:
+        if pat in low:
+            return f"禁止改网络（会同时断掉手机和另一台笔记本）：{pat}"
+    for pat in _FORBID_REMOVE:
+        if pat in low:
+            return f"禁止卸载/清数据软件：{pat}"
+    return ""
 
 
 # ---------------------------------------------------------------- 硬件画像
@@ -188,27 +299,37 @@ def shot(serial, path, timeout=60):
             "bytes": os.path.getsize(path) if os.path.isfile(path) else 0}
 
 
-def ui_xml(serial, timeout=60):
+def ui_xml(serial, timeout=60, retries=2):
     """取 UI 树原文（uiautomator dump）。
 
     必须 pull 文件而不是 shell cat：adb shell 走 pty 会做 CRLF 转换，
     几十 KB 的 XML 被改写过就解析不了。
+    dump 会偶发失败（界面还在播动画，等不到 idle 状态），所以重试，
+    否则一次抖动就会把整条自动化流程拖停。
     """
     remote = "/data/local/tmp/_fleet_ui.xml"
-    rc, txt = shell(serial, f"uiautomator dump {remote}", timeout=timeout)
-    if rc != 0 or "dumped to" not in txt:
-        return {"ok": False, "err": txt.strip() or "uiautomator dump 失败"}
     local = os.path.join(tempfile.gettempdir(), "_fleet_ui.xml")
-    rc, txt = _run(serial, ["pull", remote, local], timeout=timeout)
+    last = ""
+    for attempt in range(retries + 1):
+        rc, txt = shell(serial, f"uiautomator dump {remote}", timeout=timeout)
+        if rc == 0 and "dumped to" in txt:
+            rc, txt = _run(serial, ["pull", remote, local], timeout=timeout)
+            if rc == 0 and os.path.isfile(local):
+                with open(local, encoding="utf-8", errors="replace") as f:
+                    xml = f.read()
+                os.remove(local)
+                shell(serial, f"rm -f {remote}")
+                if "<hierarchy" in xml:
+                    return {"ok": True, "xml": xml}
+                last = "UI 树内容不完整"
+            else:
+                last = "拉不回 UI 树"
+        else:
+            last = (txt.strip() or "uiautomator dump 失败")
+        if attempt < retries:
+            time.sleep(0.5)
     shell(serial, f"rm -f {remote}")
-    if rc != 0 or not os.path.isfile(local):
-        return {"ok": False, "err": "拉不回 UI 树"}
-    with open(local, encoding="utf-8", errors="replace") as f:
-        xml = f.read()
-    os.remove(local)
-    if "<hierarchy" not in xml:
-        return {"ok": False, "err": "UI 树内容不完整"}
-    return {"ok": True, "xml": xml}
+    return {"ok": False, "err": last}
 
 
 def parse_bounds(text):
@@ -605,6 +726,7 @@ def main(argv=None):
 
     sub.add_parser("packages", help="列第三方应用")
     sub.add_parser("notify", help="读通知标题")
+    sub.add_parser("attach", help="自动接入（掉线自愈，含桥探活）")
 
     p = sub.add_parser("tap", help="按文字点击（--dry 只算落点）")
     p.add_argument("keyword")
@@ -622,6 +744,22 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     serial = args.serial or pick_serial()
+
+    if args.cmd == "attach":
+        r = attach(args.serial or "")
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        if r["ok"]:
+            br = bridge_cmd(r["serial"], "PING")
+            print("桥      ", "PONG（无障碍通道可用）" if br["ok"] else f"不可用：{br.get('err')}")
+        return 0 if r["ok"] else 1
+
+    if not serial and args.cmd not in ("pair", "connect"):
+        # 掉线了先自己找回来再干活，不用人插手
+        r = attach()
+        if r["ok"]:
+            serial = r["serial"]
+            print(f"[自动接入] {serial}（via {r['via']}）", file=sys.stderr)
+
     if args.cmd in (None, "devices"):
         ds = devices()
         if not ds:

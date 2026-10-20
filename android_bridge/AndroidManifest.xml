@@ -9,6 +9,8 @@
 
     <!-- 只为了在 127.0.0.1 上开控制端口，不接受外部连接 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 红外发射：普通权限，安装即得，不需要 root 也不需要无障碍 -->
+    <uses-permission android:name="android.permission.TRANSMIT_IR" />
 
     <application
         android:allowBackup="false"

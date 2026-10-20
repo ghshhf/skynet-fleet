@@ -11,7 +11,9 @@ package app.fleet.bridge;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.content.Context;
 import android.graphics.Path;
+import android.hardware.ConsumerIrManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -131,6 +133,10 @@ public class BridgeService extends AccessibilityService {
                     return global(GLOBAL_ACTION_NOTIFICATIONS);
                 case "FOCUS":
                     return focusInfo();
+                case "IRINFO":
+                    return irInfo();
+                case "IR":
+                    return ir(rest);
                 default:
                     return "ERR unknown " + op;
             }
@@ -226,5 +232,39 @@ public class BridgeService extends AccessibilityService {
         CharSequence cls = f.getClassName();
         CharSequence txt = f.getText();
         return "OK focus " + cls + " | " + (txt == null ? "" : txt);
+    }
+
+    // ------------------------------------------------------------ 红外
+    //
+    // 走 Android 标准的 ConsumerIrManager，只用到 TRANSMIT_IR（普通权限，安装即得），
+    // 不碰 USB 调试、不碰无障碍注入。手机在这里就是一只离线可用的万能遥控器。
+
+    private ConsumerIrManager irManager() {
+        return (ConsumerIrManager) getSystemService(Context.CONSUMER_IR_SERVICE);
+    }
+
+    private String irInfo() {
+        ConsumerIrManager m = irManager();
+        if (m == null) return "ERR no-service";
+        if (!m.hasIrEmitter()) return "ERR no-emitter";
+        StringBuilder sb = new StringBuilder("OK ir");
+        for (ConsumerIrManager.CarrierFrequencyRange r : m.getCarrierFrequencies()) {
+            sb.append(" ").append(r.getMinFrequency()).append("-").append(r.getMaxFrequency());
+        }
+        return sb.toString();
+    }
+
+    private String ir(String rest) {
+        ConsumerIrManager m = irManager();
+        if (m == null) return "ERR no-service";
+        if (!m.hasIrEmitter()) return "ERR no-emitter";
+        String[] p = rest.trim().split("\\s+");
+        if (p.length < 3) return "ERR ir-need freq+2 durations";
+        int freq = Integer.parseInt(p[0]);
+        int[] pattern = new int[p.length - 1];
+        for (int i = 1; i < p.length; i++) pattern[i - 1] = Integer.parseInt(p[i]);
+        if ((freq < 25000) || (freq > 60000)) return "ERR ir-freq 25k-60k";
+        m.transmit(freq, pattern);
+        return "OK ir " + pattern.length;
     }
 }
