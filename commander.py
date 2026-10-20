@@ -1172,6 +1172,139 @@ def _cmd_discover(save=True, do_ports=True):
     return r
 
 
+def _show_action(r, act=""):
+    """动作回执：只读的铺开细节，动手的给一句人话。"""
+    if not r or not r.get("ok"):
+        err = (r or {}).get("err") or "失败"
+        print(f"  ✗ {err}")
+        see = (r or {}).get("see")
+        if see:
+            print("    界面上有：" + "、".join(str(x) for x in see[:12]))
+        return
+    if act in ("screen", "see", "look"):
+        print(f"  前台 {r.get('foreground') or '?'}")
+        labels = r.get("labels") or []
+        print(f"  可见文字 {len(labels)} 条：")
+        for x in labels[:24]:
+            print("    ·", x)
+        if len(labels) > 24:
+            print(f"    …还有 {len(labels) - 24} 条（phone tree 看全）")
+    elif act == "tree":
+        print(f"  控件 {r.get('count', 0)} 个：")
+        print(r.get("text") or "")
+    elif act == "apps":
+        apps = r.get("apps") or []
+        print(f"  第三方应用 {len(apps)} 个：" + "、".join(apps[:20])
+              + ("…" if len(apps) > 20 else ""))
+    elif act == "fg":
+        print(f"  前台 {r.get('foreground') or '?'}")
+    elif act == "tap":
+        how = "（只算落点，没点）" if r.get("dry_run") else (
+            "界面变了" if r.get("changed") else "界面没变，可能点到死区")
+        print(f"  ✓ 点了「{r.get('hit') or r.get('hit') or ''}」{how}  ({r.get('x')},{r.get('y')})")
+    else:
+        body = {k: v for k, v in r.items() if k not in ("pattern", "nodes", "text")}
+        print("  ✓ " + json.dumps(body, ensure_ascii=False))
+
+
+def _cmd_nearby(only=""):
+    """身边全景（三层一起看）：IP 层 + 无线层 + 蓝牙层。
+
+    为什么不是「又一个扫描命令」：sweep 只看得见跟本机说过话的 IP，discover 只在已知
+    IP 上补型号，手机天线补的是电脑根本看不见的那半边（电脑射频被自己的热点占了）。
+    三层拼起来才是「此刻身边有什么」。而单次扫描的信息量很低——真正有用的是**变化**：
+    谁第一次出现、谁连续几次不见了。所以每次都比对指纹并发一句话。
+    """
+    if not _gate("nearby"):
+        return None
+    import perceive as pv
+    only = (only or "").strip().lower()
+    if only and only not in pv.LAYERS:
+        print(f"  未知层 {only}（lan / wifi / bt）")
+        return None
+    pick = only in pv.LAYERS
+    print("  三层扫描中（IP 全段 + 手机 WiFi 天线 + 手机蓝牙天线）…", flush=True)
+    out = pv.snapshot(with_lan=(not pick) or only == "lan",
+                      with_wifi=(not pick) or only == "wifi",
+                      with_bt=(not pick) or only == "bt")
+    print(pv.report(out))
+    print()
+    line = pv.look(out)
+    print("  一句话：" + line)
+    if out.get("hist_file"):
+        print(f"  指纹已留 {out['hist_file']}（下次自动比变化）")
+    if (out.get("trend") or {}).get("changed"):
+        # 变化进流水：她以后才能说出「你回来的时候楼下多了三辆车」这种话
+        _journal().log("see", "commander", line, topic="nearby")
+    return out
+
+
+def _cmd_caps():
+    """能力矩阵：现在能感知什么、能动手什么，不能的为什么不能。"""
+    import perceive as pv
+    print("  能力自检（真连一次手机，约几秒）…", flush=True)
+    rows = pv.caps(probe=True)
+    print(pv.format_caps(rows))
+    return rows
+
+
+def _cmd_phone(act, arg="", arg2="", dry_run=False):
+    """让手机看/动手。只读动作直接放行，会改状态的动作（SIDE_EFFECT）过闸。"""
+    if not act:
+        print("  用法：phone screen|tree|apps|fg | open <包名> | tap <屏幕上的字> [--dry-run]"
+              " | type <文本> | back | home | shot [路径] | wait <字> [秒]")
+        return None
+    import perceive as pv
+    act = act.strip().lower()
+    if act in pv.SIDE_EFFECT and not _gate("phone"):
+        return None
+    r = pv.phone(act, arg, arg2, dry_run=dry_run)
+    _show_action(r, act)
+    return r
+
+
+def _cmd_ir(spec, send=False):
+    """红外。默认只算序列不发——真发射会把电器打开或关掉，得人明确加 --send。"""
+    import perceive as pv
+    if send and not _gate("ir"):
+        return None
+    r = pv.ir(spec, send=send)
+    if not r.get("ok"):
+        print(f"  ✗ {r.get('err')}")
+        return r
+    if spec.strip() in ("", "info"):
+        print("  " + (r.get("out") or "（没回执）"))
+        return r
+    print(f"  协议 {r.get('proto')} 载波 {r.get('freq')}Hz 共 {r.get('segments')} 段")
+    if r.get("sent"):
+        print(f"  ✓ 已发射：{r.get('out') or ''}")
+    else:
+        print("  （未发射，加 --send 才真发）")
+    return r
+
+
+def _cmd_phone_line(rest):
+    """把一行 REPL 拆成「动作 + 参数」。
+
+    除 wait 外整段余文都算一个参数——`type 12 * 34` 这种带空格的输入不能被拆散；
+    wait 的第二个值才是超时秒数（`wait 结果 15`）。
+    """
+    rest = (rest or "").strip()
+    dry = "--dry-run" in rest.split()
+    if dry:
+        i = rest.find("--dry-run")
+        rest = (rest[:i] + rest[i + len("--dry-run"):]).strip()
+    sp = rest.split(" ", 1)
+    act = (sp[0] if sp else "").strip().lower()
+    tail = sp[1] if len(sp) > 1 else ""
+    arg, arg2 = tail, ""
+    if act == "wait" and tail:
+        head, _, last = tail.rpartition(" ")
+        if head and last.strip().isdigit():
+            arg, arg2 = head, last.strip()
+    return _cmd_phone(act, arg, arg2, dry_run=dry)
+
+
 def _cmd_intent(text):
     """统一意图编排（L2 本命位）：一句话 -> 多步计划 -> 带依赖执行 -> 失败逆序回滚。
 
@@ -1223,6 +1356,10 @@ def repl():
     print("      | policy | policy_eval <事件JSON> | her | her_memory | her_followups | her_say <文本> | intent <一句话> | quit")
     print("      | discover [--no-ports]  # 自己扫局域网、自己认设备（只探测不入网）")
     print("      | sweep                 # 扩散扫描：全段 ICMP + 多网段 + NBT 名字 + 环境画像")
+    print("      | nearby [lan|wifi|bt]   # 身边全景：IP+无线+蓝牙三层，自动比上次谁进谁走")
+    print("      | caps                   # 能力矩阵：能感知/能动手什么，不能的为什么")
+    print("      | phone screen|tree|apps|open <包名>|tap <字>|type <文本>|back|home|shot|wait <字> [秒]")
+    print("      | ir info | ir nec:0x04:0x08 [--send]   # 红外，默认只算序列不发射")
     print("      | done <topic>   # 告诉系统这件事做完了（清账，她不再追问）")
     print("      | journal [n]    # 回看对话流水（她起话题的依据）")
     print("      | arbiter        # 多控制面仲裁：谁是领袖、本机是领袖还是待机")
@@ -1304,6 +1441,15 @@ def repl():
             _cmd_sweep()
         elif op == "discover":
             _cmd_discover(do_ports="--no-ports" not in rest.split())
+        elif op == "nearby":
+            _cmd_nearby(rest.strip())
+        elif op == "caps":
+            _cmd_caps()
+        elif op == "phone":
+            _cmd_phone_line(rest)
+        elif op == "ir":
+            _cmd_ir(rest.replace("--send", "").strip(),
+                    send="--send" in rest.split())
         elif op == "rules":
             _cmd_rules_list()
         elif op == "rules_get":

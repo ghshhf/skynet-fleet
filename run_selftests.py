@@ -40,6 +40,7 @@ CASES = [
     ("survey", ["survey.py", "--selftest"], HERE, 30),
     ("ble", ["ble.py", "--selftest"], HERE, 30),
     ("nearby", ["nearby.py", "--selftest"], HERE, 30),
+    ("perceive", ["perceive.py", "--selftest"], HERE, 30),
 ]
 
 
