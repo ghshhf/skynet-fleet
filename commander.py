@@ -68,6 +68,12 @@ DISCOVERY_PATH = os.environ.get(
     "FLEET_DISCOVERY_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "discovered.json"))
 
+# 扩散扫描账本：整个网段的在场设备（含多网段）。与发现账本分开存，
+# 因为一个是「精细指纹」、一个是「全段底数」，混在一起会看不出哪条路生效。
+SWEEP_PATH = os.environ.get(
+    "FLEET_SWEEP_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "swept.json"))
+
 # ---- 多控制面仲裁（一个意图绝不割裂）----
 # 全编队只有一个领袖控制面能发令；其它待机（只读 REPL），领袖死了备用自动接管。
 # 共享状态文件路径在 serve()/self_test() 里定（自检要指到临时文件，不碰真实文件）。
@@ -268,7 +274,7 @@ def start_watchdog(**kw):
 
 GATED_OPS = ("exec", "broadcast", "push", "pull", "compute", "computemap", "ui",
              "rules_put", "rules_rollback", "enroll", "enroll_revoke", "token",
-             "intent", "cap批准", "discover")
+             "intent", "cap批准", "discover", "sweep")
 
 
 def _gate(op, role=None):
@@ -1107,6 +1113,41 @@ def _cmd_ui(node, package, use_vision=False, rounds=6):
         print("   ", line)
 
 
+def _cmd_sweep(save=True):
+    """扩散扫描：把「ARP 表里有的」扩成「整个网段在场的」。
+
+    与 discover 的分工（两个不是重复的）：
+      discover = 在**已经知道 IP** 的设备上做精细指纹（组播/型号/banner）
+      sweep    = 先把**整个网段**的人找出来（ICMP 全扫 + NBT 名字 + 多网段）
+    实际用的时候先 sweep 拿到底数，再 discover 补型号。
+    铁律：只探测、不入网；不发应用层指令、不试口令。
+    """
+    if not _gate("sweep"):
+        return None
+    import sweep as sw
+    print("  扩散扫描中（ICMP 全段 + TCP + NBT + mDNS + SSDP）…", flush=True)
+    r = sw.sweep(verbose=False)
+    print(sw.format_table(r))
+    print()
+    for line in r.get("profile") or []:
+        print("  ▪", line)
+    for n in r.get("notes", []):
+        print("  ·", n)
+    w = r.get("wifi") or {}
+    if w.get("networks"):
+        print(f"  周边 WiFi {len(w['networks'])} 个")
+    elif w.get("note"):
+        print("  ·", w["note"])
+    if save:
+        try:
+            with open(SWEEP_PATH, "w", encoding="utf-8") as f:
+                json.dump(r, f, ensure_ascii=False, indent=2)
+            print(f"  已记入扫描账本 {SWEEP_PATH}（{r.get('count', 0)} 台）")
+        except OSError as e:
+            print(f"  账本写入失败: {e}")
+    return r
+
+
 def _cmd_discover(save=True, do_ports=True):
     """主动发现局域网设备：自己不报名也要把它们找出来。
 
@@ -1181,6 +1222,7 @@ def repl():
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
     print("      | policy | policy_eval <事件JSON> | her | her_memory | her_followups | her_say <文本> | intent <一句话> | quit")
     print("      | discover [--no-ports]  # 自己扫局域网、自己认设备（只探测不入网）")
+    print("      | sweep                 # 扩散扫描：全段 ICMP + 多网段 + NBT 名字 + 环境画像")
     print("      | done <topic>   # 告诉系统这件事做完了（清账，她不再追问）")
     print("      | journal [n]    # 回看对话流水（她起话题的依据）")
     print("      | arbiter        # 多控制面仲裁：谁是领袖、本机是领袖还是待机")
@@ -1258,6 +1300,8 @@ def repl():
             sp = rest.split()
             if len(sp) >= 2:
                 _cmd_ui(sp[0], sp[1], use_vision="--vision" in sp[2:])
+        elif op == "sweep":
+            _cmd_sweep()
         elif op == "discover":
             _cmd_discover(do_ports="--no-ports" not in rest.split())
         elif op == "rules":
@@ -1303,7 +1347,7 @@ def repl():
 def self_test(host, port, password):
     """本地回路自检：起服务 + 多节点，证明身体 Phase 0–4 + 她授权闭环 + 反向推送。"""
     global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH
-    global ARBITER_PATH
+    global ARBITER_PATH, SWEEP_PATH, DISCOVERY_PATH
     SELF_TEST = True
     os.environ["FLEET_CTX"] = ":memory:"
     # 自检不碰 ~/.fleet 下的真实密钥：给本进程一份固定测试密钥
@@ -1318,7 +1362,11 @@ def self_test(host, port, password):
     JOURNAL_PATH = os.path.join(tdir, f"fleet_journal_st_{os.getpid()}.db")
     # 仲裁状态也走临时文件：自检里要模拟「另一台更高 rank 的控制面」
     ARBITER_PATH = os.path.join(tdir, f"fleet_arbiter_st_{os.getpid()}.json")
-    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH, ARBITER_PATH):
+    # 扫描/发现账本同样不能落到仓库里（一次自检就能写出一份真设备清单）
+    SWEEP_PATH = os.path.join(tdir, f"fleet_sweep_st_{os.getpid()}.json")
+    DISCOVERY_PATH = os.path.join(tdir, f"fleet_discovered_st_{os.getpid()}.json")
+    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH,
+               ARBITER_PATH, SWEEP_PATH, DISCOVERY_PATH):
         if os.path.exists(_p):
             os.remove(_p)
     import node_agent

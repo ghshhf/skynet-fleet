@@ -108,6 +108,11 @@ OUI_VENDOR = {
     "3C:84:6A": "Dahua", "BC:32:5F": "Dahua", "E0:50:8B": "Dahua",
     "4C:BD:8F": "Hikvision", "44:19:B6": "Hikvision", "C0:56:E3": "Hikvision",
     "54:C4:15": "Hikvision", "A4:14:37": "Hikvision",
+    # 以下 8 条来自实网 OUI 反查（api.macvendors.com），不是凭记忆填的：
+    # C0:51:7E 已由 mDNS 自报 "HIKVISION DS-2CD2T10FD-I3" 交叉验证
+    "C0:51:7E": "Hikvision", "8C:44:BB": "Tenda", "38:65:04": "Honor",
+    "70:66:55": "AzureWave", "E4:AA:EC": "Hualai(米家生态)",
+    "88:D7:F6": "Asus", "1C:79:2D": "ChinaDragon", "F0:99:B6": "Apple",
     "00:1F:92": "Midea", "EC:FA:5C": "Midea", "34:96:72": "Midea",
     "00:23:A7": "Gree", "20:FA:BB": "Gree", "5C:E0:F6": "Gree",
     "00:0E:8E": "Haier", "38:B8:EB": "Haier", "AC:67:B2": "Haier",
@@ -182,7 +187,7 @@ CATEGORY_CN = {
     "speaker": "音箱", "camera": "摄像头", "printer": "打印机",
     "ac": "空调/温控", "hub": "智能中枢", "light": "灯具",
     "phone": "手机/平板", "pc": "电脑", "fleet": "编队节点",
-    "sensor": "传感器/IoT", "unknown": "未知",
+    "android": "安卓设备", "sensor": "传感器/IoT", "unknown": "未知",
 }
 
 
