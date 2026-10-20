@@ -281,6 +281,7 @@ def start_watchdog(**kw):
 # ---- 常驻自转：没人敲命令，它也自己看一眼 ----
 
 SENSE_STOP = threading.Event()
+_SENSE_LAST_ANOM = set()       # 上次报过的手机异常集合：只报「新出现的」，不重复刷屏
 
 
 def _sense_loop(interval=1800.0):
@@ -305,6 +306,61 @@ def _sense_loop(interval=1800.0):
                 _journal().log("see", "commander", line, topic="nearby")
         except Exception as e:            # 感知挂了不许弄死常驻主服务
             print(f"[感知] 本轮失败（主服务照常）：{e}", flush=True)
+        # 手机状态：只在「异常集合变了」时留一笔，否则每半小时刷同一句提醒
+        try:
+            _sense_phone()
+        except Exception as e:
+            print(f"[感知] 手机状态本轮失败（主服务照常）：{e}", flush=True)
+        # 本机状态：在座/离开切换 + 新异常
+        try:
+            _sense_pc()
+        except Exception as e:
+            print(f"[感知] 本机状态本轮失败（主服务照常）：{e}", flush=True)
+
+
+def _sense_phone():
+    global _SENSE_LAST_ANOM
+    import perceive as pv
+    st = pv.state()
+    if not st.get("ok"):
+        return
+    now = set(st.get("anomalies") or [])
+    fresh = now - _SENSE_LAST_ANOM
+    _SENSE_LAST_ANOM = now
+    if fresh:
+        line = "手机：" + "；".join(sorted(fresh))
+        print(f"[感知] {line}", flush=True)
+        _journal().log("see", "commander", line, topic="phone_state")
+
+
+_SENSE_PC = {"presence": "", "anom": set()}
+
+
+def _sense_pc():
+    """本机：只在「在座/离开」切换、或出现新异常时留一笔。
+
+    为什么在座/离开也算事件：这是她判断「该不该现在开口」的唯一依据。
+    同状态连报会把流水刷成噪声，所以只在切换时写——但第一次不写
+    （prev 为空时没有「上一个状态」可比，凭空报一句「离开」是假的）。
+    """
+    import perceive as pv
+    st = pv.here()
+    if not st.get("ok"):
+        return
+    p = pv.C.presence(st)
+    prev = _SENSE_PC["presence"]
+    _SENSE_PC["presence"] = p
+    if p and prev and p != prev:
+        line = f"本机：{prev} -> {p}"
+        print(f"[感知] {line}", flush=True)
+        _journal().log("see", "commander", line, topic="pc_presence")
+    now = set(st.get("anomalies") or [])
+    fresh = now - _SENSE_PC["anom"]
+    _SENSE_PC["anom"] = now
+    if fresh:
+        line = "本机：" + "；".join(sorted(fresh))
+        print(f"[感知] {line}", flush=True)
+        _journal().log("see", "commander", line, topic="pc_state")
 
 
 def _sense_start(interval):
@@ -1006,8 +1062,12 @@ def _cmd_done(topic):
 
 
 def _cmd_journal(n=20):
-    """回看最近的对话流水（她起话题的依据都在这里）。"""
-    rows = _journal().recent(limit=n)
+    """回看最近的对话流水（她起话题的依据都在这里）。
+
+    recent() 按时间正序返回并 LIMIT，直接丢 n 进去只会拿到**最旧**的 n 条；
+    取尾部才是「最近」。流水有 cap（默认 5000），全量取回再切尾不会失控。
+    """
+    rows = _journal().recent(limit=100000)[-n:]
     if not rows:
         print("  （流水还是空的）")
         return
@@ -1284,6 +1344,15 @@ def _show_action(r, act=""):
             print(f"    · {x.get('pkg')}: {x.get('title')}")
         if not items:
             print("    （没读到——可能确实没有，也可能系统限制了 dumpsys）")
+    elif act in ("status", "state"):
+        import phone_state as ps
+        print(ps.report(r))
+    elif act == "battery":
+        print(f"  电量 {r.get('level')}%  {r.get('status')}  "
+              f"{'+'.join(r.get('plugged') or []) or '未插电'}  "
+              f"{r.get('temperature')}°C")
+        if r.get("anomaly"):
+            print(f"  ! {r['anomaly']}")
     elif act == "tap":
         how = "（只算落点，没点）" if r.get("dry_run") else (
             "界面变了" if r.get("changed") else "界面没变，可能点到死区")
@@ -1325,6 +1394,23 @@ def _cmd_nearby(only=""):
     return out
 
 
+def _cmd_pc(want_clip=False):
+    """本机状态：她终于能知道「你现在在不在电脑前、在干什么」。
+
+    为什么要这一条：感知层能看手机、看局域网，却看不见宿主自己。主动开口
+    最容易说错的就是时机——你不在座位上她说「早」，说了等于没说。
+    """
+    import perceive as pv
+    st = pv.here(want_clip=want_clip)
+    print(pv.C.report(st))
+    print()
+    print("  一句话：" + pv.C.brief(st))
+    if st.get("ok") and st.get("anomalies"):
+        _journal().log("see", "commander",
+                       "本机：" + "；".join(st["anomalies"]), topic="pc_state")
+    return st
+
+
 def _cmd_caps():
     """能力矩阵：现在能感知什么、能动手什么，不能的为什么不能。"""
     import perceive as pv
@@ -1337,7 +1423,8 @@ def _cmd_caps():
 def _cmd_phone(act, arg="", arg2="", dry_run=False):
     """让手机看/动手。只读动作直接放行，会改状态的动作（SIDE_EFFECT）过闸。"""
     if not act:
-        print("  用法：phone screen|tree|apps|fg | open <包名> | tap <屏幕上的字> [--dry-run]"
+        print("  用法：phone screen|tree|apps|fg|notify [n] | status | battery"
+              " | open <包名> | tap <屏幕上的字> [--dry-run]"
               " | type <文本> | back | home | shot [路径] | wait <字> [秒]")
         return None
     import perceive as pv
@@ -1346,6 +1433,10 @@ def _cmd_phone(act, arg="", arg2="", dry_run=False):
         return None
     r = pv.phone(act, arg, arg2, dry_run=dry_run)
     _show_action(r, act)
+    if act in ("status", "state") and r and r.get("anomalies"):
+        # 异常进流水：她以后才能说「你手机一直插着电却在掉电」这种话
+        _journal().log("see", "commander",
+                       "手机：" + "；".join(r["anomalies"]), topic="phone_state")
     return r
 
 
@@ -1462,7 +1553,9 @@ def repl():
     print("      | sweep                 # 扩散扫描：全段 ICMP + 多网段 + NBT 名字 + 环境画像")
     print("      | nearby [lan|wifi|bt]   # 身边全景：IP+无线+蓝牙三层，自动比上次谁进谁走")
     print("      | caps                   # 能力矩阵：能感知/能动手什么，不能的为什么")
+    print("      | pc [--clip]            # 本机状态：前台/在座/负载/磁盘/剪贴板（内容默认不给）")
     print("      | phone screen|tree|apps|open <包名>|tap <字>|type <文本>|back|home|shot|wait <字> [秒]")
+    print("      | phone status|battery   # 手机全身状态：电/网/声音/屏/传感器/存储（只读）")
     print("      | ir info | ir nec:0x04:0x08 [--send]   # 红外，默认只算序列不发射")
     print("      | net [端口]              # 本机能从哪些地址被连到（公网 v6 优先）+ 连法建议")
     print("      | seen [n]                # 谁来过：控制面重启也不忘的设备账（历史绝不冒充在线）")
@@ -1551,6 +1644,8 @@ def repl():
             _cmd_nearby(rest.strip())
         elif op == "caps":
             _cmd_caps()
+        elif op == "pc":
+            _cmd_pc(want_clip="--clip" in rest.split())
         elif op == "phone":
             _cmd_phone_line(rest)
         elif op == "ir":
