@@ -34,6 +34,7 @@ CASES = [
     ("enroll_install", ["install_windows.py", "--enroll-selftest"], HERE, 30),
     ("journal", ["journal.py", "--selftest"], HERE, 30),
     ("followups", ["followups.py", "--selftest"], HERE, 30),
+    ("android_device", ["android_device.py", "--selftest"], HERE, 30),
 ]
 
 
