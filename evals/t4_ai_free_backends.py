@@ -63,6 +63,18 @@ r = reg.call("ai.list")
 check(r.ok, "ai.list 成功")
 check(any(b["id"] == "pollinations" for b in r.data["backends"]),
       "pollinations 免 key 默认在（零配置开箱即用）")
+check(any(b["id"] == "ovh" and not b.get("need_key")
+          for b in r.data["backends"]),
+      "OVHcloud 免 key 兜底也在（第二个真·零配置端点）")
+# 🔴 硬编码的 model 必须还是上游真有的 model（2026-10-21 实测踩的坑）：
+#   llm7 原来写死 "gpt-4o-mini"，该模型已不在 llm7 当前 70 个模型里 → 调必 404。
+#   「配了个看着很合理的模型名」是这类 bug 的伪装，离线门禁锁死它。
+_llm7 = [b for b in r.data["backends"] if b["id"] == "llm7"]
+if _llm7:
+    check(_llm7[0].get("model") != "gpt-4o-mini",
+          "llm7 不再用已下线的 gpt-4o-mini")
+else:
+    print("  - llm7 无 token 未装配（跳过模型名断言）")
 
 
 # ② ai.chat 流式回流 + 多后端
