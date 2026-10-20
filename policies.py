@@ -27,6 +27,13 @@ import rule_engine  # noqa: E402
 DEFAULT_POLICY = os.environ.get("FLEET_POLICY", "")
 
 DEFAULT_RULES = [
+    # 心跳判死：连接还在但节点卡住/假死，摘掉避免路由到僵尸
+    {"name": "心跳判死-摘除", "priority": 11,
+     "when": {"event": "hb_dead", "match": {"age": {"op": "gt", "value": 180}}},
+     "then": [{"action": "mark_degraded"},
+              {"action": "drop"},
+              {"action": "notify", "args": {"text": "心跳判死，已摘除"}}]},
+
     # 节点掉线：标记降级（不让后续路由再选它）+ 提示
     {"name": "掉线-降级告警", "priority": 10,
      "when": {"event": "node_offline"},
@@ -89,11 +96,15 @@ def _selftest():
     assert eval_event({"event": "session_end", "mode": "session"}), "会话模式下机应清理"
     assert not eval_event({"event": "session_end", "mode": "resident"}), "常驻不该清理"
 
+    assert eval_event({"event": "hb_dead", "age": 400}), "400s 应判死摘除"
+    assert not eval_event({"event": "hb_dead", "age": 60}), "60s 不该判死"
+
     # priority 排序：掉线(10) 应排在探测(8) 前
     hits = eval_event({"event": "node_offline"}) + eval_event({"event": "hb_stale", "age": 999})
     assert hits[0][0].startswith("掉线"), hits
     print("[selftest] 掉线->降级+告警 OK")
     print("[selftest] 心跳超时阈值(90s) OK")
+    print("[selftest] 心跳判死阈值(180s) OK")
     print("[selftest] 重活优先GPU(仅训练类) OK")
     print("[selftest] 临时节点下机清理 OK")
     print("[selftest] priority 排序 OK")

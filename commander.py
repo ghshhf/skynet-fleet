@@ -113,6 +113,9 @@ def _apply_hits(name, hits):
             print(f"  [策略:{rname}] {name} 心跳超时 -> 探测（不急于判死）", flush=True)
         elif a == "cleanup":
             print(f"  [策略:{rname}] 清理临时节点凭据（下机不留痕）", flush=True)
+        elif a == "drop":
+            _drop_node_silent(name)
+            print(f"  [策略:{rname}] {name} 已从节点表摘除", flush=True)
         elif a == "prefer_gpu":
             continue                      # 查询型动作，由 pick_node 消费
         else:
@@ -129,6 +132,50 @@ def _fire(event, name=""):
 def _drop_node(name):
     REGISTRY.with_lock(lambda d: d.pop(name, None))
     _fire({"event": "node_offline", "node": name}, name)
+
+
+def _drop_node_silent(name):
+    """摘除节点但不触发 node_offline（心跳判死路径用，避免动作重复）。"""
+    node = REGISTRY.with_lock(lambda d: d.pop(name, None))
+    if node:
+        try:
+            node["sock"].close()
+        except OSError:
+            pass
+
+
+WATCHDOG_STOP = threading.Event()
+
+
+def scan_stale(rows, now=None, stale=90.0, dead=180.0):
+    """纯函数：按心跳年龄产出事件（可单测，不必等真超时）。
+
+    这是 hb_stale / hb_dead 策略的唯一事件源——没有它，策略就是空壳。
+    """
+    now = now if now is not None else time.time()
+    out = []
+    for name, hb in rows:
+        age = now - hb
+        if age > dead:
+            out.append((name, {"event": "hb_dead", "node": name, "age": round(age, 1)}))
+        elif age > stale:
+            out.append((name, {"event": "hb_stale", "node": name, "age": round(age, 1)}))
+    return out
+
+
+def watchdog_loop(interval=5.0, stale=90.0, dead=180.0):
+    """心跳看门狗：把「时间」变成事件喂给策略层。"""
+    while not WATCHDOG_STOP.is_set():
+        rows = REGISTRY.with_lock(lambda d: [(k, v["last_hb"]) for k, v in d.items()])
+        for name, ev in scan_stale(rows, stale=stale, dead=dead):
+            _fire(ev, name)
+        WATCHDOG_STOP.wait(interval)
+
+
+def start_watchdog(**kw):
+    t = threading.Thread(target=watchdog_loop, kwargs=kw, daemon=True)
+    t.start()
+    return t
 
 
 def _enqueue(name, cmd):
@@ -729,6 +776,12 @@ def self_test(host, port, password):
     _cmd_policy_eval('{"event":"compute_pick","task":"写个快排"}')
     print("  说明：策略只产出动作，副作用由控制面统一执行 -> 可 dry-run、可单测、改策略不改代码。", flush=True)
 
+    print("\n=== 心跳看门狗（把「时间」变成事件；hb_stale/hb_dead 的唯一事件源）===", flush=True)
+    now = time.time()
+    for n, ev in scan_stale([("PC-OK", now), ("PC-Slow", now - 120), ("PC-Dead", now - 400)], now=now):
+        print(f"  {n}: {ev['event']} age={ev['age']}s")
+    print("  （PC-OK 无事件 / PC-Slow 仅探测 / PC-Dead 判死并摘除）", flush=True)
+
     print("\n=== 共享算力路由（§九 dev_pick：选「谁能干」的节点跑重活）===", flush=True)
     _cmd_compute("帮我写段按修改时间排序的 Python")     # 普通任务：策略不要求占 GPU
     _cmd_compute("帮我微调一个 LoRA 训练脚本")          # 重活：策略自动转 prefer_gpu
@@ -752,6 +805,7 @@ def main():
         self_test(args.host, args.port, args.password)
     else:
         threading.Thread(target=serve, args=(args.host, args.port, args.password), daemon=True).start()
+        start_watchdog()          # 心跳看门狗：卡住/假死的节点会被自动探测/摘除
         repl()
 
 
