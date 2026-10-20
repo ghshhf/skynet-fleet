@@ -85,6 +85,11 @@ class AI(BaseDevice):
         except Exception as e:
             return R.error("ai.complete", f"{b['id']} 出错: {e}",
                            device=self.name, via=self.via)
+        if not (text or "").strip():
+            # 同 _one：空回要带原因，不许交一个空串上去（见 _one 里的说明）
+            return R.unavailable("ai.complete",
+                                 f"{b['id']} 空回：这次流里没有正文（上游临时抽风）",
+                                 device=self.name, via=self.via)
         return R.success("ai.complete", self.name, side_effect=True, via=self.via,
                          data={"backend": b["id"], "text": text})
 
@@ -148,6 +153,15 @@ class AI(BaseDevice):
         text = AB.chat(b, prompt, system=system, on_token=on_token, max_tokens=mt)
         if buf["t"].strip() and on_line:
             on_line(f"[{b['id']}] {buf['t']}")
+        if not (text or "").strip():
+            # 空回是最阴的那种失败：界面上看着像「模型没话说」，实则是流里根本没有
+            # 正文——上游临时抽风（实测 15 次里偶发 1 次，curl 直连也复现不了规律）。
+            # 静默失败不许过：失败必须给原因，否则人只能盯着一块空白猜。
+            note = ("[空回] 这个后端这次流里没有正文（上游临时抽风，实测偶发）；"
+                    "换个后端或再问一次")
+            if on_line:
+                on_line(f"[{b['id']}] {note}")
+            return note
         return text
 
     def _pick(self, spec):

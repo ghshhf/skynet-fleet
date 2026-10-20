@@ -104,7 +104,23 @@ check(bool(dead) and (dead[0]["reason"] or "").strip(),
 AB._CUSTOM.pop()          # 摘掉假后端，别留给后面的断言
 
 
-# ④ 审批档 approval：deny 永远拒绝；ask 即便非副作用也要闸门
+# ④ 空回不许静悄悄：后端流里没有正文时，必须变成一句带原因的话
+#    （真踩出来的：上游偶发空流，界面上看着像「模型没话说」，人只能盯空白猜）
+AB.chat = lambda b, prompt, system="", on_token=None, max_tokens=512, timeout=60: ""
+r = reg.call("ai.chat", args={"prompt": "你好"})
+check(r.ok, "空回时 ai.chat 仍返回信封（不是崩）")
+ans = r.data.get("answers", {})
+check(all((v or "").strip() for v in ans.values()),
+      "空回被换成一句带原因的话（不许交空串）")
+check(any("空回" in (v or "") for v in ans.values()),
+      "空回的说明里点名「空回」")
+AB.chat = fake_chat                       # 还原，后面的断言还要用它
+
+r = reg.call("ai.complete", args={"prompt": "你好"})
+check(r.ok and r.data.get("text"), "ai.complete 正常路径拿到正文")
+
+
+# ⑤ 审批档 approval：deny 永远拒绝；ask 即便非副作用也要闸门
 class Mini(BaseDevice):
     kind = "mini"
 
