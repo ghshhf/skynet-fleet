@@ -57,6 +57,8 @@ CASES = [
     # ---- T1：全屏界面 + 两个显影面共用一套 dispatch ----
     ("fleet_tui_smoke", ["-m", "fleet.tui", "--smoke"], HERE, 240),
     ("eval_t1_two_faces", ["evals/t1_cli_and_tui_share_dispatch.py"], HERE, 240),
+    # 这条超时就是失败：它卡住说明界面在长任务期间被拖死了
+    ("eval_t2_ui_alive", ["evals/t2_ui_alive_under_job_stream.py"], HERE, 120),
 ]
 
 

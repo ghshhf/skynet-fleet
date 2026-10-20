@@ -56,6 +56,23 @@ class Capability:
     check: object = None           # check_fn(registry, device) -> (bool, reason)
     note: str = ""
 
+    def __post_init__(self):
+        """把 params 一律归一成元组。
+
+        `params=(Param(...))` 少写一个逗号，得到的就是一个 Param 而不是元组——
+        这个坑阴在：写的时候看不出来，登记也不报错，要等别处 `for p in c.params`
+        才当场炸，而堆栈指向的是被炸的那个文件，不是写错的这一行。
+        所以归一放在构造器里，写错的人自己立刻拿到正确的东西。
+        """
+        p = self.params
+        if p is None:
+            p = ()
+        elif isinstance(p, Param):
+            p = (p,)
+        else:
+            p = tuple(p)
+        object.__setattr__(self, "params", p)
+
     def as_dict(self):
         return {"name": self.name, "title": self.title,
                 "params": [p.as_dict() for p in self.params],
