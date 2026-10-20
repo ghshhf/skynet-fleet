@@ -156,7 +156,19 @@ def card_summary(data):
 # --------------------------------------------------------------------------
 
 def world_book_entries(data):
-    """取角色卡里挂的世界书条目：[{keys, content, enabled, constant, ...}]。"""
+    """取角色卡里挂的世界书条目：[{keys, content, enabled, constant, ...}]。
+
+    字段语义按 SillyTavern V2/V3 规范（见 docs/角色卡生态调研_2026-10-21.md）：
+      keys            主触发词，任一命中即激活
+      secondary_keys  次级词；selective=true 时需「主+次各命中一个」才激活
+      selective       开启 AND 语义
+      constant        恒注入（无视关键词）
+      enabled         总开关
+      insertion_order 插入顺序，**数值低的先插入**
+      position        before_char / after_char
+      use_regex       V3：把 keys 当正则（此时 constant/secondary_keys 应被忽略）
+      case_sensitive  关键词是否区分大小写
+    """
     book = data.get("character_book") or {}
     entries = book.get("entries") if isinstance(book, dict) else None
     if not isinstance(entries, list):
@@ -167,34 +179,87 @@ def world_book_entries(data):
             continue
         out.append({
             "keys": [str(k) for k in (e.get("keys") or [])],
+            "secondary_keys": [str(k) for k in (e.get("secondary_keys") or [])],
             "content": str(e.get("content") or ""),
             "enabled": bool(e.get("enabled", True)),
             "constant": bool(e.get("constant", False)),
             "selective": bool(e.get("selective", False)),
+            "use_regex": bool(e.get("use_regex", False)),
+            "case_sensitive": bool(e.get("case_sensitive", False)),
+            "insertion_order": e.get("insertion_order"),
+            "position": e.get("position") or "before_char",
+            "name": e.get("name") or "",
         })
     return out
 
 
-def match_world_book(data, text):
-    """按关键词命中世界书条目，返回要注入的文本块。
+def _entry_hits(entry, text):
+    """这条世界书条目在给定文本里命中了吗？按规范实现 AND 语义。
 
-    constant 条目永远注入；其余按关键词在 text 里出现与否决定。
+    🔴 上一版把 selective / secondary_keys 读出来却**从不生效**——「读了字段但没
+    实现语义」是功能性 bug（不是缺功能）：开了 selective 的条目该要求主+次各命中
+    一个，我们却和普通条目走同一条 keys 路径，等于 AND 开关是摆设。
+    """
+    if entry.get("use_regex"):
+        # V3：keys 当正则；此时 constant/secondary_keys 应被忽略
+        import re
+        for k in entry.get("keys") or []:
+            if not k:
+                continue
+            try:
+                if re.search(k, text):
+                    return True
+            except re.error:
+                # 坏正则不许让整张卡炸掉：当普通关键词处理
+                if k in text:
+                    return True
+        return False
+
+    hay = text if entry.get("case_sensitive") else text.lower()
+
+    def hit(words):
+        for w in words or []:
+            if not w:
+                continue
+            probe = w if entry.get("case_sensitive") else w.lower()
+            if probe in hay:
+                return True
+        return False
+
+    primary = hit(entry.get("keys"))
+    if not primary:
+        return False
+    if entry.get("selective"):
+        # AND 语义：主词命中 + 次级词也至少命中一个
+        return hit(entry.get("secondary_keys"))
+    return True
+
+
+def match_world_book(data, text, scan_depth=None):
+    """按关键词命中世界书条目，返回要注入的文本块（按 insertion_order 排序）。
+
+    constant 条目永远注入；其余按命中与否决定。
+    scan_depth 语义来自规范：只看「最近 N 条消息」——调用方可以把对话切成
+    消息列表传进来，这里只按给定的 text 匹配（不做切分，切分是调用方的活）。
     """
     if not text:
         return []
-    low = str(text).lower()
+    entries = world_book_entries(data)
     hits = []
-    for e in world_book_entries(data):
+    for e in entries:
         if not e["enabled"] or not e["content"]:
             continue
-        if e["constant"]:
-            hits.append(e["content"])
+        if e["constant"] and not e["use_regex"]:
+            hits.append(e)
             continue
-        for k in e["keys"]:
-            if k and k.lower() in low:
-                hits.append(e["content"])
-                break
-    return hits
+        if _entry_hits(e, text):
+            hits.append(e)
+    # insertion_order 数值低的先插入（规范原文：数值低的先插入/更靠上）
+    def _ord(e):
+        v = e.get("insertion_order")
+        return v if isinstance(v, (int, float)) else 10 ** 6
+    hits.sort(key=_ord)
+    return [e["content"] for e in hits]
 
 
 # --------------------------------------------------------------------------
@@ -443,6 +508,44 @@ def _selftest():
         assert not any("冰箱" in h for h in hits), hits
         assert any("永远注入" in h for h in hits), hits
         assert match_world_book(d2, "") == [], "空文本不该命中关键词"
+
+        # --- selective 的 AND 语义（🔴 上一版读了字段却从不生效，是功能 bug）---
+        sel = {
+            "character_book": {"entries": [
+                {"keys": ["手机"], "secondary_keys": ["没电"], "selective": True,
+                 "content": "AND 命中：手机+没电", "enabled": True},
+                {"keys": ["电视"], "secondary_keys": ["没电"], "selective": True,
+                 "content": "AND 不该命中：电视+没电", "enabled": True},
+            ]}
+        }
+        h1 = match_world_book(sel, "我手机没电了")
+        assert any("AND 命中" in h for h in h1), h1
+        assert not any("AND 不该命中" in h for h in h1), ("selective 开了就必须主+次各命中一个", h1)
+        h2 = match_world_book(sel, "我手机屏幕裂了")
+        assert not any("AND 命中" in h for h in h2), ("secondary 没命中就不该触发", h2)
+
+        # --- disabled 总开关 ---
+        dis = {"character_book": {"entries": [
+            {"keys": ["电视"], "content": "不该出现", "enabled": False}]}}
+        assert match_world_book(dis, "电视") == [], "enabled=false 必须总开关"
+
+        # --- insertion_order 低的先插入 ---
+        order = {"character_book": {"entries": [
+            {"keys": ["x"], "content": "第二", "insertion_order": 2, "enabled": True},
+            {"keys": ["x"], "content": "第一", "insertion_order": 1, "enabled": True}]}}
+        assert match_world_book(order, "x") == ["第一", "第二"], match_world_book(order, "x")
+
+        # --- case_sensitive ---
+        cs = {"character_book": {"entries": [
+            {"keys": ["TV"], "content": "大写命中", "case_sensitive": True, "enabled": True}]}}
+        assert match_world_book(cs, "tv") == [], "区分大小写时小写不该命中"
+        assert match_world_book(cs, "TV"), "区分大小写时大写该命中"
+
+        # --- use_regex（V3）---
+        rx = {"character_book": {"entries": [
+            {"keys": [r"电视\s*\d+"], "use_regex": True, "content": "正则命中", "enabled": True}]}}
+        assert match_world_book(rx, "我的电视 55 寸"), "正则该命中"
+        assert not match_world_book(rx, "我的电视机"), "正则不该命中"
 
         # --- 开场白换名 ---
         assert first_message(d2).startswith("测试鱼:"), first_message(d2)
