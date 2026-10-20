@@ -18,9 +18,14 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import result as R
+
+try:                                    # 根目录的 capabilities.py（合自 feat/capability-self-description）
+    import capabilities as CAPSPEC
+except ImportError:                     # 包被单独使用时没有基线也不许崩
+    CAPSPEC = None
 
 NEVER = ("password", "passwd", "pwd", "token", "secret", "psk", "key", "api_key")
 KEEP_META = ("os", "platform", "model", "vendor", "addr", "port", "serial", "note")
@@ -81,10 +86,20 @@ class Registry:
     # ---------------- 登记 ----------------
 
     def register(self, cap):
+        """登记一条能力。
+
+        没写参数 schema 的能力，自动从根目录 `capabilities.py` 的基线继承——
+        「一条能力要有说明书」是注册表的事，不该指望每个写设备种类的人记得填。
+        显式声明的永远压过继承的（catalog 是唯一真相，基线只是兜底）。
+        """
         with self._lk:
             old = self._caps.get(cap.name)
             if old is not None and old != cap:
                 raise ValueError(f"能力重复注册: {cap.name}（{old.title} / {cap.title}）")
+            if not cap.params and CAPSPEC is not None:
+                inh = tuple(Param(**p) for p in CAPSPEC.params_of(cap.name))
+                if inh:
+                    cap = replace(cap, params=inh)
             self._caps[cap.name] = cap
         return cap
 
@@ -465,10 +480,23 @@ def _selftest():
     st = reg.stats()
     assert st["devices"] == 2 and st["online"] == 1 and st["caps"] == 3, st
 
+    # ⑮ 没声明参数的能力，自动从根目录 capabilities 基线继承
+    if CAPSPEC is not None:
+        reg6 = Registry(path="", ttl=0)
+        reg6.register(Capability("shell.exec", "在节点上执行命令", side_effect=True))
+        c = reg6.capability("shell.exec")
+        assert [p.name for p in c.params] == ["cmd"] and c.params[0].required, c
+        # 显式声明永远压过继承（catalog 是唯一真相）
+        reg6.register(Capability("file.pull", "取文件", params=(Param("node", "str"),)))
+        assert [p.name for p in reg6.capability("file.pull").params] == ["node"]
+        assert not CAPSPEC.known("nope.nope") and not reg6.capability("nope.nope")
+    else:
+        print("  （无根目录 capabilities 基线，跳过继承断言）")
+
     for f in (p, p + ".tmp"):
         if os.path.exists(f):
             os.remove(f)
-    print("registry 自测：14 组全过")
+    print("registry 自测：15 组全过（含能力说明书基线继承）")
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 
+import capabilities
 import common
 
 _DEBUG = bool(os.environ.get("FLEET_DEBUG"))
@@ -100,6 +101,8 @@ def _session(host, port, name, password, platform, caps, sandbox, cap_req,
         raise OSError(f"认证失败: {resp}")
     common.send_msg(s, {"t": common.REGISTER, "name": name, "platform": platform,
                         "capabilities": caps,
+                        # 不只报能力名，还报「说明书」（参数 schema）→ 编排才知道怎么调
+                        "capability_specs": capabilities.describe(caps),
                         "info": {"sandbox": os.path.abspath(sandbox), "session": session,
                                  "compute": {"cpu": os.cpu_count() or 0, "gpu": gpu,
                                              "ram_gb": ram_gb, "models": models or []}}})

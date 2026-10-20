@@ -46,6 +46,7 @@ CASES = [
     ("pc_usage", ["pc_usage.py", "--selftest"], HERE, 30),
     ("netpath", ["netpath.py", "--selftest"], HERE, 30),
     ("registry", ["registry.py", "--selftest"], HERE, 30),
+    ("capabilities", ["capabilities.py", "--selftest"], HERE, 30),
     # ---- D0 契约层（结果信封 / 设备基类 / 注册表）----
     ("fleet_result", ["-m", "fleet.core.result"], HERE, 30),
     ("fleet_registry", ["-m", "fleet.core.registry"], HERE, 30),

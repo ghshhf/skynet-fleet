@@ -17,6 +17,7 @@ fleet_context.db-journal
 fleet_journal.db
 fleet_journal.db-journal
 fleet_journal.db-wal
+fleet_audit.jsonl
 persona_state.json
 models/
 ui_automation/adskip_rules.json

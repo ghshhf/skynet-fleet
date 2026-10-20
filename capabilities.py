@@ -1,17 +1,18 @@
-"""能力自描述基线（合自 `origin/feat/capability-self-description:capabilities.py`）。
+"""能力自描述：节点不只上报能力「名字」，还上报它的「说明书」（参数 schema）。
 
-这个文件是 **schema 基线**，不是能力清单：
-  - `SPECS` 是旧分支上已经写好的那份说明书，**原样搬过来，不重写**；
-  - 设备层的能力名是 `domain.verb`（shell.exec / file.push），旧名是扁平的（exec / push），
-    两者的对应关系放在 `ALIASES` 里，**由这一处负责翻译**，调用方不许各写一份映射；
-  - 真正的能力清单在 `fleet/catalog.py`，那里没声明参数的能力，由注册表从这里继承。
+为什么需要它：统一意图编排要「发现」编队里能做什么、需要什么参数——硬编码的
+能力名（exec/ai/…）只能被广播，不能被编排。有了自描述，Commander（与她）才能
+按意图去找「能干这件事的节点 + 怎么调它」。
 
-为什么不直接并入 registry：基线要能被「还没进设备层的旧代码」单独 import
-（比如 node_agent 注册时上报自己的说明书），所以它不许依赖本包里任何东西。
+约定：`SPECS` 登记已知能力；未登记的能力字符串自动兜底为「能力名即标题」，
+保证任何节点上报的能力都有一份说明书，不会因缺失而不可发现。
+
+（2026-10-21 合入主线时补）设备层的能力名是 `domain.verb`（shell.exec / file.push），
+旧名是扁平的（exec / push）；新旧名的对应关系只登记在 `ALIASES` 这一处，
+由 `spec_of()` 统一翻译，任何调用方都不许再各写一份映射。
 """
-from . import result  # noqa: F401  # 仅为包加载顺序，不用其实体
 
-# —— 以下 SPECS 全文来自 origin/feat/capability-self-description:capabilities.py ——
+# 能力说明书：{能力名: {"title","desc","params":[{name,type,required,desc}]}}
 SPECS = {
     "exec": {
         "title": "执行命令",
@@ -117,21 +118,19 @@ def param_names(cap):
 
 
 def params_of(cap):
-    """说明书里的参数 → 设备层的 Param 原语（返回 dict，由注册表自己转成 Param）。
+    """说明书里的参数 -> 设备层的 Param 原语。
 
-    刻意不 import registry 的 Param：基线文件必须能单独 import。
+    返回 dict 列表（不返回 Param 对象）：这个文件是基线，必须能不依赖设备层单独 import。
     """
-    out = []
-    for p in spec_of(cap)["params"]:
-        out.append({"name": p["name"],
-                    "type": TYPES.get(p.get("type", "str"), "str"),
-                    "required": bool(p.get("required")),
-                    "doc": p.get("desc", "")})
-    return out
+    return [{"name": p["name"],
+             "type": TYPES.get(p.get("type", "str"), "str"),
+             "required": bool(p.get("required")),
+             "doc": p.get("desc", "")}
+            for p in spec_of(cap)["params"]]
 
 
 def known(cap):
-    """这条能力在基线里有没有说明书（没有就说明是新能力，该补登记）。"""
+    """这条能力在基线里有没有说明书（没有就说明是新的，该补登记）。"""
     return cap in SPECS or cap in ALIASES
 
 
@@ -146,7 +145,7 @@ def _selftest():
     # 未登记的能力不许抛异常，且要有兜底说明书（可发现性 > 精确性）
     s = spec_of("brand.new")
     assert s["title"] == "brand.new" and s["params"] == []
-    # 旧的扁平名照样能用（node_agent 上报时就是扁平名）
+    # 旧的扁平名照样能用（节点上报时就是扁平名）
     assert len(describe(["exec", "push"])) == 2
     assert [p["name"] for p in params_of("push")] == ["path", "data"]
     assert params_of("push")[1]["type"] == "str", "base64 要落成 str"

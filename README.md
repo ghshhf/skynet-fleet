@@ -94,6 +94,10 @@ skynet-fleet/
 ├── llm.py               # 本地推理适配层（CMD/URL/placeholder 三后端，改环境变量即切换）
 ├── bootstrap.py         # 第三原则反向推送：中心分发 bootstrap + 工具箱
 ├── compute_runner.py    # 共享算力：节点侧推理（走 llm.py 多后端）
+├── capabilities.py      # 能力自描述基线：{能力名: 说明书(参数 schema)}，编排的「发现面」
+├── install_linux.py     # Linux L1 常驻安装器（systemd root 服务 + 密码/令牌双闸）
+├── audit.py             # 控制面审计：append-only JSONL，旁路留痕（node.up/down 等）
+├── fleet/               # 设备层：契约（result/device/registry）+ 通道 + 设备种类 + 终端
 ├── platform_android.py  # Android 节点入网（adb 反向推送）
 ├── platform_apple.py    # Apple 桥接（macOS SSH / iOS 屏共 半可达）
 ├── platform_router.py   # 路由器/OpenWrt 节点（常开中枢候选）
