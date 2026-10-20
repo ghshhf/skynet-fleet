@@ -24,6 +24,7 @@ CASES = [
     ("policies", ["policies.py", "--selftest"], HERE, 30),
     ("compute_runner", ["compute_runner.py", "--selftest"], HERE, 40),
     ("queue_store", ["queue_store.py", "--selftest"], HERE, 30),
+    ("persona", ["persona.py", "--selftest"], HERE, 30),
 ]
 
 

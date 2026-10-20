@@ -172,6 +172,7 @@ def watchdog_loop(interval=5.0, stale=90.0, dead=180.0):
         rows = REGISTRY.with_lock(lambda d: [(k, v["last_hb"]) for k, v in d.items()])
         for name, ev in scan_stale(rows, stale=stale, dead=dead):
             _fire(ev, name)
+        _persona_tick()          # 她的主动性心跳：自己带频控/静默刹车，不会刷屏
         WATCHDOG_STOP.wait(interval)
 
 
@@ -481,6 +482,81 @@ def _cmd_policy_eval(js):
         print(f"  {rname} -> {act.get('action')} {act.get('args') or ''}")
 
 
+# ---------- 她（P1/P3/P4/P5） ----------
+PERSONA = None
+_PROACTIVE = None
+_LAST_TICK = [0.0]                       # 心跳节流（秒）
+PERSONA_PATH = os.environ.get(
+    "FLEET_PERSONA", os.path.join(os.path.dirname(os.path.abspath(__file__)), "persona_state.json"))
+
+
+def _her():
+    """懒初始化人格状态与主动性引擎（同一个「她」，不因设备不同而分裂）。"""
+    global PERSONA, _PROACTIVE
+    if PERSONA is None:
+        import persona as p
+        PERSONA = p.PersonaState(PERSONA_PATH)
+        _PROACTIVE = p.ProactiveEngine(PERSONA)
+    return PERSONA, _PROACTIVE
+
+
+def _persona_tick(min_interval=60.0):
+    """她的主动性心跳：产生一个念头 -> 过频控/静默/重要度三道刹车 -> 说或不说。
+
+    不说话不是失败：念头会记进 L3（pending_thought），她没消失，只是在忍。
+    """
+    st, eng = _her()
+    now = time.time()
+    if now - _LAST_TICK[0] < min_interval:
+        return None
+    _LAST_TICK[0] = now
+
+    obs = st.data.get("obsessions") or []
+    if obs:
+        o = obs[-1]
+        text = f"{st.data.get('catchphrase', '')} 我还在想 {o['cap']}（第{o['count']}次了）"
+        imp = min(0.9, 0.4 + 0.1 * o["count"])
+    else:
+        text = f"{st.data.get('catchphrase', '')} 你在干嘛？"
+        imp = 0.5
+
+    said = eng.maybe_speak(text, imp)
+    if said:
+        print(f"[她] {said}", flush=True)
+        _ctx().put("her", "last_thought", said)      # 跨设备：手机上也知道她刚说了啥
+        return said
+    _ctx().put("her", "pending_thought", text)       # 被刹车 -> 记成心事，不打扰
+    return None
+
+
+def _cmd_her():
+    st, eng = _her()
+    d = st.snapshot()
+    m = d.get("mood") or {}
+    print(f"  名字={d.get('name')} 口癖={d.get('catchphrase')} 性格={d.get('traits')}")
+    print(f"  情绪 valence={m.get('valence')} energy={m.get('energy')} cling={m.get('cling')}")
+    obs = d.get("obsessions") or []
+    for o in obs:
+        ready = time.time() >= o.get("cooldown_until", 0)
+        print(f"  执念 {o['cap']} x{o['count']} 冷却{'已过' if ready else '中'}")
+    print(f"  刹车: 频控≤{eng.per_hour}/h 静默={eng.silent[0]}-{eng.silent[1]}点")
+    lt = _ctx().get("her", "last_thought")
+    if lt.get("ok"):
+        print(f"  上次开口: {lt['val']}")
+
+
+def _cmd_her_say(text):
+    """让她现在说一句（走同一套刹车，便于真人验证主动性不会刷屏）。"""
+    st, eng = _her()
+    said = eng.maybe_speak(text, 0.8)
+    if said:
+        print(f"[她] {said}", flush=True)
+        _ctx().put("her", "last_thought", said)
+    else:
+        print("  （刹车拦下：频控/静默时段/重要度不足，已记成心事）", flush=True)
+        _ctx().put("her", "pending_thought", text)
+
+
 def _cmd_computepool():
     ns = _compute_nodes()
     if not ns:
@@ -626,7 +702,7 @@ def repl():
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
-    print("      | policy | policy_eval <事件JSON> | quit")
+    print("      | policy | policy_eval <事件JSON> | her | her_say <文本> | quit")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -707,21 +783,27 @@ def repl():
         elif op == "policy_eval":
             if rest:
                 _cmd_policy_eval(rest)
+        elif op == "her":
+            _cmd_her()
+        elif op == "her_say":
+            if rest:
+                _cmd_her_say(rest)
         else:
             print("  未知命令")
 
 
 def self_test(host, port, password):
     """本地回路自检：起服务 + 多节点，证明身体 Phase 0–4 + 她授权闭环 + 反向推送。"""
-    global SELF_TEST, RULES_PATH, QUEUE_PATH
+    global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH
     SELF_TEST = True
     os.environ["FLEET_CTX"] = ":memory:"
     import tempfile
-    # 自检用临时文件，绝不污染仓库里的规则库/队列
+    # 自检用临时文件，绝不污染仓库里的规则库/队列/人格态
     tdir = tempfile.gettempdir()
     RULES_PATH = os.path.join(tdir, f"fleet_rules_st_{os.getpid()}.json")
     QUEUE_PATH = os.path.join(tdir, f"fleet_queue_st_{os.getpid()}.json")
-    for _p in (RULES_PATH, QUEUE_PATH):
+    PERSONA_PATH = os.path.join(tdir, f"fleet_persona_st_{os.getpid()}.json")
+    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH):
         if os.path.exists(_p):
             os.remove(_p)
     import node_agent
@@ -811,6 +893,15 @@ def self_test(host, port, password):
     for n, ev in scan_stale([("PC-OK", now), ("PC-Slow", now - 120), ("PC-Dead", now - 400)], now=now):
         print(f"  {n}: {ev['event']} age={ev['age']}s")
     print("  （PC-OK 无事件 / PC-Slow 仅探测 / PC-Dead 判死并摘除）", flush=True)
+
+    print("\n=== 她的人格心跳（P3 主动性 + 三道刹车：频控/静默/重要度）===", flush=True)
+    _persona_tick(min_interval=0)                       # 无执念：打招呼
+    _her()[0].add_obsession("phone.screen.on", "想玩游戏")
+    _persona_tick(min_interval=0)                       # 有执念：谈执念
+    r3 = _persona_tick(min_interval=0)                  # 第 3 次：频控拦下
+    print(f"  第3次开口={bool(r3)}（应为 False：频控拦下，念头转心事而不是硬刷）", flush=True)
+    _ctx_get("her", "pending_thought")
+    _cmd_her()
 
     print("\n=== 共享算力路由（§九 dev_pick：选「谁能干」的节点跑重活）===", flush=True)
     _cmd_compute("帮我写段按修改时间排序的 Python")     # 普通任务：策略不要求占 GPU

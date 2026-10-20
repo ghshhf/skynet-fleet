@@ -104,10 +104,69 @@ def build_capability_request(cap="phone.screen.on", reason="想玩游戏"):
 FORBIDDEN_AUTONOMY = {"payment", "transfer", "delete_file", "change_password", "install_app"}
 
 
+def _selftest():
+    """离线验证 P1/P3/P4/P5 的刹车机制——没刹车的主动性三天就被静音。"""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(path)
+    try:
+        st = PersonaState(path)
+        assert st.snapshot()["name"] == "她"
+        assert st.snapshot()["mood"]["cling"] > 0
+
+        # 频控：每小时 2 条，第 3 条必须被拒
+        eng = ProactiveEngine(st, per_hour=2, silent=(0, 0))   # silent=(0,0) 恒不静默
+        assert not eng.silent_now(), "silent=(0,0) 不应命中"
+        assert eng.allow(0.8)[0] and eng.allow(0.8)[0], "前两条应允许"
+        ok, why = eng.allow(0.8)
+        assert not ok and why == "频控", (ok, why)
+
+        # 重要度不足：直接拒
+        eng2 = ProactiveEngine(st, per_hour=99, silent=(0, 0))
+        ok, why = eng2.allow(0.1)
+        assert not ok and why == "重要度不足", (ok, why)
+
+        # 静默时段：构造覆盖当前时刻的区间
+        h = time.localtime().tm_hour
+        eng3 = ProactiveEngine(st, per_hour=99, silent=(h, h + 1))
+        ok, why = eng3.allow(0.9)
+        assert not ok and why == "静默时段", (ok, why)
+
+        # 执念：重复请求 count 递增且进冷却
+        st.add_obsession("phone.screen.on", "想玩游戏")
+        st.add_obsession("phone.screen.on", "还是想玩")
+        o = st.snapshot()["obsessions"][0]
+        assert o["count"] == 2 and o["reason"] == "还是想玩", o
+        assert st.cooldown_ready("phone.screen.on") is False, "刚请求过应进冷却"
+
+        # 状态落盘可读回（重启后人还是那个人）
+        st2 = PersonaState(path)
+        assert st2.snapshot()["obsessions"][0]["count"] == 2
+
+        # 红线：这些能力绝不允许自主执行
+        for cap in ("payment", "transfer", "delete_file", "change_password", "install_app"):
+            assert cap in FORBIDDEN_AUTONOMY, cap
+
+        print("[selftest] 频控(2/h)第3条被拒 OK")
+        print("[selftest] 重要度不足被拒 OK")
+        print("[selftest] 静默时段被拒 OK")
+        print("[selftest] 执念递增+冷却 OK")
+        print("[selftest] 状态落盘可读回 OK")
+        print("[selftest] 红线能力受控 OK")
+        print("[selftest] PASS")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
 if __name__ == "__main__":
-    st = PersonaState(":memory:" if False else "persona_state.json")
-    eng = ProactiveEngine(st)
-    print("人格:", st.snapshot()["name"], st.snapshot()["traits"])
-    print("白天可主动?", eng.allow(0.8))
-    print("深夜可主动?", "(切到静默时段测试略)")
-    print("她想玩:", build_capability_request())
+    import sys
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        st = PersonaState("persona_state.json")
+        eng = ProactiveEngine(st)
+        print("人格:", st.snapshot()["name"], st.snapshot()["traits"])
+        print("现在可主动?", eng.allow(0.8))
+        print("她想玩:", build_capability_request())
