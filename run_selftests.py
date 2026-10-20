@@ -72,6 +72,11 @@ CASES = [
     # 这条起的是真 HTTP 服务（随机端口 + 一次性 token），门禁里打真接口，
     # 所以它能抓到「接口形状变了」「令牌校验漏了」「SSE 退化成一次性」这类坏。
     ("eval_t7_gui_backend", ["evals/t7_gui_backend.py"], HERE, 180),
+    # ---- T8：语音输入链路（kind=voice）----
+    # 必须完全离线：假录音器 + 假 STT 注入，绝不真开麦、绝不真跑模型。
+    # 门禁红 = 代码坏了（识别失败没带原因 / 简体 prompt 没传 / token 预算没减
+    # / 两段式闸门松了 / STT 文本被当指令）。
+    ("eval_t8_voice", ["evals/t8_voice.py"], HERE, 120),
 ]
 
 
