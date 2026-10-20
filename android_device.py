@@ -22,6 +22,7 @@ import argparse
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -365,6 +366,63 @@ def notifications(serial, limit=10):
 
 
 # ---------------------------------------------------------------- B 档：动
+#
+# 两条注入通道：
+#   ① 无障碍桥（android_bridge/，首选）—— 走 dispatchGesture，不碰
+#      InputManager.injectInputEvent，因此绕开 MIUI 的 INJECT_EVENTS 检查，
+#      也就不需要插 SIM 卡去开「USB 调试（安全设置）」。
+#   ② input 命令（次选）—— 只有 B 档开关真的开着才成功，否则报错。
+# 每次动作都回传 via 字段，走哪条路是看得见的，不偷偷降级。
+
+BRIDGE_LOCAL_PORT = 18765     # 电脑侧 adb forward 端口
+BRIDGE_REMOTE_PORT = 8765     # 手机侧编队桥监听端口
+BRIDGE_TOKEN_ENV = "FLEET_BRIDGE_TOKEN"
+
+
+def bridge_token():
+    """编队桥令牌：环境变量 > 构建产物里的 token.txt。都没有就返回空。"""
+    tok = os.environ.get(BRIDGE_TOKEN_ENV, "").strip()
+    if tok:
+        return tok
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "android_bridge", "build", "token.txt")
+    if os.path.isfile(p):
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+
+def bridge_cmd(serial, cmd, timeout=8):
+    """经 adb forward 隧道给编队桥发一条指令。
+
+    手机侧服务只听 127.0.0.1，隧道由 adb 建，所以不需要把端口暴露到局域网。
+    """
+    tok = bridge_token()
+    if not tok:
+        return {"ok": False, "err": "找不到编队桥令牌（先跑 android_bridge/build.sh）"}
+    _run(serial, ["forward", f"tcp:{BRIDGE_LOCAL_PORT}", f"tcp:{BRIDGE_REMOTE_PORT}"])
+    try:
+        s = socket.create_connection(("127.0.0.1", BRIDGE_LOCAL_PORT), timeout=timeout)
+    except OSError as e:
+        return {"ok": False, "err": f"桥隧道连不上：{e}"}
+    try:
+        with s:
+            f = s.makefile("rwb")
+
+            def x(line):
+                f.write((line + "\n").encode("utf-8"))
+                f.flush()
+                return f.readline().decode("utf-8", "replace").strip()
+
+            auth = x("AUTH " + tok)
+            if not auth.startswith("OK"):
+                return {"ok": False, "err": f"鉴权失败：{auth}"}
+            out = x(cmd)
+            ok = out.startswith("OK") or out == "PONG"   # PING 的回执是 PONG
+            return {"ok": ok, "out": out, "err": "" if ok else out}
+    except OSError as e:
+        return {"ok": False, "err": f"桥通信失败：{e}"}
+
 
 def can_inject(serial):
     """探 B 档是否已开（「USB 调试（安全设置）」）。用 KEYCODE_UNKNOWN 探，无副作用。"""
@@ -375,11 +433,17 @@ def can_inject(serial):
 
 
 def tap(serial, x, y):
-    """点屏幕坐标。B 档未开时返回明确错误，不假装成功。"""
+    """点屏幕坐标。优先走无障碍桥；桥不可用才试 input，两条都不行就明确报错。"""
+    r = bridge_cmd(serial, f"TAP {int(x)} {int(y)}")
+    if r["ok"]:
+        return {"ok": True, "via": "bridge", "out": r["out"]}
     rc, txt = shell(serial, f"input tap {int(x)} {int(y)}")
     if "INJECT_EVENTS" in txt:
-        return {"ok": False, "err": "缺少 INJECT_EVENTS：需在开发者选项打开「USB 调试（安全设置）」"}
-    return {"ok": rc == 0 and not txt.strip(), "out": txt.strip()}
+        return {"ok": False, "via": "none",
+                "err": "无障碍桥不可用，且 input 缺 INJECT_EVENTS："
+                       "需装编队桥并在无障碍里授权一次（或不插卡时用 USB 调试安全设置）",
+                "bridge_err": r.get("err", "")}
+    return {"ok": rc == 0 and not txt.strip(), "via": "input", "out": txt.strip()}
 
 
 def tap_text(serial, keyword, dry_run=False):
@@ -407,19 +471,31 @@ def tap_text(serial, keyword, dry_run=False):
 
 
 def swipe(serial, x1, y1, x2, y2, ms=300):
+    r = bridge_cmd(serial, f"SWIPE {x1} {y1} {x2} {y2} {int(ms)}")
+    if r["ok"]:
+        return {"ok": True, "via": "bridge"}
     rc, txt = shell(serial, f"input swipe {x1} {y1} {x2} {y2} {ms}")
     if "INJECT_EVENTS" in txt:
-        return {"ok": False, "err": "缺少 INJECT_EVENTS"}
-    return {"ok": rc == 0}
+        return {"ok": False, "via": "none", "err": "无障碍桥不可用，input 也被拦",
+                "bridge_err": r.get("err", "")}
+    return {"ok": rc == 0, "via": "input"}
 
 
 def text_input(serial, text):
-    """往当前焦点输入文字（中文需替换输入法，这里只保证 ASCII/URL 可用）。"""
-    safe = text.replace(" ", "%s")
-    rc, txt = shell(serial, f"input text '{safe}'")
+    """往当前焦点输入文字。
+
+    桥走 ACTION_SET_TEXT，中文直接可用；input text 只认 ASCII，中文会乱。
+    """
+    r = bridge_cmd(serial, f"TEXT {text}")
+    if r["ok"]:
+        return {"ok": True, "via": "bridge"}
+    if any(ord(c) > 127 for c in text):
+        return {"ok": False, "via": "none",
+                "err": "无障碍桥不可用，input text 传不了中文", "bridge_err": r.get("err", "")}
+    rc, txt = shell(serial, f"input text '{text.replace(' ', '%s')}'")
     if "INJECT_EVENTS" in txt:
-        return {"ok": False, "err": "缺少 INJECT_EVENTS"}
-    return {"ok": rc == 0}
+        return {"ok": False, "via": "none", "err": "无障碍桥与 input 都不可用"}
+    return {"ok": rc == 0, "via": "input"}
 
 
 def wait_foreground(serial, want, timeout=10.0):
@@ -495,7 +571,16 @@ def _selftest():
         bounds="[10,10][20,20]" clickable="false"/></hierarchy>""")
     assert clickable_of(alone, alone[0])["center"] == (15, 15)
 
-    print("android_device \u81ea\u6d4b\uff1a7 \u9879\u5168\u8fc7")
+    # ⑧ 桥没令牌时必须明确失败，不能假装点成了
+    real = globals()["bridge_token"]
+    globals()["bridge_token"] = lambda: ""
+    try:
+        r = bridge_cmd("fake-serial", "PING")
+        assert r["ok"] is False and "令牌" in r["err"], r
+    finally:
+        globals()["bridge_token"] = real
+
+    print("android_device \u81ea\u6d4b\uff1a8 \u9879\u5168\u8fc7")
 
 
 # ---------------------------------------------------------------- CLI
@@ -532,6 +617,9 @@ def main(argv=None):
     p = sub.add_parser("connect", help="连接无线调试端口")
     p.add_argument("addr")
 
+    p = sub.add_parser("bridge", help="给编队桥发原始指令（PING/TAP/SWIPE/TEXT/FOCUS/BACK…）")
+    p.add_argument("raw", nargs="+")
+
     args = ap.parse_args(argv)
     serial = args.serial or pick_serial()
     if args.cmd in (None, "devices"):
@@ -552,11 +640,17 @@ def main(argv=None):
     elif args.cmd == "cap":
         a = ui_xml(serial)
         b = can_inject(serial)
-        print("设备      ", serial)
-        print("A 档读屏  ", "OK" if a["ok"] else f"FAIL {a.get('err')}")
-        print("A 档启动  ", "OK" if launch(serial, "android.settings.SETTINGS")["ok"] else "FAIL")
-        print("B 档注入  ", "OK（可点可滑可输入）" if b else
-              "缺「USB 调试（安全设置）」—— 只能看和开，不能点")
+        br = bridge_cmd(serial, "PING")
+        print("设备        ", serial)
+        print("A 档读屏    ", "OK" if a["ok"] else f"FAIL {a.get('err')}")
+        print("A 档启动    ", "OK" if launch(serial, "android.settings.SETTINGS")["ok"] else "FAIL")
+        print("B 档无障碍桥", "OK（可点、可滑、可输入中文）" if br["ok"]
+              else f"不可用：{br.get('err')}")
+        print("B 档 input  ", "OK（USB 调试安全设置已开）" if b
+              else "被 MIUI 拦（无 SIM 卡时这是常态，不影响上面那条）")
+    elif args.cmd == "bridge":
+        r = bridge_cmd(serial, " ".join(args.raw))
+        print(r.get("out") or r.get("err"))
     elif args.cmd == "shot":
         r = shot(serial, args.path)
         print(r.get("path") or r.get("err"))

@@ -26,3 +26,8 @@ tmp/
 # 扫描/发现账本（含真实设备清单，不入库）
 swept.json
 discovered.json
+
+# 编队桥构建产物、签名密钥、控制令牌
+android_bridge/build/
+android_bridge/keystore.jks
+android_bridge/.token
