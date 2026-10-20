@@ -8,7 +8,8 @@
 
 免 key 当一等公民（Cherry 也内置了免费入口）：pollinations 默认就在，零配置开箱即用。
 本地模型（openai 兼容端点）有 FLEET_LLM_URL 才活；llm7 有 FLEET_LLM7_TOKEN 才活。
-外部 token 永远从环境变量读，绝不下落盘、绝不进注册表。
+外部 token（FLEET_LLM_KEY / FLEET_LLM7_TOKEN）永远从环境变量读，绝不下落盘、绝不进注册表。
+本地模型若端点要鉴权读 FLEET_LLM_KEY（可选）；model 留空则首次对话时自动从 /models 取第一个。
 
 探测契约（学 Cherry 的「检测」按钮 = probe）：ai.status 逐个后端真发一条请求，
 不通就报原因，而不是默默把能力从列表里消失。
@@ -29,14 +30,18 @@ def backends():
         "protocol": "openai", "base_url": "https://text.pollinations.ai/v1",
         "model": "openai", "key_env": None, "need_key": False,
     })
-    # ② 本地模型：openai 兼容端点（llama.cpp / Ollama / vLLM / LM Studio）
+    # ② 本地模型：openai 兼容端点（llama.cpp / Ollama / vLLM / LM Studio / 本地聚合网关）
+    #    有 FLEET_LLM_URL 才活；若端点要鉴权再读 FLEET_LLM_KEY（可选，绝不落盘）；
+    #    model 留空则首次对话时自动从 /models 取第一个（见 _resolve_model）。
     url = os.environ.get("FLEET_LLM_URL")
     if url:
+        key = os.environ.get("FLEET_LLM_KEY")
         bs.append({
             "id": "local", "title": "本地模型 " + url,
             "protocol": "openai", "base_url": url.rstrip("/"),
-            "model": os.environ.get("FLEET_LLM_MODEL", "local-model"),
-            "key_env": None, "need_key": False,
+            "model": os.environ.get("FLEET_LLM_MODEL") or None,
+            "key_env": "FLEET_LLM_KEY" if key else None,
+            "need_key": bool(key), "key": key,
         })
     # ③ llm7：免费但要 token（每天 10 万 token）——有才上，没有自动离线
     tok = os.environ.get("FLEET_LLM7_TOKEN")
@@ -55,6 +60,28 @@ def _headers(b):
     if b.get("need_key") and b.get("key"):
         h["Authorization"] = "Bearer " + b["key"]
     return h
+
+
+_MODEL_CACHE = {}      # base_url -> 自动挑到的 model（避免每次对话都打 /models）
+
+
+def _resolve_model(b):
+    """model 留空时自动从 /models 取第一个；按 base_url 缓存一次。"""
+    if b.get("model"):
+        return b["model"]
+    base = b["base_url"].rstrip("/")
+    if base in _MODEL_CACHE:
+        return _MODEL_CACHE[base]
+    try:
+        req = urllib.request.Request(base + "/models",
+                                     headers=_headers(b), method="GET")
+        obj = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        models = [m.get("id") for m in obj.get("data", []) if m.get("id")]
+        pick = models[0] if models else "local-model"
+    except Exception:
+        pick = "local-model"
+    _MODEL_CACHE[base] = pick
+    return pick
 
 
 def probe(b, timeout=8):
@@ -94,7 +121,7 @@ def _chat_stream(b, prompt, system, on_token, max_tokens, timeout):
     if system:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
-    payload = {"model": b["model"], "messages": msgs,
+    payload = {"model": _resolve_model(b), "messages": msgs,
                "stream": True, "max_tokens": max_tokens}
     req = urllib.request.Request(
         b["base_url"].rstrip("/") + "/chat/completions",
