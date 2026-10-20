@@ -36,6 +36,7 @@ CASES = [
     ("followups", ["followups.py", "--selftest"], HERE, 30),
     ("android_device", ["android_device.py", "--selftest"], HERE, 30),
     ("infrared", ["infrared.py", "--selftest"], HERE, 30),
+    ("agent_phone", ["agent_phone.py", "--selftest"], HERE, 60),
 ]
 
 
