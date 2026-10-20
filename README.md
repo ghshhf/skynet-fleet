@@ -29,9 +29,11 @@
   - **她 P3 人格心跳**：主动性 tick 接入看门狗，过**频控(≤2/h) / 静默时段 / 重要度**三道刹车；说了写 `last_thought`，不说写 `pending_thought`（她在忍，不是消失了）。接上 `llm.py` 后由模型自己开口，未接时模板兜底、绝不伪造模型输出。
   - **「她记得」（验收项：隔日 + 换设备能带出昨天的具体事）**：`recall.py` 从 L3 取 **12h–72h** 的往事（刚发生的不算回忆、一个多月前的没意义），跳过她自己的元状态（`last_thought` 等）与技术缓存，按「离昨天有多近」排序；说过的 **3 天内不重复**（去重记账落人格态，过期自动清），原文同时写 `her/last_recall`——**换设备也看得到她提过什么**。接上模型时原文进提示词并明确「只能引用、不要编造」，没模型时用模板句（只拼接库里的原文，不虚构记忆）。往事只**提高重要度**，不绕过频控/静默。REPL `her_memory` 可人工核对。
   - **「她会跟进没完成的事」（24h 对话流水 → 主动起话头）**：`journal.py` 把对话与任务事件**追加式**落盘（敏感信息打码、E-7 逐条可删、上限环切）；`followups.py` 从流水抽**未闭环项**（意图失败 / 节点离线排队 / 她想用却被拒），按 topic 合并、带**证据 id 指回流水原文**，最近欠的优先。接进人格心跳后，念头优先级 = **没闭环的账 > 往事 > 执念 > 寒暄**；同一笔账 24h 内不重复追问，闭环即销账（`done <topic>` / 任务真成了 / 上线重放成功 / 能力获批）。接上模型时流水原文进提示词并注明「只能引用、不要编造」，没模型时模板句只拼接原文。REPL `her_followups` / `done <topic>` / `journal [n]`。**诚实边界**：流水只写本地不出网；打码只覆盖已知危险形状，把秘密当普通命令行参数传（`exec PC-A echo hunter2`）挡不住——真要绝对干净就把 `FLEET_JOURNAL` 指到内存盘。
-  - **临时节点下机即清**：节点上报 `session=True` 后断开，自动触发 `session_end` 策略（清理凭据、不留痕），与场所合规清理互补。
+  - **临时节点下机即清**：节点上报 `session=True` 后断开，自动触发 `session_end` 策略——**真清**而不是打日志：撤销该节点入网凭据（PSK）、作废其配对/卸载令牌、丢弃它的离线排队命令，并写一条流水审计「清了几样」（E-7 可逐条删）。以前这步只 print 一句「已清理」，自检里也看不出来到底清没清。
+  - **多控制面仲裁（`arbiter.py`）**：全编队**只有一个领袖控制面能发令**，其它待机——否则两台机器各发各的，状态立刻分叉、她在备用面批的权限主面不认，「一个意图扇出所有设备」就破了产。选举=共享状态文件里的声明（rank 高者优先 → 先声明者 → id 全序），领袖每 15s 续期、45s 不续期即让位；待机面 REPL 仍可看（nodes/her/journal），但 exec/broadcast/compute/ui/intent/enroll 等**发令类命令一律拒绝并点名领袖是谁**；正常退出主动让位，备用立即接管（不等 TTL）。单机常态零配置（一张声明即成领袖）。**诚实边界**：仲裁是协同不是安全边界，跨机器共享盘仍有极小写窗口。
+  - **exec 白名单收紧**：三层拒绝——① base 不在白名单 ② 参数含 shell 元字符（`& | ; < > \` $` 换行），因为节点侧 `shell=True`，`echo ok & del x` 这种 base 是 echo 却能干任何事的组合是白名单最大的洞 ③ **解释器默认禁止**（`python/powershell/cmd/bash` 等于任意代码执行，要跑脚本须显式 `FLEET_ALLOW_INTERPRETER=1`）。拒绝理由分类型回执给人看，不再只给 `rc=-1`。
   - **扫码入网（`enroll.py`）**：手机出示一张二维码载荷，设备扫一下即可入网，不用在新机器上敲密码。载荷是 `fleet://enroll?p=...`（约 230 字符），**可离线验签**（HMAC-SHA256 + 共享密钥，不联网、不回调控制面）、**一次性**（兑换落本地账本，截图外流也只是废纸）、**有时效**（默认 10 分钟）、**绑节点**（A 的载荷装不成 B），且**不含用户密码**——装完节点用随机 PSK 认证，明文密码不再写进计划任务参数。载荷寿命与节点凭据寿命**分开**：码 10 分钟过期，PSK 长期有效（否则一重启就失联），撤销走 `enroll_revoke`。REPL：`enroll <节点> [有效期秒]` / `enroll_list` / `enroll_revoke <节点>`；安装侧 `install_windows.py --enroll "<uri>" [--dry-run]`。
-  - **一键自测门禁**：`run_selftests.py` 串起 **15 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups）。
+  - **一键自测门禁**：`run_selftests.py` 串起 **16 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups）。
 - **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动、手机端二维码渲染（载荷已可生成与离线验签，缺的只是把它画成图）。
 
 自测命令（全部离线，不碰真机、不需联网）：
@@ -81,6 +83,7 @@ skynet-fleet/
 ├── followups.py         # 「她会跟进」：从未闭环项生成话题（合并/去重追问/闭环销账）
 ├── enroll.py            # 扫码入网：一次性入网载荷（离线验签/绑节点/不含密码）
 ├── policies.py          # 策略层：掉线/心跳/算力/会话 的判断外置为 JSON 规则
+├── arbiter.py           # 多控制面仲裁：全编队只有一个领袖能发令（待机面只读）
 ├── queue_store.py       # 离线队列持久化（控制面重启不丢）
 ├── llm.py               # 本地推理适配层（CMD/URL/placeholder 三后端，改环境变量即切换）
 ├── bootstrap.py         # 第三原则反向推送：中心分发 bootstrap + 工具箱
@@ -130,6 +133,7 @@ ui Her-Phone com.xx.app   # 让节点按规则库当前版本跳广告（--visio
 rules / rules_put <文件>  # 规则库：看版本 / 发布会自动带版本下发
 rules_rollback 1          # 回滚（生成新版本，历史保留）
 policy / policy_eval '{...}'  # 看生效策略 / dry-run 一个事件
+arbiter                  # 多控制面仲裁：谁是领袖 / 本机是领袖还是待机
 her / her_say 你在干嘛     # 看她的状态 / 让她现在说一句（走频控刹车）
 her_memory                # 列出她能回忆的往事（隔日 12h–72h，可人工核对是否真的记得）
 her_followups / done <topic>    # 看 24h 没闭环的账 / 告诉系统这事做完了（清账）
