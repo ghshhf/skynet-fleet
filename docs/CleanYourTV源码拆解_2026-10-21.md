@@ -45,9 +45,10 @@
 ### 0.4 落地结论（明确建议）
 
 > **不要自研完整 ADB 客户端，也不要纯靠 `adb.exe`。**
-> 采用**双传输层**：`adb.exe` 优先（装了 platform-tools 的机器上最稳、错误信息最全），`adb_shell` 作为 **fallback**（无 adb.exe / macOS 被 Local Network 隐私拦截 / 需要免依赖打包时）。两者之上写**统一的能力层**（`adb.wifi.*`），不把协议细节泄漏到能力层。
+> 采用**双传输层**：**默认 `adb_shell`**（Python 直连 5555，异常结构化、跨平台一致、可打包），**`adb.exe` 作为可选增强**（用户确实装了 platform-tools、且希望与 Android Studio 共用同一台 adb server 时）。两者之上写**统一的能力层**（`adb.wifi.*`），不把协议细节泄漏到能力层。
 >
-> 理由：ADB 协议本体的坑（magic 逐命令异值、checksum 是字节和不是 CRC32、AUTH 时序、Android 7 前的 4096 字节 open payload 上限、filesync 状态机）**每一个都会静默失败**，自研验证成本远高于引入一个 Apache-2.0 成熟依赖；而 `adb.exe` 在 Windows 上不一定存在、不能假设用户装了、错误信息不可控（退出码 + stderr 文本），不满足团队「失败必须带原因」的硬要求。详见第 8 章。
+> 理由：ADB 协议本体的坑（magic 逐命令异值、checksum 是字节和不是 CRC32、AUTH 时序、Android 7 前的 4096 字节 open payload 上限、filesync 状态机）**每一个都会静默失败**，自研验证成本远高于引入一个 Apache-2.0 成熟依赖；而 `adb.exe` 在 Windows 上不一定存在、不能假设用户装了、错误信息不可控（退出码 + stderr 文本），不满足团队「失败必须带原因」的硬要求。
+> 详见第 8 章（8.1 给出完整理由与三条落地规则）。
 
 ---
 
@@ -1027,18 +1028,18 @@ KNOWN_STOCK_LAUNCHERS="com.google.android.tvlauncher com.google.android.apps.tv.
 
 ### 8.1 纯 Python ADB 客户端 vs 调 adb.exe —— 明确建议
 
-**建议：双传输层，`adb.exe` 优先 + `adb_shell` fallback；不自研完整 ADB 客户端。**
+**建议：双传输层，**默认 `adb_shell`**（Python 直连）+ `adb.exe` 可选增强；**不自研完整 ADB 客户端**。
 
 ```
                  fleet/kinds/adb_wifi.py（能力层，不感知协议细节）
                                     │
                       ┌─────────────┴─────────────┐
                       │                           │
-              AdbExecTransport            AdbShellTransport
-              （调 adb.exe）            （Python 直连 5555）
+              AdbShellTransport          AdbExecTransport
+              （默认：Python 直连 5555）    （可选：调 adb.exe）
                       │                           │
-              需 platform-tools          依赖 adb-shell==0.4.4
-              错误=退出码+stderr         错误=结构化异常
+              依赖 adb-shell==0.4.4         需 platform-tools
+              错误=结构化异常→六态          错误=退出码+stderr→需自建映射表
 ```
 
 **为什么不自研完整 ADB 客户端**：
@@ -1060,15 +1061,14 @@ KNOWN_STOCK_LAUNCHERS="com.google.android.tvlauncher com.google.android.apps.tv.
 | **错误信息不可控** | adb.exe 只给退出码 + stderr 文本，**不满足团队「失败必须带原因」的硬要求**——我们得自己维护一张脆弱的字符串匹配表 |
 | **`adb connect` 需要两步** | 先 `adb connect ip:5555` 再操作，状态散在 adb server 里（还可能是残留的旧连接） |
 
-**那 adb.exe 优先的价值在哪？**
+**那 adb.exe 值得放在哪？**
 - 它**已经处理了所有 AOSP 边缘情况**，且**它报的错更全**（"device unauthorized"、"device offline" 这类是 adb server 层的概念，Python 直连拿不到）。
-- 在装了 platform-tools 的开发机上，用它调试问题最省事。
+- 在装了 platform-tools 的开发机上，用它调试问题最省事；用户若希望与 Android Studio 共用同一台 adb server，也需要它。
 - **但它必须被封装成可选后端，且永远不是唯一后端。**
 
 **结论落地为三条规则**：
 1. `adb.wifi.*` 的实现**只依赖一个内部 `AdbLink` 抽象**（`connect / shell / push / pull / close`），有两个实现。
-2. 默认**优先 `adb_shell`**（依赖可控、错误可结构化、跨平台一致）；`adb.exe` 作为**可选增强**（用户显式开启或 `adb_shell` 不可用时）。
-   > 注：这里与我上文「adb.exe 优先」的表述修正为 **`adb_shell` 优先**——因为本项目硬要求「失败必须带原因」，而 `adb_shell` 的异常是结构化的、可映射到 `DeviceResult` 六态；`adb.exe` 的错误需要脆弱的字符串匹配。**唯一应该优先 adb.exe 的场景是「用户机器上确实装了 platform-tools 且希望与 Android Studio 共用同一台 adb server」**，此时可作为可配置项。
+2. **默认 `adb_shell`**（依赖可控、错误可结构化、跨平台一致）；**`adb.exe` 作为可选增强**（用户显式开启，或需要共用 adb server 时）。反过来的顺序会让「失败必须带原因」这条硬要求依赖一张脆弱的字符串匹配表，得不偿失。
 3. **绝不自己实现 sync 协议**（`adb_shell` 已实现，见 1.6）。
 
 ### 8.2 哪些值得抄、哪些必须重写
