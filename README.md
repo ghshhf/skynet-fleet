@@ -18,6 +18,7 @@
   - **L3 共享上下文（TinyContext 式）**：跨设备同一份记忆，逐条可删（E-7）；节点经协议读写，她的节点能跨设备读到（海马体）。
   - **离线队列 + 上线重放（Phase 4 体验）**：节点离线时命令进队，上线自动补，不手动重发。
   - **她 P4 能力请求 + 授权门**：她的节点发 `cap_req` → 路由到用户批准 → `cap_grant` 限时会话（拒绝则执念+1）。人格/训练交手机（不在此仓库训）。
+  - **人格唯一性（定调）**：全编队**统一由一个模型**承载她——人格/记忆/状态都注入同一个 model，节点是薄客户端、**不各自孕育人格**（故不存在人格分裂）；`persona_state.json` 只属「她本体节点」。详见计划书 §5.1。
   - **反向推送 bootstrap（第三原则）**：中心起迷你 HTTP 分发几 KB bootstrap + 工具箱，loopback 字节校验一致。
   - **共享算力池（§九 dev_pick）**：节点上报 CPU/GPU/模型；Commander 按「谁能干」路由计算任务；`computemap` 批量分发多节点聚合；结果进共享上下文缓存，全编队复用（更加一步共享）。
   - **算力接真推理**：`compute_runner` 走 `llm.py` 三后端（`FLEET_LLM_CMD` 命令行 / `FLEET_LLM_URL` OpenAI 兼容端点 / placeholder 占位降级），改环境变量即切换，业务代码零改动——**弱设备不装模型，算力集中在有脑的节点**。
@@ -80,7 +81,7 @@ skynet-fleet/
 ├── node_agent.py        # 被控端：连/认证/注册(带能力)/exec/push/pull/ctx/compute/心跳 + 断线重连
 ├── install_windows.py   # Windows L1 常驻安装器（零依赖，SYSTEM 计划任务 + 密码/令牌双闸）
 ├── memory.py            # L3 共享上下文（SQLite+FTS5，逐条可删）
-├── persona.py           # 她脚手架（人格态/心念tick频控/能力请求门/红线）
+├── persona.py           # 她脚手架（人格态/心念tick频控/能力请求门/红线）；人格态只属「她本体节点」
 ├── recall.py            # 「她记得」：L3 往事唤醒（窗口过滤/去重/不编造）
 ├── journal.py           # 对话流水：append-only 事件落盘（打码/可逐条删/上限）
 ├── followups.py         # 「她会跟进」：从未闭环项生成话题（合并/去重追问/闭环销账）
