@@ -22,8 +22,18 @@
 
   ⑥ **失败必须带原因**：每条失败路径都带可读的 reason，不许静默成功/静默失败。
 
-**全离线、可复现**：这里把模块级的 _adb_exe / _run_cmd / _run_bin / _probe_tcp
-四个出口全换成假的——所以本门禁**绝不发一条 adb 命令、绝不连一个 IP**。
+  ⑦ **扫描规模有硬上限**（2026-10-21 验收踩出来的真 bug）。
+     原实现默认扫「254 台候选 × 2173 个端口 = 55 万次 TCP 探测」，
+     16 并发单次 0.35s 超时 ⇒ 最坏 3.4 小时：既卡死终端，也在扫别人家的网。
+     修正后：默认走 **mDNS 发现 + 只探经典 5555**；暴力扫随机端口段必须
+     显式 `ports=random/full`，且有**次数 + 墙钟双硬预算**，到点就停并
+     如实说「已探 N 次（计划 M 次），因预算到点停下」——不许假装扫完了。
+     这条钉死：默认 254 台候选只探 254 次；opt-in 模式探测次数 ≤ 预算；
+     args 不许把上限抬回 55 万次。
+
+**全离线、可复现**：这里把模块级的 _adb_exe / _run_cmd / _run_bin / _probe_tcp /
+_mdns_discover 五个出口全换成假的——所以本门禁**绝不发一条 adb 命令、
+绝不连一个 IP、绝不发一条 mDNS 组播**。
 所有「这台机器没插设备」「adb 没装」这类环境因素都被假后端吃掉，
 门禁红只可能意味着代码坏了（t4 的教训：门禁红必须等于代码坏）。
 
@@ -143,10 +153,29 @@ def fake_probe_tcp(host, port, timeout=0.35):
     return (host, port) == ("192.168.1.50", 5555)
 
 
+MDNS_CALLS = []
+
+
+def fake_mdns_discover(timeout=3.0):
+    """假 mDNS 发现：门禁**绝不许真发一条组播**。
+
+    假装网里有两台 Android 11+ 设备：老王（解析出 IP）和小李（只有实例名，
+    没解析出 IP——真实世界里 A 记录可能缺失）。
+    """
+    MDNS_CALLS.append(timeout)
+    return ([
+        {"name": "adb-wang._adb-tls-connect._tcp.local",
+         "host": "192.168.1.77", "port": 41234, "resolved": True},
+        {"name": "adb-li._adb-tls-connect._tcp.local",
+         "host": "", "port": 39871, "resolved": False},
+    ], "")
+
+
 AW._adb_exe = fake_adb_exe
 AW._run_cmd = fake_run_cmd
 AW._run_bin = fake_run_bin
 AW._probe_tcp = fake_probe_tcp
+AW._mdns_discover = fake_mdns_discover
 
 # ---------------------------------------------------------------- 离线注册表
 _tmp = tempfile.mkdtemp(prefix="t6_adbwifi_")
@@ -208,6 +237,7 @@ check(not r.ok and r.err, "adb.wifi.info 缺 target → 失败且带原因")
 
 CALLS.clear()
 PROBED.clear()
+MDNS_CALLS.clear()
 r = reg.call("adb.wifi.scan")
 check(r.ok, "adb.wifi.scan 成功（只读免闸门）")
 check(any(d.get("host") == "192.168.1.50" and d.get("port") == 5555
@@ -215,9 +245,110 @@ check(any(d.get("host") == "192.168.1.50" and d.get("port") == 5555
       "adb.wifi.scan 找到开着的 5555 端口")
 check(PROBED, "adb.wifi.scan 真去探端口了（走 _probe_tcp）")
 check(any(p == 5555 for _h, p in PROBED), "adb.wifi.scan 探了经典 5555")
+check(not any(32768 <= p <= 60999 for _h, p in PROBED),
+      "adb.wifi.scan 默认**不**探随机端口段（默认不许暴力扫）")
+check(MDNS_CALLS, "adb.wifi.scan 默认走 mDNS 发现")
+check(any(d.get("via") == "mdns" and d.get("host") == "192.168.1.77"
+          for d in r.data.get("found", [])),
+      "adb.wifi.scan 把 mDNS 发现的设备列进结果")
+check(r.data.get("mdns_found") == 2, "adb.wifi.scan 报了 mDNS 发现数")
+check(r.data.get("truncated") is False, "adb.wifi.scan 默认路径没被截断")
+check(isinstance(r.data.get("probes"), int), "adb.wifi.scan 报了真实探测次数")
+check(isinstance(r.data.get("elapsed"), (int, float)), "adb.wifi.scan 报了耗时")
+
+# ④b 扫描规模门禁：254 台候选主机时的真实探测次数
+#
+# 为什么钉这个数：2026-10-21 验收时发现真实规模是
+# 「254 台 × 2173 个端口 = 55 万次 TCP 探测」⇒ 最坏 3.4 小时。
+# 门禁原来把 _hosts/_probe_tcp 都假掉了，量不到规模，所以漏了它。
+# 这里用假的 254 台主机把规模钉死：**默认不许暴力扫**。
+BIG_HOSTS = [f"192.168.9.{i}" for i in range(1, 255)]   # 254 台假主机
+if dev is not None:
+    dev._hosts = lambda: (list(BIG_HOSTS), "")
+PROBED.clear()
+r = reg.call("adb.wifi.scan", args={"hosts_limit": 254})
+check(r.ok, "adb.wifi.scan 254 台候选也能跑（只读免闸门）")
+check(r.data.get("probes") == 254,
+      f"默认路径 254 台候选只探 254 次（不是 55 万次），实探 {r.data.get('probes')} 次")
+check(r.data.get("ports_scanned") == 1,
+      f"默认只探 1 个端口（5555），实探端口集 {r.data.get('ports_scanned')} 个")
+check(not any(32768 <= p <= 60999 for _h, p in PROBED),
+      "默认路径一个随机段端口都没探")
+check(r.data.get("hosts_candidates") == 254,
+      "adb.wifi.scan 报了候选主机总数（254）")
+check(r.data.get("hosts_scanned") == 254, "adb.wifi.scan 报了实际扫的主机数")
+check("共 254 台候选" in (r.data.get("note") or ""),
+      "adb.wifi.scan note 说清「本次只扫了前 N 台（共 M 台候选）」")
+if dev is not None:
+    dev._hosts = lambda: (["192.168.1.50", "192.168.1.51"], "")
+
+# ④c ports="random" 显式 opt-in：可以扫随机段，但必须被硬预算截断并说清
+PROBED.clear()
+r = reg.call("adb.wifi.scan", args={"ports": "random", "hosts_limit": 254,
+                                    "max_probes": 500, "workers": 4})
+check(r.ok, "adb.wifi.scan ports=random 成功")
 check(any(32768 <= p <= 60999 for _h, p in PROBED),
-      "adb.wifi.scan 探了 Android 11+ 随机端口段 32768–60999")
-check(r.data.get("workers") is None or True, "adb.wifi.scan 报了并发/超时参数")
+      "ports=random 显式 opt-in 后才探随机端口段")
+check(r.data.get("probes") <= 500,
+      f"ports=random 探测次数受硬预算约束（≤500），实探 {r.data.get('probes')} 次")
+check(r.data.get("truncated") is True, "预算到点时 truncated=True")
+check("预算" in (r.data.get("note") or ""),
+      "预算到点时 note 说清「预算到点停下」")
+check(r.data.get("probes_planned", 0) > r.data.get("probes", 0),
+      "预算到点时如实说「已探 N 次 / 计划 M 次」")
+
+# ④d 预算只能调低不能调高：防止有人把上限抬回 55 万次
+PROBED.clear()
+r = reg.call("adb.wifi.scan", args={"ports": "random", "hosts_limit": 254,
+                                    "max_probes": 10 ** 9})
+check(r.data.get("probes", 0) <= AW.MAX_PROBES,
+      f"args 不能把探测上限抬过 MAX_PROBES（{AW.MAX_PROBES}）")
+check(r.data.get("probe_budget") == AW.MAX_PROBES,
+      "args 把 max_probes 抬高时被夹回硬上限")
+
+# ④d-2 硬上限本身被钉死（不许悄悄把常量调大）
+#
+# 为什么这条要写死数字而不是「等于模块常量」：写成 `MAX_PROBES <= 20000`
+# 才是真正的钉子；只断言「args 夹回常量」的话，谁把常量抬到 10^9
+# 门禁照样绿——这个洞是变异测试抓出来的。
+check(AW.MAX_PROBES <= 20000,
+      f"探测次数硬上限不许超过 20000（现值 {AW.MAX_PROBES}）")
+check(AW.MAX_SCAN_SECONDS <= 20.0,
+      f"墙钟硬上限不许超过 20 秒（现值 {AW.MAX_SCAN_SECONDS}）")
+# 单次 scan 的理论最坏规模：主机数 × 端口数 必须被上限压住
+_worst = 254 * 28233
+check(_worst > AW.MAX_PROBES,
+      "上界参照：254 主机 × 全量随机段远超硬上限（说明预算真的在起作用）")
+
+# ④e 非法 ports 值要说清，不许静默降级
+r = reg.call("adb.wifi.scan", args={"ports": "nonsense"})
+check(not r.ok and r.err, "ports 值非法 → 失败且带原因（不许静默降级成 classic）")
+
+# ④f 墙钟预算：秒数上限一到就停，同样要说清
+#
+# 这里必须临时换成一个**慢探针**：假探针瞬间返回，秒数预算永远轮不到触发，
+# 那这条断言就变成自欺欺人。慢探针只 sleep，不发任何包。
+import time as _time
+
+
+def slow_probe_tcp(host, port, timeout=0.35):
+    _time.sleep(0.05)
+    PROBED.append((host, port))
+    return False
+
+
+AW._probe_tcp = slow_probe_tcp
+PROBED.clear()
+r = reg.call("adb.wifi.scan", args={"ports": "random", "hosts_limit": 254,
+                                    "max_seconds": 1, "workers": 2})
+check(r.ok, "adb.wifi.scan 墙钟预算下仍返回结果（部分结果也是结果）")
+check(r.data.get("probes") < r.data.get("probes_planned", 0),
+      "墙钟预算下探测次数远少于计划数（提前停了）")
+check(r.data.get("truncated") is True, "墙钟预算到点 → truncated=True")
+check("预算" in (r.data.get("note") or ""),
+      "墙钟预算到点时 note 说清「预算到点停下」")
+check(r.data.get("seconds_budget") == 1, "墙钟预算值如实回传")
+AW._probe_tcp = fake_probe_tcp          # 换回快探针，后面的断言还要用它
 
 # ⑤ 动手能力 fail-closed：没闸门一律 denied，且**一条 adb 都不发**
 for name in ACT_CAPS:
@@ -305,6 +436,64 @@ reg.call("adb.wifi.launch", args={"target": "192.168.1.50:5555",
                                   "package": "com.x", "activity": "com.x/.Main"},
          gate=gate_yes)
 check(any("am start" in " ".join(c[1]) for c in CALLS), "launch → am start")
+
+# ---------------------------------------------------------------- mDNS 解析
+#
+# 为什么单独测解析器：mDNS 是**默认发现路径**，它要是解析错了，
+# scan 就只剩「探 5555」一条腿，Android 11+ 设备一个都发现不了。
+# 这里用手工构造的 DNS 包测（不发任何网络包，纯字节级）。
+import struct as _struct
+
+
+def _dns_name(name):
+    out = b""
+    for label in name.split("."):
+        if label:
+            lb = label.encode()
+            out += bytes([len(lb)]) + lb
+    return out + b"\x00"
+
+
+def _rr(name, rtype, rdata):
+    return _dns_name(name) + _struct.pack("!HHIH", rtype, 0x8001, 120, len(rdata)) + rdata
+
+
+# 一条典型响应：PTR(服务→实例) + SRV(实例→主机+端口) + A(主机→IP)
+_inst = "adb-wang._adb-tls-connect._tcp.local"
+_host = "adb-wang.local"
+_ptr = _rr("_adb-tls-connect._tcp.local", 12, _dns_name(_inst))
+_srv = _rr(_inst, 33, _struct.pack("!HHH", 0, 0, 41234) + _dns_name(_host))
+_a = _rr(_host, 1, bytes([192, 168, 1, 77]))
+_pkt = _struct.pack("!HHHHHH", 0, 0x8400, 0, 3, 0, 0) + _ptr + _srv + _a
+
+recs = AW._mdns_records(_pkt)
+check(len(recs) == 3, f"mDNS 解析出 3 条记录，实得 {len(recs)}")
+check(any(r["type"] == "ptr" and r["target"] == _inst for r in recs),
+      "mDNS 解析出 PTR（服务→实例名）")
+check(any(r["type"] == "srv" and r["port"] == 41234 and r["target"] == _host
+          for r in recs), "mDNS 解析出 SRV（实例→主机+端口 41234）")
+check(any(r["type"] == "a" and r["ip"] == "192.168.1.77" for r in recs),
+      "mDNS 解析出 A 记录（主机→IP）")
+
+# 压缩指针：真实 mDNS 响应几乎都用压缩名，解析器必须扛得住
+_ptr_c = _rr("_adb-tls-connect._tcp.local", 12, b"\xc0\x0c")
+_pkt2 = _struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0) + _ptr_c
+recs2 = AW._mdns_records(_pkt2)
+check(any(r["type"] == "ptr" for r in recs2),
+      "mDNS 解析器扛得住压缩指针（0xC0）")
+
+# 残包不许把门禁打崩（真实网络上的包就是残缺的）
+check(AW._mdns_records(b"") == [], "mDNS 解析空包 → 空记录，不抛异常")
+check(AW._mdns_records(b"\x00\x01\x02") == [], "mDNS 解析残包 → 空记录，不抛异常")
+
+# 查询包结构：组播地址 + TTL=255 的硬要求
+q = AW._mdns_query("_adb-tls-connect._tcp.local", 12)
+check(len(q) > 12 and q[4:6] == b"\x00\x01", "mDNS 查询包带 1 条问题记录")
+check(AW.MDNS_ADDR == ("224.0.0.251", 5353), "mDNS 组播地址是 224.0.0.251:5353")
+check("_adb-tls-connect._tcp.local" in AW.MDNS_SERVICES,
+      "mDNS 查 _adb-tls-connect._tcp.local（Android 11+ 无线调试）")
+check("_adb._tcp.local" in AW.MDNS_SERVICES,
+      "mDNS 也查 _adb._tcp.local（老 adb mDNS 服务）")
 
 CALLS.clear()
 reg.call("adb.wifi.screenshot", args={"target": "192.168.1.50:5555"}, gate=gate_yes)
@@ -404,6 +593,7 @@ check(AW._adb_exe is fake_adb_exe, "adb 可执行文件走的是假实现")
 check(AW._run_cmd is fake_run_cmd, "命令执行走的是假实现")
 check(AW._run_bin is fake_run_bin, "二进制执行走的是假实现")
 check(AW._probe_tcp is fake_probe_tcp, "端口探测走的是假实现")
+check(AW._mdns_discover is fake_mdns_discover, "mDNS 发现走的是假实现（没真发组播）")
 check(not any("192.168.1.50:5555" in c[1][0] for c in CALLS if c[0] == "cmd"
               and c[1][0:1] == ["connect"] and False), "connect 没真连（门禁只留记录）")
 

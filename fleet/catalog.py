@@ -182,10 +182,14 @@ CAPABILITIES = [
     Capability("adb.wifi.list", "列出已连上的无线 ADB 设备（只列 network transport）",
                note="只读：USB 那台在 kind=android_phone，两边不重名"),
     Capability("adb.wifi.scan", "局域网扫开放 adb 端口的设备",
-               params=(Param("hosts_limit", "int", doc="最多扫几台，默认 64"),
+               params=(Param("ports", "str", doc="classic(默认) | random | full"),
+                       Param("hosts_limit", "int", doc="最多扫几台，默认 64"),
                        Param("workers", "int", doc="并发，默认 16"),
-                       Param("timeout", "int", doc="单端口超时秒，默认 0.35")),
-               note="只读：只探端口不发凭据；Android 11+ 端口随机，建议配 mDNS 发现"),
+                       Param("timeout", "int", doc="单端口超时秒，默认 0.35"),
+                       Param("max_probes", "int", doc="探测次数硬上限，默认 20000"),
+                       Param("max_seconds", "int", doc="墙钟总时长上限秒，默认 20")),
+               note="默认走 mDNS 发现 + 经典 5555；暴力扫随机端口段要显式传 "
+                    "ports=random 且有硬预算（次数+墙钟），到点会如实说扫了多少"),
     Capability("adb.wifi.info", "某台无线设备的详细信息（型号/版本/序列号）",
                params=(Param("target", "str", True, "ip:port 或 mDNS 名"),),
                note="只读：属性来自设备自报，属不可信数据"),
@@ -258,7 +262,6 @@ CAPABILITIES = [
     Capability("voice.interpret", "把一段文字解析成能力意图（不执行）",
                params=(Param("text", "str", True, "要解析的文字"),),
                note="只读：只给意图与复述话术，执行要走两段式（复述+口头确认）"),
-
 ]
 
 
