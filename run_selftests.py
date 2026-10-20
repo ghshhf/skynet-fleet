@@ -41,6 +41,8 @@ CASES = [
     ("ble", ["ble.py", "--selftest"], HERE, 30),
     ("nearby", ["nearby.py", "--selftest"], HERE, 30),
     ("perceive", ["perceive.py", "--selftest"], HERE, 30),
+    ("phone_state", ["phone_state.py", "--selftest"], HERE, 30),
+    ("pc_state", ["pc_state.py", "--selftest"], HERE, 30),
     ("netpath", ["netpath.py", "--selftest"], HERE, 30),
     ("registry", ["registry.py", "--selftest"], HERE, 30),
 ]

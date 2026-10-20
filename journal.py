@@ -25,8 +25,10 @@ import sqlite3
 import threading
 import time
 
-# 流水里允许的事件类型。task = 有明确成败的事；her = 她的话；user = 你的话
-KINDS = ("task", "her", "user")
+# 流水里允许的事件类型。task = 有明确成败的事；her = 她的话；user = 你的话；
+# see = 感知到的事（身边设备增删、手机异常）。see 单独一类是因为它既不是任务也
+# 不是谁说的一句话——但正是「她」起话题时最常引用的一类事实（「回来时楼下多了三辆车」）。
+KINDS = ("task", "her", "user", "see")
 OPEN_STATUS = "open"
 DONE_STATUS = "done"
 DEFAULT_CAP = 5000

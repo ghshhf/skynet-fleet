@@ -14,8 +14,10 @@ commander 一个都没 import —— 能力都在仓库里，天网自己不知�
     python perceive.py                       # 三层快照（含与上次比对）
     python perceive.py --lan / --wifi / --bt # 只跑某一层
     python perceive.py caps                  # 能力矩阵：现在能感知什么、为什么不能
-    python perceive.py phone screen|tree|apps|fg
-    python perceive.py phone open|tap|type   # 会动手
+    python perceive.py phone screen|tree|apps|fg|notify
+    python perceive.py phone status           # 手机全身状态（电/网/声音/屏/传感器/存储）
+    python perceive.py phone open|tap|type    # 会动手
+    python perceive.py pc [--clip]            # 本机状态：前台/在座/负载/磁盘/剪贴板
     python perceive.py ir info | ir nec:0x04:0x08 [--send]
     python perceive.py --selftest
 """
@@ -25,7 +27,9 @@ import time
 import android_device as A
 import ble as B
 import nearby as N
+import pc_state as C
 import phone_ops as P
+import phone_state as S
 import survey as V
 
 # 会改变设备状态的动作：控制面据此走 _gate（分权 + 仲裁）
@@ -38,6 +42,7 @@ ago = N.ago                     # 「3 分钟前」这种话只该有一种写�
 
 # 手机动作表。先验名字再连设备：打错字与「手机没接」是两种错，不能混成一句
 PHONE_ACTIONS = {"screen", "see", "look", "tree", "apps", "fg", "notify",
+                 "status", "state", "battery",
                  "open", "tap", "type", "back", "home", "shot", "wait"}
 
 DEV_TTL = 30          # 手机连接缓存秒数：一条命令里连两次 adb 太慢
@@ -155,8 +160,12 @@ def caps(probe=True):
         st = B.bt_state(serial)
         rows.append({"cap": "手机蓝牙", "ok": st == "on", "why": f"状态 {st}"})
         rows.append({"cap": "WiFi 扫描", "ok": True, "why": "靠 adb shell cmd wifi 起扫"})
+        rows.append({"cap": "状态快照", "ok": True,
+                     "why": "14 节只读（电/网/声音/屏幕/传感器/存储），两批 shell 约 2 秒"})
+        rows.append({"cap": "剪贴板", "ok": False,
+                     "why": "Android 10+ 没有 cmd clipboard 读取实现（系统限制）"})
     elif probe:
-        for name in ("编队桥在线", "红外发射器", "手机蓝牙", "WiFi 扫描"):
+        for name in ("编队桥在线", "红外发射器", "手机蓝牙", "WiFi 扫描", "状态快照"):
             rows.append({"cap": name, "ok": False, "why": "手机没连上，判不了"})
     return rows
 
@@ -173,6 +182,28 @@ def format_caps(rows):
 
 # ---------------------------------------------------------------- 动作（手）
 
+def state(serial=""):
+    """手机此刻的整体状态（只读）。14 节里某一节读不出来的进 missing，其余照常。
+
+    走 _DEV 的连接缓存而不是自己去 attach：同一条命令里连两次 adb 是纯浪费。
+    """
+    if serial:
+        return S.snapshot(serial)
+    d = _DEV.get()
+    if not d.get("ok"):
+        return {"ok": False, "at": time.time(), "err": d.get("err") or "手机接不上"}
+    return S.snapshot(d["serial"])
+
+
+def here(want_clip=False):
+    """本机（天网的宿主）此刻的状态：前台是谁、人在不在、机器累不累。
+
+    感知层原来只有「手」伸到手机和局域网，宿主自己是黑的——她要判断「你现在
+    在不在电脑前」只能靠猜。这一节补的就是这个。
+    """
+    return C.snapshot(want_clip=want_clip)
+
+
 def phone(action, arg="", arg2="", dry_run=False):
     """手机动作。返回 dict，一律带 ok；会动手的动作列在 SIDE_EFFECT 里。
 
@@ -182,6 +213,7 @@ def phone(action, arg="", arg2="", dry_run=False):
       open    启动应用（包名或名称）           tap    按屏幕上的字点
       type    给焦点输入框打字                 back/home  按键
       shot    截屏存到本机                     wait   等某个字出现在界面上
+      status  全身状态（电/网/声音/屏/传感器/存储）        battery 只问电量
     """
     act = (action or "").strip().lower()
     if act not in PHONE_ACTIONS:
@@ -214,6 +246,16 @@ def phone(action, arg="", arg2="", dry_run=False):
             # 只读：不点、不展开。这是「手机在响什么」——感知里最日常的一层
             rows = A.notifications(s, limit=int(arg or 10))
             return {"ok": True, "count": len(rows), "items": rows}
+        if act in ("status", "state"):
+            return S.snapshot(s)
+        if act == "battery":
+            full = S.snapshot(s)
+            bat = (full.get("sections") or {}).get("battery")
+            if not bat:
+                why = "; ".join(m["err"] for m in full.get("missing", [])
+                                if m["section"] == "battery")
+                return {"ok": False, "err": f"电量读不出来：{why or '未知原因'}"}
+            return {"ok": True, **bat}
         if act == "open":
             if not arg:
                 return {"ok": False, "err": "要个包名或应用名"}
@@ -362,8 +404,12 @@ def _selftest():
     # ⑤ 动作分类：会动手的必须在 SIDE_EFFECT 里（控制面靠它过闸）
     for a in ("open", "tap", "type", "back", "home", "shot"):
         assert a in SIDE_EFFECT, a
-    for a in ("screen", "tree", "apps", "fg", "wait", "notify"):
+    for a in ("screen", "tree", "apps", "fg", "wait", "notify", "status", "battery"):
         assert a not in SIDE_EFFECT, a
+    # 动作表与闸门表不许互相漏：写了动作名却没分类，等于悄悄绕过闸门
+    assert PHONE_ACTIONS - SIDE_EFFECT - {"screen", "see", "look", "tree", "apps",
+                                          "fg", "wait", "notify", "status",
+                                          "state", "battery"} == set(), PHONE_ACTIONS
 
     # ⑥ 红外默认不发：只算序列，返回 sent=False
     r = ir("nec:0x04:0x08")
@@ -387,10 +433,18 @@ def _selftest():
     try:
         r = ir("nec:0x04:0x08", send=True)
         assert r["ok"] is False and r["sent"] is False and len(r["pattern"]) == 67, r
+        # 状态快照同理：设备不在时给 ok=False，而不是抛异常或返回半截结构
+        st = state()
+        assert st["ok"] is False and st.get("err"), st
     finally:
         _DEV.get = saved
 
-    print("perceive \u81ea\u6d4b\uff1a8 \u9879\u5168\u8fc7")
+    # ⑨ 本机状态：只依赖宿主，不因为手机断了就跟着失败（两条腿互不牵连）
+    hc = here()
+    assert hc.get("ok") is True, hc            # 自测只在 Windows 上跑
+    assert "foreground" in hc["sections"], hc["missing"]
+
+    print("perceive \u81ea\u6d4b\uff1a9 \u9879\u5168\u8fc7")
 
 
 # ---------------------------------------------------------------- CLI
