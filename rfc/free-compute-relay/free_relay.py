@@ -8,6 +8,7 @@
 import hashlib
 import json
 import time
+import urllib.parse
 import urllib.request
 
 # 免 key 端点登记表（示意；实际 URL/参数按各自文档补）
@@ -39,7 +40,7 @@ def probe():
 
 
 def _cache_key(prompt, model):
-    return hashlib.sha256((model or "") .encode() + b"::" + prompt.encode()).hexdigest()
+    return hashlib.sha256((model or "").encode() + b"::" + prompt.encode()).hexdigest()
 
 
 def chat(prompt, model=None, timeout=40):
