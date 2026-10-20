@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+sandbox_*/
+sandbox_*.txt
+node_modules/
+.venv/
+*.log
+.DS_Store
+
+# 运行时凭据/状态（不入库）
+.fleet_tokens.json
+.fleet_pw.json
+.fleet_enroll_used.json
+fleet_enroll.json
+fleet_context.db
+fleet_context.db-journal
+persona_state.json
+models/
+ui_automation/adskip_rules.json
+ui_automation/adskip_rules.json.tmp
+fleet_queue.json
+fleet_queue.json.tmp
+tmp/
+.workbuddy/
+
+# 扫描/发现账本（含真实设备清单，不入库）
+swept.json
+discovered.json
+
+# 编队桥构建产物、签名密钥、控制令牌
+android_bridge/build/
+android_bridge/keystore.jks
+android_bridge/.token
