@@ -38,7 +38,7 @@ CALL_STATE = {0: "空闲", 1: "响铃", 2: "通话中"}
 
 # ---------------------------------------------------------------- 采集
 
-# 分批的理由：每条 adb shell 在无线调试下约 200-400ms，14 节若各自往返要 4 秒以上。
+# 分批的理由：每条 adb shell 在无线调试下约 200-400ms，15 节若各自往返要 4 秒以上。
 # 用 @@@key@@@ 在一条命令里打分隔符，两批就能全部拿回。输出量也分批控制：
 # 第二批（dumpsys audio/sensorservice）单条几 KB，混进第一批会把小命令的错位掩盖掉。
 _BATCH_A = [
@@ -64,6 +64,8 @@ _BATCH_B = [
     ("mem", "cat /proc/meminfo | head -3"),
     ("uptime", "cat /proc/uptime"),
     ("recents", "dumpsys activity recents | grep -E 'Recent #|intent=' | head -20"),
+    ("media", "dumpsys media_session | grep -E '^ *package=|state=PlaybackState|metadata:'"
+              " | head -40"),
     ("clip", "cmd clipboard get"),
 ]
 
@@ -360,6 +362,32 @@ def parse_recents(raw):
     return {"apps": apps[:8]}
 
 
+def parse_media(raw):
+    """正在播放什么。没有活跃会话是常态，不是错误。
+
+    只认 `state=PlaybackState {state=N}` 且 N 在播放态集合里的会话：`state=null`
+    表示这个会话没在用（电信的按键会话常年是 null），把它当「在播放」就是编。
+    播放态：2 暂停 / 3 播放 / 6 缓冲（暂停也报出来，因为「刚才在听什么」有用）。
+    """
+    if raw is None:
+        raise ValueError("没有 media_session 输出")
+    playing, cur, seen = [], "", 0
+    for line in raw.splitlines():
+        m = re.search(r"package=([\w.]+)", line)
+        if m:
+            cur = m.group(1)
+            continue
+        m = re.search(r"state=PlaybackState \{state=(\d+)", line)
+        if m and cur:
+            seen += 1
+            st = int(m.group(1))
+            if st in (2, 3, 6):
+                playing.append({"package": cur,
+                                "state": {2: "暂停", 3: "播放中", 6: "缓冲"}[st]})
+    return {"sessions": seen, "playing": playing,
+            "note": "" if playing else "没有正在播放的媒体"}
+
+
 def parse_clip(raw):
     """剪贴板：Android 10 起 shell 无读取实现，这是系统限制，不是 bug。
 
@@ -377,7 +405,7 @@ _PARSERS = {
     "telephony": parse_telephony, "settings": parse_settings, "audio": parse_audio,
     "power": parse_power, "keyguard": parse_keyguard, "sensors": parse_sensors,
     "storage": parse_storage, "mem": parse_mem, "uptime": parse_uptime,
-    "recents": parse_recents, "clip": parse_clip,
+    "recents": parse_recents, "media": parse_media, "clip": parse_clip,
 }
 
 
@@ -576,6 +604,13 @@ def report(st):
     rec = s.get("recents") or {}
     if rec:
         L.append("【最近用过】" + "、".join(rec.get("apps") or []))
+    md = s.get("media") or {}
+    if md:
+        if md.get("playing"):
+            L.append("【媒体】" + "、".join(
+                f"{x['package']}（{x['state']}）" for x in md["playing"]))
+        else:
+            L.append(f"【媒体】{md.get('note') or '没有正在播放的媒体'}")
     if st.get("missing"):
         L.append("")
         L.append("【读不到】")
@@ -680,7 +715,22 @@ def _selftest():
     except ValueError as e:
         assert "Android 10" in str(e), e
 
-    # ⑨ 分节失败互不影响：坏一节，其余照常
+    # ⑨ 媒体会话：state=null 不能当「在播放」；真在播时要报出包名与状态
+    quiet = parse_media("    package=com.android.server.telecom\n    state=null\n")
+    assert quiet["playing"] == [] and "没有正在播放" in quiet["note"], quiet
+    live = parse_media("    package=com.tencent.qqmusic\n"
+                       "    state=PlaybackState {state=3, position=1234, speed=1.0}\n"
+                       "    package=com.ximalaya\n"
+                       "    state=PlaybackState {state=2, position=10, speed=0.0}\n")
+    assert [x["package"] for x in live["playing"]] == ["com.tencent.qqmusic", "com.ximalaya"], live
+    assert live["playing"][0]["state"] == "播放中", live
+    try:
+        parse_media(None)
+        raise AssertionError("没输出却当成功了")
+    except ValueError:
+        pass
+
+    # ⑩ 分节失败互不影响：坏一节，其余照常
     raw = {"battery": _FIX_BATTERY, "wifi": "", "audio": _FIX_AUDIO,
            "settings": "1\n2\n153\n0\n0\n0\n0", "sensors": _FIX_SENSORS}
     secs, missing = {}, []
@@ -693,7 +743,7 @@ def _selftest():
     assert "battery" in secs and "audio" in secs, missing
     assert any(m["section"] == "wifi" for m in missing), missing
 
-    # ⑩ 一句话与报告都不许抛，也不许输出空句
+    # ⑪ 一句话与报告都不许抛，也不许输出空句
     st = {"ok": True, "at": 0, "sections": secs, "missing": missing,
           "anomalies": ["电量只剩 12%，没在充电"]}
     line = brief(st)
@@ -702,7 +752,7 @@ def _selftest():
     assert brief({"ok": False, "err": "没接手机"}) == "手机状态没读到：没接手机"
     assert report({"ok": True, "sections": {}, "missing": []}).strip() != ""
 
-    # ⑪ 异常规则：低电未充电 / 存储将满 / WiFi 开着却没连
+    # ⑫ 异常规则：低电未充电 / 存储将满 / WiFi 开着却没连
     low = {"sections": {"battery": {"level": 15, "plugged": [], "anomaly": ""}}}
     assert any("只剩 15%" in x for x in anomalies(low)), anomalies(low)
     assert any("存储快满" in x for x in anomalies(
@@ -710,13 +760,13 @@ def _selftest():
     assert any("没连上" in x for x in anomalies(
         {"sections": {"wifi": {"enabled": True, "ssid": ""}}}))
 
-    # ⑫ 命令组里不许出现写操作（这条错了，跑一万次就会改一万次真机）
+    # ⑬ 命令组里不许出现写操作（这条错了，跑一万次就会改一万次真机）
     script = _script(_BATCH_A + _BATCH_B).lower()
     for bad in ("settings put", "svc wifi", "svc data", " am ", " input ",
                 "pm uninstall", "cmd wifi set", "cmd wifi connect"):
         assert bad not in script, f"采集命令里混进了写操作：{bad}"
 
-    print("phone_state 自测：12 项全过")
+    print("phone_state 自测：13 项全过")
 
 
 def main(argv=None):
