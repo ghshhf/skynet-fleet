@@ -219,7 +219,10 @@ _FORBID_NET_WRITE = (
     "settings put global airplane_mode_on",
     "settings put secure wifi_", "settings put global wifi_",
     "svc wifi", "svc data",
-    "cmd wifi", "cmd connectivity", "cmd telephony",
+    # 只拦真正会断网的子命令；status / start-scan / list-scan-results 是只读，放行
+    "cmd wifi set-wifi-enabled", "cmd wifi connect-network",
+    "cmd wifi forget-network", "cmd wifi disable", "cmd wifi set-",
+    "cmd connectivity", "cmd telephony",
     "am broadcast -a android.net.wifi",
     "ifconfig wlan", "ip link set wlan",
 )
