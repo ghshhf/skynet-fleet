@@ -2072,7 +2072,17 @@ def self_test(host, port, password):
     _mems = rcall.pick(_ctx(), _her()[0], now=_now)
     print(f"  可提往事 {len(_mems)} 件（应 1 件：刚发生的不算回忆）", flush=True)
     assert [m["key"] for m in _mems] == ["game_lastnight"], _mems
-    _PROACTIVE.sent_times = []            # 仅为演示重置额度：频控本身已在上一段验证过
+    def _unsilent():
+        """只为演示让「她」开口：频控与静默刹车本身都已在上面那段验证过。
+
+        不这么做的话，这条自测在 00:00–07:00 跑必然红——她按静默规矩闭嘴是
+        **正确行为**，而这段要验证的是「她会开口」，两回事。把时辰影响摘掉，
+        门禁才不会在凌晨把「刹车生效」报成「代码坏了」。
+        """
+        _PROACTIVE.silent = (0, 0)        # 空窗口 => silent_now() 恒为假
+        _PROACTIVE.sent_times = []        # 仅为演示重置额度：频控本身已在上一段验证过
+
+    _unsilent()
     _said = _persona_tick(min_interval=0)
     print(f"  她带出的往事 = {_said!r}（模板只引用库里原文，没模型也不编）", flush=True)
     assert _said and "昨晚那局还没玩完" in _said, _said
@@ -2093,7 +2103,7 @@ def self_test(host, port, password):
     _items = _followups().pick(_journal(), _her()[0])
     print(f"  可起的账 {len(_items)} 件（同一 topic 两次失败应合并成 1 件）", flush=True)
     assert len(_items) == 1 and _items[0]["count"] == 2, _items
-    _PROACTIVE.sent_times = []            # 同上：本段只验证「起话」，频控已在别段验证
+    _unsilent()
     _said2 = _persona_tick(min_interval=0)
     print(f"  她起的话 = {_said2!r}", flush=True)
     assert _said2 and "备份" in _said2, _said2
