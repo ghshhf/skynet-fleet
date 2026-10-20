@@ -54,6 +54,9 @@ CASES = [
     # ---- evals：一次真事故一个脚本 ----
     ("eval_d0_bridge_offline", ["evals/d0_bridge_offline.py"], HERE, 90),
     ("eval_t0_input", ["evals/t0_input_not_clobbered.py"], HERE, 90),
+    # ---- T1：全屏界面 + 两个显影面共用一套 dispatch ----
+    ("fleet_tui_smoke", ["-m", "fleet.tui", "--smoke"], HERE, 240),
+    ("eval_t1_two_faces", ["evals/t1_cli_and_tui_share_dispatch.py"], HERE, 240),
 ]
 
 

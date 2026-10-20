@@ -98,7 +98,10 @@ skynet-fleet/
 ├── capabilities.py      # 能力自描述基线：{能力名: 说明书(参数 schema)}，编排的「发现面」
 ├── install_linux.py     # Linux L1 常驻安装器（systemd root 服务 + 密码/令牌双闸）
 ├── audit.py             # 控制面审计：append-only JSONL，旁路留痕（node.up/down 等）
-├── fleet/               # 设备层：契约（result/device/registry）+ 通道 + 设备种类 + 终端
+├── fleet/               # 设备层：契约（result/device/registry）+ 通道 + 设备种类 + 终端（两个显影面）
+├── fleet_tui.py         # 全屏界面入口薄壳（PyInstaller 打包用；直接跑也行）
+├── fleet-tui.bat        # Windows 双击进【全屏界面】
+├── fleet-cli.bat        # Windows 双击进【命令行版】
 ├── platform_android.py  # Android 节点入网（adb 反向推送）
 ├── platform_apple.py    # Apple 桥接（macOS SSH / iOS 屏共 半可达）
 ├── platform_router.py   # 路由器/OpenWrt 节点（常开中枢候选）
@@ -114,6 +117,41 @@ skynet-fleet/
 ├── README.md
 └── LICENSE
 ```
+
+---
+
+## 终端：两个显影面，一套命令
+
+设备层的所有能力有两个入口，但**只有一套命令**——加一个能力只改注册表一处，两边同时出现。
+
+```bash
+# 全屏（人在电脑前）：双击 fleet-tui.bat，或
+python fleet_tui.py
+# 命令行（不想进全屏 / 要往管道里塞输出）：双击 fleet-cli.bat，或
+python -m fleet.shell
+
+# 不进交互，只跑一条
+python -m fleet.shell -c "caps phone"
+# 不进交互，把这一屏导出成 SVG（想看它长什么样时）
+python -m fleet.tui --shot tmp/shot.svg
+# 门禁：headless 跑一遍自检
+python -m fleet.tui --smoke
+```
+
+全屏那一屏长这样：**左边设备、右边全部能力、中间是发生过的一切**（她的话、事件、每次调用的结果）。键位不用记，底部有一条常驻的键位条。
+
+| 键 | 作用 |
+|---|---|
+| `ctrl+e` / `ctrl+d` / `ctrl+k` | 光标跳到 命令行 / 设备表 / 能力表 |
+| 右表选中后回车 | 把能力名提到命令行（不用手敲，也不用猜它叫什么） |
+| `↑` / `↓` | 命令行上下翻历史 |
+| `ctrl+y` | 放行破坏性操作（它会先把破坏性命令拦下并报出来，等你按） |
+| `ctrl+r` / `ctrl+s` / `ctrl+l` | 重新探测 / 落盘 / 清屏 |
+| `f1` / `ctrl+q` | 用法 / 退出 |
+
+**打包**：push 到 `main` 或打 `v*` tag 时，GitHub Actions 用 PyInstaller 构建 `fleet-tui.exe` 并上传为构建产物（tag 还会挂到 release 上）。
+
+两个 bat 都自己找解释器（本机 portable → `py -3` → `python`），且每个候选都要**真跑通一次**才要——Windows 商店那个存根会假装自己是 python（静默 exit=49），不实测就会被它骗到。要用别的解释器：先 `set FLEET_PY=你的python.exe` 再打开。
 
 ---
 
