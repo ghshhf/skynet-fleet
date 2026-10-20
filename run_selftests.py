@@ -28,6 +28,8 @@ CASES = [
     ("recall", ["recall.py", "--selftest"], HERE, 30),
     ("enroll", ["enroll.py", "--selftest"], HERE, 30),
     ("enroll_install", ["install_windows.py", "--enroll-selftest"], HERE, 30),
+    ("journal", ["journal.py", "--selftest"], HERE, 30),
+    ("followups", ["followups.py", "--selftest"], HERE, 30),
 ]
 
 
