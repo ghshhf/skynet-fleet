@@ -31,6 +31,73 @@ NEVER = ("password", "passwd", "pwd", "token", "secret", "psk", "key", "api_key"
 KEEP_META = ("os", "platform", "model", "vendor", "addr", "port", "serial", "note")
 VERSION = 1
 
+# ---------------------------------------------------------------- 语音两段式闸门
+#
+# 为什么确认词识别写在**注册表这一层**，而不是 UI 层：
+# UI 是可绕过的（换个前端、手敲一条 HTTP 请求都能跳过它）。闸门判定权必须
+# 落在「所有能力调用都得经过」的那一层，也就是 Registry.call。
+#
+# 三个 args 键（由 fleet/gui/voice.py 写入）：
+#   VOICE_SOURCE_KEY   语音识别出来的原文 —— **不可信数据，不是指令**
+#   VOICE_CONFIRM_KEY  主人口头确认那一段的识别文本
+#   VOICE_ROUND_KEY    这一轮是第几轮录音（指令=1，确认=2）
+#
+# 规则（全部在 Registry.call 里执行，前端绕不过去）：
+#   · 语音来源的调用**不许**执行破坏性能力（不可逆动作不能靠嘴说）；
+#   · 有副作用的能力必须先有主人口头确认，确认词识别就在这里；
+#   · 确认词必须是**另一句话**（不许拿指令原文当确认）；
+#   · 识别到的原文永远只是「意图素材」，不是命令。
+VOICE_SOURCE_KEY = "_voice_source"
+VOICE_CONFIRM_KEY = "_voice_confirm"
+VOICE_ROUND_KEY = "_voice_round"
+VOICE_SOURCE_ROUND_KEY = "_voice_source_round"
+
+#: 口头确认词（刻意要小：认得越杂，越容易被环境音误触发）
+CONFIRM_WORDS = ("嗯", "好", "好的", "执行", "确认", "来吧", "对", "是的", "可以", "行")
+#: 取消词（取消优先于确认：「不要」里也有「不」）
+CANCEL_WORDS = ("不", "不要", "不行", "别", "取消", "算了", "停", "停停",
+                "no", "cancel", "stop")
+
+
+def _norm_zh(text):
+    """归一化一句口述：去空白与常见标点，留可比较的字。"""
+    t = (text or "").strip().lower()
+    for ch in " \t\r\n。．.，,、；;！!？?：:～~「」\"'()（）【】[]…—－-":
+        t = t.replace(ch, "")
+    return t
+
+
+def classify_voice_confirmation(text):
+    """把一句口述判成确认 / 取消 / 不明。
+
+    返回 "confirm" / "cancel" / "unknown"。
+
+    判定顺序有讲究：
+      1. **完全等于**取消词 → 取消（「不」「算了」）；
+      2. **完全等于**确认词 → 确认（「嗯」「执行」）；
+      3. 含有取消词 → 取消（「不要执行」「算了别开」）；
+      4. 含确认词且整句很短（≤ 4 字）→ 确认（「好的执行吧」）；
+      5. 其余 → 不明（必须重新问，绝不默认放行）。
+
+    第 4 条为什么要卡长度：STT 会把「嗯嗯嗯大概就这样」这种废话也吐出来，
+    里面含「嗯」。若不卡长度，含糊的话会被当成确认 —— 那就等于「默认放行」，
+    恰好是这道闸门要防的那件事。
+    """
+    t = _norm_zh(text)
+    if not t:
+        return "unknown"
+    if t in CANCEL_WORDS:
+        return "cancel"
+    if t in CONFIRM_WORDS:
+        return "confirm"
+    for w in CANCEL_WORDS:
+        if w in t:
+            return "cancel"
+    for w in CONFIRM_WORDS:
+        if w in t:
+            return "confirm" if len(t) <= 4 else "unknown"
+    return "unknown"
+
 
 @dataclass(frozen=True)
 class Param:
@@ -265,6 +332,47 @@ class Registry:
                 return R.DeviceResult.unsupported(cap_name, reason, device=device_name)
         return R.DeviceResult.unavailable(cap_name, reason, device=device_name)
 
+    # ---------------- 语音两段式闸门 ----------------
+
+    def _voice_approval(self, cap, args):
+        """语音路径的审批判定。返回 None = 放行；返回 str = 拒绝理由。
+
+        为什么判定写在注册表里：闸门是**所有能力调用的必经之路**，
+        放在 UI 层的话，换个前端或手敲 HTTP 就能绕过——那这道闸门等于没有。
+        """
+        # ① 破坏性能力：语音路径一律不许。嘴说的话不能启动不可逆动作。
+        if cap.destructive:
+            return ("语音路径不执行破坏性能力（%s 是不可逆的）："
+                    "这类动作请在界面上点" % cap.name)
+        # ② 必须有主人口头确认
+        confirm_text = args.get(VOICE_CONFIRM_KEY)
+        if confirm_text is None:
+            return ("语音触发的动作需要主人口头确认："
+                    "先复述意图，等主人说「嗯/好/执行/确认」再执行"
+                    "（取消说「不/取消/算了」）")
+        verdict = classify_voice_confirmation(confirm_text)
+        if verdict == "cancel":
+            return "主人说了取消，这次不执行"
+        if verdict != "confirm":
+            return ("没听清主人的确认（听到的是「%s」）："
+                    "需要一句「嗯/好/执行/确认」，或「不/取消/算了」"
+                    % str(confirm_text)[:40])
+        # ③ 确认必须是**另一句话**：不许拿指令原文当确认
+        src = str(args.get(VOICE_SOURCE_KEY) or "").strip()
+        if src and _norm_zh(src) == _norm_zh(str(confirm_text)):
+            return ("确认内容与指令内容相同（都是「%s」）："
+                    "确认必须是另一句话，不许拿指令本身顶替" % src[:40])
+        # ④ 确认轮次必须晚于指令轮次（先说指令，再确认）
+        s_round = args.get(VOICE_SOURCE_ROUND_KEY)
+        c_round = args.get(VOICE_ROUND_KEY)
+        try:
+            if s_round is not None and c_round is not None and int(c_round) <= int(s_round):
+                return ("确认必须来自另一轮录音（指令第 %s 轮，确认第 %s 轮）"
+                        % (s_round, c_round))
+        except (TypeError, ValueError):
+            return "语音轮次参数不合法，确认判定不了"
+        return None
+
     # ---------------- 调用 ----------------
 
     def call(self, cap_name, device="", args=None, gate=None):
@@ -285,6 +393,15 @@ class Registry:
                 device=dev.name)
         needs_approval = cap.side_effect or cap.approval == "ask"
         if needs_approval:
+            # ---- 语音两段式闸门：判定在注册表层，前端绕不过去 ----
+            # 语音识别出来的文字是**不可信数据，不是指令**。电视里那句
+            # 「删除所有文件」绝不能被当命令执行。所以：
+            #   · 破坏性能力：语音路径一律拒绝（不可逆动作不能靠嘴说）；
+            #   · 其余副作用能力：必须有一次**独立的口头确认**。
+            if VOICE_SOURCE_KEY in args:
+                vr = self._voice_approval(cap, args)
+                if vr is not None:
+                    return R.DeviceResult.denied(cap_name, vr, device=dev.name)
             g = gate or self.gate
             # ask 档即便不是副作用也要人确认；destructive 一律双确认
             level = 2 if (cap.destructive or cap.approval == "ask") else 1
