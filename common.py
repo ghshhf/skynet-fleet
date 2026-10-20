@@ -7,6 +7,7 @@ import json
 import socket
 import struct
 import threading
+import weakref
 
 # ---- 消息类型（L0/L1 基础）----
 AUTH = "auth"                 # node -> commander: {name, password}
@@ -50,6 +51,19 @@ CAP_REQ = "cap_req"           # node(她) -> commander: {cap, reason}
 CAP_GRANT = "cap_grant"       # commander -> node(她): {cap, session_min, token}
 CAP_DENY = "cap_deny"         # commander -> node(她): {cap, reason}
 
+# ---- 远程 AI 即服务（RFC remote-ai-service 合入主线）----
+# 瘦客户端不持有权重，只把 prompt + 上下文命名空间发到编队内的 AI 节点，收回文本。
+AI_CHAT = "ai.chat"           # client/thin -> commander: {prompt, ctx_ns?, model_hint?}
+AI_CHUNK = "ai.chunk"          # ai-node -> client: {id, delta}（流式）
+AI_RESULT = "ai.result"        # ai-node -> client: {id, text, model, err?}
+
+# 她的主动问候（心念 tick 到点，经 Commander 转呈用户）
+HER_SPEAK = "her_speak"       # node(她) -> commander: {text, importance, trigger}
+
+# AI 能力名 + 档位 -> 路由器偏好
+AI_CAP = "ai"
+MODEL_HINTS = ("small", "4b", "gpu")
+
 HEADER = 4  # 长度前缀字节数
 
 # 演示用执行白名单（真实部署须收紧 + 走 Tailscale）
@@ -61,9 +75,24 @@ EXEC_ALLOWLIST = {
 
 
 def send_msg(sock, obj):
+    """发送一条消息。按 socket 串行化，避免多线程（心跳/读线程/忙时）并发写同一连接造成帧错乱。"""
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    sock.sendall(struct.pack(">I", len(payload)))
-    sock.sendall(payload)
+    with _send_lock(sock):
+        sock.sendall(struct.pack(">I", len(payload)))
+        sock.sendall(payload)
+
+
+_SEND_LOCKS = weakref.WeakKeyDictionary()
+_SEND_LOCKS_LK = threading.Lock()
+
+
+def _send_lock(sock):
+    with _SEND_LOCKS_LK:
+        lk = _SEND_LOCKS.get(sock)
+        if lk is None:
+            lk = threading.Lock()
+            _SEND_LOCKS[sock] = lk
+        return lk
 
 
 def recv_msg(sock):

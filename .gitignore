@@ -12,5 +12,6 @@ node_modules/
 .fleet_pw.json
 fleet_context.db
 fleet_context.db-journal
+fleet_audit.jsonl
 persona_state.json
 models/

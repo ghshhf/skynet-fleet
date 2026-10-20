@@ -53,6 +53,14 @@ class PersonaState:
                 return time.time() >= o["cooldown_until"]
         return True
 
+    def mark_satisfied(self, cap, cooldown_sec=1800):
+        """诉求被满足（授权通过）：进入冷却，短时间内不再催。"""
+        for o in self.data["obsessions"]:
+            if o["cap"] == cap:
+                o["cooldown_until"] = time.time() + cooldown_sec
+                self._save()
+                return
+
     def set_mood(self, **kw):
         self.data["mood"].update(kw)
         self._save()
