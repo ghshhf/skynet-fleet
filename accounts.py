@@ -52,6 +52,8 @@ ORDER_OPS = (
     "exec", "broadcast", "push", "pull", "compute", "computemap", "ui",
     "rules_put", "rules_rollback", "enroll", "enroll_revoke", "token",
     "intent", "cap_grant", "accounts", "discover", "sweep",
+    # 感知与手：扫描看底盘（nearby）；让手机动手（phone）；真发射红外（ir）
+    "nearby", "phone", "ir",
 )
 # 分号唯一允许的动作：看自己名下设备（只读）
 SUB_OPS = ("view_own",)
