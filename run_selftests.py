@@ -46,6 +46,13 @@ CASES = [
     ("pc_usage", ["pc_usage.py", "--selftest"], HERE, 30),
     ("netpath", ["netpath.py", "--selftest"], HERE, 30),
     ("registry", ["registry.py", "--selftest"], HERE, 30),
+    # ---- D0 契约层（结果信封 / 设备基类 / 注册表）----
+    ("fleet_result", ["-m", "fleet.core.result"], HERE, 30),
+    ("fleet_registry", ["-m", "fleet.core.registry"], HERE, 30),
+    ("fleet_list", ["-m", "fleet", "list"], HERE, 120),
+    # ---- evals：一次真事故一个脚本 ----
+    ("eval_d0_bridge_offline", ["evals/d0_bridge_offline.py"], HERE, 90),
+    ("eval_t0_input", ["evals/t0_input_not_clobbered.py"], HERE, 90),
 ]
 
 
