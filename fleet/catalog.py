@@ -12,6 +12,7 @@ import os
 from . import netrunner as NR
 from .core import Capability, Param, Registry
 from .kinds.android_phone import AndroidPhone
+from .kinds.ai import AI
 from .kinds.fleet_node import FleetNode, load_nodes
 from .kinds.internet import Internet
 from .kinds.lan_scanner import LanScanner
@@ -125,6 +126,24 @@ CAPABILITIES = [
     Capability("web.sites", "站群活站清单（只读，不联网）",
                check=_netforce_reason,
                note="看的是本地已攒的那本账，跑 web.diffuse 才会涨"),
+    # ---- 免费 AI（pollinations 免 key 当一等公民；本地模型需 FLEET_LLM_URL）----
+    Capability("ai.list", "可用的免费 AI 后端清单（只读）",
+               note="免 key 端点（pollinations）零配置开箱即用；本地模型需 FLEET_LLM_URL"),
+    Capability("ai.status", "逐个后端真发请求探测连通（学 Cherry 检测按钮）",
+               note="只读：不给网络也能看见本地已配置的后端"),
+    Capability("ai.complete", "向一个后端要一段完整回复（不流式）",
+               params=(Param("prompt", "str", True),
+                       Param("backends", "str", doc="后端 id，逗号分隔，默认用第一个"),
+                       Param("system", "str", doc="系统提示"),
+                       Param("max_tokens", "int", doc="默认 512")),
+               side_effect=True),
+    Capability("ai.chat", "流式对话（默认所有可用后端并发，按 [id] 同屏）",
+               params=(Param("prompt", "str", True),
+                       Param("backends", "str", doc="后端 id 逗号分隔，默认 all"),
+                       Param("system", "str"),
+                       Param("max_tokens", "int", doc="默认 512")),
+               side_effect=True, approval="auto",
+               note="免费端点当一等公民：pollinations 免 key 开箱即用"),
 ]
 
 
@@ -141,6 +160,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(AndroidPhone())
     reg.add(LanScanner())
     reg.add(Internet())
+    reg.add(AI())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:

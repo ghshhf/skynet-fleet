@@ -1,0 +1,158 @@
+"""AI：终端里的免费模型层。
+
+这一层把「免费 AI」当成一台设备来管，跟其它设备走同一条路：
+注册表登记 → 闸门 → 结果信封 → 终端两栏同时显形。能力名 domain 用 `ai.*`。
+
+为什么 pollinations 免 key 是默认：学 Cherry 把免费端点当一等公民——零配置开箱即用，
+不至于「装好才知道一个模型都用不了」。本地模型（openai 兼容端点）有 FLEET_LLM_URL
+才活；llm7 有 token 才活。外部 token 永远从环境变量读。
+
+多模型同问（学 Cherry 的「多模型对比」+ 话题内 executions 并行）：`ai.chat` 默认把
+问题并发丢给所有可用后端，按 [后端id] 同屏——人一眼看出谁答得更好。长任务流式回流
+走 `_on_line`（跟 web.* 同一条管道），界面才有真进度。
+
+后端清单与探测见 `ai_backends.py`（四元组：id / protocol / base_url / model）。
+"""
+import threading
+import time
+
+from .. import ai_backends as AB
+from ..core import BaseDevice, DeviceResult as R
+
+
+class AI(BaseDevice):
+    kind = "ai"
+    via = "web"
+
+    def __init__(self, name="ai:free", **kw):
+        super().__init__(name, via="web", **kw)
+        self.meta.setdefault("layer", "ai")
+
+    def probe(self):
+        bs = AB.backends()
+        if not bs:
+            return False, ("没有任何可用后端：联网状态下 pollinations（免key）会自动在；"
+                           "本地模型需设 FLEET_LLM_URL")
+        return True, ""
+
+    def caps(self):
+        return ("ai.list", "ai.status", "ai.complete", "ai.chat")
+
+    def invoke(self, cap, args=None):
+        args = args or {}
+        if cap == "ai.list":
+            return self._list(args)
+        if cap == "ai.status":
+            return self._status(args)
+        if cap == "ai.complete":
+            return self._complete(args)
+        if cap == "ai.chat":
+            return self._chat(args)
+        return super().invoke(cap, args)
+
+    # ---------------- 只读 ----------------
+
+    def _list(self, args):
+        return R.success("ai.list", self.name, via=self.via,
+                         data={"backends": AB.backends()})
+
+    def _status(self, args):
+        """逐个后端真发请求探测连通（学 Cherry 的「检测」按钮 = probe 契约）。"""
+        out = []
+        for b in AB.backends():
+            ok, reason = AB.probe(b)
+            out.append({"id": b["id"], "title": b["title"],
+                        "ok": ok, "reason": reason})
+        return R.success("ai.status", self.name, via=self.via,
+                         data={"backends": out})
+
+    # ---------------- 动手（流式）----------------
+
+    def _complete(self, args):
+        """向一个后端要一段完整回复（不流式）。默认用第一个可用后端。"""
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return R.error("ai.complete", "prompt 不能为空",
+                           device=self.name, via=self.via)
+        bs = self._pick(args.get("backends") or "")
+        if not bs:
+            return R.unavailable("ai.complete", "没有可用后端",
+                                 device=self.name, via=self.via)
+        b = bs[0]
+        try:
+            text = AB.chat(b, prompt, system=args.get("system") or "",
+                           max_tokens=int(args.get("max_tokens") or 512))
+        except Exception as e:
+            return R.error("ai.complete", f"{b['id']} 出错: {e}",
+                           device=self.name, via=self.via)
+        return R.success("ai.complete", self.name, side_effect=True, via=self.via,
+                         data={"backend": b["id"], "text": text})
+
+    def _chat(self, args):
+        """流式对话。默认所有可用后端并发，按 [id] 同屏；可 --backends a,b 指定。"""
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return R.error("ai.chat", "prompt 不能为空",
+                           device=self.name, via=self.via)
+        bs = self._pick(args.get("backends") or "")
+        if not bs:
+            return R.unavailable("ai.chat", "没有可用后端",
+                                 device=self.name, via=self.via)
+        on_line = args.get("_on_line")
+        mt = int(args.get("max_tokens") or 512)
+        system = args.get("system") or ""
+        results = {}
+
+        if len(bs) == 1:
+            try:
+                results[bs[0]["id"]] = self._one(bs[0], prompt, system, mt, on_line)
+            except Exception as e:
+                results[bs[0]["id"]] = f"[错误: {e}]"
+        else:
+            # 多模型同问：并发跑，谁先回谁先显形（学 Cherry 话题内 executions 并行）
+            lock = threading.Lock()
+
+            def work(b):
+                try:
+                    t = self._one(b, prompt, system, mt, on_line)
+                    with lock:
+                        results[b["id"]] = t
+                except Exception as e:
+                    with lock:
+                        results[b["id"]] = f"[错误: {e}]"
+            ths = [threading.Thread(target=work, args=(b,), daemon=True) for b in bs]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join()
+
+        return R.success("ai.chat", self.name, side_effect=True, via=self.via,
+                         data={"prompt": prompt,
+                               "backends": list(results.keys()),
+                               "answers": results})
+
+    def _one(self, b, prompt, system, mt, on_line):
+        """单个后端：流式拿 token，攒成行再经 _on_line 回流（界面才是一行行长出来）。
+
+        SSE 给的是 token 不是行；这里按换行切，每段完整行回流一次，末尾残行也吐掉。
+        """
+        buf = {"t": ""}
+
+        def on_token(delta):
+            buf["t"] += delta
+            while "\n" in buf["t"]:
+                head, buf["t"] = buf["t"].split("\n", 1)
+                if on_line:
+                    on_line(f"[{b['id']}] {head}")
+
+        text = AB.chat(b, prompt, system=system, on_token=on_token, max_tokens=mt)
+        if buf["t"].strip() and on_line:
+            on_line(f"[{b['id']}] {buf['t']}")
+        return text
+
+    def _pick(self, spec):
+        all_b = AB.backends()
+        if not spec or spec.strip().lower() in ("all", ""):
+            return all_b
+        want = {s.strip() for s in spec.split(",") if s.strip()}
+        return [b for b in all_b if b["id"] in want]
