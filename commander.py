@@ -1277,6 +1277,13 @@ def _show_action(r, act=""):
               + ("…" if len(apps) > 20 else ""))
     elif act == "fg":
         print(f"  前台 {r.get('foreground') or '?'}")
+    elif act == "notify":
+        items = r.get("items") or []
+        print(f"  通知 {len(items)} 条（只读，没点开）：")
+        for x in items:
+            print(f"    · {x.get('pkg')}: {x.get('title')}")
+        if not items:
+            print("    （没读到——可能确实没有，也可能系统限制了 dumpsys）")
     elif act == "tap":
         how = "（只算落点，没点）" if r.get("dry_run") else (
             "界面变了" if r.get("changed") else "界面没变，可能点到死区")

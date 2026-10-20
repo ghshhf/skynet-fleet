@@ -37,7 +37,7 @@ LAYER_CN = N.LAYER_CN
 ago = N.ago                     # 「3 分钟前」这种话只该有一种写法
 
 # 手机动作表。先验名字再连设备：打错字与「手机没接」是两种错，不能混成一句
-PHONE_ACTIONS = {"screen", "see", "look", "tree", "apps", "fg",
+PHONE_ACTIONS = {"screen", "see", "look", "tree", "apps", "fg", "notify",
                  "open", "tap", "type", "back", "home", "shot", "wait"}
 
 DEV_TTL = 30          # 手机连接缓存秒数：一条命令里连两次 adb 太慢
@@ -210,6 +210,10 @@ def phone(action, arg="", arg2="", dry_run=False):
         if act == "fg":
             info = A.info(s)
             return {"ok": True, "foreground": info.get("foreground", "")}
+        if act == "notify":
+            # 只读：不点、不展开。这是「手机在响什么」——感知里最日常的一层
+            rows = A.notifications(s, limit=int(arg or 10))
+            return {"ok": True, "count": len(rows), "items": rows}
         if act == "open":
             if not arg:
                 return {"ok": False, "err": "要个包名或应用名"}
@@ -358,7 +362,7 @@ def _selftest():
     # ⑤ 动作分类：会动手的必须在 SIDE_EFFECT 里（控制面靠它过闸）
     for a in ("open", "tap", "type", "back", "home", "shot"):
         assert a in SIDE_EFFECT, a
-    for a in ("screen", "tree", "apps", "fg", "wait"):
+    for a in ("screen", "tree", "apps", "fg", "wait", "notify"):
         assert a not in SIDE_EFFECT, a
 
     # ⑥ 红外默认不发：只算序列，返回 sent=False
