@@ -40,7 +40,7 @@ def _load_local_env():
         return
     if cp.has_section("ai"):
         for k in ("FLEET_LLM_URL", "FLEET_LLM_KEY", "FLEET_LLM_MODEL",
-                  "FLEET_LLM7_TOKEN"):
+                  "FLEET_LLM7_TOKEN", "FLEET_LLM7_MODEL", "FLEET_OVH_MODEL"):
             if cp.has_option("ai", k) and not os.environ.get(k):
                 v = cp.get("ai", k).strip()
                 if v:
@@ -88,16 +88,31 @@ def backends():
             "key_env": "FLEET_LLM_KEY" if key else None,
             "need_key": bool(key), "key": key,
         })
-    # ③ llm7：免费但要 token（每天 10 万 token）——有才上，没有自动离线
+    # ③ OVHcloud AI Endpoints：真·免 key 的第二个端点（pollinations 的替补）
+    #    实测 2026-10-21：/v1/models 免 key 可列 22 个模型；匿名 chat 200 成功。
+    #    限流 2 req/min per IP per model——是「保命符」不是主力。
+    #    model 默认 gpt-oss-20b：实测 Qwen3.5-9B / Qwen3.6-27B 匿名调用是推理模型，
+    #    600 预算被 thinking 烧光 → finish_reason=length 且正文空；gpt-oss-20b 正常收尾。
+    bs.append({
+        "id": "ovh", "title": "OVHcloud（免key·低频兜底）",
+        "protocol": "openai",
+        "base_url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        "model": os.environ.get("FLEET_OVH_MODEL") or "gpt-oss-20b",
+        "key_env": None, "need_key": False,
+    })
+    # ④ llm7：要 token 才活。
+    #    🔴 model 原来硬编码 "gpt-4o-mini"——该模型已不在 llm7 当前的 70 个模型里
+    #    （2026-10-21 实测命中 false），调必 404。改成 turbo 档的 gpt-oss:20b。
     tok = os.environ.get("FLEET_LLM7_TOKEN")
     if tok:
         bs.append({
             "id": "llm7", "title": "llm7（token）",
             "protocol": "openai", "base_url": "https://api.llm7.io/v1",
-            "model": "gpt-4o-mini", "key_env": "FLEET_LLM7_TOKEN",
+            "model": os.environ.get("FLEET_LLM7_MODEL") or "gpt-oss:20b",
+            "key_env": "FLEET_LLM7_TOKEN",
             "need_key": True, "key": tok,
         })
-    # ④ 自定义端点：来自 local.env [ai_custom]（用户给的免费 token 落地处）
+    # ⑤ 自定义端点：来自 local.env [ai_custom]（用户给的免费 token 落地处）
     for c in _CUSTOM:
         bs.append(c)
     return bs
