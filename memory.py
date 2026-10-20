@@ -42,8 +42,9 @@ class SharedContext:
                     pass
             self.con.commit()
 
-    def put(self, ns, key, val):
-        ts = time.time()
+    def put(self, ns, key, val, ts=None):
+        """ts 可显式指定：导入旧数据、回填历史记忆、以及让自测不依赖真实时钟。"""
+        ts = time.time() if ts is None else ts
         with self._lk:
             self.con.execute(
                 "INSERT INTO kv(ns,key,val,ts) VALUES(?,?,?,?) "
@@ -92,6 +93,13 @@ class SharedContext:
             rows = self.con.execute(
                 "SELECT key,val,ts FROM kv WHERE ns=? ORDER BY ts DESC LIMIT ?", (ns, k)).fetchall()
         return [{"key": r[0], "val": r[1], "ts": r[2]} for r in rows]
+
+    def items(self, k=200):
+        """跨命名空间按时间倒序扫一层——「她记得」需要在不预设 ns 的情况下找往事。"""
+        with self._lk:
+            rows = self.con.execute(
+                "SELECT ns,key,val,ts FROM kv ORDER BY ts DESC LIMIT ?", (k,)).fetchall()
+        return [{"ns": r[0], "key": r[1], "val": r[2], "ts": r[3]} for r in rows]
 
     def close(self):
         with self._lk:

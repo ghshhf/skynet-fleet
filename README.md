@@ -27,8 +27,9 @@
   - **心跳看门狗**：`scan_stale` 纯函数 + 5s 轮询，90s 探测、180s 判死摘除——把「时间」变成事件喂给策略，否则策略就是空壳。
   - **离线队列持久化**：排队命令落盘（原子替换），控制面重启自动恢复，「上线自动补」这个承诺才不是假的。
   - **她 P3 人格心跳**：主动性 tick 接入看门狗，过**频控(≤2/h) / 静默时段 / 重要度**三道刹车；说了写 `last_thought`，不说写 `pending_thought`（她在忍，不是消失了）。接上 `llm.py` 后由模型自己开口，未接时模板兜底、绝不伪造模型输出。
+  - **「她记得」（验收项：隔日 + 换设备能带出昨天的具体事）**：`recall.py` 从 L3 取 **12h–72h** 的往事（刚发生的不算回忆、一个多月前的没意义），跳过她自己的元状态（`last_thought` 等）与技术缓存，按「离昨天有多近」排序；说过的 **3 天内不重复**（去重记账落人格态，过期自动清），原文同时写 `her/last_recall`——**换设备也看得到她提过什么**。接上模型时原文进提示词并明确「只能引用、不要编造」，没模型时用模板句（只拼接库里的原文，不虚构记忆）。往事只**提高重要度**，不绕过频控/静默。REPL `her_memory` 可人工核对。
   - **临时节点下机即清**：节点上报 `session=True` 后断开，自动触发 `session_end` 策略（清理凭据、不留痕），与场所合规清理互补。
-  - **一键自测门禁**：`run_selftests.py` 串起 **10 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / compute_runner / queue_store / persona）。
+  - **一键自测门禁**：`run_selftests.py` 串起 **11 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / compute_runner / queue_store / persona / recall）。
 - **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动。
 
 自测命令（全部离线，不碰真机、不需联网）：
@@ -73,6 +74,7 @@ skynet-fleet/
 ├── install_windows.py   # Windows L1 常驻安装器（零依赖，SYSTEM 计划任务 + 密码/令牌双闸）
 ├── memory.py            # L3 共享上下文（SQLite+FTS5，逐条可删）
 ├── persona.py           # 她脚手架（人格态/心念tick频控/能力请求门/红线）
+├── recall.py            # 「她记得」：L3 往事唤醒（窗口过滤/去重/不编造）
 ├── policies.py          # 策略层：掉线/心跳/算力/会话 的判断外置为 JSON 规则
 ├── queue_store.py       # 离线队列持久化（控制面重启不丢）
 ├── llm.py               # 本地推理适配层（CMD/URL/placeholder 三后端，改环境变量即切换）
@@ -118,6 +120,7 @@ rules / rules_put <文件>  # 规则库：看版本 / 发布会自动带版本�
 rules_rollback 1          # 回滚（生成新版本，历史保留）
 policy / policy_eval '{...}'  # 看生效策略 / dry-run 一个事件
 her / her_say 你在干嘛     # 看她的状态 / 让她现在说一句（走频控刹车）
+her_memory                # 列出她能回忆的往事（隔日 12h–72h，可人工核对是否真的记得）
 intent 巡检                # 统一意图编排：一句话 -> 多步带依赖 -> 失败逆序回滚
 cap / token ...           # 她能力授权 / 配对设备令牌
 
@@ -144,7 +147,7 @@ set FLEET_LLM_URL=http://127.0.0.1:8080
            └─ 调用 ── 单点 exec ✓ + broadcast 扇出 ✓ + 共享算力路由 ✓ + 真推理 ✓ ── 统一意图编排（延后）
            └─ 上下文 ── L3 共享 ✓(已建+自测) ── 与她记忆深绑（延后训练）
            └─ 可靠性 ── 心跳看门狗 ✓ + 策略层 ✓ + 队列持久化 ✓ ── 多控制面仲裁（延后）
-           └─ 她 ── P3 人格心跳 ✓ + P4 授权门 ✓ + 接真模型开口 ✓ ── SFT 人格训练(交手机)（延后）
+           └─ 她 ── P3 人格心跳 ✓ + P4 授权门 ✓ + 接真模型开口 ✓ + 记得往事 ✓ ── SFT 人格训练(交手机)（延后）
            └─ 规则 ── 版本化规则库 ✓ + 无障碍跳广告 ✓ ── 社区规则中继（延后）
 ```
 

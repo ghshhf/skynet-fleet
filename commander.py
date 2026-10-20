@@ -527,6 +527,7 @@ def _cmd_policy_eval(js):
 # ---------- 她（P1/P3/P4/P5） ----------
 PERSONA = None
 _PROACTIVE = None
+_RECALL = None
 _LAST_TICK = [0.0]                       # 心跳节流（秒）
 PERSONA_PATH = os.environ.get(
     "FLEET_PERSONA", os.path.join(os.path.dirname(os.path.abspath(__file__)), "persona_state.json"))
@@ -540,6 +541,15 @@ def _her():
         PERSONA = p.PersonaState(PERSONA_PATH)
         _PROACTIVE = p.ProactiveEngine(PERSONA)
     return PERSONA, _PROACTIVE
+
+
+def _recall():
+    """「她记得」：从 L3 唤醒往事（延迟导入，保持 CLI 冷启动轻）。"""
+    global _RECALL
+    if _RECALL is None:
+        import recall as r
+        _RECALL = r
+    return _RECALL
 
 
 HER_SYSTEM_TMPL = ("你是{name}，性格{trait}，口癖「{catch}」。"
@@ -570,6 +580,8 @@ def _her_compose(hint):
 def _persona_tick(min_interval=60.0):
     """她的主动性心跳：产生一个念头 -> 过频控/静默/重要度三道刹车 -> 说或不说。
 
+    念头优先级：记得的往事 > 执念 > 打招呼。有往事时她带出**库里原文**，
+    没接模型就用模板句（只拼接原文），绝不编造记忆。
     不说话不是失败：念头会记进 L3（pending_thought），她没消失，只是在忍。
     """
     st, eng = _her()
@@ -578,13 +590,21 @@ def _persona_tick(min_interval=60.0):
         return None
     _LAST_TICK[0] = now
 
+    rcall = _recall()
+    mems = rcall.pick(_ctx(), st, now=now)
     obs = st.data.get("obsessions") or []
-    if obs:
+    if mems:
+        text = rcall.template_line(mems, st.data.get("catchphrase", ""))
+        hint = rcall.prompt_hint(mems) + "\n" + text
+        imp = 0.7                                    # 往事比寒暄重要，但仍过频控/静默
+    elif obs:
         o = obs[-1]
         text = f"{st.data.get('catchphrase', '')} 我还在想 {o['cap']}（第{o['count']}次了）"
+        hint = text
         imp = min(0.9, 0.4 + 0.1 * o["count"])
     else:
         text = f"{st.data.get('catchphrase', '')} 你在干嘛？"
+        hint = text
         imp = 0.5
 
     ok, why = eng.allow(imp)
@@ -592,9 +612,11 @@ def _persona_tick(min_interval=60.0):
         _ctx().put("her", "pending_thought", text)   # 被刹车 -> 记成心事，不打扰
         return None
 
-    text = _her_compose(text) or text                # 接上真模型就她来说，否则模板兜底
+    text = _her_compose(hint) or text                # 接上真模型就她来说，否则模板兜底
     print(f"[她] {text}", flush=True)
     _ctx().put("her", "last_thought", text)          # 跨设备：手机上也知道她刚说了啥
+    if mems:
+        rcall.mark_recalled(st, _ctx(), mems, now=now)   # 说过就记账，N 天内不重复
     return text
 
 
@@ -612,6 +634,21 @@ def _cmd_her():
     lt = _ctx().get("her", "last_thought")
     if lt.get("ok"):
         print(f"  上次开口: {lt['val']}")
+    mems = _recall().candidates(_ctx())
+    lr = _ctx().get("her", "last_recall")
+    print(f"  记得的往事 {len(mems)} 件" + (f"（最近提过: {lr['val']}）" if lr.get("ok") else ""))
+
+
+def _cmd_her_memory():
+    """把她能回忆起来的往事列出来——人可据此核对「她记得」是不是真的。"""
+    st, _ = _her()
+    rows = _recall().candidates(_ctx(), k=10)
+    if not rows:
+        print("  （暂无往事：L3 里没有 12h–72h 的条目）")
+    for it in rows:
+        flag = "已提过" if _recall().recalled_key(it) in (st.data.get("recalled") or {}) else "未提"
+        print(f"  [{it['when']}|{flag}] {it['ns']}/{it['key']} = {it['val']}")
+    print("  说明：只取 12h–72h 的条目，跳过她自己的元状态与技术缓存；说过的 3 天内不再提。")
 
 
 def _cmd_her_say(text):
@@ -802,7 +839,7 @@ def repl():
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
-    print("      | policy | policy_eval <事件JSON> | her | her_say <文本> | intent <一句话> | quit")
+    print("      | policy | policy_eval <事件JSON> | her | her_memory | her_say <文本> | intent <一句话> | quit")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -885,6 +922,8 @@ def repl():
                 _cmd_policy_eval(rest)
         elif op == "her":
             _cmd_her()
+        elif op == "her_memory":
+            _cmd_her_memory()
         elif op == "her_say":
             if rest:
                 _cmd_her_say(rest)
@@ -1030,6 +1069,26 @@ def self_test(host, port, password):
     print(f"  第3次开口={bool(r3)}（应为 False：频控拦下，念头转心事而不是硬刷）", flush=True)
     _ctx_get("her", "pending_thought")
     _cmd_her()
+
+    print("\n=== 她记得（隔日 + 换设备，能主动带出昨天的具体事）===", flush=True)
+    rcall = _recall()
+    _now = time.time()
+    # 造一条「昨天」的往事 + 一条「刚发生」的噪声，证明只回忆隔日的、不当场复读
+    _ctx().put("her", "game_lastnight", "昨晚那局还没玩完，说到第3关", ts=_now - 26 * 3600)
+    _ctx().put("her", "just_minutes", "刚喝了口水", ts=_now - 300)
+    _cmd_her_memory()
+    _mems = rcall.pick(_ctx(), _her()[0], now=_now)
+    print(f"  可提往事 {len(_mems)} 件（应 1 件：刚发生的不算回忆）", flush=True)
+    assert [m["key"] for m in _mems] == ["game_lastnight"], _mems
+    _PROACTIVE.sent_times = []            # 仅为演示重置额度：频控本身已在上一段验证过
+    _said = _persona_tick(min_interval=0)
+    print(f"  她带出的往事 = {_said!r}（模板只引用库里原文，没模型也不编）", flush=True)
+    assert _said and "昨晚那局还没玩完" in _said, _said
+    _again = rcall.pick(_ctx(), _her()[0], now=time.time())
+    print(f"  立刻再说同一件 = {bool(_again)}（应为 False：3 天内不重复）", flush=True)
+    assert "game_lastnight" not in [m["key"] for m in _again], _again
+    print(f"  跨设备可见 last_recall = {(_ctx().get('her', 'last_recall') or {}).get('val')!r}",
+          flush=True)
 
     print("\n=== 共享算力路由（§九 dev_pick：选「谁能干」的节点跑重活）===", flush=True)
     _cmd_compute("帮我写段按修改时间排序的 Python")     # 普通任务：策略不要求占 GPU

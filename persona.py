@@ -35,6 +35,10 @@ class PersonaState:
         json.dump(self.data, open(self.path, "w", encoding="utf-8"),
                   ensure_ascii=False, indent=2)
 
+    def save(self):
+        """公开落盘口：recall 记账（哪些往事已说过）后由此写回。"""
+        self._save()
+
     def add_obsession(self, cap, reason):
         for o in self.data["obsessions"]:
             if o["cap"] == cap:
