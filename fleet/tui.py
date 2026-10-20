@@ -514,7 +514,15 @@ class FleetTUI(App):
                       res.cap, flag, res.brief()[:60])
 
     def _tick_status(self):
-        st = self.query_one("#status", Static)
+        # 🔴 用 query（可空）而不是 query_one：worker 线程的收工回调可能早于界面
+        # 挂载完成跑进来（真踩过：dispatch 抛错 → finally → _job_end → 这里
+        # query_one("#status") 抛 NoMatches，把真正的错误盖掉了）。
+        # 状态灯是锦上添花，界面还没就绪时该跳过，不该炸。
+        # DOMQuery.first() 在无匹配时照样抛 NoMatches（实测），所以走 .nodes 列表。
+        nodes = self.query("#status").nodes
+        st = nodes[0] if nodes else None
+        if st is None:
+            return
         if not self.shell:
             return
         b = _status_bits(self.shell.reg)

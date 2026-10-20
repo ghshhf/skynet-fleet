@@ -18,8 +18,11 @@
   「失败必须带原因」这条锁死——真挂掉的后端不许从清单里静默消失。
   真连通性另有真跑验证，不进门禁。
 """
+import json
 import os
+import socket
 import sys
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -119,8 +122,112 @@ AB.chat = fake_chat                       # 还原，后面的断言还要用它
 r = reg.call("ai.complete", args={"prompt": "你好"})
 check(r.ok and r.data.get("text"), "ai.complete 正常路径拿到正文")
 
+# ⑤b3 默认 max_tokens 必须够推理模型用（防止将来被改回 512 重新踩坑）
+from fleet.kinds.ai import DEFAULT_MAX_TOKENS
+check(DEFAULT_MAX_TOKENS >= 1024,
+      f"默认 max_tokens={DEFAULT_MAX_TOKENS} 够推理模型思考（<1024 会空回）")
+_seen_mt = {}
 
-# ⑤ 审批档 approval：deny 永远拒绝；ask 即便非副作用也要闸门
+
+def _capture_mt(b, prompt, system="", on_token=None, max_tokens=512, timeout=60):
+    _seen_mt["v"] = max_tokens
+    return "好"
+
+
+AB.chat = _capture_mt
+reg.call("ai.chat", args={"prompt": "你好"})
+AB.chat = fake_chat
+check(_seen_mt.get("v") == DEFAULT_MAX_TOKENS,
+      f"ai.chat 不传 max_tokens 时用默认值（实得 {_seen_mt.get('v')}）")
+
+
+# ⑤ 流中途卡死：已收到的内容不许丢；一个字都没收到必须报原因
+#    （真踩出来的：上游偶发卡死时异常直接冲出 _chat_stream，半截答案全作废；
+#      用户只看到「出错」，其实模型已经写了一半。真跑 8 次撞到 1 次 timeout）
+class _FakeResp:
+    """假 HTTP 响应：迭代到第 n 块后按剧本抛异常。"""
+
+    def __init__(self, chunks, exc=None):
+        self._chunks = list(chunks)
+        self._exc = exc
+        self.closed = False
+
+    def __iter__(self):
+        for c in self._chunks:
+            yield c
+        if self._exc:
+            raise self._exc
+
+    def close(self):
+        self.closed = True
+
+
+def _sse(text):
+    return ("data: " + json.dumps(
+        {"choices": [{"delta": {"content": text}}]}) + "\n\n").encode("utf-8")
+
+
+_orig_urlopen = urllib.request.urlopen
+_orig_resolve = AB._resolve_model
+AB._resolve_model = lambda b: "fake-model"
+
+# ⑤a 收到一半卡死 -> 半截内容必须给出去，且标明被中断
+_captured = []
+try:
+    urllib.request.urlopen = lambda *a, **k: _FakeResp(
+        [_sse("前半句"), _sse("后半句")], exc=socket.timeout("timed out"))
+    t = AB._chat_stream({"id": "x", "base_url": "http://127.0.0.1:1/v1",
+                         "need_key": False}, "问", "", _captured.append,
+                        32, 5)
+    check("前半句" in t and "后半句" in t,
+          "流中途卡死：已收到的内容没被丢掉")
+    check("[流被中断]" in t, "卡死时答案里标明了「流被中断」")
+    check("前半句" in "".join(_captured),
+          "中断前的内容已经实时回流过（不是最后才吐）")
+except Exception as e:
+    check(False, f"流中途卡死路径不该抛异常（抛了 {type(e).__name__}: {e}）")
+
+# ⑤b 一个字都没收到就卡死 -> 必须报原因，不许交空串
+try:
+    urllib.request.urlopen = lambda *a, **k: _FakeResp([], exc=socket.timeout("timed out"))
+    AB._chat_stream({"id": "x", "base_url": "http://127.0.0.1:1/v1",
+                     "need_key": False}, "问", "", None, 32, 5)
+    check(False, "零内容超时应该抛错（不该静默返回空串）")
+except RuntimeError as e:
+    check("超时" in str(e) or "中断" in str(e),
+          f"零内容超时带原因（{e}）")
+except Exception as e:
+    check(False, f"零内容超时应抛 RuntimeError（抛了 {type(e).__name__}）")
+
+# ⑤b2 推理模型把预算烧光（真因锁死）：finish_reason=length 且正文 0 字符
+#      ⇒ 必须报「预算不够」这个**具体原因**，不许退化成笼统的「上游抽风」
+#      （真跑抓到的：max_tokens=300 时 minimax-m3.1-flash 思考烧光预算、正文 0 字符，
+#        界面看着像「模型没话说」，人被引到错误方向去——重试没用，加预算才有用）
+def _sse_fin(text, fin):
+    return ("data: " + json.dumps(
+        {"choices": [{"delta": {"content": text} if text else {},
+                      "finish_reason": fin}]}) + "\n\n").encode("utf-8")
+
+
+try:
+    urllib.request.urlopen = lambda *a, **k: _FakeResp(
+        [_sse_fin("", None), _sse_fin("", "length")])
+    AB._chat_stream({"id": "x", "base_url": "http://127.0.0.1:1/v1",
+                     "need_key": False}, "问", "", None, 300, 5)
+    check(False, "预算烧光时应该抛错（不该静默返回空串）")
+except RuntimeError as e:
+    check("预算" in str(e) and "max_tokens" in str(e),
+          f"预算烧光时给出的是具体原因（{e}）")
+    check("抽风" not in str(e),
+          "不许把「预算不够」说成「上游临时抽风」（那会把人引向错误排查方向）")
+except Exception as e:
+    check(False, f"预算烧光应抛 RuntimeError（抛了 {type(e).__name__}: {e}）")
+
+urllib.request.urlopen = _orig_urlopen
+AB._resolve_model = _orig_resolve
+
+
+# ⑥ 审批档 approval：deny 永远拒绝；ask 即便非副作用也要闸门
 class Mini(BaseDevice):
     kind = "mini"
 
