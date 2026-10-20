@@ -1,13 +1,24 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="light" data-skin="workbuddy">
 <head>
 <meta charset="utf-8">
 <title>设备编队 · Windows 图形版 W0 排版稿</title>
 <style>
 /* ==========================================================================
    W0 静态排版稿：只定「长什么样」，不连任何后端、不调任何能力。
+
    参照对象：WorkBuddy 桌面端（浅色三栏 + 顶部菜单条 + 底部输入区 + 悬浮助手）。
-   经典同款：LobeChat / Cherry Studio / Chatbox / Material You 系。
+
+   🔴 **三套皮肤，结构完全一样**（这正是用户说的「都是这个界面」）：
+     workbuddy  WorkBuddy 桌面端 —— 冷灰白、细边框、轻阴影、蓝色强调
+     honeycomb  Android 3.0 Honeycomb / Material 前身 —— 近黑平面、单一发光强调色、
+                **发光代替阴影**（Honeycomb 的精髓）
+     zhiyao     Notion 式「质朴」温暖极简 —— 暖白底、1px 细边框、几乎无阴影、
+                圆角小、字重轻
+     同款结构：LobeChat / Cherry Studio / Chatbox / Material You 系。
+
+   切皮肤只换 CSS 变量 —— 结构一行不动。这本身就是「结构是共享的，皮肤是可插拔的」
+   这条设计结论的证明。
    ========================================================================== */
 :root{
   --bg:#f7f8fa; --panel:#ffffff; --panel-2:#f2f3f5; --sidebar:#f4f5f7;
@@ -17,7 +28,46 @@
   --user:#eef0f3; --danger:#d8453c; --ok:#1f9d55;
   --radius:10px; --radius-lg:14px;
   --shadow:0 1px 2px rgba(16,20,28,.06),0 8px 24px rgba(16,20,28,.06);
+  --glow:none;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   --mono:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;
+}
+/* ---- Honeycomb：近黑平面 + 单一发光强调色，发光代替阴影 ---- */
+html[data-skin="honeycomb"]{
+  --bg:#000000; --panel:#0c0f10; --panel-2:#141819; --sidebar:#08090a;
+  --line:#1e2426; --line-soft:#161b1d;
+  --fg:#e8f7fa; --fg-2:#9fb3b8; --fg-3:#66787d;
+  --accent:#33b5e5; --accent-soft:#0d2831;
+  --user:#12181a; --danger:#ff6b5e; --ok:#4ce0b3;
+  --radius:2px; --radius-lg:4px;
+  --shadow:none;
+  --glow:0 0 0 1px rgba(51,181,229,.55),0 0 12px rgba(51,181,229,.28);
+  --font:"Roboto Condensed","Segoe UI","Microsoft YaHei",sans-serif;
+}
+html[data-skin="honeycomb"][data-theme="light"]{
+  --bg:#f2f5f6; --panel:#ffffff; --panel-2:#e9eef0; --sidebar:#e7edef;
+  --line:#d3dcdf; --line-soft:#e2e9eb;
+  --fg:#0c1a1d; --fg-2:#3d565b; --fg-3:#6d868c;
+  --accent:#0288d1; --accent-soft:#dff1fb;
+  --user:#eef4f6; --danger:#d93025; --ok:#00a37a;
+  --glow:0 0 0 1px rgba(2,136,209,.45),0 0 10px rgba(2,136,209,.20);
+}
+/* ---- 质朴（Notion 式）：暖白 + 1px 细边框 + 几乎无阴影 + 小圆角 ---- */
+html[data-skin="zhiyao"]{
+  --bg:#fbfaf8; --panel:#ffffff; --panel-2:#f3f1ed; --sidebar:#f7f5f2;
+  --line:#e9e6e1; --line-soft:#f0ede9;
+  --fg:#37352f; --fg-2:#6b6862; --fg-3:#9b978f;
+  --accent:#2f6bd8; --accent-soft:#eaf0fb;
+  --user:#f1efeb; --danger:#c0392b; --ok:#4d8b57;
+  --radius:4px; --radius-lg:6px;
+  --shadow:none;
+}
+html[data-skin="zhiyao"][data-theme="dark"]{
+  --bg:#191919; --panel:#202020; --panel-2:#252525; --sidebar:#1c1c1c;
+  --line:#2f2f2f; --line-soft:#282828;
+  --fg:#e9e7e3; --fg-2:#a8a49d; --fg-3:#6f6c66;
+  --accent:#6b93e8; --accent-soft:#1f2733;
+  --user:#282826; --danger:#e06c62; --ok:#6faa78;
 }
 html[data-theme="dark"]{
   --bg:#15171a; --panel:#1b1e22; --panel-2:#22262b; --sidebar:#181b1f;
@@ -27,11 +77,18 @@ html[data-theme="dark"]{
   --user:#242930;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
 }
+html[data-skin="workbuddy"][data-theme="dark"]{
+  --bg:#15171a; --panel:#1b1e22; --panel-2:#22262b; --sidebar:#181b1f;
+  --line:#2b3036; --line-soft:#24282d;
+  --fg:#e6e8eb; --fg-2:#a2a9b3; --fg-3:#6f7681;
+  --accent:#5b8def; --accent-soft:#1e2a3f;
+  --user:#242930;
+}
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
 body{
   background:var(--bg); color:var(--fg);
-  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+  font:14px/1.6 var(--font);
   overflow:hidden;
 }
 .app{display:flex;flex-direction:column;height:100vh}
@@ -82,7 +139,8 @@ body{
 .sb-item{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:8px;
   font-size:13px;color:var(--fg-2);cursor:pointer;margin-bottom:1px}
 .sb-item:hover{background:var(--panel);color:var(--fg)}
-.sb-item.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.sb-item.on{background:var(--accent-soft);color:var(--accent);font-weight:600;
+  box-shadow:var(--glow)}
 .sb-item .ic{width:16px;height:16px;flex:0 0 16px;opacity:.9}
 .sb-item .tag{font-size:9.5px;padding:1px 5px;border-radius:5px;
   background:var(--panel-2);color:var(--fg-3);font-weight:500}
@@ -122,7 +180,8 @@ body{
 .msg.bot{display:flex;gap:11px}
 .msg.bot .ava{width:26px;height:26px;flex:0 0 26px;border-radius:8px;
   background:linear-gradient(135deg,var(--accent),#8b5cf6);
-  display:grid;place-items:center;color:#fff;font-size:11px;font-weight:700}
+  display:grid;place-items:center;color:#fff;font-size:11px;font-weight:700;
+  box-shadow:var(--glow)}
 .msg.bot .body{flex:1;min-width:0}
 .msg.bot .who{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--fg-3);
   margin-bottom:6px}
@@ -162,7 +221,7 @@ body{
 .comp-in{max-width:760px;margin:0 auto;padding:0 28px}
 .comp-box{border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--bg);
   padding:10px 12px 8px;transition:border-color .15s}
-.comp-box:focus-within{border-color:var(--accent)}
+.comp-box:focus-within{border-color:var(--accent);box-shadow:var(--glow)}
 .comp-ph{font-size:13.5px;color:var(--fg-3);min-height:22px}
 .comp-row{display:flex;align-items:center;gap:4px;margin-top:6px}
 .cbtn{height:27px;padding:0 9px;border-radius:7px;display:flex;align-items:center;gap:5px;
@@ -182,6 +241,16 @@ body{
   background:linear-gradient(135deg,#3b82f6,#8b5cf6);box-shadow:var(--shadow);
   display:grid;place-items:center;color:#fff;font-size:20px;cursor:pointer}
 .pet:hover{transform:translateY(-2px)}
+
+/* 皮肤切换器 */
+.skins{position:fixed;right:16px;bottom:14px;z-index:10;display:flex;align-items:center;gap:5px;
+  background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:4px 6px;
+  box-shadow:var(--shadow)}
+.skins-label{font-size:11px;color:var(--fg-3);padding:0 3px;font-family:var(--mono)}
+.sk{border:1px solid var(--line);background:var(--bg);color:var(--fg-2);font-size:11.5px;
+  padding:3px 9px;border-radius:6px;cursor:pointer;font-family:inherit}
+.sk:hover{border-color:var(--accent);color:var(--fg)}
+.sk.on{background:var(--accent-soft);color:var(--accent);border-color:var(--accent);font-weight:600}
 
 /* 标注层（W0 稿的说明气泡） */
 .note{position:fixed;background:#111;color:#fff;font-size:11.5px;padding:6px 9px;
@@ -370,6 +439,15 @@ body{
 <!-- 悬浮助手（桌宠位）：就是那只大肥鱼 -->
 <div class="pet" title="悬浮助手（人格载体）">🐳</div>
 
+<!-- 皮肤切换器：证明「结构共享，皮肤可插拔」 -->
+<div class="skins">
+  <span class="skins-label">皮肤</span>
+  <button class="sk on" data-skin="workbuddy">WorkBuddy</button>
+  <button class="sk" data-skin="honeycomb">Honeycomb</button>
+  <button class="sk" data-skin="zhiyao">质朴</button>
+  <button class="sk" id="themetog" title="明暗切换">◐</button>
+</div>
+
 <!-- W0 标注 -->
 <div class="note themebtn"><b>W0 静态稿</b>：不连后端</div>
 <div class="note" style="left:222px;top:78px"><b>① 左栏</b>：品牌 / 主导航 / 任务·空间 / 会话</div>
@@ -383,10 +461,17 @@ body{
 <div class="kbdhint">W0 · 仅排版，无任何后端调用</div>
 
 <script>
-// 仅供切换明暗（不连后端、不发请求）
-document.querySelector('.themebtn').addEventListener('click',()=>{
-  const h=document.documentElement;
-  h.dataset.theme = h.dataset.theme==='light' ? 'dark' : 'light';
+// 仅供切换皮肤/明暗（不连后端、不发请求）
+const root = document.documentElement;
+document.querySelectorAll('.sk[data-skin]').forEach(b=>{
+  b.addEventListener('click',()=>{
+    root.dataset.skin = b.dataset.skin;
+    document.querySelectorAll('.sk[data-skin]').forEach(x=>x.classList.toggle('on',x===b));
+  });
+});
+const tog = document.getElementById('themetog');
+tog.addEventListener('click',()=>{
+  root.dataset.theme = root.dataset.theme==='light' ? 'dark' : 'light';
 });
 </script>
 </body>
