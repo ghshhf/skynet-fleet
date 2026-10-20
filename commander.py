@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 
+import arbiter
 import common
 import enroll
 import memory as mem_mod
@@ -59,6 +60,13 @@ RULES_PATH = os.environ.get(
     "FLEET_RULES",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_automation", "adskip_rules.json"))
 _RULES_MOD = None
+
+# ---- 多控制面仲裁（一个意图绝不割裂）----
+# 全编队只有一个领袖控制面能发令；其它待机（只读 REPL），领袖死了备用自动接管。
+# 共享状态文件路径在 serve()/self_test() 里定（自检要指到临时文件，不碰真实文件）。
+ARBITER_PATH = arbiter.default_path()
+ARBITER_ID = os.environ.get("FLEET_COMMANDER_ID") or f"{socket.gethostname()}-{os.getpid()}"
+ARBITER_RANK = int(os.environ.get("FLEET_RANK", str(arbiter.DEFAULT_RANK)) or arbiter.DEFAULT_RANK)
 
 
 def _ctx():
@@ -123,6 +131,47 @@ def send_to_node(name, msg, timeout=30):
     return {"ok": True, **slot}
 
 
+def _session_cleanup(name):
+    """临时节点（网吧/借用设备）下机：把这个节点的一切「能再进来」的东西清掉。
+
+    为什么必须真干而不是打一行日志：临时节点的意义就是「下机不留痕」。
+    留一枚凭据在账本里，等于把那台机器的钥匙挂在门上——机器换人用，
+    下一个人照样能认证进来。清理项：
+      ① 入网凭据（PSK）——撤了它才真的进不来；
+      ② 卸载/配对令牌（内存）——同机会话内签发的令牌一并作废；
+      ③ 该节点的离线队列——临时机不会「下次上线」，留着就是永久垃圾命令；
+      ④ 写流水审计——清了几样要有据可查（E-7 可逐条删）。
+
+    诚实边界：L3 里它写过的上下文**不清**（那是编队的记忆，属于她/用户，
+    不属于那台机器）；节点自己沙箱目录里的文件也不清（不在本进程权限范围内，
+    由节点的 --session 模式自己负责）。
+    """
+    out = {"psk": 0, "tokens": 0, "queued": 0}
+    try:
+        out["psk"] = enroll.revoke(ENROLL_LEDGER, name)
+    except enroll.EnrollError as e:
+        print(f"  [清理] 入网账本不可用，跳过 PSK 撤销：{e}", flush=True)
+    with _TOKEN_LK:
+        gone = [t for t, v in TOKENS.items() if v.get("node") == name]
+        for t in gone:
+            TOKENS.pop(t, None)
+        out["tokens"] = len(gone)
+    with _QUEUE_LK:
+        q = OFFLINE_QUEUE.pop(name, [])
+        if q:
+            queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
+        out["queued"] = len(q)
+    # 清完留痕：以后要查「那台机器到底清没清」只看这一条
+    try:
+        _journal().log(
+            "task", name,
+            f"临时节点下机清理：凭据 {out['psk']} 枚 / 令牌 {out['tokens']} 个 / "
+            f"丢弃排队命令 {out['queued']} 条")
+    except Exception:
+        pass
+    return out
+
+
 def _apply_hits(name, hits):
     """执行策略引擎产出的动作（引擎只判断，副作用集中在这里，便于审计）。"""
     for rname, act in hits:
@@ -136,7 +185,9 @@ def _apply_hits(name, hits):
         elif a == "probe":
             print(f"  [策略:{rname}] {name} 心跳超时 -> 探测（不急于判死）", flush=True)
         elif a == "cleanup":
-            print(f"  [策略:{rname}] 清理临时节点凭据（下机不留痕）", flush=True)
+            out = _session_cleanup(name)
+            print(f"  [策略:{rname}] 临时节点凭据已清："
+                  f"凭据 {out['psk']} / 令牌 {out['tokens']} / 排队 {out['queued']}", flush=True)
         elif a == "drop":
             _drop_node_silent(name)
             print(f"  [策略:{rname}] {name} 已从节点表摘除", flush=True)
@@ -204,6 +255,61 @@ def start_watchdog(**kw):
     t = threading.Thread(target=watchdog_loop, kwargs=kw, daemon=True)
     t.start()
     return t
+
+
+# ---- 多控制面仲裁：发令闸门 ----
+
+GATED_OPS = ("exec", "broadcast", "push", "pull", "compute", "computemap", "ui",
+             "rules_put", "rules_rollback", "enroll", "enroll_revoke", "token",
+             "intent", "cap批准")
+
+
+def _gate(op):
+    """发令类命令的统一闸门：只有领袖控制面放行。
+
+    为什么要闸门而不是「随便哪台都能发」：两台控制面各发各的，状态立刻分叉，
+    她在备用面被批的能力主面不认——「一个意图扇出所有设备」就破了产。
+    闸门读**实时**共享状态（不是内存快照），领袖死后备用最坏一个 TTL 内接管。
+    状态文件坏了/读不到 -> 放行（单机常态不能被一份坏文件摁死；仲裁是协同不是安全）。
+    """
+    try:
+        st = arbiter.status(ARBITER_PATH)
+    except Exception:
+        return True
+    leader = st.get("leader")
+    if not leader or leader.get("id") == ARBITER_ID:
+        return True
+    print(f"[仲裁] 本机待机中：领袖是 {leader.get('id')}（rank {leader.get('rank')}），"
+          f"「{op}」已拒绝。查看用 arbiter；领袖退出后本机自动接管。", flush=True)
+    return False
+
+
+def _arbiter_loop(interval=arbiter.CLAIM_INTERVAL):
+    """领袖续期线程：活着就周期性声明；被杀则声明过期，备用按 TTL 接管。"""
+    while True:
+        try:
+            arbiter.claim(ARBITER_PATH, ARBITER_ID, ARBITER_RANK)
+        except Exception as e:
+            print(f"[仲裁] 续期失败（不影响本机发令，仅影响待机判定）：{e}", flush=True)
+        time.sleep(interval)
+
+
+def _cmd_arbiter():
+    st = arbiter.status(ARBITER_PATH)
+    leader = st.get("leader")
+    me = next((c for c in st.get("claims", []) if c.get("id") == ARBITER_ID), None)
+    if leader:
+        who = "本机（领袖）" if leader.get("id") == ARBITER_ID else f"{leader.get('id')}（本机待机）"
+        print(f"  领袖: {leader.get('id')} rank={leader.get('rank')} -> {who}")
+    else:
+        print("  领袖: 无（下一轮声明后产生）")
+    if me:
+        print(f"  本机: id={ARBITER_ID} rank={me.get('rank')} since={me.get('since')}")
+    else:
+        print(f"  本机: id={ARBITER_ID} rank={ARBITER_RANK}（尚未声明）")
+    for c in st.get("claims", []):
+        if c is not leader:
+            print(f"  在册: {c.get('id')} rank={c.get('rank')}")
 
 
 def _enqueue(name, cmd):
@@ -368,6 +474,12 @@ def _route_capability_request(name, m, conn):
         return
     print(f"\n[她] {name} 想用 {cap}：{reason}", flush=True)
     print(f"      批准? y / 其它拒绝（拒绝后她的执念+1）", flush=True)
+    if not _gate("cap批准"):
+        # 待机控制面不批能力：两张皮授权比不授权更糟（主面不认，她会以为到手了）
+        common.send_msg(conn, {"t": common.CAP_DENY, "cap": cap, "reason": "本机非领袖控制面"})
+        _journal().log("her", name, f"想用 {cap}：{reason}（待机控制面，未批）",
+                       topic=_followups().her_topic(cap))
+        return
     try:
         ans = input("     approve> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -410,6 +522,8 @@ def _cmd_nodes():
 
 
 def _cmd_exec(name, cmd):
+    if not _gate("exec"):
+        return
     r = send_to_node(name, {"t": common.EXEC, "cmd": cmd})
     if not r.get("ok"):
         if r.get("offline"):
@@ -426,6 +540,8 @@ def _cmd_exec(name, cmd):
 
 
 def _cmd_push(name, localpath):
+    if not _gate("push"):
+        return
     try:
         data = open(localpath, "rb").read()
     except OSError as e:
@@ -437,6 +553,8 @@ def _cmd_push(name, localpath):
 
 
 def _cmd_pull(name, remotepath, outpath):
+    if not _gate("pull"):
+        return
     r = send_to_node(name, {"t": common.PULL, "path": remotepath})
     if not r.get("ok"):
         print(f"  失败: {r.get('err')}")
@@ -446,6 +564,8 @@ def _cmd_pull(name, remotepath, outpath):
 
 
 def _cmd_broadcast(cmd):
+    if not _gate("broadcast"):
+        return
     names = REGISTRY.with_lock(lambda d: list(d.keys()))
     if not names:
         print("（无在线节点）")
@@ -473,6 +593,8 @@ def _ctx_del(ns, key):
 
 
 def _cmd_token(name):
+    if not _gate("token"):
+        return
     tok = _issue_token(name, "uninstall")
     print(f"  一次性令牌（配对设备经手机下发）：{tok}  （10min 有效）")
     print(f"  卸载/停止时：install_windows.py --uninstall --name {name} --token {tok}")
@@ -493,6 +615,8 @@ def _advertise():
 
 def _cmd_enroll(name, ttl=enroll.DEFAULT_TTL):
     """签发一张入网二维码载荷，并把节点凭据登记进账本。返回载荷文本（供自检复用）。"""
+    if not _gate("enroll"):
+        return None
     host, port = _advertise()
     payload = enroll.issue(name, platform="windows", host=host, port=port, ttl=ttl)
     uri = enroll.encode(payload)
@@ -516,6 +640,8 @@ def _cmd_enroll_list():
 
 
 def _cmd_enroll_revoke(name):
+    if not _gate("enroll_revoke"):
+        return
     n = enroll.revoke(ENROLL_LEDGER, name)
     print(f"  已撤销 {name} 的 {n} 枚凭据（该节点下次重连即认证失败）")
 
@@ -556,6 +682,8 @@ def _cmd_compute(prompt, model=None, prefer_gpu=False):
     """共享算力：把计算任务路由到最合适的节点执行（她三段式 ③ 重活）。
     结果进共享上下文缓存（compute_cache），全编队复用，不重复算（更加一步共享）。
     """
+    if not _gate("compute"):
+        return
     ck = _cache_key(prompt, model)
     hit = _ctx().get("compute_cache", ck)
     if hit.get("ok"):
@@ -829,6 +957,8 @@ def _cmd_computepool():
 
 def _cmd_computemap(prompts, model=None, prefer_gpu=False):
     """共享算力池：一批提示词按容量分发到多个算力节点，并发执行并聚合结果。"""
+    if not _gate("computemap"):
+        return
     items = [p.strip() for p in prompts.split(";") if p.strip()]
     nodes = _compute_nodes()
     if not nodes:
@@ -923,6 +1053,8 @@ def _cmd_rules_get(version=None):
 
 
 def _cmd_rules_put(path, note=""):
+    if not _gate("rules_put"):
+        return
     rl = _rules()
     import json as _json
     try:
@@ -935,6 +1067,8 @@ def _cmd_rules_put(path, note=""):
 
 
 def _cmd_rules_rollback(version):
+    if not _gate("rules_rollback"):
+        return
     rl = _rules()
     try:
         v = rl.rollback(version, path=RULES_PATH)
@@ -945,6 +1079,8 @@ def _cmd_rules_rollback(version):
 
 def _cmd_ui(node, package, use_vision=False, rounds=6):
     """UI 自动化：让节点在挂载的 Android 设备上按规则跳过广告（源自李跳跳拆解）。"""
+    if not _gate("ui"):
+        return
     payload = build_ui_payload(package, use_vision, rounds)
     r = send_to_node(node, payload)
     if "log" not in r:          # 无 log = 传输层失败（不在线/超时/发送失败）
@@ -963,6 +1099,8 @@ def _cmd_intent(text):
     与 broadcast 的区别：扇出是「一条命令发多台」，编排是「一个意图拆多步、步间有依赖，
     某步失败就把已完成的步按逆序补偿」——这才叫一个系统在动。
     """
+    if not _gate("intent"):
+        return
     import orchestrator as orch
     nodes = REGISTRY.with_lock(lambda d: list(d.keys()))
     topic = _followups().task_topic(text)
@@ -1006,6 +1144,7 @@ def repl():
     print("      | policy | policy_eval <事件JSON> | her | her_memory | her_followups | her_say <文本> | intent <一句话> | quit")
     print("      | done <topic>   # 告诉系统这件事做完了（清账，她不再追问）")
     print("      | journal [n]    # 回看对话流水（她起话题的依据）")
+    print("      | arbiter        # 多控制面仲裁：谁是领袖、本机是领袖还是待机")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -1111,6 +1250,8 @@ def repl():
         elif op == "her_say":
             if rest:
                 _cmd_her_say(rest)
+        elif op == "arbiter":
+            _cmd_arbiter()
         elif op == "intent":
             if rest:
                 _cmd_intent(rest)
@@ -1121,6 +1262,7 @@ def repl():
 def self_test(host, port, password):
     """本地回路自检：起服务 + 多节点，证明身体 Phase 0–4 + 她授权闭环 + 反向推送。"""
     global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH
+    global ARBITER_PATH
     SELF_TEST = True
     os.environ["FLEET_CTX"] = ":memory:"
     # 自检不碰 ~/.fleet 下的真实密钥：给本进程一份固定测试密钥
@@ -1133,7 +1275,9 @@ def self_test(host, port, password):
     PERSONA_PATH = os.path.join(tdir, f"fleet_persona_st_{os.getpid()}.json")
     ENROLL_LEDGER = os.path.join(tdir, f"fleet_enroll_st_{os.getpid()}.json")
     JOURNAL_PATH = os.path.join(tdir, f"fleet_journal_st_{os.getpid()}.db")
-    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH):
+    # 仲裁状态也走临时文件：自检里要模拟「另一台更高 rank 的控制面」
+    ARBITER_PATH = os.path.join(tdir, f"fleet_arbiter_st_{os.getpid()}.json")
+    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH, ARBITER_PATH):
         if os.path.exists(_p):
             os.remove(_p)
     import node_agent
@@ -1165,6 +1309,21 @@ def self_test(host, port, password):
 
     # 先写共享上下文，确保她的节点注册后能跨设备读到（L3 一体）
     _ctx_put("her", "game_lastnight", "昨晚那局还没玩完，说到第3关")
+
+    print("\n=== 多控制面仲裁（一个意图绝不割裂）===", flush=True)
+    # 单控制面常态：claim 即成领袖，零配置
+    r = arbiter.claim(ARBITER_PATH, ARBITER_ID, ARBITER_RANK)
+    assert r["is_leader"], "单控制面应当即领袖"
+    print(f"  本机 {ARBITER_ID} rank={ARBITER_RANK} -> 领袖（单控制面零配置）")
+    _cmd_exec("PC-A", "echo 领袖发的令")
+    # 模拟第二台控制面（rank 更高）：本机应变待机，发令被拒
+    phantom = f"{ARBITER_ID}-phantom"
+    arbiter.claim(ARBITER_PATH, phantom, rank=999)
+    _cmd_exec("PC-A", "echo 待机面不该发出这条")
+    _cmd_arbiter()
+    # 幽灵退出（释放让位）：本机立即恢复发令，不等 TTL
+    arbiter.release(ARBITER_PATH, phantom)
+    _cmd_exec("PC-A", "echo 接管后恢复发令")
 
     print("\n=== 自检：本机经密码控制另一台(PC-A) ===", flush=True)
     _cmd_nodes()
@@ -1199,6 +1358,13 @@ def self_test(host, port, password):
                         sandbox="sandbox_net", bg=True, session=True)
     time.sleep(0.9)
     print(f"  上线: {bool(REGISTRY.with_lock(lambda d: d.get('PC-Net')))}（session 模式已上报）")
+    # 预置「能再进来」的东西：一枚入网凭据 + 一条排队命令 + 一枚卸载令牌。
+    # 不预置就分不清「清理跑过了」和「本来就没东西可清」。
+    _psk = "psk-" + os.urandom(6).hex()
+    enroll.register_psk(ENROLL_LEDGER, _psk, "PC-Net")
+    _enqueue("PC-Net", "echo 网吧那台不会真的回来了")
+    _net_tok = _issue_token("PC-Net", "uninstall")
+    print(f"  预置：凭据 1 枚 / 排队 1 条 / 令牌 1 个 -> 下机应全清")
     sk = REGISTRY.with_lock(lambda d: (d.get("PC-Net") or {}).get("sock"))
     if sk:
         try:
@@ -1208,6 +1374,18 @@ def self_test(host, port, password):
     time.sleep(0.9)
     print(f"  下机后在线: {bool(REGISTRY.with_lock(lambda d: d.get('PC-Net')))}"
           f"（应为 False；session_end 策略已触发清理）")
+    left_psk = [r for r in enroll.list_psks(ENROLL_LEDGER) if r["node"] == "PC-Net"]
+    with _QUEUE_LK:
+        left_q = len(OFFLINE_QUEUE.get("PC-Net", []))
+    with _TOKEN_LK:
+        left_tok = sum(1 for v in TOKENS.values() if v.get("node") == "PC-Net")
+    print(f"  清理结果：凭据余 {len(left_psk)} / 排队余 {left_q} / 令牌余 {left_tok}"
+          f"（应全 0）")
+    assert not left_psk and not left_q and not left_tok, (left_psk, left_q, left_tok)
+    _audit = [r for r in _journal().recent(hours=1, kinds=("task",))
+              if "临时节点下机清理" in (r.get("body") or "")]
+    print(f"  审计留痕：流水里有 {len(_audit)} 条清理记录（E-7 可逐条删）")
+    assert _audit, "清理必须留痕，否则事后无法核对到底清没清"
 
     print("\n=== 反向推送 bootstrap（第三原则，loopback 校验）===", flush=True)
     srv = boot.start_server(".", host, 9100)
@@ -1387,7 +1565,27 @@ def main():
         _restore_queue()
         threading.Thread(target=serve, args=(args.host, args.port, args.password), daemon=True).start()
         start_watchdog()          # 心跳看门狗：卡住/假死的节点会被自动探测/摘除
+        _arbiter_start()          # 多控制面仲裁：本机开始竞选领袖（单机即领袖）
         repl()
+        _arbiter_stop()           # 正常退出：主动让位，备用控制面立即接管（不等 TTL）
+
+
+def _arbiter_start():
+    try:
+        arbiter.claim(ARBITER_PATH, ARBITER_ID, ARBITER_RANK)
+    except Exception as e:
+        print(f"[仲裁] 首次声明失败（不影响本机使用）：{e}", flush=True)
+    t = threading.Thread(target=_arbiter_loop, daemon=True)
+    t.start()
+    return t
+
+
+def _arbiter_stop():
+    try:
+        arbiter.release(ARBITER_PATH, ARBITER_ID)
+        print(f"[仲裁] 已让位（{ARBITER_ID}），备用控制面可立即接管", flush=True)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

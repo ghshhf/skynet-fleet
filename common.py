@@ -4,6 +4,7 @@
 所有消息是 dict，含字段 "t" 表示类型。
 """
 import json
+import os
 import socket
 import struct
 import threading
@@ -59,9 +60,41 @@ HEADER = 4  # 长度前缀字节数
 # 演示用执行白名单（真实部署须收紧 + 走 Tailscale）
 EXEC_ALLOWLIST = {
     "echo", "ping", "ver", "systeminfo", "dir", "ls", "whoami",
-    "hostname", "python", "type", "cat", "ipconfig", "tasklist", "date", "time",
+    "hostname", "type", "cat", "ipconfig", "tasklist", "date", "time",
     "set", "path",
 }
+
+# 解释器 = 任意代码执行，默认**不进**白名单：要跑脚本先显式
+# FLEET_ALLOW_INTERPRETER=1（并接受「等于把节点交给命令方」这个后果）。
+INTERPRETERS = {"python", "python3", "py", "powershell", "pwsh", "cmd", "bash", "sh"}
+
+# 元字符一律拒：节点侧 exec 走 shell=True，一个 & | ; > 就能链到白名单外的命令
+# （`echo ok & del x` 这种 base 是 echo、却能干任何事的组合，是白名单最大的洞）。
+SHELL_META = set("&|;<>`$\n\r")
+
+
+def cmd_reject_reason(cmd):
+    """exec 前置检查：返回 None 放行，否则返回拒绝理由（给人看的）。
+
+    三层：① 空命令 ② base 不在白名单（解释器另走显式开关）
+    ③ 参数里带 shell 元字符（防链式命令）。
+    诚实边界：白名单内的 type/dir/cat 本来就能读服务账号能读的一切——
+    L1 的边界是安装闸（管理员启动），不是这份名单；名单防的是「借白名单命令
+    跳出去干别的」，不是「白名单命令本身别干它该干的事」。
+    """
+    if not cmd or not cmd.strip():
+        return "空命令"
+    base = cmd.strip().split(" ", 1)[0].lower()
+    if base in EXEC_ALLOWLIST:
+        pass
+    elif base in INTERPRETERS and os.environ.get("FLEET_ALLOW_INTERPRETER") == "1":
+        pass
+    else:
+        return f"命令不在白名单: {base}"
+    bad = sorted(c for c in SHELL_META if c in cmd)
+    if bad:
+        return f"含 shell 元字符 {bad}（禁止链式命令）"
+    return None
 
 
 _SEND_LOCKS = {}
@@ -114,8 +147,7 @@ def _recv_exact(sock, n):
 
 
 def is_safe_cmd(cmd):
-    base = cmd.strip().split(" ", 1)[0].lower() if cmd.strip() else ""
-    return base in EXEC_ALLOWLIST
+    return cmd_reject_reason(cmd) is None
 
 
 class LockedDict(dict):

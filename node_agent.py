@@ -207,9 +207,12 @@ def _decode(b):
 def _do_exec(s, m):
     cmd = m.get("cmd", "")
     mid = m.get("id")
-    if not common.is_safe_cmd(cmd):
+    reason = common.cmd_reject_reason(cmd)
+    if reason:
+        # 理由分层（不在白名单 / 含 shell 元字符 / 空命令）——白名单是安全边界，
+        # 拒绝原因要写清楚，否则对端只看到「rc=-1」无从排查
         common.send_msg(s, {"t": common.EXEC_RESULT, "id": mid, "rc": -1,
-                            "out": "", "err": f"命令不在白名单: {cmd.split(' ',1)[0]}"})
+                            "out": "", "err": reason})
         return
     t0 = time.time()
     if _DEBUG:
@@ -337,9 +340,38 @@ def _selftest():
               "cls": "", "clickable": True, "bounds": (10, 10, 20, 20)}]
     n, c = ua.match(nodes, _DEFAULT_UI_RULES[0]["triggers"][0])
     assert n and c == (15, 15), (n, c)
+
+    # exec 白名单收紧：三层各自要能拒（不真执行，只验判定）
+    R = common.cmd_reject_reason
+    assert R("echo 你好") is None, "白名单内命令应放行"
+    assert R("") is not None, "空命令应拒"
+    assert R("   ") is not None, "空白命令应拒"
+    assert R("rm -rf /") is not None, "不在白名单应拒"
+    assert R("echo ok & del x") is not None, "链式命令（&）应拒"
+    assert R("echo ok | more") is not None, "管道应拒"
+    assert R("type a.txt > b.txt") is not None, "重定向应拒"
+    assert R("echo `whoami`") is not None, "反引号应拒"
+    assert R("echo $HOME") is not None, "变量展开应拒"
+    assert R("echo a\nwhoami") is not None, "换行注入应拒"
+    assert R("python -c print(1)") is not None, "解释器默认应拒（等于任意代码执行）"
+    os.environ["FLEET_ALLOW_INTERPRETER"] = "1"
+    try:
+        assert R("python --version") is None, "显式开关后解释器应放行"
+        assert R("python -c a & b") is not None, "放行解释器也不能放行链式"
+    finally:
+        os.environ.pop("FLEET_ALLOW_INTERPRETER", None)
+
+    # 走一遍真实回执路径：拒绝理由要写给人看，不能只给 rc=-1
+    se = _FakeSock()
+    _do_exec(se, {"id": "x1", "cmd": "echo ok & whoami"})
+    me = _read_msgs(se)[0]
+    assert me["rc"] == -1 and "元字符" in me["err"], me
+
     print("[selftest] UI_SKIP 正常路径回执 OK")
     print("[selftest] UI_SKIP 异常路径 ok=False+err OK")
     print("[selftest] 默认规则可被 ui_automation.match 消费 OK")
+    print("[selftest] exec 白名单：链式/管道/重定向/反引号/变量/换行全拒 OK")
+    print("[selftest] exec 解释器默认拒，FLEET_ALLOW_INTERPRETER=1 才放行 OK")
     print("[selftest] PASS")
 
 
