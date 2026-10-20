@@ -279,6 +279,15 @@ _SECTIONS = [
 ]
 
 
+def foreground():
+    """这一节要往外给（使用轨迹统计每次采样都要它），所以有个公开壳。"""
+    return _foreground()
+
+
+def idle_seconds():
+    return _input()["idle_sec"]
+
+
 def human_dur(sec):
     sec = max(int(sec or 0), 0)
     d, rem = divmod(sec, 86400)
