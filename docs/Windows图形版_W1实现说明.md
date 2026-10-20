@@ -172,7 +172,7 @@ curl -N -s http://127.0.0.1:54321/api/chat -H "X-Fleet-Token: XXXX" \
 ### 跑门禁
 
 ```bash
-python evals/t7_gui_backend.py       # W1 专用门禁（104 项，离线可复现）
+python evals/t7_gui_backend.py       # W1 专用门禁（111 项，离线可复现）
 python run_selftests.py              # 全量
 python run_selftests.py t7           # 只跑含 t7 的
 ```
@@ -235,6 +235,6 @@ python run_selftests.py t7           # 只跑含 t7 的
 | `ui/index.html` | 三栏骨架（照抄 `ui/w0_layout.html` 的视觉基准） |
 | `ui/app.css` | 样式：明暗双主题 + W0 布局 + 能力面板/结果条/提示条 |
 | `ui/app.js` | 逻辑：token、SSE 渲染、能力面板、设备/会话列表、主题 |
-| `evals/t7_gui_backend.py` | W1 门禁（104 项） |
+| `evals/t7_gui_backend.py` | W1 门禁（111 项） |
 | `evals/t7_front_smoke.js` | 前端运行时冒烟（假 DOM 真跑 `app.js`） |
 | `docs/Windows图形版_W1实现说明.md` | 本文 |
