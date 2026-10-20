@@ -14,6 +14,7 @@
 import argparse
 import base64
 import hashlib
+import hmac
 import os
 import socket
 import sys
@@ -21,6 +22,7 @@ import threading
 import time
 
 import common
+import enroll
 import memory as mem_mod
 import policies
 import queue_store
@@ -39,8 +41,15 @@ QUEUE_PATH = os.environ.get(
 TOKENS = {}                              # token -> {node, purpose, exp}
 _TOKEN_LK = threading.Lock()
 
+# 入网凭据账本（PSK 哈希 -> 绑定的节点名）。扫码入网后节点用它认证，撤销也在这里。
+ENROLL_LEDGER = os.environ.get(
+    "FLEET_ENROLL_LEDGER",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleet_enroll.json"))
+
 DEGRADED = set()                         # 被策略降级的节点（掉线后不再参与路由）
 DEBUG = bool(os.environ.get("FLEET_DEBUG"))   # FLEET_DEBUG=1：打印通信收发与超时
+
+SERVE_HOST, SERVE_PORT = "127.0.0.1", 9000    # 监听地址（扫码入网要把它写进载荷）
 
 CTX = None                               # SharedContext（懒初始化）
 SELF_TEST = False
@@ -253,13 +262,31 @@ def _issue_token(name, purpose="uninstall"):
     return tok
 
 
+def _auth_ok(name, pw, global_pw):
+    """认证两路：①全局安装密码 ②扫码入网的节点凭据（绑死节点名）。
+
+    凭据走 `enroll` 账本而不是内存里的 `TOKENS`——TOKENS 是「卸载令牌」，10 分钟过期；
+    节点凭据必须扛得住重启，两者寿命不同，不能混用一份表。
+    """
+    if pw and global_pw and hmac.compare_digest(pw.encode("utf-8"), global_pw.encode("utf-8")):
+        return True
+    try:
+        if enroll.check_psk(ENROLL_LEDGER, pw, name):
+            enroll.mark_used(ENROLL_LEDGER, pw)
+            return True
+    except enroll.EnrollError as e:
+        # 账本坏了就只认全局密码，不因读不到账本而放行任何凭据（fail-closed）
+        print(f"[!] 入网凭据账本不可用，本轮仅接受全局密码：{e}", flush=True)
+    return False
+
+
 def _handle_node(conn, password):
     try:
         auth = common.recv_msg(conn)
         if not auth or auth.get("t") != common.AUTH:
             return
-        if auth.get("password") != password:
-            common.send_msg(conn, {"t": common.AUTH_FAIL, "reason": "密码错误"})
+        if not _auth_ok(auth.get("name"), auth.get("password"), password):
+            common.send_msg(conn, {"t": common.AUTH_FAIL, "reason": "密码错误或入网凭据无效"})
             return
         token = f"tok-{os.urandom(6).hex()}"
         common.send_msg(conn, {"t": common.AUTH_OK, "token": token})
@@ -348,6 +375,8 @@ def _route_capability_request(name, m, conn):
 
 
 def serve(host, port, password):
+    global SERVE_HOST, SERVE_PORT
+    SERVE_HOST, SERVE_PORT = host, port
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -436,6 +465,48 @@ def _cmd_token(name):
     tok = _issue_token(name, "uninstall")
     print(f"  一次性令牌（配对设备经手机下发）：{tok}  （10min 有效）")
     print(f"  卸载/停止时：install_windows.py --uninstall --name {name} --token {tok}")
+
+
+def _advertise():
+    """载荷里写「节点该往哪儿连」的地址。
+
+    监听 0.0.0.0 时绝不能把 0.0.0.0 写进二维码——节点没法连。用 FLEET_ADVERTISE
+    指定真实可达地址（如 Tailscale IP / 局域网 IP），没设则退回监听地址。
+    """
+    adv = os.environ.get("FLEET_ADVERTISE")
+    if adv:
+        h, _, p = adv.partition(":")
+        return (h or SERVE_HOST), (int(p) if p.isdigit() else SERVE_PORT)
+    return SERVE_HOST, SERVE_PORT
+
+
+def _cmd_enroll(name, ttl=enroll.DEFAULT_TTL):
+    """签发一张入网二维码载荷，并把节点凭据登记进账本。返回载荷文本（供自检复用）。"""
+    host, port = _advertise()
+    payload = enroll.issue(name, platform="windows", host=host, port=port, ttl=ttl)
+    uri = enroll.encode(payload)
+    enroll.register_psk(ENROLL_LEDGER, payload["k"], name, exp=0)
+    print(f"  入网载荷（{ttl}s 内有效、只能兑换一次）：")
+    print(f"  {uri}")
+    print(f"  {enroll.describe(payload)}")
+    print(f"  目标机器上：install_windows.py --enroll \"{uri}\"")
+    print("  手机侧把它渲成二维码即可；凭据长期有效（扛重启），换机/送人时用 enroll_revoke 收权")
+    return uri
+
+
+def _cmd_enroll_list():
+    rows = enroll.list_psks(ENROLL_LEDGER)
+    if not rows:
+        print("（还没有扫码入网的节点）")
+    for r in rows:
+        used = time.strftime("%m-%d %H:%M", time.localtime(r["used_at"])) if r["used_at"] else "未使用"
+        exp = time.strftime("%m-%d %H:%M", time.localtime(r["exp"])) if r["exp"] else "长期"
+        print(f"  {r['node']:12} 凭据={r['key']}… 过期={exp} 首次使用={used}")
+
+
+def _cmd_enroll_revoke(name):
+    n = enroll.revoke(ENROLL_LEDGER, name)
+    print(f"  已撤销 {name} 的 {n} 枚凭据（该节点下次重连即认证失败）")
 
 
 def pick_node(cap="compute", prefer_gpu=False, task=""):
@@ -838,6 +909,7 @@ def repl():
     print("cmd> nodes | exec <节点> <命令> | broadcast <命令> | push <节点> <文件> | pull <节点> <远程> [输出]")
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
+    print("      | enroll <节点> [有效期秒] | enroll_list | enroll_revoke <节点>   # 扫码入网（离线验签）")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
     print("      | policy | policy_eval <事件JSON> | her | her_memory | her_say <文本> | intent <一句话> | quit")
     while True:
@@ -887,6 +959,16 @@ def repl():
         elif op == "token":
             if rest:
                 _cmd_token(rest)
+        elif op == "enroll":
+            sp = rest.split()
+            if sp:
+                ttl = int(sp[1]) if len(sp) > 1 and sp[1].isdigit() else enroll.DEFAULT_TTL
+                _cmd_enroll(sp[0], ttl)
+        elif op == "enroll_list":
+            _cmd_enroll_list()
+        elif op == "enroll_revoke":
+            if rest:
+                _cmd_enroll_revoke(rest.strip())
         elif op == "queue":
             if rest:
                 _cmd_queue(rest)
@@ -936,16 +1018,19 @@ def repl():
 
 def self_test(host, port, password):
     """本地回路自检：起服务 + 多节点，证明身体 Phase 0–4 + 她授权闭环 + 反向推送。"""
-    global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH
+    global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER
     SELF_TEST = True
     os.environ["FLEET_CTX"] = ":memory:"
+    # 自检不碰 ~/.fleet 下的真实密钥：给本进程一份固定测试密钥
+    os.environ["FLEET_ENROLL_SECRET"] = "commander-selftest-secret"
     import tempfile
-    # 自检用临时文件，绝不污染仓库里的规则库/队列/人格态
+    # 自检用临时文件，绝不污染仓库里的规则库/队列/人格态/入网账本
     tdir = tempfile.gettempdir()
     RULES_PATH = os.path.join(tdir, f"fleet_rules_st_{os.getpid()}.json")
     QUEUE_PATH = os.path.join(tdir, f"fleet_queue_st_{os.getpid()}.json")
     PERSONA_PATH = os.path.join(tdir, f"fleet_persona_st_{os.getpid()}.json")
-    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH):
+    ENROLL_LEDGER = os.path.join(tdir, f"fleet_enroll_st_{os.getpid()}.json")
+    for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER):
         if os.path.exists(_p):
             os.remove(_p)
     import node_agent
@@ -1043,6 +1128,47 @@ def self_test(host, port, password):
 
     print("\n=== 配对设备一次性令牌（卸载闸门 ②）===", flush=True)
     _cmd_token("PC-A")
+
+    print("\n=== 扫码入网（一次性载荷 / 离线验签 / 凭据绑节点）===", flush=True)
+    uri = _cmd_enroll("PC-QR", ttl=600)
+    pay = enroll.verify(uri)                     # 离线验签：不联网、不回调
+    print(f"  离线验签通过: 节点={pay['n']} 中心={pay['h']}:{pay['o']} 载荷{len(uri)}字符", flush=True)
+
+    # 改一个字节 -> 签名失配（不信任载荷自述的任何字段）
+    _bs = uri.index("p=") + 2
+    _bad = uri[:_bs] + ("B" if uri[_bs] != "B" else "C") + uri[_bs + 1:]
+    try:
+        enroll.verify(_bad)
+        raise AssertionError("篡改过的载荷竟然验过了")
+    except enroll.EnrollError as _e:
+        print(f"  篡改一个字符 -> {_e.reason}（应为 bad_sig）", flush=True)
+
+    # 认证两路：凭据能上、凭据不能跨节点、乱猜的不行
+    def _try_auth(nm, pw):
+        _s = socket.create_connection((host, port), timeout=5)
+        try:
+            common.send_msg(_s, {"t": common.AUTH, "name": nm, "password": pw})
+            _r = common.recv_msg(_s)
+            return (_r or {}).get("t")
+        finally:
+            _s.close()
+
+    psk = pay["k"]
+    print(f"  凭据认证 PC-QR -> {_try_auth('PC-QR', psk)}（应 auth_ok）")
+    print(f"  同凭据冒充 PC-Fake -> {_try_auth('PC-Fake', psk)}（应 auth_fail：凭据绑节点名）")
+    print(f"  乱猜凭据 -> {_try_auth('PC-QR', '00' * 16)}（应 auth_fail）")
+
+    # 真节点持凭据注册，能接命令（不是只过握手）
+    node_agent.run_node(host, port, "PC-QR", psk, "windows", caps=["exec"],
+                        sandbox="sandbox_qr", bg=True)
+    for _ in range(30):
+        if REGISTRY.with_lock(lambda d: "PC-QR" in d):
+            break
+        time.sleep(0.1)
+    _cmd_exec("PC-QR", "echo 扫码入网节点已受控")
+    _cmd_enroll_list()
+    _cmd_enroll_revoke("PC-QR")
+    print(f"  撤销后 PC-QR 重连 -> {_try_auth('PC-QR', psk)}（应 auth_fail：收权即断）")
 
     print("\n=== 策略层（判断外置为数据，代码里不写 if/else 分支）===", flush=True)
     _cmd_policy()

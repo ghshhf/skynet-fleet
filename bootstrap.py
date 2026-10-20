@@ -15,14 +15,16 @@ import threading
 BOOTSTRAP_SCRIPT = '''# 天网工程 bootstrap：从中心拉取工具箱并注册
 import os, sys, urllib.request
 BASE = os.environ.get("FLEET_BASE", "http://127.0.0.1:9100")
-for fn in ("common.py", "node_agent.py"):
+for fn in ("common.py", "node_agent.py", "enroll.py"):
     try:
         data = urllib.request.urlopen(BASE + "/" + fn, timeout=15).read()
         open(fn, "wb").write(data)
         print("[bootstrap] 已拉取", fn, len(data), "B")
     except Exception as e:
         print("[bootstrap] 拉取失败", fn, e); sys.exit(1)
-print("[bootstrap] 工具箱就绪，运行: python node_agent.py --host <CommanderIP> --port 9000 --name <本机名> --password <密码>")
+print("[bootstrap] 工具箱就绪。两种入网方式：")
+print("  ① 扫码（推荐）：install_windows.py --enroll \\"fleet://enroll?p=...\\"")
+print("  ② 密码：python node_agent.py --host <CommanderIP> --port 9000 --name <本机名> --password <密码>")
 '''
 
 

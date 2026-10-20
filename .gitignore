@@ -10,6 +10,8 @@ node_modules/
 # 运行时凭据/状态（不入库）
 .fleet_tokens.json
 .fleet_pw.json
+.fleet_enroll_used.json
+fleet_enroll.json
 fleet_context.db
 fleet_context.db-journal
 persona_state.json
@@ -19,3 +21,4 @@ ui_automation/adskip_rules.json.tmp
 fleet_queue.json
 fleet_queue.json.tmp
 tmp/
+.workbuddy/
