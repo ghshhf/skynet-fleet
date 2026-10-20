@@ -8,11 +8,11 @@ import socket
 import struct
 import threading
 
-# ---- 消息类型 ----
+# ---- 消息类型（L0/L1 基础）----
 AUTH = "auth"                 # node -> commander: {name, password}
 AUTH_OK = "auth_ok"           # commander -> node:  {token}
 AUTH_FAIL = "auth_fail"       # commander -> node:  {reason}
-REGISTER = "register"         # node -> commander: {name, platform, info}
+REGISTER = "register"         # node -> commander: {name, platform, info, capabilities[]}
 HEARTBEAT = "hb"              # node -> commander
 EXEC = "exec"                 # commander -> node: {id, cmd}
 EXEC_RESULT = "exec_result"   # node -> commander: {id, rc, out, err}
@@ -20,7 +20,35 @@ PUSH = "push"                 # commander -> node: {id, path, data(b64)}
 PUSH_RESULT = "push_result"   # node -> commander: {id, ok, err}
 PULL = "pull"                 # commander -> node: {id, path}
 PULL_RESULT = "pull_result"   # node -> commander: {id, ok, data(b64), err}
-RESULT = "result"             # commander -> 本地运维CLI: {ok, data, err}
+
+# ---- L1 能力注册表 ----
+CAPABILITIES = "capabilities" # node -> commander: 上报/更新能力列表
+
+# ---- L2 离线队列（Phase 4 体验）----
+QUEUE = "queue"              # commander -> node（上线重放）: {cmds:[{id, cmd}]}
+
+# ---- L3 共享上下文（TinyContext 式）----
+CTX_PUT = "ctx_put"
+CTX_PUT_RESULT = "ctx_put_result"
+CTX_GET = "ctx_get"
+CTX_GET_RESULT = "ctx_get_result"
+CTX_SEARCH = "ctx_search"
+CTX_SEARCH_RESULT = "ctx_search_result"
+CTX_DEL = "ctx_del"
+CTX_DEL_RESULT = "ctx_del_result"
+
+# ---- 配对设备一次性令牌（卸载闸门 ②）----
+TOKEN_REQUEST = "token_req"   # node/install -> commander: {purpose, node}
+TOKEN_RESULT = "token_res"    # commander -> 请求方: {token}（也经手机下发）
+
+# ---- 共享算力（§九 dev_pick 路由选「谁能干」；§五 电脑=她的手跑重活）----
+COMPUTE = "compute"           # commander -> node: {id, prompt, model?}
+COMPUTE_RESULT = "compute_result"  # node -> commander: {id, ok, out, model}
+
+# ---- 她 P4 能力请求 + 授权门 ----
+CAP_REQ = "cap_req"           # node(她) -> commander: {cap, reason}
+CAP_GRANT = "cap_grant"       # commander -> node(她): {cap, session_min, token}
+CAP_DENY = "cap_deny"         # commander -> node(她): {cap, reason}
 
 HEADER = 4  # 长度前缀字节数
 
@@ -28,6 +56,7 @@ HEADER = 4  # 长度前缀字节数
 EXEC_ALLOWLIST = {
     "echo", "ping", "ver", "systeminfo", "dir", "ls", "whoami",
     "hostname", "python", "type", "cat", "ipconfig", "tasklist", "date", "time",
+    "set", "path",
 }
 
 

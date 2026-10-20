@@ -6,3 +6,11 @@ node_modules/
 .venv/
 *.log
 .DS_Store
+
+# 运行时凭据/状态（不入库）
+.fleet_tokens.json
+.fleet_pw.json
+fleet_context.db
+fleet_context.db-journal
+persona_state.json
+models/
