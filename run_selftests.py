@@ -64,6 +64,10 @@ CASES = [
     ("eval_t3_live_switch", ["evals/t3_live_switch_papers.py"], HERE, 240),
     ("eval_t4_ai_free", ["evals/t4_ai_free_backends.py"], HERE, 240),
     ("eval_t5_host_control", ["evals/t5_host_control.py"], HERE, 120),
+    # ---- T6：WiFi ADB 设备（kind=adb_wifi）----
+    # 这条门禁必须完全离线：它连一条 adb 命令都不发、不连一个 IP。
+    # 本机没插设备、PATH 里没 adb 都不能让它变红（t4 的教训）。
+    ("eval_t6_adb_wifi", ["evals/t6_adb_wifi.py"], HERE, 120),
 ]
 
 
