@@ -22,3 +22,7 @@ fleet_queue.json
 fleet_queue.json.tmp
 tmp/
 .workbuddy/
+
+# 扫描/发现账本（含真实设备清单，不入库）
+swept.json
+discovered.json
