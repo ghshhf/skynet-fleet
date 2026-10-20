@@ -59,6 +59,10 @@ CASES = [
     ("eval_t1_two_faces", ["evals/t1_cli_and_tui_share_dispatch.py"], HERE, 240),
     # 这条超时就是失败：它卡住说明界面在长任务期间被拖死了
     ("eval_t2_ui_alive", ["evals/t2_ui_alive_under_job_stream.py"], HERE, 120),
+    # ---- T3/T4/T5：论文直播开关 / 免费 AI 后端 / 本机操控设备 ----
+    ("eval_t3_live_switch", ["evals/t3_live_switch_papers.py"], HERE, 240),
+    ("eval_t4_ai_free", ["evals/t4_ai_free_backends.py"], HERE, 240),
+    ("eval_t5_host_control", ["evals/t5_host_control.py"], HERE, 120),
 ]
 
 

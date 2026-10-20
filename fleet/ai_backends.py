@@ -19,6 +19,50 @@ import os
 import time
 import urllib.error
 import urllib.request
+import configparser
+from pathlib import Path
+
+_CUSTOM = []   # 来自仓库根 local.env [ai_custom] 的自定义后端（gitignored，只本机）
+
+
+def _load_local_env():
+    """读仓库根 local.env（gitignored），把 [ai] 段注入环境变量、[ai_custom] 段
+    解析成自定义后端。这是『落地但不外泄』——用户给的免费 token 写进本机配置，
+    不进仓库，也不用手工每回设环境变量。"""
+    p = Path(__file__).resolve().parent.parent / "local.env"
+    if not p.exists():
+        return
+    try:
+        cp = configparser.ConfigParser(interpolation=None)
+        cp.read(p, encoding="utf-8")
+    except Exception:
+        return
+    if cp.has_section("ai"):
+        for k in ("FLEET_LLM_URL", "FLEET_LLM_KEY", "FLEET_LLM_MODEL",
+                  "FLEET_LLM7_TOKEN"):
+            if cp.has_option("ai", k) and not os.environ.get(k):
+                v = cp.get("ai", k).strip()
+                if v:
+                    os.environ[k] = v
+    if cp.has_section("ai_custom"):
+        groups = {}
+        for key, val in cp.items("ai_custom"):
+            name, _, field = key.partition(".")
+            groups.setdefault(name, {})[field] = val.strip()
+        for name, g in groups.items():
+            base = g.get("base_url")
+            if not base:
+                continue
+            _CUSTOM.append({
+                "id": name, "title": "自定义 " + name,
+                "protocol": "openai", "base_url": base.rstrip("/"),
+                "model": g.get("model") or None,
+                "key_env": None, "need_key": bool(g.get("key")),
+                "key": g.get("key") or None,
+            })
+
+
+_load_local_env()
 
 
 def backends():
@@ -52,6 +96,9 @@ def backends():
             "model": "gpt-4o-mini", "key_env": "FLEET_LLM7_TOKEN",
             "need_key": True, "key": tok,
         })
+    # ④ 自定义端点：来自 local.env [ai_custom]（用户给的免费 token 落地处）
+    for c in _CUSTOM:
+        bs.append(c)
     return bs
 
 

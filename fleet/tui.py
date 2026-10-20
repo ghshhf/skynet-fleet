@@ -22,10 +22,11 @@
   总日志（输出页）永远收一份；论文的活额外喂给「论文」页、联网的活额外喂给
   「联网」页，这两屏才是长任务时人真正盯着的地方。
 
-  标签页（顶部横排，仿网页）：设备 / 联网(netforce) / 论文 / AI / 输出 / 结果。
+  标签页（顶部横排，仿网页）：设备 / 联网(netforce) / 论文 / AI / 主机 / 输出 / 结果。
   「论文」页上半行显示今日论文数与来源分布，下面是全屏 RichLog，web.papers
   跑起来这一屏就一行行长出来；「联网」页左侧站群表、右侧收获流；
-  「AI」页顶部列可用免费后端、下方全屏对话流，提问框回车即向所有后端并发提问。
+  「AI」页顶部列可用免费后端、下方全屏对话流，提问框回车即向所有后端并发提问；
+  「主机」页资源条(CPU/MEM/DISK/NET)+进程表+屏幕盲文预览（操控电脑的可视化）。
 """
 from __future__ import annotations
 
@@ -84,6 +85,10 @@ TabPane { padding: 0; }
 #pane_ai { layout: vertical; }
 #ailine { height: 1; padding: 0 1; color: #8b949e; background: #161b22; }
 #ailog { height: 1fr; }
+#pane_host { layout: vertical; }
+#hostbars { height: 1; padding: 0 1; color: #c9d1d9; background: #161b22; }
+#hostprocs { height: 12; }
+#hostshot { height: 1fr; }
 #devices { width: 34; }
 #caps { width: 1fr; }
 #sites { width: 56; }
@@ -111,6 +116,7 @@ class FleetTUI(App):
         ("ctrl+w", "focus_web", "联网"),
         ("ctrl+p", "focus_papers", "论文"),
         ("ctrl+a", "focus_ai", "AI"),
+        ("ctrl+h", "focus_host", "主机"),
         ("ctrl+b", "toggle_live", "直播"),
         ("ctrl+r", "refresh", "重新探测"),
         ("ctrl+c", "stop_job", "叫停"),
@@ -180,6 +186,13 @@ class FleetTUI(App):
                                   highlight=False, markup=False)
                     yield Input(placeholder="问 AI（回车即向所有免费后端并发提问；多后端按 [id] 同屏）",
                                 id="aiprompt")
+            with TabPane("主机", id="pane_host"):
+                with Vertical():
+                    yield Static("主机页：跑 host.monitor 看资源、host.screen 看屏（盲文预览）",
+                                 id="hostbars")
+                    yield DataTable(id="hostprocs", zebra_stripes=True)
+                    yield RichLog(id="hostshot", wrap=True,
+                                  highlight=False, markup=False)
             with TabPane("输出", id="pane_log"):
                 yield RichLog(id="log", wrap=True, highlight=False, markup=False)
             with TabPane("结果", id="pane_res"):
@@ -250,6 +263,8 @@ class FleetTUI(App):
         self._results.append((time.time(), res))
         self._results = self._results[-60:]
         self.call_from_thread(self._paint_results)
+        if res.cap.startswith("host."):
+            self.call_from_thread(self._paint_host_latest)
 
     def _drain_stream(self):
         """主线程：把作业吐出的行喂给该去的那一屏，并据此推进度。
@@ -440,6 +455,55 @@ class FleetTUI(App):
         t.update(Text(f"AI 后端 {len(bs)} 个：{ids}　（下方输入框提问，回车即问所有后端）",
                       style="bold #58a6ff"))
 
+    @staticmethod
+    def _bar(pct, width=14):
+        pct = max(0.0, min(100.0, float(pct)))
+        filled = int(round(pct / 100.0 * width))
+        return "\u2588" * filled + "\u2591" * (width - filled)
+
+    def _paint_host_latest(self):
+        """结果页里最新的 host.* 结果，画进主机页。"""
+        for _ts, res in reversed(self._results):
+            if res.cap.startswith("host."):
+                self._paint_host(res)
+                return
+
+    def _paint_host(self, res):
+        """主机页可视化：资源条 + 进程表 + 屏幕盲文预览。"""
+        if res.cap == "host.monitor" and res.ok:
+            d = res.data
+            b = Text()
+            for label, key, color in (("CPU", "cpu", "#58a6ff"),
+                                      ("MEM", "mem", "#3fb950"),
+                                      ("DISK", "disk", "#d29922")):
+                b.append(f"{label} ", style="bold")
+                b.append(self._bar(d.get(key, 0)) + f" {d.get(key, 0):.0f}%  ",
+                         style=color)
+            b.append(f"\u2191{d.get('net_up', 0)} ", style="#8b949e")
+            b.append(f"\u2193{d.get('net_down', 0)} KB/s", style="#8b949e")
+            self.query_one("#hostbars", Static).update(b)
+            t = self.query_one("#hostprocs", DataTable)
+            t.clear(columns=True)
+            t.add_columns("PID", "进程", "CPU%")
+            for p in (d.get("procs") or [])[:12]:
+                t.add_row(str(p.get("pid", "")), (p.get("name") or "")[:22],
+                          str(p.get("cpu", "")))
+        elif res.cap == "host.apps" and res.ok:
+            t = self.query_one("#hostprocs", DataTable)
+            t.clear(columns=True)
+            t.add_columns("PID", "进程")
+            for p in (res.data.get("apps") or [])[:40]:
+                t.add_row(str(p.get("pid", "")), (p.get("name") or "")[:30])
+            self.query_one("#hostbars", Static).update(
+                Text(f"本机进程 {len(res.data.get('apps', []))} 个", style="#58a6ff"))
+        elif res.cap == "host.screen" and res.ok:
+            rl = self.query_one("#hostshot", RichLog)
+            rl.clear()
+            prev = res.data.get("preview") or ""
+            if prev:
+                rl.write(Text(prev, style="#c9d1d9"))
+            rl.write(Text("截图：" + res.data.get("path", ""), style="#8b949e"))
+
     def _paint_results(self):
         t = self.query_one("#results", DataTable)
         t.clear(columns=True)
@@ -513,7 +577,8 @@ class FleetTUI(App):
     def _run(self, line, confirm=False):
         # 联网作业才亮进度条：别的活都是一瞬间，画条出来反而晃眼
         head = (line.split() or [""])[0]
-        self._job_cap = head if (head.startswith("web.") or head.startswith("ai.")) else ""
+        self._job_cap = head if (head.startswith("web.") or head.startswith("ai.")
+                                 or head.startswith("host.")) else ""
         self._job_done = self._job_total = self._job_steps = 0
         self._job_lines = 0
         self._job_t0 = time.time()
@@ -633,6 +698,10 @@ class FleetTUI(App):
         self.query_one("TabbedContent", TabbedContent).active = "pane_ai"
         self.query_one("#aiprompt", Input).focus()
 
+    def action_focus_host(self):
+        self.query_one("TabbedContent", TabbedContent).active = "pane_host"
+        self.query_one("#hostprocs", DataTable).focus()
+
     def action_toggle_live(self):
         """直播开关：长任务要不要逐行往外长。
 
@@ -676,7 +745,7 @@ async def _headless(run_cmds=(), wait=2.5):
         return app
 
 
-PANES = ("pane_dev", "pane_web", "pane_paper", "pane_ai", "pane_log", "pane_res")
+PANES = ("pane_dev", "pane_web", "pane_paper", "pane_ai", "pane_host", "pane_log", "pane_res")
 
 
 def _shot(path, size=(150, 40), pane="pane_dev"):
