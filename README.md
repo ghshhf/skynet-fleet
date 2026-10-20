@@ -19,6 +19,7 @@
   - **离线队列 + 上线重放（Phase 4 体验）**：节点离线时命令进队，上线自动补，不手动重发。
   - **她 P4 能力请求 + 授权门**：她的节点发 `cap_req` → 路由到用户批准 → `cap_grant` 限时会话（拒绝则执念+1）。人格/训练交手机（不在此仓库训）。
   - **她的人格运行时（P3/P4/P5）**：节点侧 `--persona-daemon` 跑心念 tick——到点先过刹车（频控 ≤2/h + 静默时段 + 重要度），再主动开口（`her_speak`）+ 发能力请求；批准=限时会话+心情↑，拒绝=执念+1，被抑制的话只写进她的「心事」（L3，逐条可删）。
+  - **人格唯一性（定调）**：全编队**统一由一个模型**承载她——人格/记忆/状态都注入同一个 model，节点是薄客户端、**不各自孕育人格**（故不存在人格分裂）；`persona_state.json` 只属「她本体节点」。详见计划书 §5.1。
   - **反向推送 bootstrap（第三原则）**：中心起迷你 HTTP 分发几 KB bootstrap + 工具箱，loopback 字节校验一致。
   - **共享算力池（§九 dev_pick）**：节点上报 CPU/GPU/模型；Commander 按「谁能干」路由计算任务；`computemap` 批量分发多节点聚合；结果进共享上下文缓存，全编队复用（更加一步共享）。
   - **远程 AI 即服务（RFC 合入，真·流式）**：不是每台设备都装得动 / 值得装 AI——瘦客户端（电视/盒子/临时网吧机/老本子）**不持有权重**，经 Commander 把 prompt + L3 共享上下文路由到「有脑」的 AI 节点（她本人跑在手机/盒子），**一边想一边说**逐段回吐；`ai`/`ainodes` 两条 REPL + `remote_ai_client.py` 瘦客户端（`--stream`）。
@@ -69,7 +70,7 @@ skynet-fleet/
 ├── install_windows.py   # Windows L1 常驻安装器（SYSTEM 计划任务 + 密码/令牌双闸）
 ├── install_linux.py     # Linux L1 常驻安装器（systemd root 服务 + 同款双闸）
 ├── memory.py            # L3 共享上下文（SQLite+FTS5，逐条可删）
-├── persona.py           # 她脚手架（人格态/心念tick频控/能力请求门/红线）
+├── persona.py           # 她脚手架（人格态/心念tick频控/能力请求门/红线）；人格态只属「她本体节点」
 ├── bootstrap.py         # 第三原则反向推送：中心分发 bootstrap + 工具箱
 ├── compute_runner.py    # 共享算力：节点侧本地推理接口（委托 llm.py）
 ├── llm.py               # 本地推理适配层：多后端（CMD/URL/占位）+ 真·流式，改环境变量即切换
