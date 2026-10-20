@@ -15,6 +15,16 @@
   （worker 只攒进队列 + `call_from_thread`，主线程负责写进界面）。
   联网作业是唯一会跑几分钟的活，它的每一行都经 `_on_job_line` 实时回流，
   界面上才有真进度条和收获流，而不是一句干巴巴的「在跑」。
+
+  用户原话——"web 会耗时很长，所以如果一个屏不刷新，他就看不到收获"。
+  因此回流受一个**直播开关**（默认开，ctrl+b 切换）管：开着，长任务逐行
+  往外长；关着，界面不被刷屏、只在收工时报一句"共 N 行"。回流目标也分屏——
+  总日志（输出页）永远收一份；论文的活额外喂给「论文」页、联网的活额外喂给
+  「联网」页，这两屏才是长任务时人真正盯着的地方。
+
+  标签页（顶部横排，仿网页）：设备 / 联网(netforce) / 论文 / 输出 / 结果。
+  「论文」页上半行显示今日论文数与来源分布，下面是全屏 RichLog，web.papers
+  跑起来这一屏就一行行长出来；「联网」页左侧站群表、右侧收获流。
 """
 from __future__ import annotations
 
@@ -68,10 +78,14 @@ ProgressBar { height: 1; }
 TabbedContent { height: 100%; }
 TabPane { padding: 0; }
 #pane_dev, #pane_web { layout: horizontal; }
+#pane_paper { layout: vertical; }
 #devices { width: 34; }
 #caps { width: 1fr; }
-#sites { width: 1fr; }
-#papers { width: 1fr; }
+#sites { width: 56; }
+#weblog { width: 1fr; }
+#paperline { height: 1; padding: 0 1; color: #8b949e; background: #161b22; }
+#papers { height: 8; }
+#paperlog { height: 1fr; }
 DataTable { height: 100%; background: #0d1117; }
 RichLog { height: 100%; background: #0d1117; }
 #cmd { border: round #58a6ff; background: #161b22; }
@@ -90,6 +104,8 @@ class FleetTUI(App):
         ("ctrl+e", "focus_cmd", "命令行"),
         ("ctrl+d", "focus_devices", "设备"),
         ("ctrl+w", "focus_web", "联网"),
+        ("ctrl+p", "focus_papers", "论文"),
+        ("ctrl+b", "toggle_live", "直播"),
         ("ctrl+r", "refresh", "重新探测"),
         ("ctrl+c", "stop_job", "叫停"),
         ("ctrl+s", "save", "落盘"),
@@ -113,11 +129,13 @@ class FleetTUI(App):
         self._dev_rows = []
         self._cap_rows = []
         self._rendered = 0          # 真正写进界面的块数（门禁里可断言）
+        self._live = True           # 直播开关：作业每吐一行就长一行（默认开）
         # 当前在跑的联网作业：进度靠它算，叫停也靠它
         self._job_cap = ""
         self._job_done = 0
         self._job_total = 0
         self._job_steps = 0
+        self._job_lines = 0
         self._job_t0 = 0.0
         self._job_minutes = 0.0
         self._job_tick = None
@@ -139,7 +157,15 @@ class FleetTUI(App):
             with TabPane("联网", id="pane_web"):
                 with Horizontal():
                     yield DataTable(id="sites", zebra_stripes=True)
+                    yield RichLog(id="weblog", wrap=True,
+                                  highlight=False, markup=False)
+            with TabPane("论文", id="pane_paper"):
+                with Vertical():
+                    yield Static("论文页：跑 web.papers 后这一屏会逐行长出来",
+                                 id="paperline")
                     yield DataTable(id="papers", zebra_stripes=True)
+                    yield RichLog(id="paperlog", wrap=True,
+                                  highlight=False, markup=False)
             with TabPane("输出", id="pane_log"):
                 yield RichLog(id="log", wrap=True, highlight=False, markup=False)
             with TabPane("结果", id="pane_res"):
@@ -195,6 +221,14 @@ class FleetTUI(App):
     # 用 call_from_thread 就没有这问题——它是事件循环自己的跨线程入口。
 
     def _on_job_line(self, line):
+        """worker 线程：作业吐一行。
+
+        直播开着重在"人能看见东西长出来"——每行都往界面递一次；
+        关着就一行都不递（界面不刷新），只把行数攒着，收工时一并汇报。
+        """
+        if not self._live:
+            self._job_lines += 1
+            return
         self._stream.append(str(line))
         self.call_from_thread(self._drain_stream)
 
@@ -204,17 +238,34 @@ class FleetTUI(App):
         self.call_from_thread(self._paint_results)
 
     def _drain_stream(self):
-        """主线程：把联网作业吐出的行写进输出页，并据此推进度。"""
+        """主线程：把作业吐出的行喂给该去的那一屏，并据此推进度。
+
+        总日志（输出页）永远收一份，免得切走之后什么都看不见；
+        论文的活额外喂给论文页、联网的活额外喂给联网页——
+        这两屏才是长任务时人真正盯着的地方。
+        """
         if not self._stream:
             return
-        log = self.query_one("#log", RichLog)
         lines = self._stream
         self._stream = []
+        log = self.query_one("#log", RichLog)
+        extra = self._stream_target()
         for ln in lines:
             log.write(Text(ln, style="dim"))
+            if extra is not None:
+                extra.write(Text(ln, style="dim"))
             self._absorb(ln)
+            self._job_lines += 1
         self._rendered += len(lines)
         self._show_job()
+
+    def _stream_target(self):
+        """这一趟作业的收获该落在哪一屏。"""
+        if self._job_cap == "web.papers":
+            return self.query_one("#paperlog", RichLog)
+        if self._job_cap.startswith("web."):
+            return self.query_one("#weblog", RichLog)
+        return None
 
     def _absorb(self, line):
         """从一行里认领进度。认不出就只记步数，绝不假装有精确进度。"""
@@ -328,6 +379,29 @@ class FleetTUI(App):
                           (i.get("title") or "")[:52])
         else:
             p.add_row("—", "", (papers.err if papers else "联网层没装")[:40])
+        self._paint_paper_head(papers)
+
+    def _paint_paper_head(self, papers):
+        """论文页顶上那一句：今天攒了多少、从哪来的、现在有没有在抓。"""
+        head = Text()
+        if papers and papers.ok:
+            items = papers.data.get("items") or []
+            seen = []
+            for i in items:
+                s = i.get("src") or ""
+                if s and s not in seen:
+                    seen.append(s)
+            head.append(f"论文 {papers.data.get('day', '')}　"
+                        f"共 {papers.data.get('count', 0)} 篇",
+                        style="bold #58a6ff")
+            head.append(f"　来源 {'/'.join(seen) or '—'}", style="#8b949e")
+        else:
+            head.append("论文", style="bold #58a6ff")
+            head.append(f"　{(papers.err if papers else '联网层没装')[:44]}",
+                        style="#8b949e")
+        if self._job_cap == "web.papers":
+            head.append(f"　抓取中：已出 {self._job_lines} 行", style="bold #d29922")
+        self.query_one("#paperline", Static).update(head)
 
     def _paint_results(self):
         t = self.query_one("#results", DataTable)
@@ -355,6 +429,9 @@ class FleetTUI(App):
                        style="bold #3fb950" if on else "#f85149")
         txt.append(f"　在线 {b['online']}/{b['devices']} 台　{b['caps']} 项能力",
                    style="#8b949e")
+        txt.append("　直播", style="bold")
+        txt.append("开" if self._live else "关",
+                   style="bold #3fb950" if self._live else "#8b949e")
         if self._danger:
             txt.append("　⚠ 有待确认的破坏性操作（ctrl+y）", style="bold #f85149")
         st.update(txt)
@@ -391,6 +468,7 @@ class FleetTUI(App):
         head = (line.split() or [""])[0]
         self._job_cap = head if head.startswith("web.") else ""
         self._job_done = self._job_total = self._job_steps = 0
+        self._job_lines = 0
         self._job_t0 = time.time()
         self._job_minutes = 0.0
         if self._job_cap == "web.discover":
@@ -409,11 +487,25 @@ class FleetTUI(App):
         if self._job_tick:
             self._job_tick.stop()
             self._job_tick = None
+        cap = self._job_cap
         self._job_cap = ""
         self._job_done = self._job_total = self._job_steps = 0
         self._show_job()
+        if cap:
+            self._job_tail(cap)
         self._refresh()          # 收工后把新收获刷进那两张表
         self._tick_status()
+
+    def _job_tail(self, cap):
+        """收工那一句。直播关着的时候，这是这趟活唯一让人看见的东西。"""
+        txt = Text(f"── {cap} 收工：共 {self._job_lines} 行"
+                   + ("" if self._live else "（直播关着，中途没逐行刷新）"),
+                   style="bold #3fb950")
+        self.query_one("#log", RichLog).write(txt)
+        if cap == "web.papers":
+            self.query_one("#paperlog", RichLog).write(txt)
+        elif cap.startswith("web."):
+            self.query_one("#weblog", RichLog).write(txt)
 
     # ---------------- 选中即填 ----------------
 
@@ -450,7 +542,8 @@ class FleetTUI(App):
 
     def action_help(self):
         self.shell.dispatch("help")
-        self.shell.say("右表选中回车即把能力名提到命令行；联网作业按 ctrl+c 叫停",
+        self.shell.say("右表选中回车即把能力名提到命令行；ctrl+p 进论文页，"
+                       "ctrl+w 进联网页，ctrl+b 开关直播，联网作业按 ctrl+c 叫停",
                        level="info")
 
     def action_clear_log(self):
@@ -483,6 +576,23 @@ class FleetTUI(App):
         self.query_one("TabbedContent", TabbedContent).active = "pane_web"
         self.query_one("#sites", DataTable).focus()
 
+    def action_focus_papers(self):
+        self.query_one("TabbedContent", TabbedContent).active = "pane_paper"
+        self.query_one("#paperlog", RichLog).focus()
+
+    def action_toggle_live(self):
+        """直播开关：长任务要不要逐行往外长。
+
+        开着（默认）—— 联网的活一跑就是几分钟到几小时，屏幕不刷新
+        人就等于没看见收获，不知道它是在干活还是已经死了。
+        关着 —— 界面不再被刷屏，只在收工时汇报一句（含总行数）。
+        """
+        self._live = not self._live
+        self.shell.say(f"直播已{'开' if self._live else '关'}："
+                       + ("长任务逐行长出来" if self._live
+                          else "长任务只在收工时汇报一句"), level="info")
+        self._tick_status()
+
     def action_history_prev(self):
         if not isinstance(self.focused, Input) or not self._hist:
             return
@@ -512,7 +622,10 @@ async def _headless(run_cmds=(), wait=2.5):
         return app
 
 
-def _shot(path, size=(150, 40), web=False):
+PANES = ("pane_dev", "pane_web", "pane_paper", "pane_log", "pane_res")
+
+
+def _shot(path, size=(150, 40), pane="pane_dev"):
     """headless 起界面、跑几条命令、把这一屏导出成 SVG（给人看它长什么样）。"""
 
     async def go():
@@ -522,9 +635,8 @@ def _shot(path, size=(150, 40), web=False):
             for c in ("devices", "pc.state", "web.status"):
                 app._submit(c)
                 await pilot.pause(1.2)
-            # 停在哪一页就截哪一页：默认截设备页，指定 --shot-web 截联网页
-            if web:
-                app.query_one("TabbedContent", TabbedContent).active = "pane_web"
+            # 停在哪一页就截哪一页：默认截设备页
+            app.query_one("TabbedContent", TabbedContent).active = pane
             await pilot.pause(0.8)
             return app.export_screenshot()
 
@@ -589,11 +701,13 @@ def main(argv=None):
     ap.add_argument("--interval", type=float, default=20.0, help="设备事件探测间隔秒")
     ap.add_argument("--shot", default="", help="不进交互：把界面导出成 SVG（给人看长什么样）")
     ap.add_argument("--shot-web", action="store_true",
-                    help="配合 --shot：截联网那一页（默认是设备页）")
+                    help="配合 --shot：截联网那一页")
+    ap.add_argument("--shot-pane", default="pane_dev", choices=PANES,
+                    help="配合 --shot：停在哪一页截图")
     ap.add_argument("--smoke", action="store_true", help="不进交互：headless 跑一遍自检")
     a = ap.parse_args(argv)
     if a.shot:
-        return _shot(a.shot, web=a.shot_web)
+        return _shot(a.shot, pane=("pane_web" if a.shot_web else a.shot_pane))
     if a.smoke:
         return _smoke()
     FleetTUI(interval=a.interval).run()
