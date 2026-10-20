@@ -55,6 +55,14 @@ CAP_REQ = "cap_req"           # node(她) -> commander: {cap, reason}
 CAP_GRANT = "cap_grant"       # commander -> node(她): {cap, session_min, token}
 CAP_DENY = "cap_deny"         # commander -> node(她): {cap, reason}
 
+# ---- 账号与分权（主号/分号，见 accounts.py）----
+LOGIN = "login"               # client -> commander: {user, password}
+LOGIN_RESULT = "login_res"    # commander -> client: {ok, token, role, exp, err}
+GRANT_MAKE = "grant_make"     # owner -> commander: {target, kind}
+GRANT_RESULT = "grant_res"    # commander -> owner: {code, uri, exp, err}
+GRANT_REDEEM = "grant_redeem"  # client -> commander: {code | uri}
+GRANT_REDEEM_RESULT = "grant_redeem_res"  # commander -> client: {ok, target, role, err}
+
 HEADER = 4  # 长度前缀字节数
 
 # 演示用执行白名单（真实部署须收紧 + 走 Tailscale）

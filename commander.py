@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 
+import accounts
 import arbiter
 import common
 import enroll
@@ -264,14 +265,21 @@ GATED_OPS = ("exec", "broadcast", "push", "pull", "compute", "computemap", "ui",
              "intent", "cap批准")
 
 
-def _gate(op):
-    """发令类命令的统一闸门：只有领袖控制面放行。
+def _gate(op, role=None):
+    """发令类命令的统一闸门：**先查分权，再查仲裁**。
 
-    为什么要闸门而不是「随便哪台都能发」：两台控制面各发各的，状态立刻分叉，
-    她在备用面被批的能力主面不认——「一个意图扇出所有设备」就破了产。
-    闸门读**实时**共享状态（不是内存快照），领袖死后备用最坏一个 TTL 内接管。
-    状态文件坏了/读不到 -> 放行（单机常态不能被一份坏文件摁死；仲裁是协同不是安全）。
+    顺序不能反：没权限就不该发令，跟本机是不是领袖无关。分号即使占了领袖位，
+    「exec」也该被拒；反过来，有权限但本机在待机，就得等领袖退位。
+    两道闸的失败语义也不同——分权是**安全**（拒绝即拒绝，不看运气），
+    仲裁是**协同**（状态文件坏了就放行，不能被一份坏文件把单机摁死）。
+
+    角色来源：登录令牌（第 3 步接 CLI 后由令牌带入）；当前单主号在役，
+    未显式传入时回落 `FLEET_ROLE`（默认 owner）。分号显式传 `role="sub"`。
     """
+    role = role if role is not None else os.environ.get("FLEET_ROLE", "owner")
+    if not accounts.can(role, op):
+        print(f"[权限] {accounts.deny_reason(role, op)}", flush=True)
+        return False
     try:
         st = arbiter.status(ARBITER_PATH)
     except Exception:
@@ -1324,6 +1332,22 @@ def self_test(host, port, password):
     # 幽灵退出（释放让位）：本机立即恢复发令，不等 TTL
     arbiter.release(ARBITER_PATH, phantom)
     _cmd_exec("PC-A", "echo 接管后恢复发令")
+
+    print("\n=== 分权（主号可发令，分号只能被控）===", flush=True)
+    # 闸门顺序：先分权后仲裁。分号即使本机是领袖也必须被拒。
+    a_sub = _gate("exec", role="sub")
+    a_owner = _gate("exec", role="owner")
+    a_ghost = _gate("exec", role="ghost")
+    print(f"  分号发 exec -> {a_sub}（应 False）")
+    print(f"  主号发 exec -> {a_owner}（应 True）")
+    print(f"  未知角色   -> {a_ghost}（应 False，fail-closed）")
+    assert a_sub is False and a_owner is True and a_ghost is False
+    # 权限矩阵必须覆盖闸门清单：漏一个动作就等于给自己留了一道后门
+    leaked = [o for o in GATED_OPS if accounts.can("sub", o)]
+    print(f"  分号还能触碰的闸门动作: {leaked}（应为空）")
+    assert not leaked, f"权限矩阵漏了这些动作：{leaked}"
+    print(f"  分号可见范围: {accounts.nodes_of.__name__} 只返回自己名下节点"
+          f"（主号返回 None = 全部）")
 
     print("\n=== 自检：本机经密码控制另一台(PC-A) ===", flush=True)
     _cmd_nodes()
