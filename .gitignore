@@ -9,6 +9,7 @@ node_modules/
 
 # 运行时凭据/状态（不入库）
 .fleet_tokens.json
+local.env
 .fleet_pw.json
 .fleet_enroll_used.json
 fleet_enroll.json
