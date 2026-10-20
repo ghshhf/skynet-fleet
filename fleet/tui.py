@@ -755,7 +755,10 @@ def _shot(path, size=(150, 40), pane="pane_dev"):
         app = FleetTUI()
         async with app.run_test(size=size) as pilot:
             await pilot.pause(3.0)
-            for c in ("devices", "pc.state", "web.status"):
+            # 每页都要有真东西在画面上：设备页看清单，host.* 喂「主机」页
+            # （资源条/进程表/盲文预览），web.status 喂「联网」页。
+            for c in ("devices", "pc.state", "web.status",
+                      "host.monitor", "host.apps", "host.screen"):
                 app._submit(c)
                 await pilot.pause(1.2)
             # 停在哪一页就截哪一页：默认截设备页
