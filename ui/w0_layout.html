@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>设备编队 · Windows 图形版 W0 排版稿</title>
+<style>
+/* ==========================================================================
+   W0 静态排版稿：只定「长什么样」，不连任何后端、不调任何能力。
+   参照对象：WorkBuddy 桌面端（浅色三栏 + 顶部菜单条 + 底部输入区 + 悬浮助手）。
+   经典同款：LobeChat / Cherry Studio / Chatbox / Material You 系。
+   ========================================================================== */
+:root{
+  --bg:#f7f8fa; --panel:#ffffff; --panel-2:#f2f3f5; --sidebar:#f4f5f7;
+  --line:#e3e5e8; --line-soft:#edeef0;
+  --fg:#1b1d21; --fg-2:#5c626d; --fg-3:#8f959e;
+  --accent:#2f6bd8; --accent-soft:#e8effc;
+  --user:#eef0f3; --danger:#d8453c; --ok:#1f9d55;
+  --radius:10px; --radius-lg:14px;
+  --shadow:0 1px 2px rgba(16,20,28,.06),0 8px 24px rgba(16,20,28,.06);
+  --mono:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;
+}
+html[data-theme="dark"]{
+  --bg:#15171a; --panel:#1b1e22; --panel-2:#22262b; --sidebar:#181b1f;
+  --line:#2b3036; --line-soft:#24282d;
+  --fg:#e6e8eb; --fg-2:#a2a9b3; --fg-3:#6f7681;
+  --accent:#5b8def; --accent-soft:#1e2a3f;
+  --user:#242930;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--fg);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+  overflow:hidden;
+}
+.app{display:flex;flex-direction:column;height:100vh}
+
+/* ---------- 顶部菜单条（照 WorkBuddy：极简一排） ---------- */
+.titlebar{
+  height:38px;flex:0 0 38px;display:flex;align-items:center;gap:2px;
+  padding:0 6px 0 10px;background:var(--panel);border-bottom:1px solid var(--line);
+  user-select:none;
+}
+.tb-logo{display:flex;align-items:center;gap:7px;padding-right:10px;font-weight:600;font-size:13px}
+.tb-mark{width:18px;height:18px;border-radius:5px;
+  background:linear-gradient(135deg,var(--accent),#8b5cf6);
+  display:grid;place-items:center;color:#fff;font-size:11px;font-weight:700}
+.tb-menu{display:flex;align-items:center;gap:1px}
+.tb-menu span{padding:4px 9px;border-radius:6px;font-size:12.5px;color:var(--fg-2);cursor:default}
+.tb-menu span:hover{background:var(--panel-2);color:var(--fg)}
+.tb-menu .kbd{font-size:10.5px;color:var(--fg-3);margin-left:4px}
+.tb-spacer{flex:1}
+.tb-win{display:flex;gap:2px}
+.tb-win i{width:30px;height:26px;display:grid;place-items:center;border-radius:6px;
+  color:var(--fg-3);font-style:normal;font-size:11px}
+.tb-win i:hover{background:var(--panel-2);color:var(--fg)}
+.tb-win i.close:hover{background:var(--danger);color:#fff}
+
+/* ---------- 主体三栏 ---------- */
+.body{flex:1;display:flex;min-height:0}
+
+/* 左栏 */
+.sidebar{
+  width:212px;flex:0 0 212px;background:var(--sidebar);
+  border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;
+}
+.sb-brand{padding:12px 14px 10px;display:flex;align-items:center;gap:9px}
+.sb-mark{width:26px;height:26px;border-radius:8px;flex:0 0 26px;
+  background:linear-gradient(135deg,var(--accent),#8b5cf6);
+  display:grid;place-items:center;color:#fff;font-weight:700;font-size:12px}
+.sb-brand b{font-size:13.5px;display:block;line-height:1.25}
+.sb-brand small{font-size:10.5px;color:var(--fg-3);font-family:var(--mono)}
+.sb-discover{
+  margin:2px 12px 10px;padding:7px 10px;border:1px solid var(--line);
+  border-radius:8px;background:var(--panel);display:flex;align-items:center;gap:7px;
+  font-size:12.5px;color:var(--fg-2);cursor:pointer;
+}
+.sb-discover:hover{border-color:var(--accent);color:var(--fg)}
+.sb-discover .grow{flex:1}
+.sb-nav{padding:0 8px}
+.sb-item{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:8px;
+  font-size:13px;color:var(--fg-2);cursor:pointer;margin-bottom:1px}
+.sb-item:hover{background:var(--panel);color:var(--fg)}
+.sb-item.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.sb-item .ic{width:16px;height:16px;flex:0 0 16px;opacity:.9}
+.sb-item .tag{font-size:9.5px;padding:1px 5px;border-radius:5px;
+  background:var(--panel-2);color:var(--fg-3);font-weight:500}
+.sb-sec{margin:14px 12px 6px;font-size:11px;color:var(--fg-3);display:flex;
+  justify-content:space-between;align-items:center}
+.sb-sec .cnt{font-family:var(--mono);font-size:10.5px}
+.sb-list{flex:1;overflow-y:auto;padding:0 8px 8px}
+.sb-conv{padding:7px 9px;border-radius:8px;font-size:12.5px;color:var(--fg-2);
+  cursor:pointer;margin-bottom:2px;display:flex;gap:8px;align-items:center}
+.sb-conv:hover{background:var(--panel)}
+.sb-conv.on{background:var(--panel);color:var(--fg);font-weight:500}
+.sb-conv .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:0 0 6px}
+.sb-conv .txt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-foot{padding:9px 12px;border-top:1px solid var(--line);display:flex;
+  align-items:center;gap:9px;font-size:12.5px;color:var(--fg-2)}
+.sb-foot .ava{width:24px;height:24px;border-radius:50%;background:var(--accent);
+  color:#fff;display:grid;place-items:center;font-size:11px}
+
+/* 中栏 */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--panel)}
+.main-head{height:46px;flex:0 0 46px;display:flex;align-items:center;padding:0 16px;
+  border-bottom:1px solid var(--line-soft);gap:10px}
+.main-head h1{font-size:14.5px;font-weight:600}
+.main-head .sub{font-size:11.5px;color:var(--fg-3);font-family:var(--mono)}
+.main-head .grow{flex:1}
+.hbtn{width:28px;height:28px;border-radius:7px;display:grid;place-items:center;
+  color:var(--fg-3);cursor:pointer}
+.hbtn:hover{background:var(--panel-2);color:var(--fg)}
+
+/* 消息流 */
+.stream{flex:1;overflow-y:auto;padding:22px 0 8px}
+.stream-in{max-width:760px;margin:0 auto;padding:0 28px}
+.msg{margin-bottom:26px}
+.msg.user{display:flex;justify-content:flex-end}
+.msg.user .bubble{max-width:78%;background:var(--user);padding:9px 13px;
+  border-radius:var(--radius-lg);font-size:13.5px;line-height:1.62}
+.msg.bot{display:flex;gap:11px}
+.msg.bot .ava{width:26px;height:26px;flex:0 0 26px;border-radius:8px;
+  background:linear-gradient(135deg,var(--accent),#8b5cf6);
+  display:grid;place-items:center;color:#fff;font-size:11px;font-weight:700}
+.msg.bot .body{flex:1;min-width:0}
+.msg.bot .who{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--fg-3);
+  margin-bottom:6px}
+.msg.bot .who b{color:var(--fg);font-size:12.5px}
+.msg.bot .who .pill{font-size:10.5px;padding:1px 6px;border-radius:6px;
+  background:var(--panel-2);color:var(--fg-3);font-family:var(--mono)}
+.msg.bot .txt{font-size:13.5px;line-height:1.72}
+.msg.bot .txt p{margin:0 0 9px}
+.msg.bot .txt p:last-child{margin-bottom:0}
+.msg.bot .txt .hl{background:var(--accent-soft);color:var(--accent);padding:0 4px;
+  border-radius:4px;font-family:var(--mono);font-size:12.5px}
+.msg.bot .txt ul{margin:0 0 9px;padding-left:18px}
+.msg.bot .txt li{margin:2px 0}
+.msg.bot .txt code{font-family:var(--mono);font-size:12.5px;background:var(--panel-2);
+  padding:1px 5px;border-radius:4px}
+.actbar{display:flex;align-items:center;gap:3px;margin-top:9px;opacity:.65}
+.actbar i{width:24px;height:24px;border-radius:6px;display:grid;place-items:center;
+  color:var(--fg-3);font-style:normal;font-size:12px;cursor:pointer}
+.actbar i:hover{background:var(--panel-2);color:var(--fg);opacity:1}
+.actbar .meta{margin-left:6px;font-size:11px;color:var(--fg-3);font-family:var(--mono)}
+
+/* 语音状态条 */
+.voicebar{margin:0 28px 8px;max-width:760px;margin-inline:auto;
+  border:1px solid var(--line);border-radius:var(--radius);background:var(--panel-2);
+  padding:9px 13px;display:flex;align-items:center;gap:11px;font-size:12.5px}
+.voicebar .mic{width:26px;height:26px;border-radius:50%;background:var(--danger);
+  color:#fff;display:grid;place-items:center;flex:0 0 26px;animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(216,69,60,.5)}50%{box-shadow:0 0 0 7px rgba(216,69,60,0)}}
+.voicebar .wv{display:flex;align-items:center;gap:2.5px;height:18px}
+.voicebar .wv b{width:2.5px;border-radius:2px;background:var(--danger);display:block}
+.voicebar .grow{flex:1}
+.voicebar .hint{color:var(--fg-3);font-size:11.5px}
+
+/* 底部输入区 */
+.composer{flex:0 0 auto;border-top:1px solid var(--line-soft);padding:12px 0 10px;
+  background:var(--panel)}
+.comp-in{max-width:760px;margin:0 auto;padding:0 28px}
+.comp-box{border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--bg);
+  padding:10px 12px 8px;transition:border-color .15s}
+.comp-box:focus-within{border-color:var(--accent)}
+.comp-ph{font-size:13.5px;color:var(--fg-3);min-height:22px}
+.comp-row{display:flex;align-items:center;gap:4px;margin-top:6px}
+.cbtn{height:27px;padding:0 9px;border-radius:7px;display:flex;align-items:center;gap:5px;
+  font-size:12px;color:var(--fg-2);cursor:pointer}
+.cbtn:hover{background:var(--panel-2);color:var(--fg)}
+.cbtn.mic{margin-left:auto;width:27px;padding:0;justify-content:center}
+.cbtn.mic.on{background:var(--danger);color:#fff}
+.cbtn .kbd{font-size:10px;color:var(--fg-3);font-family:var(--mono)}
+.comp-model{display:flex;align-items:center;gap:7px;padding:6px 10px;border-radius:8px;
+  font-size:12px;color:var(--fg-2);cursor:pointer;margin-top:6px;justify-content:flex-end}
+.comp-model:hover{background:var(--panel-2)}
+.comp-model b{font-weight:600;color:var(--fg)}
+.comp-model .m{font-family:var(--mono);font-size:11px}
+
+/* 右下角悬浮助手（桌宠位） */
+.pet{position:fixed;right:18px;bottom:74px;width:44px;height:44px;border-radius:50%;
+  background:linear-gradient(135deg,#3b82f6,#8b5cf6);box-shadow:var(--shadow);
+  display:grid;place-items:center;color:#fff;font-size:20px;cursor:pointer}
+.pet:hover{transform:translateY(-2px)}
+
+/* 标注层（W0 稿的说明气泡） */
+.note{position:fixed;background:#111;color:#fff;font-size:11.5px;padding:6px 9px;
+  border-radius:7px;box-shadow:0 6px 20px rgba(0,0,0,.28);pointer-events:none;
+  font-family:var(--mono);line-height:1.5;z-index:9}
+.note b{color:#7dd3fc;font-weight:600}
+.kbdhint{position:fixed;left:222px;bottom:10px;font-size:11px;color:var(--fg-3);
+  font-family:var(--mono)}
+.themebtn{position:fixed;left:228px;top:44px;z-index:8}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- 顶栏 -->
+  <div class="titlebar">
+    <div class="tb-logo"><span class="tb-mark">F</span>设备编队</div>
+    <div class="tb-menu">
+      <span>文件<span class="kbd">Ctrl+F</span></span>
+      <span>编辑<span class="kbd">Ctrl+E</span></span>
+      <span>窗口<span class="kbd">Ctrl+W</span></span>
+      <span>帮助<span class="kbd">Ctrl+H</span></span>
+      <span>关于</span>
+    </div>
+    <div class="tb-spacer"></div>
+    <div class="tb-win"><i>—</i><i>▢</i><i class="close">✕</i></div>
+  </div>
+
+  <div class="body">
+    <!-- 左栏 -->
+    <aside class="sidebar">
+      <div class="sb-brand">
+        <div class="sb-mark">编</div>
+        <div><b>设备编队</b><small>v0.1 · W0 稿</small></div>
+      </div>
+
+      <div class="sb-discover">
+        <span>◈</span><span class="grow">发现应用</span><span>⌄</span>
+      </div>
+
+      <nav class="sb-nav">
+        <div class="sb-item on"><span class="ic">◉</span>新建任务</div>
+        <div class="sb-item"><span class="ic">◐</span>助理<span class="tag">BETA</span></div>
+        <div class="sb-item"><span class="ic">⌘</span>专家技能·连接器</div>
+        <div class="sb-item"><span class="ic">⏱</span>定时任务</div>
+        <div class="sb-item"><span class="ic">▤</span>资料库</div>
+        <div class="sb-item"><span class="ic">⋯</span>更多<span class="tag">灵感</span></div>
+      </nav>
+
+      <div class="sb-sec"><span>任务</span><span class="cnt">(0)</span></div>
+      <div class="sb-sec"><span>空间</span><span class="cnt">(1)</span></div>
+      <div class="sb-list">
+        <div class="sb-conv on"><span class="dot"></span><span class="txt">接入本地免费AI服务</span></div>
+        <div class="sb-conv"><span class="txt">电视去广告 + 换桌面</span></div>
+        <div class="sb-conv"><span class="txt">手机麦克风接入</span></div>
+        <div class="sb-conv"><span class="txt">角色卡调试</span></div>
+        <div class="sb-conv"><span class="txt">凌晨 2:30 安静时段</span></div>
+      </div>
+
+      <div class="sb-foot">
+        <span class="ava">寇</span>
+        <span class="grow">小鲸</span>
+        <span style="color:var(--fg-3)">⚙</span>
+      </div>
+    </aside>
+
+    <!-- 中栏 -->
+    <main class="main">
+      <div class="main-head">
+        <h1>接入本地免费AI服务</h1>
+        <span class="sub">registry: 6 devices / 43 caps</span>
+        <span class="grow"></span>
+        <div class="hbtn">⌕</div>
+        <div class="hbtn">↗</div>
+        <div class="hbtn">◫</div>
+      </div>
+
+      <div class="stream">
+        <div class="stream-in">
+
+          <div class="msg user">
+            <div class="bubble">把电视的广告去掉，顺便换成一个像 Apple TV 那样干净的桌面</div>
+          </div>
+
+          <div class="msg bot">
+            <div class="ava">编</div>
+            <div class="body">
+              <div class="who"><b>设备编队</b><span class="pill">人格: 大肥鱼 v3</span><span class="pill">已取消 43m31s</span></div>
+              <div class="txt">
+                <p>先说结论：电视去广告不需要 root，走 WiFi 局域网 ADB 就够，而且完全可逆。</p>
+                <ul>
+                  <li>核心命令是 <span class="hl">pm disable-user</span>——只在当前用户层停用组件，系统分区原封不动。</li>
+                  <li>改完想还原，跑一键恢复脚本，把被停用的包 <span class="hl">pm enable</span> 回来即可。</li>
+                  <li>前提是电视开着「网络 ADB 调试」，电脑和电视在同一个 Wi-Fi 下。</li>
+                </ul>
+                <p>不过动手前我得先确认两件事：你的电视是什么牌子型号（不同品牌开调试的路径不一样），以及那台电视能不能被无线 ADB 连上——三星和 LG 是不支持的，因为底层不是安卓。</p>
+              </div>
+              <div class="actbar">
+                <i title="复制">⧉</i><i title="赞">👍</i><i title="踩">👎</i>
+                <i title="朗读">🔊</i><i title="重新生成">↻</i>
+                <i title="分享">↗</i><i title="更多">⋯</i>
+                <span class="meta">minimax-M3.1 Flash · 05:25</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="msg user">
+            <div class="bubble">小米的那台，55 寸</div>
+          </div>
+
+          <div class="msg bot">
+            <div class="ava">编</div>
+            <div class="body">
+              <div class="who"><b>设备编队</b><span class="pill">人格: 大肥鱼 v3</span><span class="pill">已取消 43m31s</span></div>
+              <div class="txt">
+                <p>小米的话，在电视上按这个顺序开：</p>
+                <ul>
+                  <li>设置 → 关于 → 连点「版本号」7 次，进入开发者模式。</li>
+                  <li>返回设置 → 系统 → 开发者选项 → 打开 <span class="hl">USB 调试</span> 和 <span class="hl">网络调试</span>。</li>
+                  <li>注意小米国内特供固件有时会把「网络调试」单独锁掉，如果菜单里没有这一项，就要走别的路子。</li>
+                </ul>
+                <p>开好之后我这边扫网段找它，找到会先问你一句再动手——动电视是要过闸门的。</p>
+              </div>
+              <div class="actbar">
+                <i title="复制">⧉</i><i title="赞">👍</i><i title="踩">👎</i>
+                <i title="朗读">🔊</i><i title="重新生成">↻</i>
+                <i title="分享">↗</i><i title="更多">⋯</i>
+                <span class="meta">minimax-M3.1 Flash · 05:26</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="msg bot">
+            <div class="ava">编</div>
+            <div class="body">
+              <div class="who"><b>设备编队</b><span class="pill">正在听 · 语音</span></div>
+              <div class="txt">
+                <p>（这一条是语音转文字后的回复：把音量开到 12，然后截一张当前屏幕给我看。）</p>
+              </div>
+              <div class="actbar">
+                <i title="复制">⧉</i><i title="赞">👍</i><i title="踩">👎</i>
+                <i title="朗读">🔊</i><i title="重新生成">↻</i>
+                <i title="分享">↗</i>
+                <span class="meta">语音输入 · CER 0.125 · 05:27</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- 语音状态条 -->
+      <div class="voicebar" style="max-width:704px">
+        <span class="mic">●</span>
+        <span>正在听……</span>
+        <span class="wv">
+          <b style="height:6px"></b><b style="height:12px"></b><b style="height:17px"></b>
+          <b style="height:9px"></b><b style="height:14px"></b><b style="height:7px"></b>
+          <b style="height:16px"></b><b style="height:10px"></b><b style="height:5px"></b>
+        </span>
+        <span class="grow"></span>
+        <span class="hint">说完自动转文字 · 两段式确认后才动手</span>
+      </div>
+
+      <!-- 底部输入区 -->
+      <div class="composer">
+        <div class="comp-in">
+          <div class="comp-box">
+            <div class="comp-ph">在这里输入，或按住说话……</div>
+            <div class="comp-row">
+              <span class="cbtn">＋</span>
+              <span class="cbtn">⊘ 允许浏览访问 <span class="kbd">⌄</span></span>
+              <span class="cbtn mic">🎙</span>
+            </div>
+          </div>
+          <div class="comp-model">
+            <span>◈</span><b>minimax-M3.1 Flash</b>
+            <span class="m">minimax-m3.1-flash</span><span>⌄</span>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 悬浮助手（桌宠位）：就是那只大肥鱼 -->
+<div class="pet" title="悬浮助手（人格载体）">🐳</div>
+
+<!-- W0 标注 -->
+<div class="note themebtn"><b>W0 静态稿</b>：不连后端</div>
+<div class="note" style="left:222px;top:78px"><b>① 左栏</b>：品牌 / 主导航 / 任务·空间 / 会话</div>
+<div class="note" style="left:230px;bottom:150px"><b>② 侧边</b>开关：可折叠</div>
+<div class="note" style="right:60px;top:60px"><b>③ 标题条</b>：页面名 + 注册表状态</div>
+<div class="note" style="right:20px;top:300px"><b>④ 消息流</b>：每条下方反馈条</div>
+<div class="note" style="right:24px;bottom:150px"><b>⑤ 语音条</b>：录音中 + 波形</div>
+<div class="note" style="right:24px;bottom:76px"><b>⑥ 输入区</b>：麦克风 + 浏览权限</div>
+<div class="note" style="right:20px;bottom:34px"><b>⑦ 模型选择</b>：右下</div>
+<div class="note" style="right:14px;bottom:56px"><b>⑧ 悬浮助手</b></div>
+<div class="kbdhint">W0 · 仅排版，无任何后端调用</div>
+
+<script>
+// 仅供切换明暗（不连后端、不发请求）
+document.querySelector('.themebtn').addEventListener('click',()=>{
+  const h=document.documentElement;
+  h.dataset.theme = h.dataset.theme==='light' ? 'dark' : 'light';
+});
+</script>
+</body>
+</html>
