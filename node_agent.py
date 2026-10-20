@@ -169,6 +169,8 @@ def _dispatch(s, m, name, sandbox):
             _do_exec(s, {"id": c["id"], "cmd": c["cmd"]})
     elif t == common.COMPUTE:
         _do_compute(s, m)
+    elif t == common.UI_SKIP:
+        _do_ui_skip(s, m)
     elif t == common.CAP_GRANT:
         print(f"[{name}] ✓ 收到授权 {m.get('cap')}（限 {m.get('session_min')}min，token={m.get('token','')[:8]}）", flush=True)
     elif t == common.CAP_DENY:
@@ -242,11 +244,101 @@ def _do_compute(s, m):
                             "out": "", "err": str(e)})
 
 
+_DEFAULT_UI_RULES = [{
+    "packageName": "*",
+    "triggers": [
+        {"name": "跳过", "action": "click", "text": ["跳过广告", "跳过"],
+         "textRegex": r"跳过|skip", "desc": ["关闭"]},
+    ],
+}]
+
+
+def _do_ui_skip(s, m, skip_fn=None):
+    """UI 自动化：在本节点挂载的 Android 设备上按规则跳过广告。
+
+    skip_fn 可注入（测试用），默认调 ui_automation.skip_ad。
+    无 adb / 无设备时返回 ok=False + err，不崩。
+    """
+    mid = m.get("id")
+    try:
+        if skip_fn is None:
+            ua_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_automation")
+            if ua_dir not in sys.path:
+                sys.path.insert(0, ua_dir)
+            import ui_automation as _ua
+            skip_fn = _ua.skip_ad
+        rules = m.get("rules") or _DEFAULT_UI_RULES
+        ok, log = skip_fn(m.get("serial"), m.get("package", ""), rules,
+                          rounds=int(m.get("rounds", 6)),
+                          use_vision=bool(m.get("use_vision", False)))
+        common.send_msg(s, {"t": common.UI_SKIP_RESULT, "id": mid, "ok": bool(ok),
+                            "log": list(log)[-20:], "err": ""})
+    except Exception as e:
+        common.send_msg(s, {"t": common.UI_SKIP_RESULT, "id": mid, "ok": False,
+                            "log": [], "err": str(e)})
+
+
+def _selftest():
+    """离线验证 UI_SKIP 能力接线（无需真机/adb）。"""
+    s = _FakeSock()
+    _do_ui_skip(s, {"id": "u1", "package": "com.x", "rounds": 1},
+                skip_fn=lambda serial, pkg, rules, rounds=6, use_vision=False:
+                (True, ["hit 跳过"]))
+    msgs = _read_msgs(s)
+    assert msgs and msgs[0]["t"] == common.UI_SKIP_RESULT and msgs[0]["ok"] is True, msgs
+    assert msgs[0]["id"] == "u1" and msgs[0]["log"] == ["hit 跳过"], msgs
+
+    s2 = _FakeSock()
+
+    def _boom(*a, **k):
+        raise RuntimeError("adb 不存在")
+
+    _do_ui_skip(s2, {"id": "u2", "package": "com.x"}, skip_fn=_boom)
+    msgs2 = _read_msgs(s2)
+    assert msgs2 and msgs2[0]["ok"] is False and "adb" in msgs2[0]["err"], msgs2
+
+    ua_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_automation")
+    if ua_dir not in sys.path:
+        sys.path.insert(0, ua_dir)
+    import ui_automation as ua
+    nodes = [{"text": "跳过 3s", "desc": "", "rid": "", "package": "com.x",
+              "cls": "", "clickable": True, "bounds": (10, 10, 20, 20)}]
+    n, c = ua.match(nodes, _DEFAULT_UI_RULES[0]["triggers"][0])
+    assert n and c == (15, 15), (n, c)
+    print("[selftest] UI_SKIP 正常路径回执 OK")
+    print("[selftest] UI_SKIP 异常路径 ok=False+err OK")
+    print("[selftest] 默认规则可被 ui_automation.match 消费 OK")
+    print("[selftest] PASS")
+
+
+class _FakeSock:
+    def __init__(self):
+        self.buf = b""
+
+    def sendall(self, b):
+        self.buf += b
+
+
+def _read_msgs(sock):
+    """解析 _FakeSock 累积的长度前缀帧。"""
+    import struct
+    out = []
+    buf = sock.buf
+    while len(buf) >= 4:
+        n = struct.unpack(">I", buf[:4])[0]
+        if len(buf) < 4 + n:
+            break
+        out.append(json.loads(buf[4:4 + n].decode("utf-8")))
+        buf = buf[4 + n:]
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true", help="离线自测 UI_SKIP 接线（不连网）")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
-    ap.add_argument("--name", required=True)
+    ap.add_argument("--name", default="", help="节点名（非 selftest 必填）")
     ap.add_argument("--password", default=os.environ.get("FLEET_PASSWORD", "changeme"))
     ap.add_argument("--platform", default="windows")
     ap.add_argument("--caps", default="exec,push,pull")
@@ -257,6 +349,11 @@ def main():
     ap.add_argument("--gpu", action="store_true", help="本节点有 GPU（路由优先）")
     ap.add_argument("--ram", type=int, default=0, help="本节点内存 GB（路由参考）")
     args = ap.parse_args()
+    if args.selftest:
+        _selftest()
+        return
+    if not args.name:
+        raise SystemExit("--name 必填（或使用 --selftest）")
     run_node(args.host, args.port, args.name, args.password, args.platform,
              args.caps, args.sandbox, bg=False, cap_req=args.cap_req, session=args.session,
              models=args.models, gpu=args.gpu, ram_gb=args.ram)

@@ -16,6 +16,7 @@ PY = sys.executable
 # (名字, 命令参数, 工作目录, 超时秒)
 CASES = [
     ("commander", ["commander.py", "--self-test", "--password", "demo123"], HERE, 120),
+    ("node_agent", ["node_agent.py", "--selftest"], HERE, 30),
     ("install_windows", ["install_windows.py", "--selftest", "--password", "demo123"], HERE, 90),
     ("ui_automation", ["ui_automation.py", "--selftest"], os.path.join(HERE, "ui_automation"), 30),
     ("rule_engine", ["rule_engine.py", "--selftest"], os.path.join(HERE, "rfc", "rule-engine"), 30),

@@ -396,10 +396,23 @@ def _cmd_queue(name):
     print(f"  {name} 离线队列: {len(q)} 条" + ("" if not q else " -> " + ", ".join(c['cmd'] for c in q)))
 
 
+def _cmd_ui(node, package, use_vision=False, rounds=6):
+    """UI 自动化：让节点在挂载的 Android 设备上按规则跳过广告（源自李跳跳拆解）。"""
+    r = send_to_node(node, {"t": common.UI_SKIP, "package": package,
+                            "use_vision": use_vision, "rounds": rounds})
+    if "log" not in r:          # 无 log = 传输层失败（不在线/超时/发送失败）
+        print(f"  失败: {r.get('err')}")
+        return
+    print(f"  → {node}: {'已跳过' if r.get('ok') else '未命中'}（{package or '*'}）")
+    for line in (r.get("log") or [])[-8:]:
+        print("   ", line)
+
+
 def repl():
     print("cmd> nodes | exec <节点> <命令> | broadcast <命令> | push <节点> <文件> | pull <节点> <远程> [输出]")
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
-    print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool | quit")
+    print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
+    print("      | ui <节点> <包名|*> [--vision] | quit")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -458,6 +471,10 @@ def repl():
                 _cmd_computemap(rest)
         elif op == "computepool":
             _cmd_computepool()
+        elif op == "ui":
+            sp = rest.split()
+            if len(sp) >= 2:
+                _cmd_ui(sp[0], sp[1], use_vision="--vision" in sp[2:])
         else:
             print("  未知命令")
 

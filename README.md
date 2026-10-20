@@ -20,13 +20,15 @@
   - **她 P4 能力请求 + 授权门**：她的节点发 `cap_req` → 路由到用户批准 → `cap_grant` 限时会话（拒绝则执念+1）。人格/训练交手机（不在此仓库训）。
   - **反向推送 bootstrap（第三原则）**：中心起迷你 HTTP 分发几 KB bootstrap + 工具箱，loopback 字节校验一致。
   - **共享算力池（§九 dev_pick）**：节点上报 CPU/GPU/模型；Commander 按「谁能干」路由计算任务；`computemap` 批量分发多节点聚合；结果进共享上下文缓存，全编队复用（更加一步共享）。
+  - **`ui_automation` 节点能力（源自李跳跳拆解）**：节点挂 Android 设备后用 adb 拉节点树 → 规则匹配（含 `textRegex` 抗文案漂移）→ `input tap`；匹配不到且标了 `needVision` 时走 AI 视觉兜底。控制面 `ui <节点> <包名> [--vision]`。
+  - **一键自测门禁**：`run_selftests.py` 串起 commander / node_agent / install_windows / ui_automation / rule_engine 五项离线自测。
 - **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、临时节点（网吧）会话注入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）。
 
-自测命令（loopback 多节点，不碰真机）：
+自测命令（全部离线，不碰真机、不需联网）：
 
 ```bash
-python commander.py --self-test --password demo123
-python install_windows.py --selftest --password demo123   # L1 常驻 + 令牌闸
+python run_selftests.py            # 一键跑全部（推荐）
+python run_selftests.py ui rule    # 只跑名字含 ui/rule 的
 ```
 
 ---
@@ -69,8 +71,15 @@ skynet-fleet/
 ├── platform_android.py  # Android 节点入网（adb 反向推送）
 ├── platform_apple.py    # Apple 桥接（macOS SSH / iOS 屏共 半可达）
 ├── platform_router.py   # 路由器/OpenWrt 节点（常开中枢候选）
+├── run_selftests.py     # 一键离线自测门禁（五项目）
+├── ui_automation/       # ui_automation 节点能力（李跳跳抽象：adb 节点树+规则+点击+视觉兜底）
+├── rfc/
+│   ├── remote-ai-service/   # RFC：远程 AI 即服务（瘦客户端）
+│   ├── free-compute-relay/  # RFC：免费外部算力中继（免 key 端点兜底）
+│   └── rule-engine/         # RFC：通用规则引擎（判断外置为数据）
 ├── docs/
-│   └── 个人设备编队与本地她_计划书.md   # 完整计划书（任务书）
+│   ├── 个人设备编队与本地她_计划书.md   # 完整计划书（任务书）
+│   └── 李跳跳拆解.md                   # 广告跳过软件拆解与启示
 ├── README.md
 └── LICENSE
 ```

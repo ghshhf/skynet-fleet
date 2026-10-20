@@ -45,6 +45,10 @@ TOKEN_RESULT = "token_res"    # commander -> 请求方: {token}（也经手机�
 COMPUTE = "compute"           # commander -> node: {id, prompt, model?}
 COMPUTE_RESULT = "compute_result"  # node -> commander: {id, ok, out, model}
 
+# ---- UI 自动化（无障碍跳广告 / 通用 UI 动作，源自李跳跳拆解）----
+UI_SKIP = "ui_skip"                 # commander -> node: {id, package, serial?, rounds?, use_vision?, rules?}
+UI_SKIP_RESULT = "ui_skip_result"   # node -> commander: {id, ok, log[], err}
+
 # ---- 她 P4 能力请求 + 授权门 ----
 CAP_REQ = "cap_req"           # node(她) -> commander: {cap, reason}
 CAP_GRANT = "cap_grant"       # commander -> node(她): {cap, session_min, token}
