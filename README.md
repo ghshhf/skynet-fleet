@@ -72,6 +72,37 @@ L4  体验/离线队列   「她」人格层            → 主动性、连续�
 
 ---
 
+## 联网层（`web.*`）
+
+编队原来只能碰本地设备（手机 / 本机 / 局域网 / 编队节点），**联网是空的**。
+联网层把两个外部项目当成「远程设备」接进同一张注册表——它们在注册表里跟手机没有
+本质区别：都是「有的能力现在能用，有的现在不能用，问一句才知道」。
+
+| 源 | 位置（外部，不纳入本仓） | 提供 |
+|---|---|---|
+| netforce | `D:/code/netforce` | 资源站发现 / 游戏 wiki 角色语料 / 站群扩散 |
+| ai_frontier_crawl | `train_15b/tools` | arXiv 12 类 + HF Papers + OpenAlex 中英论文 |
+
+| 能力 | 干什么 | 性质 |
+|---|---|---|
+| `web.status` | 联网层现状（两个源在不在 / 各攒了多少） | 只读 |
+| `web.discover` | 资源站发现（它自己是无限流，**必须限时**） | 动手 |
+| `web.corpus` | 游戏 wiki 角色语料 | 动手 |
+| `web.diffuse` | 站群扩散盘点（逐个判活） | 动手 |
+| `web.papers` | 前沿论文抓取 | 动手 |
+| `web.frontier` | 今天的论文清单 | 只读 |
+| `web.sites` | 站群活站清单 | 只读 |
+
+三条不直观的地方：
+
+- **一律走子进程，不 import 进来当函数调用。** netforce 的发现模式一跑就是到次日 6 点，
+  import 进来等于把无限循环塞进我们进程。子进程崩了也只是这一条作业失败。
+- **路径全走环境变量，对方仓库一个字不改。** `NETFORCE_HOME` / `PAPERS_HOME` /
+  `NETFORCE_DATA`（覆盖 netforce 默认的 `G:/_train_corpus_raw`）。没装就自动降级：
+  只塌那一组能力，其余照常。
+- **域是 `web.*` 不是 `net.*`。** 局域网那台扫描器早就占了 `net.scan` / `net.nearby`，
+  而能力名必须唯一——重名在注册表里会当场炸。
+
 ## 目录结构
 
 ```
@@ -98,7 +129,8 @@ skynet-fleet/
 ├── capabilities.py      # 能力自描述基线：{能力名: 说明书(参数 schema)}，编排的「发现面」
 ├── install_linux.py     # Linux L1 常驻安装器（systemd root 服务 + 密码/令牌双闸）
 ├── audit.py             # 控制面审计：append-only JSONL，旁路留痕（node.up/down 等）
-├── fleet/               # 设备层：契约（result/device/registry）+ 通道 + 设备种类 + 终端（两个显影面）
+├── fleet/               # 设备层：契约 + 通道 + 设备种类 + 联网作业执行器 + 终端（两个显影面）
+│   ├── netrunner.py     #   联网作业执行器：把外部爬虫包成「能起/能看/能停/能收」的作业
 ├── fleet_tui.py         # 全屏界面入口薄壳（PyInstaller 打包用；直接跑也行）
 ├── fleet-tui.bat        # Windows 双击进【全屏界面】
 ├── fleet-cli.bat        # Windows 双击进【命令行版】

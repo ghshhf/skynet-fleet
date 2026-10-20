@@ -87,13 +87,23 @@ class FleetCompleter(Completer):
 # ---------------------------------------------------------------- 状态栏
 
 def _status_bits(reg):
-    """三个数字：她在不在（控制面）/ 手机在不在（adb）/ 几台设备在线。"""
+    """四个灯：她在不在（控制面）/ 手机在不在（adb）/ 联网层在不在 / 几台设备在线。
+
+    联网层单独成一项：它跟 adb 那种"连没连上"不是一回事——
+    它在线不等于抓得到（源没装就是没装），所以状态栏要能一眼分出来是
+    「网络不在」还是「网络在但没装工具」。
+    """
     ctl = get_transport("control")
     her_ok, her_reason = ctl.available() if ctl else (False, "没有 control 通道")
     adb = get_transport("adb")
     phone_ok, phone_reason = adb.available() if adb else (False, "没有 adb 通道")
+    web_ok, web_reason = False, "没有联网层设备"
+    for row in reg.availability():
+        if row.get("name") == "web:net":
+            web_ok, web_reason = bool(row.get("ok")), row.get("reason") or ""
     st = reg.stats()
     return {"her": (her_ok, her_reason), "phone": (phone_ok, phone_reason),
+            "web": (web_ok, web_reason),
             "online": st["online"], "devices": st["devices"], "caps": st["caps"]}
 
 
@@ -163,6 +173,10 @@ class FleetShell:
         self._pending = []          # 输入行之前的「她的话」缓冲（测试里可断言）
         self.lines = []             # 实际提交的每一行（回放与验收用）
         self._confirm = False       # 本次调用是否已在命令行上预置 --yes
+        # 长任务逐行回调。只有 TUI 会挂它（画进度条 + 实时流），命令行留空。
+        self.line_hook = None
+        # 每次调用的结果回调。只有 TUI 会挂它（攒「结果」页），命令行留空。
+        self.result_hook = None
 
     # ---- 闸门：只读直接过，动手告知，破坏性必须显式确认 ----
 
@@ -276,6 +290,9 @@ class FleetShell:
             self._print(Panel(Text(f"{res.code}: {res.err}"),
                                      title=f"✗ {res.cap}", border_style="red", expand=False))
         self._pending.append(res.brief())
+        # TUI 的「结果」页靠它攒出历史。命令行不挂钩子，行为不变。
+        if self.result_hook is not None:
+            self.result_hook(res)
 
     # ---- 分发 ----
 
@@ -349,6 +366,10 @@ class FleetShell:
 
         kw = self.parse_args(cap, tokens[1:])
         device = kw.pop("device", "") or ""
+        # 联网作业这类长活要把它的输出行一路吐出来给人看。不给钩子时行为完全不变，
+        # 只是跑完拿结果——命令行模式就是这么用的。
+        if self.line_hook is not None:
+            kw["_on_line"] = self.line_hook
         # 行内写了 --yes 就不必再问一遍；TUI 的 ctrl+y 已预先置位，别把它冲掉
         pre = self._confirm
         self._confirm = pre or bool(kw.pop("yes", False))

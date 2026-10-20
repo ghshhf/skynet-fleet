@@ -9,9 +9,11 @@ verb 是动作；这样补全能按族分组，权限树也能按族授权。
 """
 import os
 
+from . import netrunner as NR
 from .core import Capability, Param, Registry
 from .kinds.android_phone import AndroidPhone
 from .kinds.fleet_node import FleetNode, load_nodes
+from .kinds.internet import Internet
 from .kinds.lan_scanner import LanScanner
 from .kinds.windows_pc import WindowsPC
 from .transports import get as get_transport
@@ -25,6 +27,19 @@ def _bridge_reason(reg, dev):
     t = get_transport("bridge")
     ok, reason = t.available() if t else (False, "没有 bridge 通道")
     return ok, reason
+
+
+def _netforce_reason(reg, dev):
+    """联网层分两个供应商，各自缺各自的——缺哪个，只有那几个能力下线。"""
+    if NR.netforce_cli():
+        return True, ""
+    return False, "没装 netforce：把 NETFORCE_HOME 指到它的仓库"
+
+
+def _papers_reason(reg, dev):
+    if NR.papers_cli():
+        return True, ""
+    return False, "没装论文爬虫：把 PAPERS_HOME 指到 train_15b"
 
 
 CAPABILITIES = [
@@ -87,16 +102,45 @@ CAPABILITIES = [
     Capability("file.pull", "从编队节点取文件",
                params=(Param("node", "str"), Param("path", "str", True)),
                side_effect=True, note="同上"),
+    # ---- 万维网（联网层）：外面的世界，经两个爬虫伸进去 ----
+    Capability("web.status", "联网层现状（两个源在不在 / 各攒了多少）",
+               note="只读：不联网也看得见本地已攒的"),
+    Capability("web.discover", "资源站发现（netforce 无限流，必须限时）",
+               params=(Param("minutes", "int", doc="跑几分钟就收，默认 3"),),
+               side_effect=True, check=_netforce_reason,
+               note="这活本身没有终点（原样跑到早上 6 点），所以由我们限时叫停"),
+    Capability("web.corpus", "游戏 wiki 角色语料（netforce）",
+               params=(Param("tag", "str", doc="站点代号，默认 blhx"),
+                       Param("limit", "int", doc="最多几个角色，默认 10")),
+               side_effect=True, check=_netforce_reason),
+    Capability("web.diffuse", "站群扩散盘点（netforce，逐个判活）",
+               params=(Param("limit", "int", doc="最多几个子站，默认 10"),),
+               side_effect=True, check=_netforce_reason),
+    Capability("web.papers", "前沿论文抓取（arXiv+HF+OpenAlex 中英）",
+               params=(Param("days", "int", doc="补抓近几天，默认 1"),),
+               side_effect=True, check=_papers_reason),
+    Capability("web.frontier", "今天的论文清单（只读，不联网）",
+               params=(Param("day", "str", doc="YYYY-MM-DD，默认今天"),),
+               check=_papers_reason),
+    Capability("web.sites", "站群活站清单（只读，不联网）",
+               check=_netforce_reason,
+               note="看的是本地已攒的那本账，跑 web.diffuse 才会涨"),
 ]
 
 
 def build(path=None, gate=None, ttl=5.0, with_nodes=True):
-    """组装注册表。设备按「先能验证的」顺序加：本机 → 手机 → 扫描器 → 编队节点。"""
+    """组装注册表。设备按「先能验证的」顺序加：本机 → 手机 → 扫描器 → 编队节点 → 万维网。
+
+    联网层排最后：前几台都要动真设备（adb / 端口 / 桥），联网是唯一一个
+    「不在场也能登记」的，且它的探测最慢（要起子进程）。放最后是为了让
+    「本机好不好使」这种第一手的判断先出结果，不被慢活拖住。
+    """
     reg = Registry(path=path if path is not None else DEVICES_PATH, gate=gate, ttl=ttl)
     reg.register_all(CAPABILITIES)
     reg.add(WindowsPC())
     reg.add(AndroidPhone())
     reg.add(LanScanner())
+    reg.add(Internet())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:
