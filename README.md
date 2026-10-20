@@ -37,7 +37,12 @@
   - **分权（`accounts.py`）**：账号是「人」，节点是「设备」，两维分开。**主号唯一**——能发令、能发码、能增删分号、能看全部；**分号只能被控**——没有发令权，只能看到自己名下节点（过滤在控制面做，不在客户端做，否则改个脚本就绕过了）。闸门顺序刻意是**先分权、再仲裁**：分号即使占了领袖位也拒，因为没有权限跟谁是领袖无关；两道闸失败语义也不同（分权是安全、拒绝即拒绝；仲裁是协同、状态文件坏了就放行）。令牌自带角色与过期时间，并带权限版本 `pv`——**吊销分号后旧令牌立刻作废**，不等自然过期。**授权码**（用户要的「密码生成器 / 扫码同步权限」）是**同一枚一次性码的两种呈现**：终端里念 6 位短码，手机上画二维码；6 位用去掉 0/O/1/I 的 32 字母表（≈10 亿组合）+ 5 分钟寿命 + 一次性；二维码载荷 `fleet://grant?p=…` 用账本自带密钥签 HMAC，**伪造载荷在查账本之前就被拒**。与入网码刻意分开：入网码离线验签（装设备时可能没网），授权码必须中心验（改权限不能交给客户端自己认）。**诚实边界**：没有找回密码——主号忘了只能删账本重建（会连带吊销所有分号），因为找回通道本身就是后门。
   - **主动发现（`discovery.py`）**：不问「你是谁」，自己看、自己猜、自己归类。三条路互补——**组播询问**（SSDP M-SEARCH + mDNS 手写 DNS 解析，设备自己举手报名，信息最准）、**邻居表 + OUI**（读 arp/ip neigh，零打扰，靠 MAC 前三字节查厂商）、**特征端口组合**（单端口只能投票，`9000+554+23+8080` 这种**招牌组合**才定案）。实测在真实局域网上认出了具体型号：`HIKVISION DS-2CD2T10FD-I3`（6 台，连序列号都有）、`TPOS/1.0.0 UPnP/1.0 YLWR1200G易展版`（TP-Link 路由）。三条铁律写在代码里：只在本网段活动（跨网段直接拒）、只对 ARP 表里已存在的 IP 敲端口（不做全网段暴力扫描）、**发现 != 入网**（结果只进发现账本，要成为节点仍需在设备上装 agent 并入网）。**踩过的坑**（都是真实误判，已修）：① 9000 端口曾被当成「编队节点」——它同时是 Portainer/海康 SDK 端口，等于把陌生人当自己人；② `192.168.0.255` 广播地址曾被列为设备；③ 一台开 554 的 Windows 电脑曾被判成摄像头，而它的 mDNS 明明写着 `Microsoft-Windows + iVCam`——**设备自报的身份永远压过端口投票**；④ 多网卡机器不显式绑网卡发组播，一个响应都收不到；⑤ 隐私随机 MAC（本地管理位=1）查 OUI 必然为空，不能当「厂商缺失」。
   - **扩散扫描（`sweep.py`）**：把「ARP 表里有的」扩成「整个网段在场的」。上一版只读 ARP，等于只看见**最近跟本机说过话**的设备——这才是「只扫到 30 台」的真因。四条补齐：**ICMP 全段 sweep**（并发 ping 整个 /24，活着的全部进 ARP 表）、**TCP connect 兜底**（IoT 常关 ICMP 却开着端口）、**NetBIOS(NBNS) 名字查询**（Windows 会把机器名报出来）、**mDNS 服务类型枚举**（`_services._dns-sd._udp.local` 让设备自报有哪些服务）。另加两层：**多网段**（本机每张网卡都扫，实测找回被漏掉的移动热点段 `192.168.137.0/24`——手机就在那里）与**环境画像**（摄像头密度、运营商 IPv6 前缀、OUI 批次）。实网 44 台 / 15 秒 / 两个网段。**踩过的坑**：① 本机 `192.168.0.103` 曾被判成「NAS/存储」（因为本机自己开着 139/445）——比漏发现更糟；② 广播地址 `.255` 曾被当成设备；③ 5555 端口曾被判成「手机」，实际那是安卓一体机/中控终端。**边界**：只发 ICMP/TCP/NBNS PTR，不发应用层指令、不试口令；跨网段「跳板扩散」不做——那需要别人机器上的执行权，现在没有也不该去拿。
-  - **一键自测门禁**：`run_selftests.py` 串起 **19 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / discovery / sweep / accounts / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups）。
+  - **一键自测门禁**：`run_selftests.py` 串起 **47 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / discovery / sweep / accounts / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups / t4 AI后端 / t6 无线ADB / t7 GUI后端 / t8 语音）。
+- **设备层三块新地基**（2026-10-21）：
+  - **Windows 图形版（W1）**：`fleet/gui/server.py` + `fleet/gui/app.py`（pywebview 窗口壳）+ `ui/index.html|app.css|app.js`（纯原生三栏，无 CDN 外链）。三层安全：只绑 `127.0.0.1` + 随机端口（`port=0`）、一次性 token 走 **URL 片段**（片段不随 HTTP 发出 ⇒ 不进服务端日志、不进 Referer）+ `secrets.compare_digest`、一切能力调用走 `registry.call`（前端绕不过闸门）。T 版与命令行**保留**，但不当日常入口。
+  - **无线 ADB（`kind=adb_wifi`，14 条能力）**：`fleet/kinds/adb_wifi.py`。只读 3 条 auto 档，动手 11 条全 `approval="ask"` + fail-closed。shell 只读白名单按「首词 + 参数形态」两级判定，**禁 shell 元字符**（管道符也拦）堵组合拳。发现方式默认 **mDNS + 经典 5555**（纯 stdlib），深度扫须显式 opt-in 且带**次数 + 墙钟双硬预算**，到点如实说扫了多少——**不许假装扫完了**。
+  - **语音输入（W4）**：`fleet/gui/voice.py` + `voice_runner.py`。STT **跨进程**调 polaris venv 的 whisper（fleet 自带解释器没有 torch）。**语音路径的两段式安全闸判定权在注册表层**：识别文字是**不可信数据不是指令**，破坏性能力一律拒，确认词必须来自另一句话，取消优先于确认，含糊拒。
+  - **角色卡人格**：`persona_card.py` 吃 SillyTavern chara_card V1/V2/V3（纯 stdlib 解 PNG tEXt，不引 Pillow），世界书按关键词命中才注入。**卡是第三方数据不是指令来源**——system prompt 外框由本模块拼，只有白名单字段能进。
 - **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动、手机端二维码渲染（载荷已可生成与离线验签，缺的只是把它画成图）。
 
 自测命令（全部离线，不碰真机、不需联网）：
@@ -131,20 +136,31 @@ skynet-fleet/
 ├── audit.py             # 控制面审计：append-only JSONL，旁路留痕（node.up/down 等）
 ├── fleet/               # 设备层：契约 + 通道 + 设备种类 + 联网作业执行器 + 终端（两个显影面）
 │   ├── netrunner.py     #   联网作业执行器：把外部爬虫包成「能起/能看/能停/能收」的作业
+│   ├── kinds/           #   设备种类实现（adb_wifi.py 无线调试 等）
+│   ├── gui/             #   Windows 图形版：server.py(后端) app.py(窗口壳) voice.py(语音)
 ├── fleet_tui.py         # 全屏界面入口薄壳（PyInstaller 打包用；直接跑也行）
 ├── fleet-tui.bat        # Windows 双击进【全屏界面】
 ├── fleet-cli.bat        # Windows 双击进【命令行版】
 ├── platform_android.py  # Android 节点入网（adb 反向推送）
 ├── platform_apple.py    # Apple 桥接（macOS SSH / iOS 屏共 半可达）
 ├── platform_router.py   # 路由器/OpenWrt 节点（常开中枢候选）
-├── run_selftests.py     # 一键离线自测门禁（十项）
+├── run_selftests.py     # 一键离线自测门禁（47 项）
 ├── ui_automation/       # ui_automation 节点能力（李跳跳抽象：adb 节点树+规则+点击+视觉兜底）
 ├── rfc/
 │   ├── remote-ai-service/   # RFC：远程 AI 即服务（瘦客户端）
 │   ├── free-compute-relay/  # RFC：免费外部算力中继（免 key 端点兜底）
 │   └── rule-engine/         # RFC：通用规则引擎（判断外置为数据）
+├── cards/               # 角色卡（SillyTavern chara_card 格式），当前替代人格「大肥鱼」
+├── ui/                  # 图形版前端资源（index.html / app.css / app.js，无 CDN 外链）
 ├── docs/
 │   ├── 个人设备编队与本地她_计划书.md   # 完整计划书（任务书）
+│   ├── Windows图形版与语音接口_计划书.md # W0–W7 分阶段计划与验收
+│   ├── Windows图形版_W1实现说明.md      # 图形版架构 / API 契约 / 安全边界
+│   ├── 语音输入链路_2026-10-21.md       # 语音链路与两段式安全闸
+│   ├── ADB无线调试能力_2026-10-21.md    # 无线调试能力清单 / 扫描预算 / 白名单
+│   ├── CleanYourTV源码拆解_2026-10-21.md# 第三方 ADB 客户端源码级拆解
+│   ├── 免费AI后端清单_2026-10-21.md      # 免费后端实测清单（访问日期 + 来源）
+│   ├── 角色卡生态调研_2026-10-21.md      # chara_card 规范与生态
 │   └── 李跳跳拆解.md                   # 广告跳过软件拆解与启示
 ├── README.md
 └── LICENSE
