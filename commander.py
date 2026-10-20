@@ -1968,7 +1968,23 @@ def self_test(host, port, password):
             sk.close()                 # 模拟下机（拔线/关浏览器）
         except OSError:
             pass
-    time.sleep(0.9)
+    # 🔴 这里**不能**用固定 sleep 等清理（2026-10-21 真踩过）：
+    #   清理动作发生在 _handle_node 那个线程的 finally 里（socket 关闭 → recv 返回
+    #   None → break → finally → _drop_node → session_end 策略 → _session_cleanup）。
+    #   那是**另一个线程**，机器一忙（门禁并行跑、磁盘慢）它就还没轮到，
+    #   固定 sleep 0.9s 到了就断言 —— 于是「代码没坏但门禁红了」。
+    #   2026-10-21 实测：全量门禁跑到这条时红过一次，单跑却是绿的。
+    #   正确写法：**轮询等条件成立**，并给一个明确的上限；到点还没成立就是真坏了。
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        _left_psk = [r for r in enroll.list_psks(ENROLL_LEDGER) if r["node"] == "PC-Net"]
+        with _QUEUE_LK:
+            _left_q = len(OFFLINE_QUEUE.get("PC-Net", []))
+        with _TOKEN_LK:
+            _left_tok = sum(1 for v in TOKENS.values() if v.get("node") == "PC-Net")
+        if not _left_psk and not _left_q and not _left_tok:
+            break
+        time.sleep(0.05)
     print(f"  下机后在线: {bool(REGISTRY.with_lock(lambda d: d.get('PC-Net')))}"
           f"（应为 False；session_end 策略已触发清理）")
     left_psk = [r for r in enroll.list_psks(ENROLL_LEDGER) if r["node"] == "PC-Net"]
