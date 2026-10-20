@@ -89,15 +89,17 @@ def pack(self):
 
 > “The checksum is just a sum of all the bytes. I swear.”
 
-等价伪代码（`adb_message.py:58`、`:66` 两处累加，`:72` 取掩码）：
+等价伪代码（`adb_message.py:56-72`）：
 
 ```python
 def checksum(data: bytes) -> int:
-    total = 0
-    for chunk in (data[i:i+4] for i in range(0, len(data), 4)):
-        total = sum(chunk)          # 逐字节求和
+    # bytearray: total = sum(data)
+    # bytes (py3): total = sum(data)     # data[i] 直接是 int
+    total = sum(data)
     return total & 0xFFFFFFFF
 ```
+
+（`adb_message.py:58` 对 bytearray 直接 `sum(data)`；`:66` 对 py3 bytes 也是 `sum(data)`；`:72` 取掩码。Python 2 兼容分支在 `:64`。）
 
 **AOSP 侧**：`adb/transport.cpp` 的 `calculate_apacket_checksum()` 同样是「所有字节求和 & 0xFFFFFFFF」。
 
@@ -338,7 +340,7 @@ buf = struct.pack(b'<2I', constants.FILESYNC_ID_TO_WIRE[command_id], size) + dat
 
   3. **venv 路径**：`tools/disable.sh:14-15` 先试 `tools/venv/bin/python`（Unix），再试 `tools/venv/Scripts/python.exe`（Windows）。
 
-- **macOS Local Network 隐私**：`docs/TROUBLESHOOTING.md:8-10` 原文——Google 签名的 `adb` 作为独立 app 受 Local Network 隐私管辖并被**静默拦截**。`PROMPT.md:25` 给的解法是「不要纠缠：改用 Python 的 `adb-shell` 包」。**这与 team-lead 的动机一致，但解决手段是「用 `adb_shell` 这个第三方包」，不是「用这个仓库自研的客户端」。**
+- **macOS Local Network 隐私**：`docs/TROUBLESHOOTING.md:8-10` 原文——Google 签名的 `adb` 作为独立 app 受 Local Network 隐私管辖并被**静默拦截**。`PROMPT.md:24-25` 给的解法是「不要纠缠：改用 Python 的 `adb-shell` 包」。**这与 team-lead 的动机一致，但解决手段是「用 `adb_shell` 这个第三方包」，不是「用这个仓库自研的客户端」。**
 
 ### 1.9 `host:connect:` —— **未查到**
 
@@ -451,7 +453,7 @@ added = [name for name in packages if name not in record["packages"]]
 - **清单新增项会被追加**，状态取「当前」值——这些包本轮之前没被动过，现在的状态就是清理前的状态。
 - 没有新增项时直接 `return 0`，不连电视。
 
-`README.md:299-303` 复述同一行为：「a second run of the same list keeps the first record instead of saving the cleaned-up state over it」。
+`README.md:303-304` 复述同一行为：「a second run of the same list keeps the first record instead of saving the cleaned-up state over it」。
 
 **恢复侧的对应处理**（`tools/recovery.py:269-271`）：
 
@@ -553,12 +555,12 @@ PACKAGE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+")
           continue
       out = dev.shell(line, read_timeout_s=120.0)
   ```
-- 「小批」只存在于**提示词层**：`PROMPT.md:59`「Disable in small batches and screenshot between them: a batch can take something load-bearing with it and you cannot tell which.」以及 `README.md:341`「applied in small batches with a restore script ready」。
+- 「小批」只存在于**提示词层**：`PROMPT.md:59-60`「Disable in small batches and screenshot between them: a batch can take something load-bearing with it and you cannot tell which.」以及 `README.md:341`「applied in small batches with a restore script ready」。
 
 → **对我们的含义**：若要「一小批一小批」，得由**上层**（我们的 `invoke` 编排层）分批，而不是抄他们的脚本。抄他们的脚本只能得到「一整批」。
 
 **另一条关键纪律：一次 shell 调用只跑一条 `pm` 命令。**
-- `PROMPT.md:57`「Run `pm` commands one per shell call, chained commands may silently stop after the first.」
+- `PROMPT.md:58`「Run `pm` commands one per shell call, chained commands may silently stop after the first.」
 - `docs/TROUBLESHOOTING.md:53-54`「**Chained `pm` commands** (`pm disable a; pm disable b`) may silently stop after the first. Run one per shell call; `--batch` does exactly that.」
 - 这条**必须照做**：链式 `pm` 会在第一条后静默中断，而电视上看起来「成功了一半」。
 
@@ -689,7 +691,7 @@ return 1
 
 参数：host 来自 `argv[0]` 或 `TV_HOST`；port 来自 `argv[1]` 或 `TV_PORT`（默认 5555）；`TIMEOUT_S = 3.0`（`tools/adb-closed.py:13`）。
 
-README 的用法（`README.md:363-364`）：`python tools/adb-closed.py <tv ip>` 必须说端口已关。
+README 的用法（`README.md:364`）：`python tools/adb-closed.py <tv ip>` 必须说端口已关。
 
 ### 4.2 TROUBLESHOOTING 全部坑（逐条摘出）
 
@@ -876,30 +878,50 @@ tools/tv.py "dumpsys wifi" | grep -o 'cname=[^ ]*'
 
 | 主题 | 内容 | 行号 |
 |---|---|---|
-| 连接 | 端口 5555；macOS 被 Local Network 隐私拦截 → **改用 Python `adb-shell` 包**；push 挂起 → base64 分块 + md5 | 21-34 |
-| 无线调试 | 只有 Wireless debugging 时用 `dns-sd -B` / `adb mdns services` 找配对端口 → `adb pair` → `adb connect` → `adb tcpip 5555` | 28-32 |
-| 授权提示 | **要主动告诉用户「电视上什么时候会弹『允许 USB 调试？』」** | 33 |
-| Android 14 install 挂住 | 是在等屏幕确认 → push APK 后用 shell 跑 `pm install -r` | 31-32 |
-| **先备份** | 存全部包列表、停用列表、getprop 输出、所有 settings 到备份目录，**并写一个恢复脚本** | 36-39 |
-| USB 副作用 | 问用户 USB 口接了什么；有些设备开调试时断电；提醒用完关调试 | 40-42 |
-| **用完关 ADB** | 关 USB 调试与 Network/ADB 调试、撤销授权、重启、确认 `nc -vz` 失败 | 43-45 |
-| 停用分类 | 把包分成：厂商遥测/分析、厂商内容与广告服务、后台服务、预装应用、流媒体应用 | 47-48 |
-| **只停用不卸载** | `pm disable-user --user 0`，**绝不卸载系统包** | 49 |
-| **不能停的** | 电视应用与输入服务（HDMI/调谐器）、输入/源菜单、遥控与蓝牙配对、软键盘、Google Play Store 与 Play Services | 50-52 |
-| 查清再停 | 厂商包名常不说明功能 → 先 `dumpsys package` 看 activities/services | 52-53 |
-| 问用户 | 动流媒体/语音助手/Chromecast/Miracast/更新服务前，**先列清单问用户用了哪些** | 54-55 |
-| **一次一条** | `pm` 命令一次 shell 调用一条，链式可能静默中断 | 57 |
-| **小批 + 截图** | 分小批停用，批间截图；一批可能带走承重的东西 | 59 |
-| 卸载应用广告 | Android 9+ Private DNS 指向 AdGuard，`private_dns_mode hostname`；撤销是 `private_dns_mode opportunistic` | 60-63 |
+| 连接 | 端口 5555；macOS 被 Local Network 隐私拦截 → **改用 Python `adb-shell` 包**；push 挂起 → base64 分块 + md5 | 21-27 |
+| 无线调试 | 只有 Wireless debugging 时用 `dns-sd -B` / `adb mdns services` 找配对端口 → `adb pair` → `adb connect` → `adb tcpip 5555` | 28-31 |
+| 授权提示 | **要主动告诉用户「电视上什么时候会弹『允许 USB 调试？』」** | 32 |
+| Android 14 install 挂住 | 是在等屏幕确认 → push APK 后用 shell 跑 `pm install -r` | 33-34 |
+| **先备份** | 存全部包列表、停用列表、getprop 输出、所有 settings 到备份目录，**并写一个恢复脚本** | 36-38 |
+| USB 副作用 | 问用户 USB 口接了什么；有些设备开调试时断电；提醒用完关调试 | 39-40 |
+| **用完关 ADB** | 关 USB 调试与 Network/ADB 调试、撤销授权、重启、确认 `nc -vz` 失败 | 41-44 |
+| 停用分类 | 把包分成：厂商遥测/分析、厂商内容与广告服务、后台服务、预装应用、流媒体应用 | 47-49 |
+| **只停用不卸载** | `pm disable-user --user 0`，**绝不卸载系统包** | 50 |
+| **不能停的** | 电视应用与输入服务（HDMI/调谐器）、输入/源菜单、遥控与蓝牙配对、软键盘、Google Play Store 与 Play Services | 51-53 |
+| 查清再停 | 厂商包名常不说明功能 → 先 `dumpsys package` 看 activities/services | 53-55 |
+| 问用户 | 动流媒体/语音助手/Chromecast/Miracast/更新服务前，**先列清单问用户用了哪些** | 56-57 |
+| **一次一条** | `pm` 命令一次 shell 调用一条，链式可能静默中断 | 58 |
+| **小批 + 截图** | 分小批停用，批间截图；一批可能带走承重的东西 | 59-60 |
+| 卸载应用广告 | Android 9+ Private DNS 指向 AdGuard，`private_dns_mode hostname`；撤销是 `private_dns_mode opportunistic` | 61-64 |
 
 **对本项目最有用的两条**：
-- `PROMPT.md:49`「**只停用不卸载**」——与 `tools/disable.sh:3` 一致，是整个可逆性体系的地基。
-- `PROMPT.md:36-39`「**先备份 + 写恢复脚本**」——与 `tools/disable.sh:125-128` 的「先落盘记录再动手」是同一条原则的两种表述。
+- `PROMPT.md:50`「**只停用不卸载**」——与 `tools/disable.sh:3` 一致，是整个可逆性体系的地基。
+- `PROMPT.md:36-38`「**先备份 + 写恢复脚本**」——与 `tools/disable.sh:125-128` 的「先落盘记录再动手」是同一条原则的两种表述。
+
+### 5.6 stock launcher 怎么「探测」出来
+
+`launcher/build-and-install.sh:22-57` 是一段**四分支**的 Home 探测：
+
+| 情形 | 处理 | 行号 |
+|---|---|---|
+| 当前 HOME owner 在已知白名单里 | `STOCK_LAUNCHER=$HOME_PKG` | `:29-30` |
+| HOME 已属于本项目 launcher | `STOCK_LAUNCHER=none`（不停任何东西） | `:32-33` |
+| HOME 是 Android 选择器（`android`，两个 launcher 打平） | 查 `cmd package query-activities --brief ... HOME` 的全部 claimant，**若恰好只有一个已知 stock launcher** 就用它 | `:34-46` |
+| 其它（未知 launcher） | **报错退出**，并明确列出 `android` / `setupwraith` / 其它三种含义 | `:47-55` |
+
+已知 stock launcher 白名单（`launcher/build-and-install.sh:23`）：
+
+```bash
+KNOWN_STOCK_LAUNCHERS="com.google.android.tvlauncher com.google.android.apps.tv.launcherx com.google.android.leanbacklauncher com.mitv.tvhome"
+```
+
+**注释里的关键洞察**（`:35-37`）：Android 的选择器状态正是「`restore.sh` 之后又套一份清单」的结果——所以他们的 `restore` 与 `install` 脚本必须能处理这种状态，而不是假设 HOME 永远指向某个具体包。
+
+**对我们的启示**：我们的 `adb.wifi.launch` / `adb.wifi.home_query` 能力应该**返回 Home 的完整 claimant 列表**，而不是单个 owner，因为「owner 是什么」取决于优先级，而「谁有资格」是集合问题。
 
 ---
 
 ## 6. 品牌去废清单的组织与「先探测再决定停什么」
-
 ### 6.1 清单放哪、命名规则
 
 - **目录**：`examples/<brand>-<model>/debloat.txt`，例如 `examples/xiaomi-mi-tv-4a/debloat.txt`。
@@ -955,7 +977,7 @@ tools/tv.py "dumpsys wifi" | grep -o 'cname=[^ ]*'
 
 > “CleanYourTV talks to TVs over ADB and installs a launcher on them, so a security bug here can reach people's living rooms. Please report anything you find privately, not in a public issue.”
 
-**`README.md:355-364`（"Isn't ADB access a security hole?"）**：
+**`README.md:355-363`（"Isn't ADB access a security hole?"）**：
 
 > “It is one explicit "allow this computer" tap on the TV, the same as developing an Android app. Network ADB is plaintext on port 5555, and on firmware with `ro.adb.secure=0` any device on the LAN gets a shell, so close it when you are done:”
 
@@ -968,7 +990,7 @@ tools/tv.py "dumpsys wifi" | grep -o 'cname=[^ ]*'
 
 > “**Close port 5555 when you're done**: plaintext, and a shell for anyone on the LAN when `ro.adb.secure=0`.”
 
-**`PROMPT.md:43-45`**：
+**`PROMPT.md:41-44`**：
 
 > “When you finish, close network ADB instead of leaving it open: switch USB debugging and Network/ADB debugging off on the TV, revoke the USB debugging authorisations, reboot, and check that `nc -vz <tv ip> 5555` fails. Port 5555 is plaintext, and on firmware with `ro.adb.secure=0` any device on the LAN can get a shell.”
 
@@ -1152,7 +1174,7 @@ tools/tv.py "dumpsys wifi" | grep -o 'cname=[^ ]*'
    ② 探测设备状态（HOME owner / cname / TV_INPUT）  ← tools/disable.sh:29-123
    ③ 计算「实际要执行的包」= 清单 − 被护栏跳过的
    ④ 落盘恢复记录（原子写；失败则中止，设备不动）  ← tools/disable.sh:125-128
-   ⑤ 按 N 个一批执行，每条一次 shell（不链式）      ← PROMPT.md:57,59
+   ⑤ 按 N 个一批执行，每条一次 shell（不链式）      ← PROMPT.md:58,59-60
    ⑥ 每批后回读状态并回报（可截图）
    ⑦ 任何一步失败 → 返回带原因的 DeviceResult，附上恢复命令
    ```
