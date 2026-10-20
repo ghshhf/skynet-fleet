@@ -12,10 +12,27 @@
     <!-- 红外发射：普通权限，安装即得，不需要 root 也不需要无障碍 -->
     <uses-permission android:name="android.permission.TRANSMIT_IR" />
 
+    <!-- 蓝牙扫描：只扫不连。BLUETOOTH_SCAN 带 neverForLocation，
+         这样不申请定位权限也能扫到设备（不拿它推位置）。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"
         android:hasCode="true">
+
+        <!-- 只为申请「附近的设备」权限而存在，申请完立即关闭 -->
+        <activity
+            android:name=".BridgeSetupActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar" />
 
         <service
             android:name=".BridgeService"

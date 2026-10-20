@@ -11,7 +11,14 @@ package app.fleet.bridge;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanRecord;
+import android.bluetooth.le.ScanResult;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.graphics.Path;
 import android.hardware.ConsumerIrManager;
 import android.os.Bundle;
@@ -26,6 +33,10 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -137,6 +148,10 @@ public class BridgeService extends AccessibilityService {
                     return irInfo();
                 case "IR":
                     return ir(rest);
+                case "BTSTATE":
+                    return btState();
+                case "BLE":
+                    return ble(rest);
                 default:
                     return "ERR unknown " + op;
             }
@@ -266,5 +281,111 @@ public class BridgeService extends AccessibilityService {
         if ((freq < 25000) || (freq > 60000)) return "ERR ir-freq 25k-60k";
         m.transmit(freq, pattern);
         return "OK ir " + pattern.length;
+    }
+
+    // ------------------------------------------------------------ 蓝牙
+    //
+    // 只扫不连：BLUETOOTH_SCAN 带 neverForLocation，不申请定位也能扫，
+    // 因为这里不拿蓝牙信号推位置。扫到的设备按 BLE 广播念出来，
+    // 名字/厂商字段能认出耳机、手环、电视、门锁这类「身边的东西」。
+
+    private BluetoothAdapter btAdapter() {
+        BluetoothManager m = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+        return m == null ? null : m.getAdapter();
+    }
+
+    private String btState() {
+        BluetoothAdapter a = btAdapter();
+        if (a == null) return "ERR no-adapter";
+        return "OK bt " + (a.isEnabled() ? "on" : "off");
+    }
+
+    private String ble(String rest) {
+        int secs = 8;
+        try {
+            if (!rest.isEmpty()) secs = Math.max(1, Math.min(Integer.parseInt(rest.trim()), 30));
+        } catch (NumberFormatException ignored) {
+        }
+        BluetoothAdapter a = btAdapter();
+        if (a == null) return "ERR no-adapter";
+        if (!a.isEnabled()) return "ERR bt-off";
+        if (checkSelfPermission("android.permission.BLUETOOTH_SCAN") != PackageManager.PERMISSION_GRANTED) {
+            return "ERR no-permission BLUETOOTH_SCAN";
+        }
+        final BluetoothLeScanner sc = a.getBluetoothLeScanner();
+        if (sc == null) return "ERR no-scanner";
+
+        // 同一个 MAC 会被反复广播，按地址留信号最强的那次
+        final Map<String, ScanResult> seen = new LinkedHashMap<>();
+        ScanCallback cb = new ScanCallback() {
+            @Override
+            public void onScanResult(int type, ScanResult r) {
+                keep(seen, r);
+            }
+
+            @Override
+            public void onBatchScanResults(List<ScanResult> rs) {
+                if (rs != null) for (ScanResult r : rs) keep(seen, r);
+            }
+        };
+        try {
+            sc.startScan(cb);
+        } catch (Exception e) {
+            return "ERR scan-start " + e.getClass().getSimpleName();
+        }
+        try {
+            Thread.sleep(secs * 1000L);
+        } catch (InterruptedException ignored) {
+        }
+        try {
+            sc.stopScan(cb);
+        } catch (Exception ignored) {
+        }
+
+        StringBuilder sb = new StringBuilder("OK ble ");
+        int n = 0;
+        synchronized (seen) {
+            for (ScanResult r : seen.values()) {
+                if (n++ > 0) sb.append(";");
+                String mac = "";
+                try {
+                    mac = r.getDevice().getAddress();
+                } catch (SecurityException ignored) {
+                }
+                ScanRecord rec = r.getScanRecord();
+                String name = rec == null ? null : rec.getDeviceName();
+                String mfr = "";
+                if (rec != null && rec.getManufacturerSpecificData() != null
+                        && rec.getManufacturerSpecificData().size() > 0) {
+                    int id = rec.getManufacturerSpecificData().keyAt(0);
+                    mfr = String.format("%04x", id);
+                }
+                sb.append(mac).append(",").append(r.getRssi()).append(",")
+                  .append(rec == null ? -127 : rec.getTxPowerLevel()).append(",")
+                  .append(clean(name)).append(",").append(mfr);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void keep(Map<String, ScanResult> seen, ScanResult r) {
+        if (r == null || r.getDevice() == null) return;
+        String mac;
+        try {
+            mac = r.getDevice().getAddress();
+        } catch (SecurityException e) {
+            return;
+        }
+        if (mac == null || mac.isEmpty()) return;
+        synchronized (seen) {
+            ScanResult old = seen.get(mac);
+            if (old == null || r.getRssi() > old.getRssi()) seen.put(mac, r);
+        }
+    }
+
+    /** 一行一个回复，字段分隔符不许出现在名字里。 */
+    private static String clean(String s) {
+        if (s == null) return "";
+        return s.replace(";", " ").replace(",", " ").replace("\n", " ").replace("\r", " ").trim();
     }
 }

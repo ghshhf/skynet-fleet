@@ -20,14 +20,19 @@ import time
 from collections import Counter
 
 import android_device as A
+import ble as B
 import survey as V
 import sweep as S
 
 HIST = os.path.join(os.path.expanduser("~"), ".fleet", "nearby_hist.json")
+BT_SECS = 8         # 蓝牙扫一轮的时长；BLE 广播是事件式的，扫久点才收得全
+LAYERS = ("lan", "wifi", "bt")
+LAYER_CN = {"lan": "IP 层", "wifi": "无线层", "bt": "蓝牙层"}
+LAYER_UNIT = {"lan": "台", "wifi": "个", "bt": "个"}
 
 
-def run(with_lan=True, with_wifi=True):
-    out = {"at": int(time.time()), "lan": None, "wifi": None, "notes": []}
+def run(with_lan=True, with_wifi=True, with_bt=True):
+    out = {"at": int(time.time()), "lan": None, "wifi": None, "bt": None, "notes": []}
     if with_lan:
         r = S.sweep(do_wifi=False)   # 电脑侧扫 WiFi 是浪费：射频被热点占了
         devs = r.get("devices") or []
@@ -46,9 +51,12 @@ def run(with_lan=True, with_wifi=True):
         }
         if not devs:
             out["notes"].append("IP 层没扫到设备（网卡断了？）")
+    dev = None
+    if with_wifi or with_bt:
+        dev = A.attach()          # 手机只接一次，两层共用
     if with_wifi:
-        d = A.attach()
-        if not d["ok"]:
+        d = dev
+        if not d or not d.get("ok"):
             out["wifi"] = {"ok": False, "err": d.get("err")}
             out["notes"].append("手机接不上，无线层缺失")
         else:
@@ -58,12 +66,30 @@ def run(with_lan=True, with_wifi=True):
             else:
                 out["wifi"] = {"ok": False, "err": g.get("err")}
                 out["notes"].append("无线扫描失败：" + str(g.get("err"))[:80])
+    if with_bt:
+        d = dev
+        if not d or not d.get("ok"):
+            out["bt"] = {"ok": False, "err": d.get("err")}
+            out["notes"].append("蓝牙层缺失：手机接不上")
+        else:
+            st = B.bt_state(d["serial"])
+            if st == "off":
+                out["bt"] = {"ok": False, "err": "蓝牙关着"}
+                out["notes"].append("蓝牙层跳过：手机蓝牙关着（ble.py --on 打开）")
+            else:
+                g = B.scan(d["serial"], secs=BT_SECS)
+                if g.get("ok"):
+                    out["bt"] = {"ok": True, "devices": g["devices"],
+                                 "summary": B.summary(g["devices"])}
+                else:
+                    out["bt"] = {"ok": False, "err": g.get("err")}
+                    out["notes"].append("蓝牙扫描失败：" + str(g.get("err"))[:80])
     return out
 
 
 def fingerprint(out):
     """只抽会变的部分：谁在（IP / BSSID）以及它是什么。"""
-    fp = {"at": out.get("at") or 0, "lan": {}, "wifi": {}}
+    fp = {"at": out.get("at") or 0, "lan": {}, "wifi": {}, "bt": {}}
     lan = out.get("lan") or {}
     for d in lan.get("devices") or []:
         if d.get("ip"):
@@ -75,6 +101,11 @@ def fingerprint(out):
             fp["wifi"][a["bssid"]] = {"ssid": a.get("ssid") or "",
                                       "kind": a.get("kind") or "",
                                       "rssi": a.get("rssi")}
+    for x in (out.get("bt") or {}).get("devices") or []:
+        if x.get("mac"):
+            fp["bt"][x["mac"]] = {"ssid": x.get("name") or "",
+                                  "kind": x.get("kind") or "",
+                                  "rssi": x.get("rssi")}
     return fp
 
 
@@ -99,17 +130,17 @@ def trend(hist, cur, window=WINDOW):
     """
     hist = [h for h in (hist or []) if isinstance(h, dict)][-window:]
     t = {"runs": len(hist), "window": window,
-         "lan": {"solid": [], "new": [], "lost": []},
-         "wifi": {"solid": [], "new": [], "lost": [], "fringe": 0},
          "age": (cur.get("at") or 0) - (hist[-1].get("at") or 0) if hist else 0}
+    for layer in LAYERS:
+        t[layer] = {"solid": [], "new": [], "lost": [], "fringe": 0}
     if not hist:
         return t
     n = len(hist)
-    for layer in ("lan", "wifi"):
+    for layer in LAYERS:
         cur_map = cur.get(layer) or {}
         trackable = {k for k, v in cur_map.items() if _near(v)}
-        if layer == "wifi":
-            t["wifi"]["fringe"] = len(cur_map) - len(trackable)
+        if layer in ("wifi", "bt"):
+            t[layer]["fringe"] = len(cur_map) - len(trackable)
         seen = {k: 0 for k in trackable}
         for h in hist:
             hm = h.get(layer) or {}
@@ -129,12 +160,12 @@ def trend(hist, cur, window=WINDOW):
             # 只有「最近 window 次里每次都在、且每次都够得着」的才算真消失
             if all(k in (h.get(layer) or {}) and _near(h[layer][k]) for h in hist):
                 t[layer]["lost"].append({"key": k, **hist[-1][layer][k]})
-        if layer == "wifi":     # 同一 BSSID 可能被多次统计，去重后按名字排
+        if layer in ("wifi", "bt"):     # 同一 BSSID 可能被多次统计，去重后按名字排
             for kind in ("new", "lost", "solid"):
                 uniq = {x["key"]: x for x in t[layer][kind]}
                 t[layer][kind] = sorted(uniq.values(),
                                         key=lambda x: x.get("ssid") or "~")
-    t["changed"] = any(t[l]["new"] or t[l]["lost"] for l in ("lan", "wifi"))
+    t["changed"] = any(t[l]["new"] or t[l]["lost"] for l in LAYERS)
     return t
 
 
@@ -169,28 +200,27 @@ def _ago(sec):
 def _trend_lines(t):
     if not t or not t.get("runs"):
         return []
-    n = t["runs"]
     lines = ["",
-             f"【存续】按最近 {n} 次扫描算（本次距上次 {_ago(t['age'])}）："]
-    lan, wifi = t["lan"], t["wifi"]
-    if lan["solid"] or lan["new"] or lan["lost"] or wifi["solid"]:
-        lines.append(f"  · IP 层：一直在 {len(lan['solid'])} 台"
-                     + (f"，这次才见 {len(lan['new'])} 台" if lan["new"] else "")
-                     + (f"，连续几次不见 {len(lan['lost'])} 台" if lan["lost"] else ""))
-    lines.append(f"  · 无线层：一直在 {len(wifi['solid'])} 个"
-                 + (f"，这次才见 {len(wifi['new'])} 个" if wifi["new"] else "")
-                 + (f"，连续几次不见 {len(wifi['lost'])} 个" if wifi["lost"] else ""))
-    if wifi.get("fringe"):
-        lines.append(f"  （另有 {wifi['fringe']} 个弱于 {FRINGE}dBm 的远场 AP，"
-                     "信号在噪底上漂，不参与进出判断）")
-    if wifi["new"]:
-        lines.append("  新见到的：" + "、".join(
-            (x.get("ssid") or "(隐藏)") + f"（{x['key'][:8]}…）" for x in wifi["new"][:6]))
-    if wifi["lost"]:
-        lines.append("  不见了的：" + "、".join(
-            (x.get("ssid") or "(隐藏)") for x in wifi["lost"][:6]))
-    if lan["new"]:
-        lines.append("  新 IP：" + "、".join(x["key"] for x in lan["new"][:8]))
+             f"【存续】按最近 {t['runs']} 次扫描算（本次距上次 {_ago(t['age'])}）："]
+    for layer in LAYERS:
+        seg = t.get(layer) or {}
+        u = LAYER_UNIT[layer]
+        if not (seg.get("solid") or seg.get("new") or seg.get("lost")):
+            continue
+        lines.append(f"  · {LAYER_CN[layer]}：一直在 {len(seg['solid'])} {u}"
+                     + (f"，这次才见 {len(seg['new'])} {u}" if seg["new"] else "")
+                     + (f"，连续几次不见 {len(seg['lost'])} {u}" if seg["lost"] else ""))
+        if seg.get("fringe"):
+            lines.append(f"    （另有 {seg['fringe']} {u}弱于 {FRINGE}dBm 的远场，"
+                         "信号在噪底上漂，不参与进出判断）")
+    for layer in ("bt", "wifi", "lan"):        # 蓝牙的「新出现」最值得先看
+        seg = t.get(layer) or {}
+        if seg.get("new"):
+            names = [(x.get("ssid") or x.get("kind") or "(无名)") for x in seg["new"][:6]]
+            lines.append(f"  新见到的（{LAYER_CN[layer]}）：" + "、".join(names))
+        if seg.get("lost"):
+            names = [(x.get("ssid") or x.get("kind") or "(无名)") for x in seg["lost"][:6]]
+            lines.append(f"  不见了的（{LAYER_CN[layer]}）：" + "、".join(names))
     if not t["changed"]:
         lines.append("  （没有真的进出，都是扫描抖动范围内）")
     return lines
@@ -232,6 +262,20 @@ def report(out, t=None):
     elif wifi and not wifi.get("ok"):
         lines.append(f"\n【无线层】不可用：{wifi.get('err')}")
 
+    bt = out.get("bt")
+    if bt and bt.get("ok"):
+        s = bt["summary"]
+        lines.append(f"\n【蓝牙层】{s['total']} 个在广播，有名 {s['named']} 个，"
+                     f"近处（-75dBm 内）{s['near']} 个")
+        lines.append("  类型：" + "，".join(f"{k} {v}" for k, v in
+                                         sorted(s["kinds"].items(), key=lambda x: -x[1])))
+        named = [d for d in bt["devices"] if d.get("name")][:8]
+        if named:
+            lines.append("  认得出的：" + "、".join(
+                f"{d['name']}（{d['kind']} {d['rssi']}）" for d in named))
+    elif bt and not bt.get("ok"):
+        lines.append(f"\n【蓝牙层】不可用：{bt.get('err')}")
+
     if out.get("notes"):
         lines.append("\n注意：" + "；".join(out["notes"]))
     lines.extend(_trend_lines(t))
@@ -251,6 +295,11 @@ def _selftest():
         ], "summary": {"total": 2, "near": 0, "kinds": {"家电": 1, "隐藏网络": 1},
                        "near_names": []}},
         "notes": [],
+        "bt": {"ok": True, "devices": [
+            {"mac": "B0:96:EA:C9:28:E4", "name": "midea", "kind": "家电", "rssi": -72},
+            {"mac": "E4:1F:07:33:3A:22", "name": "mobike", "kind": "共享单车", "rssi": -90},
+        ], "summary": {"total": 2, "named": 2, "near": 1,
+                       "kinds": {"家电": 1, "共享单车": 1}}},
     }
     t = report(out)
     assert "44 台设备" in t and "2 个网段" in t
@@ -258,6 +307,7 @@ def _selftest():
     assert "2 个 AP" in t
     assert "midea_e3_0543" in t
     assert "隐藏网络 1 个" in t
+    assert "【蓝牙层】2 个在广播" in t and "认得出的" in t and "共享单车" in t
 
     # ② 无线层缺：不能抛异常，要显式说明不可用
     out2 = {"at": 0, "lan": out["lan"], "wifi": {"ok": False, "err": "手机接不上"},
@@ -337,12 +387,27 @@ def _selftest():
                {"at": 160, "lan": {}, "wifi": {"B9": {"ssid": "墙外的", "rssi": -88}}})
     assert g6["wifi"]["lost"] == []
 
-    print("nearby 自测：11 项全过")
+    # ⑫ 蓝牙层也进存续统计，单位是「个」，名字取不到就按类型叫
+    bh = [{"at": 100, "lan": {}, "wifi": {}, "bt": {"M1": {"ssid": "midea", "kind": "家电", "rssi": -70}}}]
+    bc = {"at": 160, "lan": {}, "wifi": {},
+          "bt": {"M1": {"ssid": "midea", "kind": "家电", "rssi": -75},
+                 "M2": {"ssid": "", "kind": "共享单车", "rssi": -78}}}
+    bd = trend(bh, bc)
+    assert [x["key"] for x in bd["bt"]["solid"]] == ["M1"]
+    assert [x["key"] for x in bd["bt"]["new"]] == ["M2"]
+    body = _trend_lines(bd)
+    assert any("蓝牙层" in x for x in body)
+    assert any("共享单车" in x for x in body)      # 无名设备用类型代替名字
+
+    print("nearby 自测：12 项全过")
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    out = run(with_lan="--wifi" not in argv, with_wifi="--lan" not in argv)
+    out = run(with_lan=("--wifi" not in argv and "--bt" not in argv),
+              with_wifi=("--lan" not in argv and "--bt" not in argv),
+              with_bt=("--no-bt" not in argv and "--lan" not in argv
+                       and "--wifi" not in argv))
     fp = fingerprint(out)
     g = None
     if "--no-save" not in argv:

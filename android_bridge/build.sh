@@ -35,12 +35,13 @@ if [ ! -f "$TOKEN_FILE" ] || [ "${1:-}" = "--new-token" ]; then
   "$PY" -c "import secrets;print(secrets.token_hex(12))" > "$TOKEN_FILE"
 fi
 TOKEN="$(cat "$TOKEN_FILE")"
-sed "s/__TOKEN__/$TOKEN/" src/app/fleet/bridge/BridgeService.java > build/src/app/fleet/bridge/BridgeService.java
+cp src/app/fleet/bridge/*.java build/src/app/fleet/bridge/
+sed -i "s/__TOKEN__/$TOKEN/" build/src/app/fleet/bridge/BridgeService.java
 echo "$TOKEN" > build/token.txt
 
 # ② 编译 Java：--release 11 产出 class 55，d8 认得
 "$JAVA/javac.exe" -encoding UTF-8 --release 11 -classpath "$PLATFORM" \
-  -d build/classes build/src/app/fleet/bridge/BridgeService.java
+  -d build/classes build/src/app/fleet/bridge/*.java
 echo "[1/5] javac 完成"
 
 # ③ 转 dex

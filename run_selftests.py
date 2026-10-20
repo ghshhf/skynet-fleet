@@ -38,6 +38,7 @@ CASES = [
     ("infrared", ["infrared.py", "--selftest"], HERE, 30),
     ("agent_phone", ["agent_phone.py", "--selftest"], HERE, 60),
     ("survey", ["survey.py", "--selftest"], HERE, 30),
+    ("ble", ["ble.py", "--selftest"], HERE, 30),
     ("nearby", ["nearby.py", "--selftest"], HERE, 30),
 ]
 
