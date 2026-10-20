@@ -149,26 +149,43 @@ class Watcher(threading.Thread):
 # ---------------------------------------------------------------- 终端
 
 class FleetShell:
-    def __init__(self, reg=None, interval=15.0, watch=True, console=None):
+    def __init__(self, reg=None, interval=15.0, watch=True, console=None, emit=None):
         self.reg = reg if reg is not None else build(gate=self.gate)
         if reg is None:
             self.reg.gate = self.gate
         self.console = console or Console()
+        # 输出去向：None=打到控制台（命令行版）；给了就转发（TUI 版写进它的日志窗）
+        self.emit = emit
         self.interval = interval
         self.watch = watch
         self.watcher = None
         self.session = None
         self._pending = []          # 输入行之前的「她的话」缓冲（测试里可断言）
         self.lines = []             # 实际提交的每一行（回放与验收用）
+        self._confirm = False       # 本次调用是否已在命令行上预置 --yes
 
-    # ---- 闸门：只读直接过，动手告知，破坏性必须手打 yes ----
+    # ---- 闸门：只读直接过，动手告知，破坏性必须显式确认 ----
 
     def gate(self, cap, dev, args, level):
         if level >= 2:
+            if self._confirm:                    # 命令行已写 --yes，不必再问
+                return True, ""
+            if self.blocking_confirm:            # TUI 不阻塞：它另有一套确认
+                return False, "未确认（在 TUI 里按 ctrl+y 确认此行）"
             ans = input(f"  ⚠ {cap.name} @ {dev.name} 不可逆，输入 yes 继续: ").strip().lower()
             return (ans == "yes", "主人没确认")
         self.say(f"动手：{cap.name} @ {dev.name}", level="action")
         return True, ""
+
+    blocking_confirm = True         # TUI 版置 False：它不许在事件循环里 input()
+
+    # ---- 输出：一切 renderable 都经由此口，命令行与 TUI 共用同一套渲染 ----
+
+    def _print(self, renderable):
+        if self.emit is not None:
+            self.emit(renderable)
+        else:
+            self.console.print(renderable)   # 注意：这里绝不能再写 _print
 
     # ---- 安全输出：她开口 / 事件 / 结果都走这里，绝不裸 print ----
 
@@ -176,10 +193,10 @@ class FleetShell:
         style = {"info": "white", "event": "cyan", "warn": "yellow",
                  "error": "red", "action": "magenta"}.get(level, "white")
         if title:
-            self.console.print(Panel(Text(text, style=style), title=title,
+            self._print(Panel(Text(text, style=style), title=title,
                                      border_style=style, expand=False))
         else:
-            self.console.print(Text(text, style=style))
+            self._print(Text(text, style=style))
         self._pending.append(text)
 
     # ---- 渲染 ----
@@ -198,7 +215,7 @@ class FleetShell:
             t.add_row(r["name"], r["kind"], r["via"],
                       Text("在线", style="green") if r["ok"] else Text("不可用", style="red"),
                       str(len(r["caps"])), "" if r["ok"] else r["reason"])
-        self.console.print(t)
+        self._print(t)
 
     def show_caps(self, word=""):
         caps = self._pick_caps(word)
@@ -215,9 +232,9 @@ class FleetShell:
             t.add_row(c.name, c.title, kind,
                       Text("可用", style="green") if ok else Text("不可用", style="red"),
                       dev.name if ok and dev else ("" if ok else _short_reason(reason)))
-        self.console.print(t)
+        self._print(t)
         if word and not caps:
-            self.console.print(Text(f"没有匹配「{word}」的设备或能力族。"
+            self._print(Text(f"没有匹配「{word}」的设备或能力族。"
                                     f"可用族：{', '.join(sorted({c.name.split('.')[0] for c in self.reg.capabilities()}))}",
                                     style="yellow"))
 
@@ -244,7 +261,7 @@ class FleetShell:
             t.add_row(r["name"],
                       Text("通", style="green") if r["ok"] else Text("不通", style="red"),
                       r["title"], "" if r["ok"] else r["reason"])
-        self.console.print(t)
+        self._print(t)
 
     def show_result(self, res):
         if res.ok:
@@ -252,11 +269,11 @@ class FleetShell:
             for k, v in (res.data or {}).items():
                 body.append(f"{k}: ", style="bold")
                 body.append(f"{_oneline(v)}\n")
-            self.console.print(Panel(body, title=f"✓ {res.cap} @ {res.device} "
+            self._print(Panel(body, title=f"✓ {res.cap} @ {res.device} "
                                                 f"（{res.ms:.0f}ms / {res.via}）",
                                      border_style="green", expand=False))
         else:
-            self.console.print(Panel(Text(f"{res.code}: {res.err}"),
+            self._print(Panel(Text(f"{res.code}: {res.err}"),
                                      title=f"✗ {res.cap}", border_style="red", expand=False))
         self._pending.append(res.brief())
 
@@ -299,8 +316,8 @@ class FleetShell:
         if head in ("quit", "exit", "q"):
             return False
         if head in ("help", "?", "h"):
-            self.console.print(Text(__doc__ or "", style="dim"))
-            self.console.print(Text(
+            self._print(Text(__doc__ or "", style="dim"))
+            self._print(Text(
                 "内置：" + " / ".join(BUILTINS) + "\n"
                 "任意能力：<cap> [--device 设备] [--参数 值 ...]\n"
                 "例：pc.state / screen.read --device phone:main / "
@@ -332,8 +349,11 @@ class FleetShell:
 
         kw = self.parse_args(cap, tokens[1:])
         device = kw.pop("device", "") or ""
-        kw.pop("yes", None)
+        # 行内写了 --yes 就不必再问一遍；TUI 的 ctrl+y 已预先置位，别把它冲掉
+        pre = self._confirm
+        self._confirm = pre or bool(kw.pop("yes", False))
         res = self.reg.call(head, device=device, args=kw, gate=self.gate)
+        self._confirm = False
         self.show_result(res)
         return True
 
@@ -361,7 +381,7 @@ class FleetShell:
         if self.watch:
             self.watcher = Watcher(self, self.interval)
             self.watcher.start()
-        self.console.print(Text("设备编队终端（T0）—— help 看用法，quit 退出",
+        self._print(Text("设备编队终端（T0）—— help 看用法，quit 退出",
                                 style="bold cyan"))
         self.show_devices()
         try:

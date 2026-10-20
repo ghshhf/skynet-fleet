@@ -35,3 +35,9 @@ discovered.json
 android_bridge/build/
 android_bridge/keystore.jks
 android_bridge/.token
+
+# PyInstaller 打包产物（exe 由 GitHub Actions 构建，不入库）
+build/
+dist/
+*.spec
+*.exe
