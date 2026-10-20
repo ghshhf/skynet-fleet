@@ -26,6 +26,8 @@ CASES = [
     ("queue_store", ["queue_store.py", "--selftest"], HERE, 30),
     ("persona", ["persona.py", "--selftest"], HERE, 30),
     ("recall", ["recall.py", "--selftest"], HERE, 30),
+    ("enroll", ["enroll.py", "--selftest"], HERE, 30),
+    ("enroll_install", ["install_windows.py", "--enroll-selftest"], HERE, 30),
 ]
 
 

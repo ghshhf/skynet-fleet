@@ -29,8 +29,9 @@
   - **她 P3 人格心跳**：主动性 tick 接入看门狗，过**频控(≤2/h) / 静默时段 / 重要度**三道刹车；说了写 `last_thought`，不说写 `pending_thought`（她在忍，不是消失了）。接上 `llm.py` 后由模型自己开口，未接时模板兜底、绝不伪造模型输出。
   - **「她记得」（验收项：隔日 + 换设备能带出昨天的具体事）**：`recall.py` 从 L3 取 **12h–72h** 的往事（刚发生的不算回忆、一个多月前的没意义），跳过她自己的元状态（`last_thought` 等）与技术缓存，按「离昨天有多近」排序；说过的 **3 天内不重复**（去重记账落人格态，过期自动清），原文同时写 `her/last_recall`——**换设备也看得到她提过什么**。接上模型时原文进提示词并明确「只能引用、不要编造」，没模型时用模板句（只拼接库里的原文，不虚构记忆）。往事只**提高重要度**，不绕过频控/静默。REPL `her_memory` 可人工核对。
   - **临时节点下机即清**：节点上报 `session=True` 后断开，自动触发 `session_end` 策略（清理凭据、不留痕），与场所合规清理互补。
-  - **一键自测门禁**：`run_selftests.py` 串起 **11 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / compute_runner / queue_store / persona / recall）。
-- **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动。
+  - **扫码入网（`enroll.py`）**：手机出示一张二维码载荷，设备扫一下即可入网，不用在新机器上敲密码。载荷是 `fleet://enroll?p=...`（约 230 字符），**可离线验签**（HMAC-SHA256 + 共享密钥，不联网、不回调控制面）、**一次性**（兑换落本地账本，截图外流也只是废纸）、**有时效**（默认 10 分钟）、**绑节点**（A 的载荷装不成 B），且**不含用户密码**——装完节点用随机 PSK 认证，明文密码不再写进计划任务参数。载荷寿命与节点凭据寿命**分开**：码 10 分钟过期，PSK 长期有效（否则一重启就失联），撤销走 `enroll_revoke`。REPL：`enroll <节点> [有效期秒]` / `enroll_list` / `enroll_revoke <节点>`；安装侧 `install_windows.py --enroll "<uri>" [--dry-run]`。
+  - **一键自测门禁**：`run_selftests.py` 串起 **13 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / compute_runner / queue_store / persona / recall / enroll / enroll_install）。
+- **延后**（等真机/拍板）：Android `adb` 真机推、Apple macOS SSH / iOS 屏共、路由器 OpenWrt 中枢接入、`她` SFT 模型训练（交手机/盒子跑）、Linux systemd 单元（本期全 Windows）、L2 内核驱动、手机端二维码渲染（载荷已可生成与离线验签，缺的只是把它画成图）。
 
 自测命令（全部离线，不碰真机、不需联网）：
 
@@ -107,6 +108,12 @@ python commander.py --password 你的密码 --host 0.0.0.0 --port 9000
 # 2) 另一台装常驻节点（管理员跑一次即永久常驻、无弹窗）
 python install_windows.py --install --name PC-B --host <CommanderIP> --port 9000 --password 你的密码
 
+# 2b) 或：扫码入网（推荐，不必在新机器上敲密码）
+#     在 Commander 控制台签发 -> 把输出的 fleet:// 文本渲成二维码 -> 目标机扫/粘贴
+enroll PC-B                    # 得到 fleet://enroll?p=...（10 分钟、一次性、绑 PC-B）
+python install_windows.py --enroll "fleet://enroll?p=..." --dry-run   # 先在目标机验签看参数
+python install_windows.py --enroll "fleet://enroll?p=..."             # 兑换并装（管理员）
+
 # 3) 控制台
 nodes                      # 看在线节点 + 能力
 exec PC-B ipconfig         # 单点执行
@@ -142,7 +149,7 @@ set FLEET_LLM_URL=http://127.0.0.1:8080
 决策分叉 ── 持久化深度 ── L1 SYSTEM 服务 ✓(已建+自测) ── L2 内核驱动（延后，用户定调回 L1）
            └─ 平台 ── Windows ✓(本期) ── Linux / Android / Apple / 路由（适配器已写，延后真机）
            └─ 节点性质 ── 常驻 ✓ ── 临时(网吧) ✓(session_end 下机即清) ── 真机验证（延后）
-           └─ 认证 ── 密码 ✓ + 配对设备一次性令牌 ✓ ── 手机扫码入网（延后）
+           └─ 认证 ── 密码 ✓ + 配对设备一次性令牌 ✓ + 扫码入网 ✓(离线验签/一次性/绑节点) ── 手机端二维码渲染（延后）
            └─ 推送 ── 反向推送 ✓(bootstrap+文件) ── 手机 adb 真推（延后）
            └─ 调用 ── 单点 exec ✓ + broadcast 扇出 ✓ + 共享算力路由 ✓ + 真推理 ✓ ── 统一意图编排（延后）
            └─ 上下文 ── L3 共享 ✓(已建+自测) ── 与她记忆深绑（延后训练）
