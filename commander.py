@@ -24,6 +24,8 @@ import time
 
 import accounts
 import arbiter
+import audit
+import capabilities
 import common
 import enroll
 import memory as mem_mod
@@ -574,6 +576,8 @@ def _handle_node(conn, password):
             "last_hb": time.time(),
         }))
         print(f"[+] 节点上线: {name} ({reg.get('platform')}) caps={reg.get('capabilities')}", flush=True)
+        audit.log("node.up", node=name, platform=reg.get("platform"),
+                  caps=reg.get("capabilities"))
         # 记进「来过」的历史（凭据字段由 registry 白名单剔掉，密码不会落盘）
         REGISTRY.observe(name, reg, force=True)
         if DEBUG:
@@ -596,7 +600,13 @@ def _handle_node(conn, password):
                     print(f"[dbg] <- {name} {t} id={m.get('id')}", flush=True)
                 _resolve_pending(m.get("id"), m)
             elif t == common.CAPABILITIES:
-                REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("capabilities", m.get("caps", [])))
+                # 节点不报能力名，还报「说明书」（参数 schema）——编排据此知道怎么调它
+                def _upd(d):
+                    if d.get(name):
+                        d[name]["capabilities"] = m.get("caps", [])
+                        if m.get("specs"):
+                            d[name]["capability_specs"] = m["specs"]
+                REGISTRY.with_lock(_upd)
                 REGISTRY.observe(name, {"capabilities": m.get("caps", [])})
             elif t == common.CTX_PUT:
                 r = _ctx().put(m.get("ns"), m.get("key"), m.get("val"))
@@ -625,6 +635,7 @@ def _handle_node(conn, password):
         if nm:
             _drop_node(nm)
             print(f"[-] 节点下线: {nm}", flush=True)
+            audit.log("node.down", node=nm)
 
 
 def _route_capability_request(name, m, conn):
@@ -686,6 +697,48 @@ def _cmd_nodes():
         print("（无在线节点）")
     for k, p, caps, age in rows:
         print(f"  {k:12} {p:8} caps={caps} 心跳 {age}s 前")
+
+
+def _cmd_can(cap):
+    """发现：谁会干这件事 + 怎么调（参数 schema）——编排据此「按谁能干」选点。
+
+    与 `caps`（手机能力矩阵）分工：caps 回答「**她现在能感知什么**」，
+    can 回答「**编队里谁能干这件事、参数怎么填**」。
+    """
+    s = capabilities.spec_of(cap)
+    print(f"  {cap}: {s['title']} —— {s['desc']}")
+    for p in s["params"]:
+        req = "必填" if p.get("required") else "可选"
+        print(f"    - {p['name']}:{p['type']}（{req}）{p['desc']}")
+    ns = REGISTRY.with_lock(
+        lambda d: [k for k, v in d.items() if cap in v.get("capabilities", [])])
+    print(f"  能干此事的节点: {', '.join(ns) if ns else '（无）'}")
+
+
+def _cmd_nodecaps():
+    """能力自描述总览：编队里出现过的能力 + 各自一句话 + 谁能干（编排的发现面）。"""
+    nodes = REGISTRY.with_lock(lambda d: list(d.items()))
+    agg = {}
+    for nm, v in nodes:
+        for c in v.get("capabilities", []):
+            agg.setdefault(c, []).append(nm)
+    if not agg:
+        print("（无在线节点）")
+        return
+    for c in sorted(agg):
+        s = capabilities.spec_of(c)
+        ps = ", ".join(p["name"] for p in s["params"]) or "—"
+        print(f"  {c:10} {s['title']:12} 参数[{ps}]  能干: {', '.join(agg[c])}")
+
+
+def _cmd_audit(n=20):
+    """控制面审计流水：谁在什么时候调了什么（append-only，纯旁路不改控制流）。"""
+    rows = audit.tail(n)
+    print(f"  审计流水 {audit.path()}（共 {audit.count()} 条，显示最近 {len(rows)}）")
+    for r in rows:
+        ts = time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0)))
+        extra = " ".join(f"{k}={v}" for k, v in r.items() if k not in ("ts", "kind"))
+        print(f"    {ts}  {r.get('kind'):12} {extra}")
 
 
 def _cmd_seen(n=20):
@@ -1613,6 +1666,9 @@ def repl():
     print("      | done <topic>   # 告诉系统这件事做完了（清账，她不再追问）")
     print("      | journal [n]    # 回看对话流水（她起话题的依据）")
     print("      | arbiter        # 多控制面仲裁：谁是领袖、本机是领袖还是待机")
+    print("      | can <能力>                # 能力自描述：谁能干这件事 + 参数怎么填")
+    print("      | nodecaps                  # 编队能力总览（与 caps 分工：那个是她的能力矩阵）")
+    print("      | audit [n]                 # 控制面审计流水（谁在什么时候调了什么）")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -1747,6 +1803,13 @@ def repl():
                 _cmd_her_say(rest)
         elif op == "arbiter":
             _cmd_arbiter()
+        elif op == "can":
+            if rest:
+                _cmd_can(rest)
+        elif op == "nodecaps":
+            _cmd_nodecaps()
+        elif op == "audit":
+            _cmd_audit(int(rest) if (rest or "").isdigit() else 20)
         elif op == "intent":
             if rest:
                 _cmd_intent(rest)
