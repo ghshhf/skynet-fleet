@@ -16,3 +16,5 @@ persona_state.json
 models/
 ui_automation/adskip_rules.json
 ui_automation/adskip_rules.json.tmp
+fleet_queue.json
+fleet_queue.json.tmp

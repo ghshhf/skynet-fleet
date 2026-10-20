@@ -23,6 +23,7 @@ import time
 import common
 import memory as mem_mod
 import policies
+import queue_store
 
 REGISTRY = common.LockedDict()          # name -> {sock, token, platform, info, capabilities, last_hb}
 PENDING = {}                             # msg id -> {ev, slot}
@@ -32,6 +33,8 @@ _counter = 0
 
 OFFLINE_QUEUE = {}                       # name -> [{id, cmd}]  （离线排队，上线重放）
 _QUEUE_LK = threading.Lock()
+QUEUE_PATH = os.environ.get(
+    "FLEET_QUEUE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleet_queue.json"))
 
 TOKENS = {}                              # token -> {node, purpose, exp}
 _TOKEN_LK = threading.Lock()
@@ -179,18 +182,32 @@ def start_watchdog(**kw):
 
 
 def _enqueue(name, cmd):
-    """离线排队（Phase 4）。"""
+    """离线排队（Phase 4）：同时落盘，控制面重启不丢。"""
     with _QUEUE_LK:
         OFFLINE_QUEUE.setdefault(name, []).append({"id": _next_id("q"), "cmd": cmd})
+        queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
 
 
 def _replay_queue(name):
     """节点上线时，把排队命令重放过去（透明上下线）。"""
     with _QUEUE_LK:
         q = OFFLINE_QUEUE.pop(name, [])
+        if q:
+            queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
     if q:
         send_to_node(name, {"t": common.QUEUE, "cmds": q})
         print(f"[*] 节点 {name} 上线，重放 {len(q)} 条离线命令", flush=True)
+
+
+def _restore_queue():
+    """启动时恢复磁盘上未重放的排队命令（控制面重启不丢）。"""
+    saved = queue_store.load(QUEUE_PATH)
+    if saved:
+        with _QUEUE_LK:
+            for k, v in saved.items():
+                OFFLINE_QUEUE.setdefault(k, []).extend(v)
+        print(f"[*] 已恢复 {queue_store.pending_count(saved)} 条离线排队命令", flush=True)
+    return saved
 
 
 def _issue_token(name, purpose="uninstall"):
@@ -696,9 +713,17 @@ def repl():
 
 def self_test(host, port, password):
     """本地回路自检：起服务 + 多节点，证明身体 Phase 0–4 + 她授权闭环 + 反向推送。"""
-    global SELF_TEST
+    global SELF_TEST, RULES_PATH, QUEUE_PATH
     SELF_TEST = True
     os.environ["FLEET_CTX"] = ":memory:"
+    import tempfile
+    # 自检用临时文件，绝不污染仓库里的规则库/队列
+    tdir = tempfile.gettempdir()
+    RULES_PATH = os.path.join(tdir, f"fleet_rules_st_{os.getpid()}.json")
+    QUEUE_PATH = os.path.join(tdir, f"fleet_queue_st_{os.getpid()}.json")
+    for _p in (RULES_PATH, QUEUE_PATH):
+        if os.path.exists(_p):
+            os.remove(_p)
     import node_agent
     import bootstrap as boot
     threading.Thread(target=serve, args=(host, port, password), daemon=True).start()
@@ -741,6 +766,16 @@ def self_test(host, port, password):
                          caps=["exec"], sandbox="sandbox_ghost", bg=True)
     time.sleep(1.0)  # 等其上线->重放
 
+    print("\n=== 离线队列持久化（控制面重启也不丢「上线自动补」这个承诺）===", flush=True)
+    _enqueue("PC-Restart", "echo 重启后命令还在")
+    disk = queue_store.load(QUEUE_PATH)
+    print(f"  磁盘排队 {queue_store.pending_count(disk)} 条；含 PC-Restart={bool(disk.get('PC-Restart'))}")
+    with _QUEUE_LK:
+        OFFLINE_QUEUE.clear()               # 模拟控制面重启：内存清空
+    restored = _restore_queue()              # 从磁盘恢复
+    print(f"  模拟重启后恢复 {queue_store.pending_count(restored)} 条；"
+          f"命令原文={restored.get('PC-Restart', [{}])[0].get('cmd')!r}")
+
     print("\n=== 反向推送 bootstrap（第三原则，loopback 校验）===", flush=True)
     srv = boot.start_server(".", host, 9100)
     b = boot.fetch_bytes(f"http://{host}:9100", "node_agent.py")
@@ -749,12 +784,7 @@ def self_test(host, port, password):
     srv.shutdown()
 
     print("\n=== adskip 规则库 → ui 能力（规则=编队共享资产，改一次全端生效）===", flush=True)
-    global RULES_PATH
     import json as _json
-    import tempfile
-    RULES_PATH = os.path.join(tempfile.gettempdir(), f"fleet_rules_st_{os.getpid()}.json")
-    if os.path.exists(RULES_PATH):
-        os.remove(RULES_PATH)
     seed_path = RULES_PATH + ".seed.json"
     with open(seed_path, "w", encoding="utf-8") as f:
         _json.dump([{"packageName": "*", "triggers": [
@@ -804,6 +834,7 @@ def main():
     if args.self_test:
         self_test(args.host, args.port, args.password)
     else:
+        _restore_queue()
         threading.Thread(target=serve, args=(args.host, args.port, args.password), daemon=True).start()
         start_watchdog()          # 心跳看门狗：卡住/假死的节点会被自动探测/摘除
         repl()
