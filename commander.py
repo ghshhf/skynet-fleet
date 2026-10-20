@@ -1035,6 +1035,12 @@ def _her_compose(hint):
 
     算力在哪台设备都行：只要那台节点设了 FLEET_LLM_CMD / FLEET_LLM_URL，她就真说话。
     注意：只在「已经过刹车、确定要说」时才调用，绝不为了说话而空烧 GPU。
+
+    人格来源优先级（2026-10-21）：
+      ① 角色卡（cards/ 里选中的那张，chara_card 格式）——用户自训人格还在训练中，
+         角色卡是替代载体，换卡即换人格，不用重训也不用改代码。
+      ② 没选卡时退回旧的模板句（name/traits/catchphrase）。
+    世界书按 hint 里的关键词命中才注入，避免把整本设定塞进上下文。
     """
     try:
         import llm
@@ -1042,9 +1048,19 @@ def _her_compose(hint):
             return None
         st, _ = _her()
         d = st.snapshot()
-        sys_prompt = HER_SYSTEM_TMPL.format(
-            name=d.get("name"), trait="、".join(d.get("traits") or []),
-            catch=d.get("catchphrase", ""))
+        sys_prompt = ""
+        try:
+            import persona_card as pc
+            card = pc.active_card()
+            if card:
+                extra = "\n".join(pc.match_world_book(card, hint))
+                sys_prompt = pc.build_system(card, state=st, extra=extra)
+        except Exception:
+            sys_prompt = ""
+        if not sys_prompt:
+            sys_prompt = HER_SYSTEM_TMPL.format(
+                name=d.get("name"), trait="、".join(d.get("traits") or []),
+                catch=d.get("catchphrase", ""))
         text, _b = llm.complete(hint, system=sys_prompt)
         return (text or "").strip() or None
     except Exception:
