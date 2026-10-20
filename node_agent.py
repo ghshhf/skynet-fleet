@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 
+import capabilities
 import common
 
 PENDING = {}
@@ -100,6 +101,7 @@ def _session(host, port, name, password, platform, caps, sandbox, cap_req,
         raise OSError(f"认证失败: {resp}")
     common.send_msg(s, {"t": common.REGISTER, "name": name, "platform": platform,
                         "capabilities": caps,
+                        "capability_specs": capabilities.describe(caps),
                         "info": {"sandbox": os.path.abspath(sandbox), "session": session,
                                  "compute": {"cpu": os.cpu_count() or 0, "gpu": gpu,
                                              "ram_gb": ram_gb, "models": models or []}}})

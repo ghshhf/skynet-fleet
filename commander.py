@@ -21,6 +21,7 @@ import threading
 import time
 
 import audit
+import capabilities
 import common
 import llm
 import memory as mem_mod
@@ -156,6 +157,7 @@ def _handle_node(conn, password):
             "platform": reg.get("platform", "?"),
             "info": reg.get("info", {}),
             "capabilities": reg.get("capabilities", []),
+            "capability_specs": reg.get("capability_specs", {}),
             "last_hb": time.time(),
         }))
         print(f"[+] 节点上线: {name} ({reg.get('platform')}) caps={reg.get('capabilities')}", flush=True)
@@ -183,7 +185,12 @@ def _handle_node(conn, password):
                 audit.log("her.speak", node=name, text=m.get("text"),
                           importance=m.get("importance"))
             elif t == common.CAPABILITIES:
-                REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("capabilities", m.get("caps", [])))
+                def _upd(d):
+                    if d.get(name):
+                        d[name]["capabilities"] = m.get("caps", [])
+                        if m.get("specs"):
+                            d[name]["capability_specs"] = m["specs"]
+                REGISTRY.with_lock(_upd)
             elif t == common.CTX_PUT:
                 r = _ctx().put(m.get("ns"), m.get("key"), m.get("val"))
                 common.send_msg(conn, {"t": common.CTX_PUT_RESULT, "id": m.get("id"), **r})
@@ -261,6 +268,33 @@ def _cmd_nodes():
         print("（无在线节点）")
     for k, p, caps, age in rows:
         print(f"  {k:12} {p:8} caps={caps} 心跳 {age}s 前")
+
+
+def _cmd_caps():
+    """能力自描述总览：编队里出现过的能力 + 各自一句话 + 谁能干（编排的发现面）。"""
+    nodes = REGISTRY.with_lock(lambda d: list(d.items()))
+    agg = {}
+    for nm, v in nodes:
+        for c in v.get("capabilities", []):
+            agg.setdefault(c, []).append(nm)
+    if not agg:
+        print("（无在线节点）")
+        return
+    for c in sorted(agg):
+        s = capabilities.spec_of(c)
+        ps = ", ".join(p["name"] for p in s["params"]) or "—"
+        print(f"  {c:10} {s['title']:12} 参数[{ps}]  能干: {', '.join(agg[c])}")
+
+
+def _cmd_can(cap):
+    """发现：谁会干这件事 + 怎么调（参数 schema）——编排据此「按谁能干」选点。"""
+    s = capabilities.spec_of(cap)
+    print(f"  {cap}: {s['title']} —— {s['desc']}")
+    for p in s["params"]:
+        req = "必填" if p.get("required") else "可选"
+        print(f"    - {p['name']}:{p['type']}（{req}）{p['desc']}")
+    ns = REGISTRY.with_lock(lambda d: [k for k, v in d.items() if cap in v.get("capabilities", [])])
+    print(f"  能干此事的节点: {', '.join(ns) if ns else '（无）'}")
 
 
 def _cmd_exec(name, cmd):
@@ -612,6 +646,7 @@ def repl():
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool | quit")
     print("      | ai [small|4b|gpu] <提示词> | ainodes | aihelp   # 远程 AI 即服务（瘦客户端调她）")
     print("      | audit [n]   # 看控制面审计流水（谁在什么时候调了什么）")
+    print("      | caps | can <能力>   # 能力自描述：看编队能做什么、怎么调（编排发现面）")
     while True:
         try:
             line = input("cmd> ").strip()
@@ -679,6 +714,11 @@ def repl():
             _cmd_ainodes()
         elif op == "aihelp":
             _cmd_aihelp()
+        elif op == "caps":
+            _cmd_caps()
+        elif op == "can":
+            if rest:
+                _cmd_can(rest)
         elif op == "audit":
             _cmd_audit(int(rest) if rest.isdigit() else 20)
         else:
@@ -726,6 +766,10 @@ def self_test(host, port, password):
     _cmd_exec("PC-A", "echo 由Commander控制")
     _cmd_exec("PC-A", "hostname")
     _cmd_exec("PC-A", "whoami")
+
+    print("\n=== 能力自描述（节点上报说明书，供统一意图编排「发现」）===", flush=True)
+    _cmd_caps()
+    _cmd_can("exec")
 
     print("\n=== L3 共享上下文（跨设备记忆，海马体）===", flush=True)
     _ctx_search("her", "昨晚")
