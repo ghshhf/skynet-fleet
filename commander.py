@@ -133,7 +133,10 @@ def _fire(event, name=""):
 
 
 def _drop_node(name):
-    REGISTRY.with_lock(lambda d: d.pop(name, None))
+    node = REGISTRY.with_lock(lambda d: d.pop(name, None))
+    if node and (node.get("info") or {}).get("session"):
+        # 临时节点（网吧等）下机：先走清理策略，再走掉线策略
+        _fire({"event": "session_end", "mode": "session"}, name)
     _fire({"event": "node_offline", "node": name}, name)
 
 
@@ -500,6 +503,31 @@ def _her():
     return PERSONA, _PROACTIVE
 
 
+HER_SYSTEM_TMPL = ("你是{name}，性格{trait}，口癖「{catch}」。"
+                   "用一句口语回答，不超过30字，不要旁白、不要解释。")
+
+
+def _her_compose(hint):
+    """用本地模型让她自己开口；没接模型（placeholder）时返回 None，由调用方用模板句。
+
+    算力在哪台设备都行：只要那台节点设了 FLEET_LLM_CMD / FLEET_LLM_URL，她就真说话。
+    注意：只在「已经过刹车、确定要说」时才调用，绝不为了说话而空烧 GPU。
+    """
+    try:
+        import llm
+        if llm.backend() == "placeholder":
+            return None
+        st, _ = _her()
+        d = st.snapshot()
+        sys_prompt = HER_SYSTEM_TMPL.format(
+            name=d.get("name"), trait="、".join(d.get("traits") or []),
+            catch=d.get("catchphrase", ""))
+        text, _b = llm.complete(hint, system=sys_prompt)
+        return (text or "").strip() or None
+    except Exception:
+        return None
+
+
 def _persona_tick(min_interval=60.0):
     """她的主动性心跳：产生一个念头 -> 过频控/静默/重要度三道刹车 -> 说或不说。
 
@@ -520,13 +548,15 @@ def _persona_tick(min_interval=60.0):
         text = f"{st.data.get('catchphrase', '')} 你在干嘛？"
         imp = 0.5
 
-    said = eng.maybe_speak(text, imp)
-    if said:
-        print(f"[她] {said}", flush=True)
-        _ctx().put("her", "last_thought", said)      # 跨设备：手机上也知道她刚说了啥
-        return said
-    _ctx().put("her", "pending_thought", text)       # 被刹车 -> 记成心事，不打扰
-    return None
+    ok, why = eng.allow(imp)
+    if not ok:
+        _ctx().put("her", "pending_thought", text)   # 被刹车 -> 记成心事，不打扰
+        return None
+
+    text = _her_compose(text) or text                # 接上真模型就她来说，否则模板兜底
+    print(f"[她] {text}", flush=True)
+    _ctx().put("her", "last_thought", text)          # 跨设备：手机上也知道她刚说了啥
+    return text
 
 
 def _cmd_her():
@@ -548,13 +578,14 @@ def _cmd_her():
 def _cmd_her_say(text):
     """让她现在说一句（走同一套刹车，便于真人验证主动性不会刷屏）。"""
     st, eng = _her()
-    said = eng.maybe_speak(text, 0.8)
-    if said:
-        print(f"[她] {said}", flush=True)
-        _ctx().put("her", "last_thought", said)
-    else:
-        print("  （刹车拦下：频控/静默时段/重要度不足，已记成心事）", flush=True)
+    ok, why = eng.allow(0.8)
+    if not ok:
+        print(f"  （刹车拦下: {why}，已记成心事）", flush=True)
         _ctx().put("her", "pending_thought", text)
+        return
+    said = _her_compose(text) or text
+    print(f"[她] {said}", flush=True)
+    _ctx().put("her", "last_thought", said)
 
 
 def _cmd_computepool():
@@ -858,6 +889,21 @@ def self_test(host, port, password):
     print(f"  模拟重启后恢复 {queue_store.pending_count(restored)} 条；"
           f"命令原文={restored.get('PC-Restart', [{}])[0].get('cmd')!r}")
 
+    print("\n=== 临时节点（网吧）：下机即清，不留凭据 ===", flush=True)
+    node_agent.run_node(host, port, "PC-Net", password, "windows", caps=["exec"],
+                        sandbox="sandbox_net", bg=True, session=True)
+    time.sleep(0.9)
+    print(f"  上线: {bool(REGISTRY.with_lock(lambda d: d.get('PC-Net')))}（session 模式已上报）")
+    sk = REGISTRY.with_lock(lambda d: (d.get("PC-Net") or {}).get("sock"))
+    if sk:
+        try:
+            sk.close()                 # 模拟下机（拔线/关浏览器）
+        except OSError:
+            pass
+    time.sleep(0.9)
+    print(f"  下机后在线: {bool(REGISTRY.with_lock(lambda d: d.get('PC-Net')))}"
+          f"（应为 False；session_end 策略已触发清理）")
+
     print("\n=== 反向推送 bootstrap（第三原则，loopback 校验）===", flush=True)
     srv = boot.start_server(".", host, 9100)
     b = boot.fetch_bytes(f"http://{host}:9100", "node_agent.py")
@@ -895,6 +941,10 @@ def self_test(host, port, password):
     print("  （PC-OK 无事件 / PC-Slow 仅探测 / PC-Dead 判死并摘除）", flush=True)
 
     print("\n=== 她的人格心跳（P3 主动性 + 三道刹车：频控/静默/重要度）===", flush=True)
+    import llm as _llm
+    print(f"  说话后端={_llm.backend()}（placeholder 用模板句；设 FLEET_LLM_CMD/URL 后由模型自己说）")
+    if _llm.backend() == "placeholder":
+        assert _her_compose("测试") is None, "placeholder 下不许伪造模型输出"
     _persona_tick(min_interval=0)                       # 无执念：打招呼
     _her()[0].add_obsession("phone.screen.on", "想玩游戏")
     _persona_tick(min_interval=0)                       # 有执念：谈执念
