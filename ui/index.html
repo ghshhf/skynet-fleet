@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>设备编队 · Windows 图形版</title>
+<!-- 纯本地资源：无 CDN、无外部字体、无框架。断网可用，也不外传任何东西。 -->
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- 顶栏 -->
+  <div class="titlebar">
+    <div class="tb-logo"><span class="tb-mark">F</span>设备编队</div>
+    <div class="tb-menu">
+      <span>文件<span class="kbd">Ctrl+F</span></span>
+      <span>编辑<span class="kbd">Ctrl+E</span></span>
+      <span>窗口<span class="kbd">Ctrl+W</span></span>
+      <span>帮助<span class="kbd">Ctrl+H</span></span>
+      <span>关于</span>
+    </div>
+    <div class="tb-spacer"></div>
+    <button class="tb-theme" id="themeBtn" title="明暗切换">◐</button>
+    <div class="tb-win"><i>—</i><i>▢</i><i class="close">✕</i></div>
+  </div>
+
+  <div class="body">
+    <!-- 左栏 -->
+    <aside class="sidebar">
+      <div class="sb-brand">
+        <div class="sb-mark">编</div>
+        <div><b>设备编队</b><small id="verline">v0.1 · W1</small></div>
+      </div>
+
+      <div class="sb-discover">
+        <span>◈</span><span class="grow">发现应用</span><span>⌄</span>
+      </div>
+
+      <nav class="sb-nav">
+        <div class="sb-item on"><span class="ic">◉</span>新建任务</div>
+        <div class="sb-item"><span class="ic">◐</span>助理<span class="tag">BETA</span></div>
+        <div class="sb-item"><span class="ic">⌘</span>专家技能·连接器</div>
+        <div class="sb-item"><span class="ic">⏱</span>定时任务</div>
+        <div class="sb-item"><span class="ic">▤</span>资料库</div>
+        <div class="sb-item"><span class="ic">⋯</span>更多<span class="tag">灵感</span></div>
+      </nav>
+
+      <div class="sb-sec"><span>任务</span><span class="cnt">(0)</span></div>
+      <div class="sb-sec"><span>设备</span><span class="cnt" id="devCount">(0)</span></div>
+      <div class="sb-list" id="deviceList"></div>
+
+      <div class="sb-sec"><span>会话</span><span class="cnt" id="sessCount">(0)</span></div>
+      <div class="sb-list" id="sessionList" style="flex:0 0 auto;max-height:180px"></div>
+
+      <div class="sb-foot">
+        <span class="ava" id="personaAva">编</span>
+        <span class="grow" id="personaName">读取中…</span>
+        <span style="color:var(--fg-3)">⚙</span>
+      </div>
+    </aside>
+
+    <!-- 中栏 -->
+    <main class="main">
+      <div class="main-head">
+        <h1>设备编队</h1>
+        <span class="sub" id="regStat">registry: —</span>
+        <span class="grow"></span>
+        <div class="hbtn" id="capBtn" title="能力面板">◫</div>
+        <div class="hbtn" title="搜索">⌕</div>
+        <div class="hbtn" title="分享">↗</div>
+      </div>
+
+      <div class="stream" id="stream">
+        <div class="stream-in" id="streamIn"></div>
+      </div>
+
+      <!-- 语音状态条（W1 只是 UI 占位，语音在 W4 接） -->
+      <div class="voicebar" id="voiceBar" hidden>
+        <span class="mic">●</span>
+        <span id="voiceText">正在听……</span>
+        <span class="wv" aria-hidden="true">
+          <b style="height:6px"></b><b style="height:12px"></b><b style="height:17px"></b>
+          <b style="height:9px"></b><b style="height:14px"></b><b style="height:7px"></b>
+          <b style="height:16px"></b><b style="height:10px"></b><b style="height:5px"></b>
+        </span>
+        <span class="grow"></span>
+        <span class="hint">W4 才接真录音 · 现在只是界面占位</span>
+      </div>
+
+      <!-- 能力调用的真实结果 -->
+      <div class="resbar" id="resBar" hidden></div>
+
+      <!-- 底部输入区 -->
+      <div class="composer">
+        <div class="comp-in">
+          <div class="comp-box">
+            <div class="comp-ph">
+              <textarea id="input" rows="1" placeholder="在这里输入，或按住说话……（Enter 发送 / Shift+Enter 换行）"></textarea>
+            </div>
+            <div class="comp-row">
+              <span class="cbtn" title="添加附件（W3 开放）">＋</span>
+              <span class="cbtn" title="浏览访问权限（W3 开放）">⊘ 允许浏览访问 <span class="kbd">⌄</span></span>
+              <span class="cbtn mic" id="micBtn" title="语音输入（W4 开放）">🎙</span>
+              <button class="cbtn send" id="sendBtn" disabled>发送</button>
+            </div>
+          </div>
+          <div class="comp-model" id="modelPick" title="后端选择器">
+            <span>◈</span><b id="modelName">读取中…</b>
+            <span class="m" id="modelId"></span><span>⌄</span>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 能力面板（可折叠）：让用户看得见哪些动作要过闸门 -->
+<div class="capwrap" id="capPanel">
+  <div class="caphead">
+    <span>能力清单</span><span class="grow"></span>
+    <span class="badge" id="capCount">0</span>
+    <button class="hbtn" id="capClose" title="关闭">✕</button>
+  </div>
+  <div class="capbody" id="capBody"></div>
+</div>
+
+<!-- 右下角悬浮助手（桌宠位） -->
+<div class="pet" id="pet" title="悬浮助手（人格载体）">🐳</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

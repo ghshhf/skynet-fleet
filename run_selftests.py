@@ -68,6 +68,10 @@ CASES = [
     # 这条门禁必须完全离线：它连一条 adb 命令都不发、不连一个 IP。
     # 本机没插设备、PATH 里没 adb 都不能让它变红（t4 的教训）。
     ("eval_t6_adb_wifi", ["evals/t6_adb_wifi.py"], HERE, 120),
+    # ---- W1 图形版：本地后端 + 前端壳（离线；起真服务打真接口）----
+    # 这条起的是真 HTTP 服务（随机端口 + 一次性 token），门禁里打真接口，
+    # 所以它能抓到「接口形状变了」「令牌校验漏了」「SSE 退化成一次性」这类坏。
+    ("eval_t7_gui_backend", ["evals/t7_gui_backend.py"], HERE, 180),
 ]
 
 
