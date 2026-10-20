@@ -26,17 +26,27 @@ shell 白名单为什么必须有：能执行 shell 就等于能在对方手机�
 写操作（rm / settings put / pm uninstall / am start / reboot …）一律 denied 并说清理由。
 写操作要走专用能力（adb.wifi.disable_pkg 等），不许从 shell 绕进去。
 
-离线可测：所有外部调用都经由模块级的 _adb_exe() / _run_cmd() / _probe_tcp()，
-门禁把这几个换成假的即可，绝不真连任何设备。
+发现路径为什么是「mDNS 优先」：暴力扫随机端口段的真实规模是
+「254 台候选主机 × 2173 个端口 = 55 万次 TCP 探测」，16 并发单次 0.35s 超时
+⇒ 最坏 3.4 小时；既卡死终端，也是在扫别人家的网。而 Android 11+ 端口随机，
+官方唯一可靠的发现方式是 mDNS。所以默认走 mDNS（设备自己举手报名），
+只补探经典 5555；暴力扫必须显式 ports=random/full，且有次数 + 墙钟双硬预算，
+到点就停并如实说「已探 N 次（计划 M 次），因预算到点停下」——不许假装扫完了。
+
+离线可测：所有外部调用都经由模块级的 _adb_exe() / _run_cmd() / _run_bin() /
+_probe_tcp() / _mdns_discover()，门禁把这几个换成假的即可，绝不真连任何设备、
+绝不发一条真组播。
 """
 import os
 import re
 import shlex
 import socket
+import struct
 import subprocess
 import tempfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from ..core import BaseDevice, DeviceResult as R
 
@@ -115,8 +125,28 @@ ANDROID11_PORT_LO = 32768
 ANDROID11_PORT_HI = 60999
 CLASSIC_ADB_PORT = 5555
 
-#: 扫描端口段的默认上限（防止一次扫爆网）
+#: 随机端口段的采样步长（只在显式 opt-in 时才用得上）
 MAX_SCAN_PORTS = 2048
+
+#: 单次扫描的**硬预算**：最多发多少次 TCP 探测。
+#:
+#: 为什么必须有这个数：真实规模是「254 台候选主机 × 2173 个端口 = 55 万次探测」，
+#: 16 并发、单次 0.35s 超时 ⇒ 最坏 3.4 小时。这既会把终端卡死，
+#: 也等于拿自家路由器/公司网当靶子扫。预算到点就停，并如实说清扫了多少。
+MAX_PROBES = 20000
+
+#: 单次扫描的**墙钟总时长上限**（秒）。预算的另一维：
+#: 探测次数够但每个都慢（0.35s 超时 × 2 万次）也等不起。
+MAX_SCAN_SECONDS = 20.0
+
+#: mDNS 服务名（Android 11+ 无线调试自己广播）
+MDNS_SERVICES = ("_adb-tls-connect._tcp.local", "_adb._tcp.local")
+
+#: mDNS 组播地址
+MDNS_ADDR = ("224.0.0.251", 5353)
+
+#: mDNS 查询超时（秒）
+MDNS_TIMEOUT = 3.0
 
 #: adb 命令超时（秒）
 ADB_TIMEOUT = 20
@@ -158,6 +188,170 @@ def _probe_tcp(host, port, timeout=0.35):
             return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------- mDNS 发现
+
+def _mdns_enc_name(name):
+    """把 "a.b.local" 编码成 DNS 名字格式（长度前缀标签序列）。"""
+    out = b""
+    for label in name.split("."):
+        if label:
+            lb = label.encode()
+            out += bytes([len(lb)]) + lb
+    return out + b"\x00"
+
+
+def _mdns_read_name(buf, off, depth=0):
+    """读一个 DNS 名字（支持 0xC0 压缩指针）。返回 (名字, 下一个偏移)。"""
+    if depth > 8:
+        return "", off + 1
+    labels = []
+    while off < len(buf):
+        ln = buf[off]
+        if ln == 0:
+            off += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= len(buf):
+                return ".".join(labels), off + 1
+            ptr = ((ln & 0x3F) << 8) | buf[off + 1]
+            sub, _ = _mdns_read_name(buf, ptr, depth + 1)
+            if sub:
+                labels.append(sub)
+            off += 2
+            break
+        off += 1
+        labels.append(buf[off:off + ln].decode("utf-8", "replace"))
+        off += ln
+    return ".".join([x for x in labels if x]), off
+
+
+def _mdns_query(name, qtype=12, qid=0):
+    """组一条 mDNS 查询。qtype：12=PTR 33=SRV 1=A。"""
+    header = struct.pack("!HHHHHH", qid, 0, 1, 0, 0, 0)
+    return header + _mdns_enc_name(name) + struct.pack("!HH", qtype, 1)
+
+
+def _mdns_records(buf):
+    """解析一条 mDNS 响应，返回记录字典列表。
+
+    只取我们要的三类：PTR（服务→实例名）、SRV（实例→主机+端口）、A（主机→IP）。
+    """
+    if len(buf) < 12:
+        return []
+    qd, an, ns, ar = struct.unpack("!HHHH", buf[4:12])
+    off = 12
+    for _ in range(qd):
+        _, off = _mdns_read_name(buf, off)
+        off += 4
+    out = []
+    for _ in range(an + ns + ar):
+        if off + 10 > len(buf):
+            break
+        name, off = _mdns_read_name(buf, off)
+        if off + 10 > len(buf):
+            break
+        rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", buf[off:off + 10])
+        off += 10
+        rdata = buf[off:off + rdlen]
+        if rtype == 12 and rdlen > 0:            # PTR
+            target, _ = _mdns_read_name(buf, off)
+            if target:
+                out.append({"type": "ptr", "name": name, "target": target})
+        elif rtype == 33 and rdlen >= 7:         # SRV
+            port = struct.unpack("!H", rdata[4:6])[0]
+            target, _ = _mdns_read_name(buf, off + 6)
+            if target:
+                out.append({"type": "srv", "name": name,
+                            "target": target, "port": port})
+        elif rtype == 1 and rdlen == 4:          # A
+            ip = ".".join(str(b) for b in rdata)
+            out.append({"type": "a", "name": name, "ip": ip})
+        off += rdlen
+    return out
+
+
+def _mdns_discover(timeout=MDNS_TIMEOUT):
+    """用 mDNS 找出局域网里开着无线调试的安卓设备。
+
+    为什么这是**默认**发现路径：Android 11+ 的无线调试端口每次开关都随机
+    （32768–60999），挨个敲门扫不出来；但它会自己广播
+    `_adb-tls-connect._tcp`——「问一句谁在」比「挨个端口敲门」又快又不打扰。
+
+    纯 stdlib（socket + struct），不引第三方 zeroconf：设备层是整个编队的
+    地基，依赖越少越不会在别人机器上跑不起来。
+
+    门禁会换掉这个函数——**开发/测试阶段绝不允许真发组播**。
+    返回 (设备列表, 错误原因)；错误原因非空时列表可能仍有部分结果。
+    """
+    devices = []
+    err = ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return [], f"建 mDNS socket 失败：{e}"
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", 0))
+        try:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+        except OSError:
+            pass
+        s.settimeout(0.3)
+        pending = [(svc, 12) for svc in MDNS_SERVICES]
+        sent = set(pending)
+        instances = set()
+        srv = {}            # 实例名 -> (目标主机, 端口)
+        addrs = {}          # 目标主机 -> IP
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            for name, qt in pending:
+                try:
+                    s.sendto(_mdns_query(name, qt), MDNS_ADDR)
+                except OSError:
+                    err = "mDNS 组播发送失败（可能防火墙拦了）"
+                    break
+            pending = []
+            try:
+                data, _src = s.recvfrom(9000)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                err = f"mDNS 收包失败：{e}"
+                break
+            for rec in _mdns_records(data):
+                if rec["type"] == "ptr":
+                    if rec["name"] in MDNS_SERVICES and rec["target"] not in instances:
+                        instances.add(rec["target"])
+                        q = (rec["target"], 33)
+                        if q not in sent:
+                            sent.add(q)
+                            pending.append(q)
+                elif rec["type"] == "srv":
+                    srv[rec["name"]] = (rec["target"], rec["port"])
+                    q = (rec["target"], 1)
+                    if q not in sent:
+                        sent.add(q)
+                        pending.append(q)
+                elif rec["type"] == "a":
+                    addrs[rec["name"]] = rec["ip"]
+        for inst in sorted(instances):
+            target = srv.get(inst)
+            if not target:
+                continue
+            host, port = target
+            ip = addrs.get(host, "")
+            devices.append({"name": inst, "host": ip, "port": int(port),
+                            "resolved": bool(ip)})
+    except OSError as e:
+        err = err or f"mDNS 发现异常：{e}"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return devices, err
 
 
 # ---------------------------------------------------------------- shell 白名单判定
@@ -356,13 +550,23 @@ class AdbWifi(BaseDevice):
                 continue
         return hosts, ""
 
-    def _scan_ports(self):
-        """要探的端口集合：经典 5555 + Android 11+ 随机段（按上限取步长，够得着但炸不穿网）。"""
-        ports = [CLASSIC_ADB_PORT]
+    def _scan_ports(self, mode="classic"):
+        """按模式给要探的端口集合。
+
+        classic（默认）：只有 5555 —— 经典 tcpip 模式的老设备。
+        random：5555 + 随机段的**采样**（步长采样，上限 MAX_SCAN_PORTS 个）。
+        full：5555 + 随机段**全量**（28232 个端口，必然撞预算）。
+
+        为什么默认不给随机段：Android 11+ 端口随机，官方唯一可靠的发现
+        方式是 mDNS，不是暴力扫。暴力扫必须显式 opt-in。
+        """
+        if mode == "classic":
+            return [CLASSIC_ADB_PORT]
+        if mode == "full":
+            return [CLASSIC_ADB_PORT] + list(range(ANDROID11_PORT_LO, ANDROID11_PORT_HI + 1))
         span = ANDROID11_PORT_HI - ANDROID11_PORT_LO + 1
         step = max(1, span // MAX_SCAN_PORTS)
-        ports.extend(range(ANDROID11_PORT_LO, ANDROID11_PORT_HI + 1, step))
-        return ports
+        return [CLASSIC_ADB_PORT] + list(range(ANDROID11_PORT_LO, ANDROID11_PORT_HI + 1, step))
 
     # ---------------- 截图盲文预览 ----------------
 
@@ -466,37 +670,177 @@ class AdbWifi(BaseDevice):
     # ---------------- 只读：scan / info ----------------
 
     def _scan(self, args):
-        """局域网扫开放 adb 的端口。
+        """找出局域网里开着无线调试的安卓设备。
 
-        限并发 + 限超时：这是**别人家的网**，扫太快等于 DDoS 自己家的路由器，
-        扫太慢就是卡住终端。所以并发与单端口超时都可调，且有上限。
+        默认路径（ports="classic"）= **mDNS 发现 + 只探经典 5555**。
+
+        为什么默认不暴力扫随机端口段：真实规模是
+        「254 台候选主机 × 2173 个端口（5555 + 32768..60999 采样）= 55 万次
+        TCP 探测」，16 并发、单次 0.35s 超时 ⇒ 最坏 3.4 小时。
+        这既会把终端卡死，也等于在扫别人家的网。
+        而 Android 11+ 的端口每次开关都随机，官方唯一可靠的发现方式是
+        mDNS（`_adb-tls-connect._tcp`）——设备自己举手报名，不用猜端口。
+        所以：**mDNS 是默认，暴力扫必须显式 opt-in（ports=random/full）**，
+        且 opt-in 也有硬预算（次数 + 墙钟），到点就停并如实说清。
         """
+        mode = str(args.get("ports") or "classic").strip().lower()
+        if mode not in ("classic", "random", "full"):
+            return R.error("adb.wifi.scan",
+                           f"ports 只支持 classic/random/full，收到 {mode!r}",
+                           device=self.name, via=self.via)
+
+        t0 = time.time()
+        found = []
+        notes = []
+
+        # ---- ① mDNS 发现（默认路径的主体）----
+        # 所有模式都跑 mDNS：它是官方推荐的发现方式，白捡的为什么要拒绝。
+        # ports=random/full 只是**额外**加一层暴力扫，不取代 mDNS。
+        mdns_devs = []
+        mdns_timeout = float(args.get("mdns_timeout") or MDNS_TIMEOUT)
+        try:
+            mdns_devs, mdns_err = _mdns_discover(timeout=mdns_timeout)
+        except Exception as e:
+            mdns_devs, mdns_err = [], f"mDNS 发现异常：{e}"
+        for d in mdns_devs:
+            host = d.get("host") or ""
+            port = int(d.get("port") or 0)
+            if not host or not port:
+                continue
+            found.append({"host": host, "port": port, "via": "mdns",
+                          "name": d.get("name", "")})
+        if mdns_err:
+            notes.append(f"mDNS 发现不完整：{mdns_err}")
+        notes.append(f"mDNS 发现到 {len(mdns_devs)} 台（服务 "
+                     f"{'、'.join(MDNS_SERVICES)}）")
+
+        # ---- ② 端口探测（classic 只探 5555；random/full 才碰随机段）----
         hosts, err = self._hosts()
         if hosts is None:
             return R.unavailable("adb.wifi.scan", err, device=self.name, via=self.via)
+        candidates = len(hosts)
         limit = int(args.get("hosts_limit") or 64)
         hosts = list(hosts)[:limit]
-        ports = self._scan_ports()
+        hosts_limited = len(hosts) < candidates
+        ports = self._scan_ports(mode)
         workers = max(1, min(int(args.get("workers") or 16), 64))
         tmo = float(args.get("timeout") or 0.35)
-        t0 = time.time()
-        found = []
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_probe_tcp, h, p, tmo): (h, p)
-                    for h in hosts for p in ports}
-            for fut, hp in futs.items():
-                try:
-                    if fut.result():
-                        found.append({"host": hp[0], "port": hp[1]})
-                except Exception:
-                    continue
-        found.sort(key=lambda r: (r["host"], r["port"]))
+        # 硬预算：args 只能调低，调不高（防止有人把上限抬回 55 万次）
+        max_probes = min(int(args.get("max_probes") or MAX_PROBES), MAX_PROBES)
+        max_seconds = min(float(args.get("max_seconds") or MAX_SCAN_SECONDS),
+                          MAX_SCAN_SECONDS)
+        deadline = time.time() + max_seconds
+
+        found_tcp, probes, truncated, why = self._scan_tcp(
+            hosts, ports, workers, tmo, max_probes, max_seconds, deadline)
+        for d in found_tcp:
+            found.append({"host": d["host"], "port": d["port"], "via": "tcp"})
+
+        planned = len(hosts) * len(ports)
+        if truncated:
+            notes.append(f"预算到点停下：{why}")
+        notes.append(f"本次只扫了前 {len(hosts)} 台（共 {candidates} 台候选）")
+        if mode != "classic":
+            notes.append("暴力扫随机端口段是你显式要的（ports=%s），"
+                         "默认路径是 mDNS 发现" % mode)
+
+        # 去重（mDNS 与 TCP 探测可能撞上同一台）
+        uniq = []
+        seen = set()
+        for d in found:
+            key = (d["host"], d["port"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(d)
+        uniq.sort(key=lambda r: (r["host"], r["port"]))
+
         return R.success("adb.wifi.scan", self.name, via=self.via, data={
-            "found": found, "count": len(found),
-            "hosts_scanned": len(hosts), "ports_scanned": len(ports),
+            "found": uniq, "count": len(uniq),
+            "mode": mode,
+            "mdns_found": len(mdns_devs),
+            "hosts_scanned": len(hosts), "hosts_candidates": candidates,
+            "hosts_limited": hosts_limited,
+            "ports_scanned": len(ports),
+            "probes": probes, "probes_planned": planned,
+            "probe_budget": max_probes, "seconds_budget": max_seconds,
             "elapsed": round(time.time() - t0, 1),
-            "note": ("扫到开放端口不等于有 adb——要用 adb.wifi.connect 试；"
-                     "Android 11+ 端口随机，建议配合 mDNS 发现")})
+            "truncated": truncated,
+            "note": ("；".join(notes) if notes else "")
+                    + "。扫到开放端口不等于有 adb——要用 adb.wifi.connect 试",
+        })
+
+    def _scan_tcp(self, hosts, ports, workers, tmo, max_probes, max_seconds, deadline):
+        """按 (host, port) 组合探端口，带**硬预算**。
+
+        预算两维：探测次数上限（max_probes）与墙钟上限（deadline）。
+        任何一维到点就停，并把「为什么停」如实回传——不许假装扫完了。
+
+        提交是**有界**的：组合用生成器产出，在飞的任务不超过 workers*4 个。
+        原因：full 模式理论上有 28233 个端口 × 上百台主机，一次性物化成
+        几百 MB 的 future 列表是另一种形式的「卡死」。
+
+        返回 (命中列表, 实际探测次数, 是否被截断, 原因)。
+        """
+        found = []
+        probes = 0
+        truncated = False
+        why = ""
+        lock = threading.Lock()
+        stop = threading.Event()
+        planned = len(hosts) * len(ports)
+
+        def one(host, port):
+            nonlocal probes, truncated, why
+            with lock:
+                if stop.is_set():
+                    return
+                if probes >= max_probes:
+                    truncated = True
+                    why = (f"探测次数预算 {max_probes} 次到点，"
+                           f"已探 {probes} 次（计划 {planned} 次）")
+                    stop.set()
+                    return
+                if time.time() >= deadline:
+                    truncated = True
+                    why = (f"墙钟预算到点（{max_seconds} 秒上限已到），"
+                           f"已探 {probes} 次（计划 {planned} 次）")
+                    stop.set()
+                    return
+                probes += 1
+            if _probe_tcp(host, port, tmo):
+                with lock:
+                    found.append({"host": host, "port": port})
+
+        def combos():
+            for h in hosts:
+                for p in ports:
+                    yield h, p
+
+        max_inflight = max(1, workers) * 4
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            pending = set()
+            it = combos()
+            exhausted = False
+            while True:
+                while not exhausted and len(pending) < max_inflight and not stop.is_set():
+                    try:
+                        h, p = next(it)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    pending.add(ex.submit(one, h, p))
+                if not pending:
+                    break
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        fut.result()
+                    except Exception:
+                        continue
+        if truncated and not why:
+            why = "预算到点"
+        return found, probes, truncated, why
 
     def _info(self, args):
         """某台无线设备的详细信息：型号、Android 版本、序列号等。"""
