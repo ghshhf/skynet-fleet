@@ -363,6 +363,40 @@ def _sense_pc():
         _journal().log("see", "commander", line, topic="pc_state")
 
 
+USAGE_STOP = threading.Event()
+
+
+def _usage_loop(interval=60.0):
+    """使用轨迹采样：先采一次再等，所以启动瞬间就有第一个点。
+
+    为什么单独一条线程而不是塞进 _sense_loop：感知是「每半小时看一眼身边」，
+    轨迹是「每分钟记一次在用什么」。两个节奏差 30 倍，混在一起会让轨迹断成
+    一堆「间隔过大」，统计出来的时长全被扔掉。
+    """
+    import pc_usage as pu
+    while not USAGE_STOP.is_set():
+        try:
+            rec = pu.tick()
+            if rec.get("err"):
+                print(f"[轨迹] {rec['err']}", flush=True)
+        except Exception as e:              # 采样挂了不许弄死常驻主服务
+            print(f"[轨迹] 本次采样失败（主服务照常）：{e}", flush=True)
+        if USAGE_STOP.wait(interval):
+            break
+
+
+def _usage_start(interval):
+    USAGE_STOP.clear()
+    t = threading.Thread(target=_usage_loop, args=(interval,), daemon=True)
+    t.start()
+    print(f"[轨迹] 使用轨迹已开：每 {int(interval)}s 记一次前台应用", flush=True)
+    return t
+
+
+def _usage_stop():
+    USAGE_STOP.set()
+
+
 def _sense_start(interval):
     SENSE_STOP.clear()
     t = threading.Thread(target=_sense_loop, args=(interval,), daemon=True)
@@ -1411,6 +1445,22 @@ def _cmd_pc(want_clip=False):
     return st
 
 
+def _cmd_usage(day=None, titles=False):
+    """今天（或某天）在电脑前做了什么，按应用累计。
+
+    与 pc 的区别：pc 回答「此刻」，这条回答「这一整天」。后者只能靠常驻采样攒，
+    单次快照再准也攒不出来——所以它和 --usage 常驻线程是一对。
+    """
+    import pc_usage as pu
+    rows = pu.load(day=day)
+    s = pu.summarize(rows)
+    print(pu.report(s, day=day, show_titles=titles))
+    b = pu.brief(s)
+    if b:
+        print("  一句话：" + b)
+    return s
+
+
 def _cmd_caps():
     """能力矩阵：现在能感知什么、能动手什么，不能的为什么不能。"""
     import perceive as pv
@@ -1554,6 +1604,7 @@ def repl():
     print("      | nearby [lan|wifi|bt]   # 身边全景：IP+无线+蓝牙三层，自动比上次谁进谁走")
     print("      | caps                   # 能力矩阵：能感知/能动手什么，不能的为什么")
     print("      | pc [--clip]            # 本机状态：前台/在座/负载/磁盘/剪贴板（内容默认不给）")
+    print("      | usage [--titles] [--day 日期]   # 今天在电脑前做了什么（常驻 --usage 攒的）")
     print("      | phone screen|tree|apps|open <包名>|tap <字>|type <文本>|back|home|shot|wait <字> [秒]")
     print("      | phone status|battery   # 手机全身状态：电/网/声音/屏/传感器/存储（只读）")
     print("      | ir info | ir nec:0x04:0x08 [--send]   # 红外，默认只算序列不发射")
@@ -1646,6 +1697,14 @@ def repl():
             _cmd_caps()
         elif op == "pc":
             _cmd_pc(want_clip="--clip" in rest.split())
+        elif op == "usage":
+            sp = rest.split()
+            day = None
+            if "--day" in sp:
+                i = sp.index("--day")
+                if len(sp) > i + 1:
+                    day = sp[i + 1]
+            _cmd_usage(day=day, titles="--titles" in sp)
         elif op == "phone":
             _cmd_phone_line(rest)
         elif op == "ir":
@@ -2021,6 +2080,8 @@ def main():
                     help="常驻模式：只跑服务/看门狗/仲裁/周期感知，不要交互 REPL")
     ap.add_argument("--sense", type=int, default=1800,
                     help="常驻时周期感知的间隔秒（0=关；默认 1800）")
+    ap.add_argument("--usage", type=int, default=60,
+                    help="常驻时使用轨迹采样间隔秒（0=关；默认 60）")
     args = ap.parse_args()
     if args.self_test:
         self_test(args.host, args.port, args.password)
@@ -2032,6 +2093,8 @@ def main():
         _arbiter_start()
         if args.sense > 0:
             _sense_start(args.sense)
+        if args.usage > 0:
+            _usage_start(args.usage)      # 轨迹采样与感知不同节奏，见 _usage_loop
         print("[*] 常驻模式：没有 REPL。看日志 / 用另一台机器的控制面连过来。", flush=True)
         try:
             while True:
@@ -2039,6 +2102,7 @@ def main():
         except KeyboardInterrupt:
             print("\n[*] 收到中断，让位退出", flush=True)
         finally:
+            _usage_stop()
             _sense_stop()
             _arbiter_stop()
     else:
