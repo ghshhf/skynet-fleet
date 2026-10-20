@@ -117,8 +117,14 @@ def vision_fallback(serial, prompt="找到这个界面上跳过/关闭广告的�
     return None, "vision 未接（需在线 AI 节点；截图已取 %d bytes）" % len(png)
 
 
-def skip_ad(serial, package, rules, rounds=6, interval=0.8, use_vision=False):
-    """多轮尝试跳过指定包的开屏广告。返回 (ok, log[])。"""
+def skip_ad(serial, package, rules, rounds=6, interval=0.8, use_vision=False,
+            dry_run=False):
+    """多轮尝试跳过指定包的开屏广告。返回 (ok, log[])。
+
+    dry_run=True 时**只报告会点哪里，绝不执行 tap**。这不是调试开关，
+    是安全阀：设备可能是别人的生产机器（本项目就发现过一台开着的消防中控终端），
+    在不确定归属的设备上必须先用 dry_run 看清落点。
+    """
     app_rules = [r for r in rules if r.get("packageName") == package] or \
                 [r for r in rules if r.get("packageName") in (None, "", "*")]
     triggers = []
@@ -152,11 +158,19 @@ def skip_ad(serial, package, rules, rounds=6, interval=0.8, use_vision=False):
         for tr in triggers:
             node, c = match(nodes, tr)
             if node and c:
+                if dry_run:
+                    log.append(f"[{i}] [dry-run] 命中「{tr.get('name')}」"
+                               f"text='{node['text'][:24]}' 将 tap{c}（未执行）")
+                    hit = True
+                    break
                 ok, terr = tap(serial, *c)
                 log.append(f"[{i}] 命中「{tr.get('name')}」text='{node['text'][:24]}' "
                            f"tap{c} {'OK' if ok else 'FAIL:' + terr}")
                 hit = True
                 break
+        if dry_run and hit:
+            # dry-run 一轮就够：落点已看清，不再重复 dump 空转
+            return False, log + ["[dry-run] 未执行任何点击；确认落点无误后再实跑"]
         if not hit and use_vision:
             c, verr = vision_fallback(serial)
             if c:

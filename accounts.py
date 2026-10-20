@@ -51,7 +51,7 @@ class AccountError(Exception):
 ORDER_OPS = (
     "exec", "broadcast", "push", "pull", "compute", "computemap", "ui",
     "rules_put", "rules_rollback", "enroll", "enroll_revoke", "token",
-    "intent", "cap_grant", "accounts",
+    "intent", "cap_grant", "accounts", "discover",
 )
 # 分号唯一允许的动作：看自己名下设备（只读）
 SUB_OPS = ("view_own",)

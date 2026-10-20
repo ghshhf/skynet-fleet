@@ -23,6 +23,7 @@ CASES = [
     ("rule_engine", ["rule_engine.py", "--selftest"], os.path.join(HERE, "rfc", "rule-engine"), 30),
     ("policies", ["policies.py", "--selftest"], HERE, 30),
     ("arbiter", ["arbiter.py", "--selftest"], HERE, 30),
+    ("discovery", ["discovery.py", "--selftest"], HERE, 120),
     ("accounts", ["accounts.py", "--selftest"], HERE, 60),
     ("compute_runner", ["compute_runner.py", "--selftest"], HERE, 40),
     ("queue_store", ["queue_store.py", "--selftest"], HERE, 30),
