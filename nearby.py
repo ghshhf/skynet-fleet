@@ -186,7 +186,7 @@ def save_hist(hist, fp, keep=12):
     return HIST
 
 
-def _ago(sec):
+def ago(sec):
     sec = max(int(sec or 0), 0)          # 时钟回拨时不许出现「-5 分钟前」
     if sec < 60:
         return f"{sec} 秒"
@@ -195,6 +195,9 @@ def _ago(sec):
     if sec < 86400:
         return f"{sec // 3600} 小时"
     return f"{sec // 86400} 天"
+
+
+_ago = ago          # 老调用点留着，别为了改名去动测试
 
 
 def _trend_lines(t):

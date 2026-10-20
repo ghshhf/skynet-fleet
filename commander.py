@@ -27,10 +27,18 @@ import arbiter
 import common
 import enroll
 import memory as mem_mod
+import netpath
 import policies
 import queue_store
+import registry
 
-REGISTRY = common.LockedDict()          # name -> {sock, token, platform, info, capabilities, last_hb}
+# 节点表：在线在内存，历史在磁盘。重启后历史还在——「谁来过、它是什么」
+# 不该每天从零认识一遍（但历史绝不冒充在线，见 registry.py）。
+NODES_PATH = os.environ.get(
+    "FLEET_NODES_PATH",
+    os.path.join(os.path.expanduser("~"), ".fleet", "nodes.json"))
+
+REGISTRY = registry.NodeTable(NODES_PATH)   # name -> {sock, token, platform, info, capabilities, last_hb}
 PENDING = {}                             # msg id -> {ev, slot}
 _PENDING_LK = threading.Lock()
 _ID = threading.Lock()
@@ -270,6 +278,47 @@ def start_watchdog(**kw):
     return t
 
 
+# ---- 常驻自转：没人敲命令，它也自己看一眼 ----
+
+SENSE_STOP = threading.Event()
+
+
+def _sense_loop(interval=1800.0):
+    """周期感知：没人敲命令，天网也自己看一眼身边。
+
+    为什么必须常驻做：人是会动的——出门、回家、朋友来访、新设备拆箱，这些变化
+    只有连续采样才看得见；手敲一次 nearby 只是抓了个瞬间，而单次快照的价值很低。
+    变化写进对话流水，她才有「今天楼下多了三辆车」这种话可说。
+
+    只写变化摘要，不写完整设备清单：清单留在本地指纹文件里（那是 E-7 意义上
+    可逐条删的数据），流水里只留一句人话。
+    """
+    import perceive as pv
+    while not SENSE_STOP.is_set():
+        if SENSE_STOP.wait(interval):
+            break
+        try:
+            out = pv.snapshot()
+            if (out.get("trend") or {}).get("changed"):
+                line = pv.look(out)
+                print(f"[感知] {line}", flush=True)
+                _journal().log("see", "commander", line, topic="nearby")
+        except Exception as e:            # 感知挂了不许弄死常驻主服务
+            print(f"[感知] 本轮失败（主服务照常）：{e}", flush=True)
+
+
+def _sense_start(interval):
+    SENSE_STOP.clear()
+    t = threading.Thread(target=_sense_loop, args=(interval,), daemon=True)
+    t.start()
+    print(f"[感知] 周期感知已开：每 {int(interval)}s 看一眼身边（0 表示关）", flush=True)
+    return t
+
+
+def _sense_stop():
+    SENSE_STOP.set()
+
+
 # ---- 多控制面仲裁：发令闸门 ----
 
 GATED_OPS = ("exec", "broadcast", "push", "pull", "compute", "computemap", "ui",
@@ -435,6 +484,8 @@ def _handle_node(conn, password):
             "last_hb": time.time(),
         }))
         print(f"[+] 节点上线: {name} ({reg.get('platform')}) caps={reg.get('capabilities')}", flush=True)
+        # 记进「来过」的历史（凭据字段由 registry 白名单剔掉，密码不会落盘）
+        REGISTRY.observe(name, reg, force=True)
         if DEBUG:
             try:
                 print(f"[dbg] 注册 {name} fd={conn.fileno()}", flush=True)
@@ -448,6 +499,7 @@ def _handle_node(conn, password):
             t = m.get("t")
             if t == common.HEARTBEAT:
                 REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("last_hb", time.time()))
+                REGISTRY.observe(name, {})      # 只刷新 last_seen（内部节流写盘）
             elif t in (common.EXEC_RESULT, common.PUSH_RESULT, common.PULL_RESULT,
                        common.COMPUTE_RESULT, common.UI_SKIP_RESULT):
                 if DEBUG:
@@ -455,6 +507,7 @@ def _handle_node(conn, password):
                 _resolve_pending(m.get("id"), m)
             elif t == common.CAPABILITIES:
                 REGISTRY.with_lock(lambda d: d.get(name) and d[name].__setitem__("capabilities", m.get("caps", [])))
+                REGISTRY.observe(name, {"capabilities": m.get("caps", [])})
             elif t == common.CTX_PUT:
                 r = _ctx().put(m.get("ns"), m.get("key"), m.get("val"))
                 common.send_msg(conn, {"t": common.CTX_PUT_RESULT, "id": m.get("id"), **r})
@@ -520,11 +573,15 @@ def _route_capability_request(name, m, conn):
 def serve(host, port, password):
     global SERVE_HOST, SERVE_PORT
     SERVE_HOST, SERVE_PORT = host, port
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((host, port))
-    srv.listen(32)
-    print(f"[*] Commander 监听 {host}:{port}（密码认证已启用）", flush=True)
+    # 监听走路径层：host 给 0.0.0.0/空 时自动双栈（v4+v6），本机的公网 IPv6 才用得上。
+    # 原来写死 AF_INET，等于把运营商给的公网 v6 白扔——跨网络只能借道第三方。
+    srv, note = netpath.listen(host, port)
+    show = host or "0.0.0.0"
+    print(f"[*] Commander 监听 {show}:{port}（{note}，密码认证已启用）", flush=True)
+    if note.startswith("双栈"):
+        for r in netpath.addresses():
+            if r["scope"] in ("public", "lan") and not r["temp"]:
+                print(f"    可达：{r['addr']}（{netpath.SCOPE_CN[r['scope']]}）", flush=True)
     while True:
         conn, addr = srv.accept()
         threading.Thread(target=_handle_node, args=(conn, password), daemon=True).start()
@@ -539,6 +596,28 @@ def _cmd_nodes():
         print("（无在线节点）")
     for k, p, caps, age in rows:
         print(f"  {k:12} {p:8} caps={caps} 心跳 {age}s 前")
+
+
+def _cmd_seen(n=20):
+    """谁来过：重启也不忘的设备账。
+
+    在线看内存（socket 断了就是断了），来过看磁盘（历史）。两者刻意分开显示——
+    把历史当在线，nodes 里就会站一排连不上的幽灵，策略层也会以为编队还在。
+    """
+    import perceive as pv
+    rows = REGISTRY.seen()
+    live = set(REGISTRY.with_lock(lambda d: list(d.keys())))
+    if not rows:
+        print("  （还没有任何节点来过；等一个节点注册后这里就有账了）")
+        return rows
+    print(f"  来过 {len(rows)} 台（历史落盘在 {NODES_PATH}）：")
+    for r in rows[:max(int(n or 20), 1)]:
+        mark = "在线" if r["name"] in live else "离线"
+        caps = ",".join(r.get("capabilities") or []) or "-"
+        age = time.time() - (r.get("last_seen") or 0)
+        print(f"  {r['name']:12} {mark}  {(r.get('platform') or '?'):8} caps={caps:<24}"
+              f" 最后见 {pv.ago(age)}前")
+    return rows
 
 
 def _cmd_exec(name, cmd):
@@ -1305,6 +1384,24 @@ def _cmd_phone_line(rest):
     return _cmd_phone(act, arg, arg2, dry_run=dry)
 
 
+def _cmd_net(port=None):
+    """本机能从哪些地址被连到，节点该往哪连。
+
+    为什么单独一条命令：跨网络直连的前提是「知道该给节点填哪个 host」。这台机器
+    同时有内网 v4、公网 v6、热点网关和一堆 fe80，凭印象填十有八九是错的（填成
+    fe80 就只能同链路、填成临时地址会随隐私扩展轮换而失效）。
+    """
+    import netpath as np
+    rows = np.addresses()
+    print("【本机地址】按「外人能不能连进来」排序：")
+    print(np.fmt(rows))
+    print()
+    print(f"【连法建议】控制面端口 {port or SERVE_PORT}")
+    for line in np.hint(port or SERVE_PORT):
+        print(line)
+    return rows
+
+
 def _cmd_intent(text):
     """统一意图编排（L2 本命位）：一句话 -> 多步计划 -> 带依赖执行 -> 失败逆序回滚。
 
@@ -1360,6 +1457,8 @@ def repl():
     print("      | caps                   # 能力矩阵：能感知/能动手什么，不能的为什么")
     print("      | phone screen|tree|apps|open <包名>|tap <字>|type <文本>|back|home|shot|wait <字> [秒]")
     print("      | ir info | ir nec:0x04:0x08 [--send]   # 红外，默认只算序列不发射")
+    print("      | net [端口]              # 本机能从哪些地址被连到（公网 v6 优先）+ 连法建议")
+    print("      | seen [n]                # 谁来过：控制面重启也不忘的设备账（历史绝不冒充在线）")
     print("      | done <topic>   # 告诉系统这件事做完了（清账，她不再追问）")
     print("      | journal [n]    # 回看对话流水（她起话题的依据）")
     print("      | arbiter        # 多控制面仲裁：谁是领袖、本机是领袖还是待机")
@@ -1450,6 +1549,10 @@ def repl():
         elif op == "ir":
             _cmd_ir(rest.replace("--send", "").strip(),
                     send="--send" in rest.split())
+        elif op == "net":
+            _cmd_net(int(rest) if rest.strip().isdigit() else None)
+        elif op == "seen":
+            _cmd_seen(int(rest) if rest.strip().isdigit() else 20)
         elif op == "rules":
             _cmd_rules_list()
         elif op == "rules_get":
@@ -1493,7 +1596,7 @@ def repl():
 def self_test(host, port, password):
     """本地回路自检：起服务 + 多节点，证明身体 Phase 0–4 + 她授权闭环 + 反向推送。"""
     global SELF_TEST, RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH
-    global ARBITER_PATH, SWEEP_PATH, DISCOVERY_PATH
+    global ARBITER_PATH, SWEEP_PATH, DISCOVERY_PATH, NODES_PATH, REGISTRY
     SELF_TEST = True
     os.environ["FLEET_CTX"] = ":memory:"
     # 自检不碰 ~/.fleet 下的真实密钥：给本进程一份固定测试密钥
@@ -1511,8 +1614,11 @@ def self_test(host, port, password):
     # 扫描/发现账本同样不能落到仓库里（一次自检就能写出一份真设备清单）
     SWEEP_PATH = os.path.join(tdir, f"fleet_sweep_st_{os.getpid()}.json")
     DISCOVERY_PATH = os.path.join(tdir, f"fleet_discovered_st_{os.getpid()}.json")
+    # 节点表也走临时文件：一次自检不该往 ~/.fleet 留下一堆假节点历史
+    NODES_PATH = os.path.join(tdir, f"fleet_nodes_st_{os.getpid()}.json")
+    REGISTRY = registry.NodeTable(NODES_PATH, interval=0)
     for _p in (RULES_PATH, QUEUE_PATH, PERSONA_PATH, ENROLL_LEDGER, JOURNAL_PATH,
-               ARBITER_PATH, SWEEP_PATH, DISCOVERY_PATH):
+               ARBITER_PATH, SWEEP_PATH, DISCOVERY_PATH, NODES_PATH):
         if os.path.exists(_p):
             os.remove(_p)
     import node_agent
@@ -1809,9 +1915,30 @@ def main():
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--password", default=os.environ.get("FLEET_PASSWORD", "changeme"))
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--daemon", action="store_true",
+                    help="常驻模式：只跑服务/看门狗/仲裁/周期感知，不要交互 REPL")
+    ap.add_argument("--sense", type=int, default=1800,
+                    help="常驻时周期感知的间隔秒（0=关；默认 1800）")
     args = ap.parse_args()
     if args.self_test:
         self_test(args.host, args.port, args.password)
+    elif args.daemon:
+        _restore_queue()
+        threading.Thread(target=serve, args=(args.host, args.port, args.password),
+                         daemon=True).start()
+        start_watchdog()          # 看门狗同时驱动策略与她的人格心跳
+        _arbiter_start()
+        if args.sense > 0:
+            _sense_start(args.sense)
+        print("[*] 常驻模式：没有 REPL。看日志 / 用另一台机器的控制面连过来。", flush=True)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print("\n[*] 收到中断，让位退出", flush=True)
+        finally:
+            _sense_stop()
+            _arbiter_stop()
     else:
         _restore_queue()
         threading.Thread(target=serve, args=(args.host, args.port, args.password), daemon=True).start()

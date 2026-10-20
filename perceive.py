@@ -34,6 +34,7 @@ SIDE_EFFECT = {"open", "tap", "type", "back", "home", "shot"}
 # 三层名字沿用 nearby 的定义，不在这里另起一套
 LAYERS = N.LAYERS
 LAYER_CN = N.LAYER_CN
+ago = N.ago                     # 「3 分钟前」这种话只该有一种写法
 
 # 手机动作表。先验名字再连设备：打错字与「手机没接」是两种错，不能混成一句
 PHONE_ACTIONS = {"screen", "see", "look", "tree", "apps", "fg",
