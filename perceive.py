@@ -161,9 +161,13 @@ def caps(probe=True):
         rows.append({"cap": "手机蓝牙", "ok": st == "on", "why": f"状态 {st}"})
         rows.append({"cap": "WiFi 扫描", "ok": True, "why": "靠 adb shell cmd wifi 起扫"})
         rows.append({"cap": "状态快照", "ok": True,
-                     "why": "14 节只读（电/网/声音/屏幕/传感器/存储），两批 shell 约 2 秒"})
+                     "why": "15 节只读（电/网/声音/屏幕/传感器/媒体/存储），两批 shell 约 1.7 秒"})
         rows.append({"cap": "剪贴板", "ok": False,
                      "why": "Android 10+ 没有 cmd clipboard 读取实现（系统限制）"})
+        rows.append({"cap": "媒体会话", "ok": True,
+                     "why": "能报包名+播放/暂停；state=null 的会话不算在播"})
+        rows.append({"cap": "手机使用统计", "ok": False,
+                     "why": "这台 ROM 的 usagestats 不记 ACTIVITY_RESUMED，没有前台时长"})
     elif probe:
         for name in ("编队桥在线", "红外发射器", "手机蓝牙", "WiFi 扫描", "状态快照"):
             rows.append({"cap": name, "ok": False, "why": "手机没连上，判不了"})
@@ -183,7 +187,7 @@ def format_caps(rows):
 # ---------------------------------------------------------------- 动作（手）
 
 def state(serial=""):
-    """手机此刻的整体状态（只读）。14 节里某一节读不出来的进 missing，其余照常。
+    """手机此刻的整体状态（只读）。15 节里某一节读不出来的进 missing，其余照常。
 
     走 _DEV 的连接缓存而不是自己去 attach：同一条命令里连两次 adb 是纯浪费。
     """
