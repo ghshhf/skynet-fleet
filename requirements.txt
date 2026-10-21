@@ -30,6 +30,13 @@ pyautogui>=0.9
 rule_engine>=3
 sounddevice>=0.4
 
+# —— 对话语音（语音对话视图 + /api/voice/*）——
+# 🔴 这两个必须在这里。2026-10-22 实测：CI 只装本文件，「语音对话」进了冻扁包
+#    却不会说话——voice.say() 直接返回 ("none", None)，因为包里压根没有 edge_tts。
+#    build_gui.py 里的 --hidden-import 只是"别漏收"，装不上的包它收不出来。
+edge-tts>=7.0
+faster-whisper>=1.0
+
 # —— 终端版（TUI）依赖，这里一并列出，便于单文件安装 ——
 rich>=13
 textual>=0.50

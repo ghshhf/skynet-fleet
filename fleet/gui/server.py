@@ -1009,6 +1009,13 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._err(500, "合成失败：%s: %s" % (type(e).__name__, e))
         if not path or not os.path.isfile(path):
+            # backend == "none" 的意思是 kokoro 和 edge_tts 都没成——这个字符串
+            # 本身没法排查，把"为什么"直接带出去。冻扁包最常见的就是这一条。
+            if backend == "none":
+                return self._err(500,
+                                 "没有可用的 TTS 后端：kokoro 需要 torch（冻扁包已排除），"
+                                 "所以只能走 edge_tts（在线）。检查 ①edge-tts 是否装了 "
+                                 "②这台机器能不能连微软的语音服务")
             return self._err(500, "合成失败：后端 %r 没有产出文件" % (backend,))
         try:
             with open(path, "rb") as f:
