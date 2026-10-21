@@ -104,11 +104,149 @@ def _png_card_payload(path):
 
 
 # --------------------------------------------------------------------------
+# 外来私有 schema 适配器
+# --------------------------------------------------------------------------
+
+#: 已知的私有 schema → 标准 data 字段的映射。
+#:
+#: 为什么需要：`aicharactercards.com` 把自己的一套 schema 塞进了**标准 ccv3 关键字**里，
+#: 但内容是私有的（spec="aicc_card"）。实测它的字段与 SillyTavern 语义一一对应，
+#: 只是名字不同 ⇒ 30 行映射就能接上，不必写完整解析器。
+#:
+#: 🔴 边界：只接**语义明确等价**的字段。接不上的（appearance 等）
+#: 也不能丢——丢字段等于静默丢人格，所以接不上的也要**如实带进** data，
+#: 让体检器能看见「这张卡有多少内容本仓用不上」。
+AICC_SPEC = "aicc_card"
+
+#: aicc → 标准字段。值是 (目标字段, 取值函数名) 或固定字段名。
+#: 只收**一对一**的；嵌套结构在下面单独处理。
+_AICC_FIELD_MAP = {
+    "general_description": "description",
+    "background_history": "scenario",
+    "appearance": "appearance",
+    "name": "name",
+}
+
+
+def _aicc_to_data(obj):
+    """把 aicc_card 私有 schema 转成标准 data 结构。
+
+    实测字段树（2026-10-21 下载真卡核对）：
+        data.general_description      → description
+        data.appearance                → appearance（本仓标准 schema 没有 ⇒ 保留原名，不丢）
+        data.personality.core          → personality（behavior_rules / speech_style 合并进来）
+        data.personality.behavior_rules→ 追加进 personality
+        data.personality.speech_style  → 追加进 personality
+        data.background_history         → scenario
+        data.world_setting_context      → 追加进 scenario
+        data.dialogue.greetings[0]     → first_mes
+        data.dialogue.greetings[1:]     → alternate_greetings
+        data.dialogue.dialogue_examples → mes_example
+        data.prompts.system_prompt      → system_prompt
+        data.prompts.post_history_instructions → post_history_instructions
+        data.world.worldbook_entries   → character_book.entries（**内核本就是标准 ST 格式**）
+        data.metadata.tags              → tags
+        data.metadata.creator           → creator
+        data.metadata.version           → character_version
+    """
+    src = obj.get("data")
+    if not isinstance(src, dict):
+        raise ValueError(f"{AICC_SPEC} 缺 data 对象")
+    d = dict(src)                     # 先整体带上，接不上的字段也不丢
+
+    # --- 文本字段一对一 ---
+    for a, b in (("general_description", "description"),
+                 ("background_history", "scenario"),
+                 ("name", "name")):
+        if src.get(a):
+            d[b] = src[a]
+
+    # --- appearance：本仓标准 schema 没有这个字段，但**不许丢**（丢=静默丢人格）---
+    if src.get("appearance"):
+        d["appearance"] = src["appearance"]
+
+    # --- personality：core 是主段，behavior_rules / speech_style 合并 ---
+    per = src.get("personality")
+    if isinstance(per, dict):
+        chunks = []
+        if per.get("core"):
+            chunks.append(str(per["core"]))
+        rules = per.get("behavior_rules")
+        if isinstance(rules, list) and rules:
+            chunks.append("【行为准则】\n" + "\n".join("- " + str(r) for r in rules))
+        style = per.get("speech_style")
+        if isinstance(style, dict) and style:
+            lines = [f"{k}: {v}" for k, v in style.items() if v]
+            if lines:
+                chunks.append("【说话风格】\n" + "\n".join(lines))
+        if chunks:
+            d["personality"] = "\n\n".join(chunks)
+    elif per:
+        d["personality"] = str(per)
+
+    # --- scenario：追加 world_setting_context ---
+    sc = d.get("scenario") or ""
+    wsc = src.get("world_setting_context")
+    if wsc:
+        d["scenario"] = (sc + "\n\n【世界设定】\n" + str(wsc)).strip() if sc else str(wsc)
+
+    # --- dialogue → first_mes / alternate_greetings / mes_example ---
+    dlg = src.get("dialogue")
+    if isinstance(dlg, dict):
+        gs = dlg.get("greetings")
+        if isinstance(gs, list) and gs:
+            d["first_mes"] = str(gs[0])
+            if len(gs) > 1:
+                d["alternate_greetings"] = [str(g) for g in gs[1:]]
+        ex = dlg.get("dialogue_examples")
+        if isinstance(ex, list) and ex:
+            d["mes_example"] = "\n\n".join(str(e) for e in ex)
+
+    # --- prompts ---
+    pr = src.get("prompts")
+    if isinstance(pr, dict):
+        for a, b in (("system_prompt", "system_prompt"),
+                     ("post_history_instructions", "post_history_instructions")):
+            if pr.get(a):
+                d[b] = pr[a]
+
+    # --- world.worldbook_entries → character_book.entries（内核就是标准 ST 格式）---
+    w = src.get("world")
+    if isinstance(w, dict) and isinstance(w.get("worldbook_entries"), list):
+        d["character_book"] = {
+            "name": w.get("worldbook_name") or "",
+            "entries": w["worldbook_entries"],
+        }
+
+    # --- metadata ---
+    md = src.get("metadata")
+    if isinstance(md, dict):
+        for a, b in (("tags", "tags"), ("creator", "creator"),
+                     ("version", "character_version")):
+            if md.get(a):
+                d[b] = md[a]
+
+    d["_spec"] = AICC_SPEC
+    d["_adapter"] = "aicc"
+    return d
+
+
+# --------------------------------------------------------------------------
 # 读卡
 # --------------------------------------------------------------------------
 
 def load_card(path):
-    """读一张角色卡，返回归一化后的 dict（永远是 V2/V3 的 data 结构）。"""
+    """读一张角色卡，返回归一化后的 dict（永远是 V2/V3 的 data 结构）。
+
+    🔴 遇到**不认识的 spec 必须报明确原因，绝不许降级**。
+    上一版把「spec 不是 v2/v3」一律当 V1 顶层平铺，结果：
+      某社区站的卡 spec = "aicc_card"（私有 schema，字段名是
+      general_description / appearance 而非 description）
+      → 落进 V1 平铺分支 → 真卡内容还埋在 obj["data"] 里没取出
+      → build_system() 只吐出 47 字的「你现在扮演『她』」
+      → **卡内容全丢，而且不报错**。
+    这就是「静默失败最阴」：读到了「一个 dict」，但那个 dict 是空的。
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"角色卡不存在: {path}")
     ext = os.path.splitext(path)[1].lower()
@@ -130,9 +268,20 @@ def load_card(path):
         if not isinstance(data, dict):
             raise ValueError(f"{spec} 缺 data 对象")
         data = dict(data)
-    else:
-        # V1：顶层平铺
+    elif not spec:
+        # V1：顶层平铺，且**没有 spec 字段**（V1 规范如此）
         data = dict(obj)
+    elif spec == AICC_SPEC:
+        # 已知私有 schema（aicharactercards）：有专门适配器
+        data = _aicc_to_data(obj)
+    else:
+        # 🔴 有 spec 但不是我们认的 ⇒ 明确拒绝，不许猜
+        raise ValueError(
+            f"不认的角色卡格式 spec={spec!r}："
+            f"本仓只认 chara_card_v2 / chara_card_v3 / V1(无 spec 字段)。"
+            f"这张卡来自别的 schema（顶层键：{sorted(obj.keys())[:8]}）——"
+            f"如果它确实是有效角色卡，需要为它加一个适配器，"
+            f"而不是当成 V1 平铺把内容读空。")
     data["_spec"] = spec or "v1"
     return data
 
@@ -569,6 +718,107 @@ def _selftest():
         print("[selftest] system prompt 组装 + 占位符替换 OK")
         print("[selftest] 世界书关键词/常驻 命中正确 OK")
         print("[selftest] 卡库列出 + 选中 OK")
+        # --- 🔴 陌生 spec 必须报明确原因，绝不许降级成 V1 平铺 ---
+        # 背景：某社区站的卡 spec="aicc_card"（私有 schema，字段名 general_description
+        # 而非 description）。上一版把「spec 不是 v2/v3」一律当 V1 平铺 → 真卡内容
+        # 没取出 → build_system() 只吐 47 字的空人设，**而且不报错**。这是静默失败。
+        # 现在 aicc 已有专门适配器（见 _aicc_to_data），所以这里测的是**真正陌生**的 schema。
+        alien = {"spec": "some_unknown_schema", "spec_version": "9.9",
+                 "data": {"name": "外星卡", "description": "很长的描述"}}
+        alien_path = os.path.join(tmp, "alien.json")
+        with open(alien_path, "w", encoding="utf-8") as fh:
+            json.dump(alien, fh, ensure_ascii=False)
+        try:
+            load_card(alien_path)
+            raise AssertionError("🔴 不认识的 spec 必须报错，不能静默降级成 V1 平铺")
+        except ValueError as e:
+            msg = str(e)
+            assert "some_unknown_schema" in msg, msg
+            assert "只认" in msg, "报错必须说清本仓只认哪几种：" + msg
+
+        # --- aicc 私有 schema：走适配器，内容必须全在 ---
+        # 夹具按真卡字段树写（2026-10-21 从 aicharactercards 下载真卡核对过结构）
+        aicc = {
+            "spec": "aicc_card", "spec_version": "1.0", "id": "abc",
+            "data": {
+                "name": "测试A",
+                "general_description": "她是一个在海边小镇修钟表的老太太",
+                "appearance": "驼背，左眼有旧伤疤",
+                "personality": {
+                    "core": "沉默寡言，但对手艺极其骄傲",
+                    "behavior_rules": ["不主动谈论自己的过去", "被问到钟表时话会变多"],
+                    "speech_style": {"口头禅": "时间不等人", "语速": "慢"},
+                },
+                "background_history": "她十七岁那年离开大城市回到小镇",
+                "world_setting_context": "小镇靠海，冬天常有雾",
+                "dialogue": {
+                    "greetings": ["风把门吹开了。你是来修表的？", "又一块坏表。坐下吧。"],
+                    "dialogue_examples": ["{{char}}: 别晃它。", "{{user}}: 抱歉。"],
+                    "group_only_greetings": [],
+                },
+                "prompts": {
+                    "system_prompt": "保持克制的语气",
+                    "post_history_instructions": "不要突然变得热情",
+                    "depth_prompt": {},
+                },
+                "world": {
+                    "worldbook_name": "海边小镇",
+                    "worldbook_entries": [
+                        {"keys": ["钟表"], "content": "她的工作台上有三台老钟", "enabled": True},
+                    ],
+                },
+                "metadata": {"card_format": "AICC-Chat", "creator": "某某",
+                             "notes": "创作笔记", "version": "0.1",
+                             "tags": ["手艺", "小镇"]},
+            },
+        }
+        aicc_path = os.path.join(tmp, "aicc.json")
+        with open(aicc_path, "w", encoding="utf-8") as fh:
+            json.dump(aicc, fh, ensure_ascii=False)
+        da = load_card(aicc_path)
+        assert da.get("_adapter") == "aicc", da.get("_adapter")
+        assert da.get("name") == "测试A", da
+        # 一对一映射
+        assert "修钟表的老太太" in da.get("description", ""), da.get("description")
+        assert "十七岁那年" in da.get("scenario", ""), da.get("scenario")
+        assert "冬天常有雾" in da.get("scenario", ""), da.get("scenario")
+        # personality 三段合并
+        assert "沉默寡言" in da.get("personality", ""), da.get("personality")
+        assert "不主动谈论自己的过去" in da.get("personality", ""), da.get("personality")
+        assert "时间不等人" in da.get("personality", ""), da.get("personality")
+        # dialogue
+        assert da.get("first_mes", "").startswith("风把门吹开了"), da.get("first_mes")
+        assert da.get("alternate_greetings") == ["又一块坏表。坐下吧。"], da.get("alternate_greetings")
+        assert "别晃它" in da.get("mes_example", ""), da.get("mes_example")
+        # prompts
+        assert da.get("system_prompt") == "保持克制的语气", da.get("system_prompt")
+        assert da.get("post_history_instructions") == "不要突然变得热情"
+        # 🔴 接不上的字段也必须留着（丢字段=静默丢人格）
+        assert "旧伤疤" in da.get("appearance", ""), da.get("appearance")
+        # 世界书内核是标准 ST 格式 ⇒ 本仓的匹配器能直接吃
+        assert len((da.get("character_book") or {}).get("entries") or []) == 1
+        assert match_world_book(da, "我那钟表坏了") == ["她的工作台上有三台老钟"], \
+            "aicc 卡的世界书条目要能被本仓匹配器直接吃"
+        # metadata
+        assert da.get("creator") == "某某", da.get("creator")
+        assert "手艺" in (da.get("tags") or []), da.get("tags")
+        # 🔴 最终拼出来的 prompt 不许是空壳
+        sys_out = build_system(da)
+        assert len(sys_out) > 150, "适配后的卡拼出来太短，可能读空了：" + sys_out
+        assert "修钟表的老太太" in sys_out
+
+        # --- V1 卡（顶层平铺、无 spec 字段）仍然要读得开 ---
+        v1 = {"name": "V1鱼", "description": "V1 的描述", "personality": "V1 性格"}
+        v1_path = os.path.join(tmp, "v1only.json")
+        with open(v1_path, "w", encoding="utf-8") as fh:
+            json.dump(v1, fh, ensure_ascii=False)
+        d_v1 = load_card(v1_path)
+        assert d_v1.get("name") == "V1鱼", d_v1
+        assert d_v1.get("description") == "V1 的描述", d_v1
+        assert d_v1.get("_spec") == "v1", d_v1
+
+        print("[selftest] 陌生 spec 报明确原因、不降级读空 OK")
+        print("[selftest] aicc 私有 schema 适配：内容全在、世界书能匹配 OK")
         print("[selftest] PASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
