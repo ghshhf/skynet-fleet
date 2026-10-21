@@ -153,11 +153,15 @@ skynet-fleet/
 ├── cards/               # 角色卡（SillyTavern chara_card 格式），当前替代人格「大肥鱼」
 │                         #   + 执行角色卡：研究员/批评者/编辑/程序员/验收者
 ├── fleet/agents/        # 角色编队：五段式契约 / 角色边界 / 容量闸 / 名册
+├── fleet/mcp/           # MCP 出口（stdio，零依赖）：server / schema / client
+│                         #   「设备也是 MCP」——本仓能力可被外部 AI 客户端直接用
+├── fleet/kinds/render_html.py + htmlrender.js  # Video as Code：写 HTML 出 MP4（确定性逐帧）
 ├── ui/                  # 图形版前端资源（index.html / app.css / app.js，无 CDN 外链）
 ├── docs/
 │   ├── 个人设备编队与本地她_计划书.md   # 完整计划书（任务书）
 │   ├── Windows图形版与语音接口_计划书.md # W0–W7 分阶段计划与验收
 │   ├── 整体路线图_2026-10-21.md          # 四本计划书合流：一条主线 + 两处重复 + 一个真空缺
+│   ├── Video-as-Code渲染路线_2026-10-21.md # 写 HTML 出 MP4：确定性逐帧 / 性能实测 / 三条铁律
 │   ├── 计划书现状说明书_2026-10-21.md    # 【给强模型读】现状/下一段/框架问题/待主人拍板 20 条
 │   ├── 桌面端工具链_2026-10-21.md        # UI 工具链盘点 + 新装 + 三个验收工具（真截图/像素回归/死链）
 │   ├── 下一步计划书_2026-10-21.md        # X0–X6：从「能看」到「能用」的下一步
