@@ -10,6 +10,7 @@ verb 是动作；这样补全能按族分组，权限树也能按族授权。
 import os
 
 from . import netrunner as NR
+from . import netforce_skynet as NS
 from .core import Capability, Param, Registry
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
@@ -47,6 +48,13 @@ def _papers_reason(reg, dev):
     if NR.papers_cli():
         return True, ""
     return False, "没装论文爬虫：把 PAPERS_HOME 指到 train_15b"
+
+
+def _skynet_reason(reg, dev):
+    """skynet 采集内核在不在。它是 netforce 仓库里的一个子包，
+    所以「netforce 在」不等于「skynet 在」——两件事分开判。"""
+    ok, why = NS.available()
+    return ok, why
 
 
 CAPABILITIES = [
@@ -132,6 +140,34 @@ CAPABILITIES = [
     Capability("web.sites", "站群活站清单（只读，不联网）",
                check=_netforce_reason,
                note="看的是本地已攒的那本账，跑 web.diffuse 才会涨"),
+    # ---- 采集内核 skynet（netforce 仓库里的子包）：搜索 / 取正文 / 判活 / 探结构 ----
+    Capability("web.search", "多引擎聚合搜索（skynet，带意图校验）",
+               params=(Param("query", "str", True),
+                       Param("only", "str", doc="只跑指定引擎，逗号分隔，如 ddg,github"),
+                       Param("wiki_tag", "str", doc="MediaWiki 站点标签；不给就不跑 wiki 引擎"),
+                       Param("limit", "int", doc="最多几条，默认 20"),
+                       Param("min_rel", "float", doc="相关度下限，默认用内核的 0.18")),
+               check=_skynet_reason,
+               note="只读：只发网络请求，不改本地任何东西。"
+                    "内置意图校验与引擎健康度——搜到的垃圾结果会被过滤"),
+    Capability("web.fetch", "取一个 URL 的正文（skynet）",
+               params=(Param("url", "str", True),
+                       Param("timeout", "float", doc="单次超时秒，默认 15")),
+               check=_skynet_reason,
+               note="只读：带熔断、限速、GitHub raw 镜像降级；失败会带原因"),
+    Capability("web.probe", "判一个页面值不值得抓（skynet 四级判定）",
+               params=(Param("url", "str", True),),
+               check=_skynet_reason,
+               note="只读：返回 valuable/portal/thin/dead/blocked/junk 之一，"
+                    "「页面能打开」不等于「有内容」"),
+    Capability("web.structure", "探站结构：robots / sitemap / feed（定向扩散入口）",
+               params=(Param("url", "str", True),),
+               check=_skynet_reason,
+               note="只读：看结构比看首页准得多——sitemap 里一堆 .mp3 就是音频站"),
+    Capability("web.download", "下载一个 URL 到本地（skynet，真 Range 续传）",
+               params=(Param("url", "str", True), Param("dest", "str", True)),
+               side_effect=True, check=_skynet_reason,
+               note="写本地文件 ⇒ 要过审批闸门。断点续传、落盘按内容去重"),
     # ---- 免费 AI（pollinations 免 key 当一等公民；本地模型需 FLEET_LLM_URL）----
     Capability("ai.list", "可用的免费 AI 后端清单（只读）",
                note="免 key 端点（pollinations）零配置开箱即用；本地模型需 FLEET_LLM_URL"),

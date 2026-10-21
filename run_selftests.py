@@ -128,6 +128,17 @@ CASES = [
     # ⑥ 下载/入库是副作用 ⇒ 没闸门时 fail-closed 拒绝。
     # 全离线：下载层打桩，不连真网络。
     ("eval_t15_card_store", ["evals/t15_card_store.py"], HERE, 180),
+    # T16：netforce skynet 采集内核接进 web.* 能力族
+    # 钉六件事：① 适配层字段名不许猜（probe 的真实字段是 alive/score/verdict/
+    # text_chars，不是 ok/text_len/density/why）；
+    # ② structure() 的键类型也不许猜（sitemap_files 是 int 不是 list，
+    #    当成 list 会 TypeError 直接炸能力）；
+    # ③ 内核不在 ⇒ 不可用且说清怎么装（不许静默降级成空回）；
+    # ④ web.download 是副作用 ⇒ 没闸门时 fail-closed 拒绝；
+    # ⑤ check 判「skynet 在不在」而不是「netforce 在不在」；
+    # ⑥ 不许 vendoring（只 import，不复制源码）。
+    # 全离线：门禁自造假 skynet 包，不连真网络。
+    ("eval_t16_skynet_bridge", ["evals/t16_skynet_bridge.py"], HERE, 120),
 ]
 
 
