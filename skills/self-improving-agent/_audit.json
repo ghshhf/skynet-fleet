@@ -1,0 +1,12 @@
+{
+  "name": "self-improving-agent",
+  "dir": "C:/Users/admin/.workbuddy/skills/self-improving-agent",
+  "verdict": "clean",
+  "license": "",
+  "findings": [],
+  "scanned": [
+    "SKILL.md",
+    "_skillhub_meta.json",
+    "references\\setup.md"
+  ]
+}

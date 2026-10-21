@@ -34,7 +34,7 @@ import os
 
 #: 技能根目录。仓内优先，其次用户级。
 REPO_SKILLS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "skills")
 USER_SKILLS_DIR = os.path.join(os.path.expanduser("~"), ".workbuddy", "skills")
 

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "name": "self-improving-agent",
+      "source": "user-level",
+      "license": "UNKNOWN",
+      "verdict": "clean",
+      "acquired_at": "2026-10-21T19:30",
+      "dir": "skills\\self-improving-agent"
+    }
+  ]
+}

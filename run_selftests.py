@@ -149,6 +149,10 @@ CASES = [
     # ⑥ audio.synth 写文件 ⇒ 副作用 ⇒ 没闸门时 fail-closed。
     # 全离线：合成全在内存与临时目录里完成。
     ("eval_t17_audio_synth", ["evals/t17_audio_synth.py"], HERE, 180),
+    # ---- P4：vendored 技能完整性（第4层技能自进化地基）----
+    # 仓库 skills/ 下每个 vendored 技能必须带 _audit.json 且结论 clean，
+    # 且 MANIFEST.json 登记与实际目录一一对应。未审查进仓 = 红。
+    ("eval_p4_skills_integrity", ["evals/p4_skills_integrity.py"], HERE, 120),
 ]
 
 
