@@ -6,6 +6,7 @@
     transports  四条通道通不通
     call        调一项能力（--args 传 JSON）
     save        把「这设备是什么」落盘（绝不含凭据）
+    crew        角色编队：名册 / 容量闸 / 五段式契约
 
 为什么先用纯文本而不用 rich：这份输出要被 evals 与自测断言（`fleet list | grep`），
 ANSI 与框线会让断言变脆。终端（fleet/shell.py）才是给人看的，那里才上 rich。
@@ -112,6 +113,70 @@ def _cmd_call(reg, cap_name, device="", args=None, assume_yes=False):
     return 0 if res.ok else 2
 
 
+def _cmd_crew(reg, as_json, argv):
+    """角色编队：名册 / 容量闸 / 契约。
+
+    子命令：
+      roster           角色名册（谁、什么后端、能用哪些能力、能往下派几层）
+      gate             容量闸当前状态
+      contract         五段式契约说明 + 给模型的格式条款
+    """
+    from .agents import capacity as cap
+    from .agents import contract as ct
+    from .agents import roster
+
+    sub = argv.pop(0).lower() if argv and not argv[0].startswith("-") else "roster"
+    known = set(reg.cap_names())
+
+    if sub == "roster":
+        try:
+            profiles = roster.load_all(known_caps=known)
+        except roster.RosterError as e:
+            print(f"名册不合法：{e}", file=sys.stderr)
+            return 1
+        rows = roster.summary(profiles, known)
+        if as_json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            return 0
+        print(f"角色名册（{len(rows)} 个）：")
+        for r in rows:
+            print(f"  · {r['name']}  后端={r['provider']}  "
+                  f"能力={r['cap_allow']}  可派层={r['max_depth']}  [{r['source']}]")
+        try:
+            print(f"\n当前激活：{roster.active_name()}")
+        except roster.RosterError as e:
+            print(f"\n激活角色读不到：{e}", file=sys.stderr)
+            return 1
+        return 0
+
+    if sub == "gate":
+        gate = cap.CapacityGate(capacity=4, max_depth=1)
+        snap = gate.snapshot()
+        if as_json:
+            print(json.dumps(snap, ensure_ascii=False, indent=2))
+            return 0
+        print(f"容量闸：容量 {snap['capacity']} / 已占 {snap['in_use']} / "
+              f"空闲 {snap['free']}，深度上限 {snap['max_depth']}")
+        print("默认容量 4（不是 8）：16GB 内存 + 多个角色打同一个免费端点抢额度。")
+        return 0
+
+    if sub == "contract":
+        if as_json:
+            print(json.dumps({"sections": list(ct.SECTIONS),
+                              "hints": ct.SECTION_HINTS}, ensure_ascii=False, indent=2))
+            return 0
+        print("五段式输出契约（子智能体必须交这份答卷）：")
+        for name in ct.SECTIONS:
+            print(f"  {name:9s} {ct.SECTION_HINTS[name]}")
+        print("\n给模型的格式条款：")
+        print(ct.prompt_block())
+        return 0
+
+    print(f"未知 crew 子命令: {sub}\n"
+          f"可用：roster / gate / contract", file=sys.stderr)
+    return 1
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in argv
@@ -152,6 +217,8 @@ def main(argv=None):
             p = reg.save()
             print(f"已落盘: {p or '（没有写：路径不可写）'}")
             return 0 if p else 1
+        if sub == "crew":
+            return _cmd_crew(reg, as_json, argv)
         if sub == "call":
             ap = argparse.ArgumentParser(prog="python -m fleet call")
             ap.add_argument("cap")
