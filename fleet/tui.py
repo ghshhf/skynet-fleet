@@ -742,14 +742,36 @@ SMOKE_CMDS = ("devices", "caps", "pc.state", "web.status", "web.sites",
               "ai.list", "transports")
 
 
+async def _await_render(pilot, app, before, deadline=20.0):
+    """等这条命令的输出**真的渲染出来**，而不是「睡够固定时长」。
+
+    🔴 **为什么不能固定 pause**（实测踩过）：
+        原来每条命令后固定 `pilot.pause(1.2)`，靠「睡够 1.2 秒这命令肯定跑完了」
+        这个假设。能力一多（加了 audio 那批），有的命令就睡不够 ⇒
+        那一轮少渲染一块 ⇒ 门禁**随机红**（实测 5 轮红 1 轮，
+        报 "7 条命令只渲染出 6 块"）。
+        这种 flaky 门禁比没有门禁更坏：它会让所有人学会忽略红灯。
+
+    ⇒ 现在改成**轮询到 _rendered 增长为止**，并留一个上限兜底（免得真卡死时无限等）。
+    返回实际等了多久（秒），调用方可查。
+    """
+    waited = 0.0
+    step = 0.05
+    while app._rendered <= before and waited < deadline:
+        await pilot.pause(step)
+        waited += step
+    return waited
+
+
 async def _headless(run_cmds=(), wait=2.5):
     """起一个不占真终端的界面，可选跑几条命令。"""
     app = FleetTUI()
     async with app.run_test(size=(150, 40)) as pilot:
         await pilot.pause(wait)
         for c in run_cmds:
+            before = app._rendered
             app._submit(c)
-            await pilot.pause(1.2)
+            await _await_render(pilot, app, before)
         return app
 
 
@@ -767,8 +789,9 @@ def _shot(path, size=(150, 40), pane="pane_dev"):
             # （资源条/进程表/盲文预览），web.status 喂「联网」页。
             for c in ("devices", "pc.state", "web.status",
                       "host.monitor", "host.apps", "host.screen"):
+                before = app._rendered
                 app._submit(c)
-                await pilot.pause(1.2)
+                await _await_render(pilot, app, before)
             # 停在哪一页就截哪一页：默认截设备页
             app.query_one("TabbedContent", TabbedContent).active = pane
             await pilot.pause(0.8)
@@ -786,8 +809,10 @@ def _smoke():
         async with app.run_test(size=(150, 40)) as pilot:
             await pilot.pause(3.0)
             for c in SMOKE_CMDS:
+                # 🔴 **等到位，不要等固定时长**（理由见 `_await_render` 的注释）。
+                before = app._rendered
                 app._submit(c)
-                await pilot.pause(1.2)
+                await _await_render(pilot, app, before)
             return (app.shell is not None, app._rendered,
                     app.query_one("#caps", DataTable).row_count,
                     app.query_one("#devices", DataTable).row_count,
