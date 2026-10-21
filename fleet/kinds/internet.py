@@ -20,6 +20,7 @@
 import time
 
 from .. import netrunner as NR
+from .. import netforce_skynet as NS
 from ..core import BaseDevice, DeviceResult as R
 
 
@@ -45,7 +46,9 @@ class Internet(BaseDevice):
 
     def caps(self):
         return ("web.status", "web.discover", "web.corpus", "web.diffuse",
-                "web.papers", "web.frontier", "web.sites")
+                "web.papers", "web.frontier", "web.sites",
+                "web.search", "web.fetch", "web.probe", "web.structure",
+                "web.download")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -63,6 +66,75 @@ class Internet(BaseDevice):
             return self._frontier(args)
         if cap == "web.sites":
             return self._sites(args)
+        if cap in ("web.search", "web.fetch", "web.probe", "web.structure",
+                   "web.download"):
+            return self._skynet(cap, args)
+        return super().invoke(cap, args)
+
+    # ---------------- 采集内核（skynet，短任务，直接 import 同步调）----------------
+
+    def _skynet(self, cap, args):
+        """走 netforce 仓库里的 skynet 采集内核。
+
+        🔴 短任务（一次搜索几十秒）⇒ 直接 import 同步调，拿结构化结果。
+        长任务（跑一夜的资源发现）走上面的子进程路。两条路别混。
+        """
+        ok, why = NS.available()
+        if not ok:
+            return R.unavailable(cap, why, device=self.name, via=self.via)
+        try:
+            if cap == "web.search":
+                only = args.get("only")
+                only = [x.strip() for x in only.split(",") if x.strip()] if only else None
+                hits = NS.search(
+                    args.get("query") or "",
+                    wiki_tag=(args.get("wiki_tag") or None),
+                    only=only,
+                    min_rel=(float(args["min_rel"]) if args.get("min_rel") is not None else None),
+                    limit=int(args.get("limit") or 20))
+                return R.success(cap, self.name, via=self.via, data={
+                    "query": args.get("query") or "",
+                    "count": len(hits),
+                    "hits": hits,
+                    "engines": NS.engine_health(),
+                })
+            if cap == "web.fetch":
+                url = (args.get("url") or "").strip()
+                if not url:
+                    return R.unavailable(cap, "缺少 url（要取哪一页）",
+                                         device=self.name, via=self.via)
+                d = NS.fetch_text(url, timeout=float(args.get("timeout") or 15.0))
+                return R.success(cap, self.name, via=self.via, data=d)
+            if cap == "web.probe":
+                url = (args.get("url") or "").strip()
+                if not url:
+                    return R.unavailable(cap, "缺少 url（要判哪一页）",
+                                         device=self.name, via=self.via)
+                d = NS.probe(url)
+                return R.success(cap, self.name, via=self.via, data=d)
+            if cap == "web.structure":
+                url = (args.get("url") or "").strip()
+                if not url:
+                    return R.unavailable(cap, "缺少 url（要探哪个站）",
+                                         device=self.name, via=self.via)
+                d = NS.structure(url)
+                return R.success(cap, self.name, via=self.via, data=d)
+            if cap == "web.download":
+                url = (args.get("url") or "").strip()
+                dest = (args.get("dest") or "").strip()
+                if not url or not dest:
+                    return R.unavailable(cap, "缺少 url 或 dest",
+                                         device=self.name, via=self.via)
+                d = NS.download(url, dest)
+                return R.success(cap, self.name, via=self.via, side_effect=True, data=d)
+        except ImportError as e:
+            return R.unavailable(cap, f"skynet 内核不在：{e}",
+                                 device=self.name, via=self.via)
+        except Exception as e:
+            # 🔴 静默失败最阴：这里绝不能吞掉异常。
+            #    失败必须带原因回去，让界面显示「为什么没成」。
+            return R.error(cap, f"{type(e).__name__}: {e}", device=self.name,
+                           via=self.via)
         return super().invoke(cap, args)
 
     # ---------------- 只读 ----------------
