@@ -1,0 +1,17 @@
+{
+  "name": "fleet-uicheck",
+  "private": true,
+  "version": "0.1.0",
+  "description": "图形版的视觉验收工具：真截图 + 像素级回归 + 无障碍扫描。开发期工具，不进产品。",
+  "type": "commonjs",
+  "scripts": {
+    "shot": "node shot.js",
+    "a11y": "node a11y.js"
+  },
+  "dependencies": {
+    "axe-core": "^4.11.0",
+    "pixelmatch": "^5.3.0",
+    "playwright": "^1.56.0",
+    "pngjs": "^7.0.0"
+  }
+}

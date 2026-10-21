@@ -29,6 +29,12 @@ fleet_queue.json.tmp
 tmp/
 .workbuddy/
 
+# 图形版视觉验收工具（tools/uicheck/）
+# 依赖装在仓库外（D:/tools/uitools），这里是软链接，不入库
+tools/uicheck/node_modules
+# 截图与门禁产物：含本机真实进程名/设备名/屏幕内容，不入库
+tools/uicheck/shots/
+
 # 扫描/发现账本（含真实设备清单，不入库）
 swept.json
 discovered.json
