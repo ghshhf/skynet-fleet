@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    # 安卓端/文档改动不重启桌面打包：两个产物互不依赖，
+    # 同时排队只会互相抢 runner，也让"哪个先好"看不清楚。
+    paths-ignore:
+      - "tianwang_android/**"
+      - "android_bridge/**"
+      - "docs/**"
+      - "**.md"
   workflow_dispatch:
 
 permissions:
