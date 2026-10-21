@@ -34,8 +34,15 @@ sounddevice>=0.4
 # 🔴 这两个必须在这里。2026-10-22 实测：CI 只装本文件，「语音对话」进了冻扁包
 #    却不会说话——voice.say() 直接返回 ("none", None)，因为包里压根没有 edge_tts。
 #    build_gui.py 里的 --hidden-import 只是"别漏收"，装不上的包它收不出来。
-edge-tts>=7.0
-faster-whisper>=1.0
+# 三个都钉版本：冻扁包要的是"和我本机跑通的那一套一模一样"。
+# 2026-10-22 首次上 CI 没钉，装出来的组合在包内报
+#   open() got an unexpected keyword argument 'metadata_errors'
+# ——ASR 直接崩，而 TTS 却正常，最容易误判成"模型没下载好"。
+# 下面这组是本机实测通过的组合（faster_whisper small@cpu/int8 回读正确）。
+edge-tts==7.3.1
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+huggingface-hub==2.2.0
 
 # —— 终端版（TUI）依赖，这里一并列出，便于单文件安装 ——
 rich>=13

@@ -986,7 +986,13 @@ class _Handler(BaseHTTPRequestHandler):
                         os.remove(p)
                 except OSError:
                     pass
-        return self._json({"ok": True, "text": (text or "").strip(), "meta": meta})
+        body = (text or "").strip()
+        # voice.transcribe 内部吞异常、把原因塞进 meta["error"]。空文本 + 有 error
+        # 就是"识别器坏了"，不能报 ok:true —— 2026-10-22 实测：冻扁包里 ASR 崩了，
+        # 接口却回 ok:true/text:""，前端只会显示"没听清，再说一次"，人永远查不出来。
+        if not body and isinstance(meta, dict) and meta.get("error"):
+            return self._err(500, "识别失败：%s" % meta["error"])
+        return self._json({"ok": True, "text": body, "meta": meta})
 
     def _post_voice_say(self, body):
         text = (body.get("text") or "").strip()
