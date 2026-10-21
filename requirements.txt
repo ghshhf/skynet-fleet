@@ -1,0 +1,36 @@
+# 设备编队 —— Python 依赖（Windows 图形版 / 终端版 共用）
+#
+# 安装：  pip install -r requirements.txt
+# 打包：  见 tools/build_gui.py 与 .github/workflows/build-gui.yml
+#
+# ⚠️ 以下包在冻扁包里被刻意排除（见 tools/build_gui.py 的 EXCLUDES），
+#    不要因为“没列在这里”就以为能用：
+#      torch        —— 属 polaris STT/TTS 子进程（独立解释器），
+#                      架构铁律：fleet 解释器绝不 import torch
+#      skynet       —— 外部 netforce 仓库，经 NETFORCE_HOME 指路，不 vendoring
+#      listen/speak —— polaris 模块（同上，跨进程）
+#      rules_relay  —— 可选广告跳过中继（commander 用，GUI 不依赖）
+#
+# 这些子进程需要的 torch/polaris 环境，在各自独立的 Python 里单独装，
+# 不进本仓库的依赖树。
+
+# —— 图形版窗口壳 ——
+pywebview>=5
+
+# —— 设备能力依赖的第三方 ——
+adb-shell>=0.4
+cryptography>=42
+pycryptodome>=3.20
+Pillow>=10
+mss>=9
+numpy>=1.26
+psutil>=5.9
+pyaudio>=0.2.11
+pyautogui>=0.9
+rule_engine>=3
+sounddevice>=0.4
+
+# —— 终端版（TUI）依赖，这里一并列出，便于单文件安装 ——
+rich>=13
+textual>=0.50
+prompt_toolkit>=3.0
