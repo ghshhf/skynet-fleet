@@ -40,6 +40,9 @@ function arg(name, dflt) {
 }
 const THEME = arg("theme", "light");
 const SETTLE = Number(arg("settle", 350));
+// 🔴 「有反应」最多等多久（毫秒）。点下去是异步动作时（POST /api/call
+// 要等审批弹窗出来），固定等一小会儿会误判成死链 ⇒ 轮询到变了就停。
+const ASYNC_WAIT = Number(arg("asyncWait", 2000));
 const JSON_OUT = arg("json", "");
 
 function startServer() {
@@ -68,10 +71,50 @@ function startServer() {
 const CLICKABLE_SEL =
   "a[href], button, [role=button], [onclick], .hbtn, .cbtn, .sb-item, .sb-foot, .tb-win i";
 
-const ENUMERATE = () => {
+const ENUMERATE = (onlyPhase) => {
   const sel = "a[href], button, [role=button], [onclick], .hbtn, .cbtn, .sb-item, .sb-foot, .tb-win i";
-  const nodes = Array.from(document.querySelectorAll(sel));
+  // 🔴 先清掉上一轮打的标记——每轮枚举都要重新分配，
+  // 否则同一个元素会带着旧标记，取到的可能是别的元素。
+  document.querySelectorAll("[data-audit-id]").forEach((n) => {
+    n.removeAttribute("data-audit-id");
+  });
+  // 🔴 元素归属：谁负责测这个元素。
+  //   抽屉是**模态**——打开后背景被遮罩盖住，背景上的元素本来就点不到。
+  //   若不限定范围，人格抽屉相位会把侧栏、titlebar 等 30 多个背景元素
+  //   全记成「被遮住，点不到」——报告被噪音淹没，覆盖统计算歪，
+  //   真正该测的抽屉内元素反而被淹了。
+  //   规则（先匹配到的赢）：模态 → view → 其余归聊天主视图。
+  //   抽屉里的元素归抽屉相位；背景元素**由聊天相位测**（那时抽屉没开）。
+  //   这不是放水——是让每个元素在**它该被测的环境里**被测一次。
+  const ownerOf = (n) => {
+    const mw = n.closest && n.closest(".apprmask");
+    if (mw) {
+      return (mw.id === "drawerMask") ? "人格抽屉" : "能力面板";
+    }
+    if (n.closest && n.closest(".capwrap")) { return "能力面板"; }
+    const v = n.closest && n.closest(".view");
+    if (v) {
+      if (v.id === "viewAssets") { return "专家·技能·连接器"; }
+      if (v.id === "viewCrew") { return "助理·角色编队"; }
+      return "聊天主视图";
+    }
+    return "聊天主视图";
+  };
+  const all = Array.from(document.querySelectorAll(sel));
+  const nodes = onlyPhase ? all.filter((n) => ownerOf(n) === onlyPhase) : all;
   const vw = window.innerWidth, vh = window.innerHeight;
+  // 🔴 给每个元素打一个**稳定标记**（data-audit-id）。
+  // 实测踩出来的坑（门禁骗人的第六种形态）：原先用
+  // `page.$$(sel)` 在**初始快照**时一次性取回全部句柄，
+  // 之后按**下标** handles[i] 去用。可相位里 DOM 一直在变
+  // （展开面板插入新按钮 / 换视图重建卡片 / 列表刷新换节点），
+  // 下标就对不上了 ⇒ 拿到的句柄根本不是本次要测的那个元素。
+  // 症状很迷惑：`.tab` 被报「被 DIV.titlebar 遮住」、
+  // `#drawerRefresh` 被报「元素已不在 DOM」——实测那三个 Tab
+  // 明明能点（elementFromPoint 命中自己，y=94 而 titlebar 只到 y=38）。
+  // ⇒ 改为：枚举时打标记，之后**每次按标记重新查**。
+  // 元素真被删了，查不到就如实记「元素已不在 DOM」，不猜。
+  nodes.forEach((n, i) => n.setAttribute("data-audit-id", "a" + i));
   return nodes.map((n, idx) => {
     const r = n.getBoundingClientRect();
     const cs = getComputedStyle(n);
@@ -80,17 +123,42 @@ const ENUMERATE = () => {
     // 里面的「执行」按钮尺寸仍然是 28×28 ⇒ 只看尺寸会把它算成可点，
     // 于是每个按钮都变成「被遮住，点不到」，白白跳过 70 多个。
     // 移出视口的元素本来就没法点 ⇒ 不该进可点清单。
-    const inViewport = r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh;
+    //
+    // 🔴 但「在视口内」要**按滚动容器算**，不能按窗口算。
+    // 实测踩出来的坑（这一条是覆盖不足的假绿的第二层）：
+    // 能力面板里 76 个「执行」按钮，只有 8 个在窗口视口内，
+    // 其余 68 个在面板自己的**滚动容器**里（往下滚就能看到）。
+    // 按窗口视口判 ⇒ 那 68 个被当成「不可见」静默跳过
+    // ⇒ 报告写着「共枚举 76 个」，实际只测了 8 个 ⇒ **又是假绿**。
+    // ⇒ 判据改成：元素在窗口视口内 **或** 在某个可滚动容器内
+    //   （可滚动容器 = 祖先里有 overflow 是 auto/scroll 且能滚）。
+    //   这样「点之前把它滚进来」才有意义。
+    const inWindow = r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh;
+    let scrollable = false;
+    let p = n.parentElement;
+    while (p && p !== document.body) {
+      const pcs = getComputedStyle(p);
+      if (/(auto|scroll)/.test(pcs.overflowY + " " + pcs.overflowX)) {
+        // 容器本身能滚（scrollHeight > clientHeight）才算
+        if (p.scrollHeight > p.clientHeight + 2) { scrollable = true; }
+        break;
+      }
+      p = p.parentElement;
+    }
     const visible = r.width > 0 && r.height > 0 && cs.visibility !== "hidden" &&
-                    cs.display !== "none" && cs.opacity !== "0" && inViewport;
+                    cs.display !== "none" && cs.opacity !== "0" &&
+                    (inWindow || scrollable);
     return {
       idx,
+      auditId: "a" + idx,
       tag: n.tagName.toLowerCase(),
       id: n.id || "",
       cls: (n.className && typeof n.className === "string") ? n.className : "",
       text: (n.textContent || "").trim().slice(0, 24),
       title: n.getAttribute("title") || "",
       visible,
+      inWindow,
+      scrollable,
       disabled: !!n.disabled || n.getAttribute("aria-disabled") === "true",
       rect: { x: r.x + r.width / 2, y: r.y + r.height / 2 },
     };
@@ -110,38 +178,90 @@ const ENUMERATE = () => {
  *
  * 所以改成：每个相位把对应的那层**打开**，再扫一遍这一层里的可点元素。
  * 每个相位都会先枚举、再逐个点，点完恢复状态。
+ *
+ * 🔴 相位还要声明**只管哪一块**（scope）：
+ *   抽屉是模态——打开后背景被遮罩盖住，背景上的元素**本来就点不到**
+ *   （这不是死链，是模态的正常表现）。若不限定范围，人格抽屉相位
+ *   会把侧栏、titlebar 等 30 多个背景元素全记成「被遮住，点不到」，
+ *   报告被噪音淹没，还把覆盖统计算歪。
+ *   ⇒ scope = 只枚举这一相位**该管**的元素；背景元素归其它相位管。
+ *
+ * 🔴 setup 必须走**真实入口**（点侧栏 / 点开面板），不能只改 class。
+ *   实测踩出来的坑：早期 setup 只 `v.classList.toggle("on", …)`，
+ *   于是「专家·技能·连接器」相位里 Tab 内容是**空的**
+ *   （真正的内容是点击侧栏后 loadAssetTab() 拉接口渲染的）⇒
+ *   那个相位只枚举到 4 个元素，覆盖率从 82% 掉到 31%。
+ *   ⇒ 改成点真入口：点 `.sb-item[data-view=assets]` / `[data-view=crew]`，
+ *   走 app.js 自己的 showView + setAssetTab + loadCrew。
+ *
+ * 🔴 setup 与 restore 要分开：setup 是**真入口**（会拉接口重渲染 DOM），
+ *   只能在相位开始时做一次；restore 是**轻量复位**（只切 class，不重渲染），
+ *   每个元素测完都要做——否则点侧栏切走视图后测不下去，
+ *   而重渲染又会把 data-audit-id 标记全冲掉（元素就成「已不在 DOM」）。
  * ------------------------------------------------------------------ */
 const PHASES = [
   {
     name: "聊天主视图",
+    // 聊天相位管「全局骨架 + 聊天视图里的东西」
+    scope: "#viewChat, .sidebar, .titlebar, .pet, .chatwrap, .composer, .topbar",
     setup: () => {
+      const item = document.querySelector('.sb-item[data-view="chat"]');
+      if (item) { item.click(); return; }
       document.querySelectorAll(".view").forEach((v) => {
         v.classList.toggle("on", v.id === "viewChat");
       });
       document.querySelectorAll(".capwrap").forEach((c) => c.classList.remove("open"));
     },
+    restore: () => {
+      document.querySelectorAll(".view").forEach((v) => {
+        v.classList.toggle("on", v.id === "viewChat");
+      });
+    },
   },
   {
     name: "专家·技能·连接器",
+    scope: "#viewAssets",
     setup: () => {
+      // 走真入口：点侧栏 ⇒ app.js 会 showView + setAssetTab（拉接口渲染内容）
+      const item = document.querySelector('.sb-item[data-view="assets"]');
+      if (item) { item.click(); return; }
       document.querySelectorAll(".view").forEach((v) => {
         v.classList.toggle("on", v.id === "viewAssets");
       });
-      document.querySelectorAll(".capwrap").forEach((c) => c.classList.remove("open"));
+    },
+    restore: () => {
+      // 轻量：只切视图显示，**不重渲染**（保住 data-audit-id 标记）
+      document.querySelectorAll(".view").forEach((v) => {
+        v.classList.toggle("on", v.id === "viewAssets");
+      });
     },
   },
   {
     name: "助理·角色编队",
+    scope: "#viewCrew",
     setup: () => {
+      const item = document.querySelector('.sb-item[data-view="crew"]');
+      if (item) { item.click(); return; }
       document.querySelectorAll(".view").forEach((v) => {
         v.classList.toggle("on", v.id === "viewCrew");
       });
-      document.querySelectorAll(".capwrap").forEach((c) => c.classList.remove("open"));
+    },
+    restore: () => {
+      document.querySelectorAll(".view").forEach((v) => {
+        v.classList.toggle("on", v.id === "viewCrew");
+      });
     },
   },
   {
     name: "能力面板",
+    scope: ".capwrap",
     setup: () => {
+      document.querySelectorAll(".view").forEach((v) => {
+        v.classList.toggle("on", v.id === "viewChat");
+      });
+      document.querySelectorAll(".capwrap").forEach((c) => c.classList.add("open"));
+    },
+    restore: () => {
       document.querySelectorAll(".view").forEach((v) => {
         v.classList.toggle("on", v.id === "viewChat");
       });
@@ -150,6 +270,7 @@ const PHASES = [
   },
   {
     name: "人格抽屉",
+    scope: "#drawerMask",
     setup: () => {
       document.querySelectorAll(".view").forEach((v) => {
         v.classList.toggle("on", v.id === "viewChat");
@@ -159,8 +280,32 @@ const PHASES = [
       const d = document.getElementById("drawerMask");
       if (d) { d.hidden = false; }
     },
+    restore: () => {
+      document.querySelectorAll(".view").forEach((v) => {
+        v.classList.toggle("on", v.id === "viewChat");
+      });
+      document.querySelectorAll(".apprmask").forEach((m) => { m.hidden = true; });
+      const d = document.getElementById("drawerMask");
+      if (d) { d.hidden = false; }
+    },
   },
 ];
+
+/* 元素归属：谁负责测这个元素。
+ *
+ * 🔴 为什么要有归属（实测踩出来的坑）：
+ *   抽屉是**模态**——打开后背景被遮罩盖住，背景上的元素本来就点不到。
+ *   若不限定范围，人格抽屉相位会把侧栏、titlebar 等 30 多个背景元素
+ *   全记成「被遮住，点不到」——报告被噪音淹没，覆盖统计算歪，
+ *   真正该测的抽屉内元素反而被淹了。
+ *
+ *   规则（**优先级从下往上，先匹配到的赢**）：
+ *   ① 在某个模态里（.apprmask / .capwrap）⇒ 归那个模态；
+ *   ② 在某个 view 里（#viewAssets / #viewCrew / #viewChat）⇒ 归那个 view；
+ *   ③ 其余（侧栏、titlebar、悬浮球、toast）⇒ 归「聊天主视图」。
+ *
+ *   抽屉相位只测抽屉里的；背景元素**由聊天相位测**（那时抽屉没开）。
+ *   这不是放水——是让每个元素在**它该被测的环境里**被测一次。 */
 
 /* 把页面恢复到「点击前的样子」，供下一个元素测量用。
  *
@@ -239,6 +384,14 @@ const FINGERPRINT = () => {
     srv = await startServer();
     const browser = await chromium.launch();
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    // 🔴 记录「点了之后有没有真的发请求出去」。
+    // 实测踩出来的坑：能力面板里的「执行」按钮点下去是 POST /api/call，
+    // 后端要真调一次能力（可能慢，比如探设备）。等固定时长看不到结果
+    // 就被判成「点了页面无任何变化」的假死链。
+    // ⇒ 用「请求确实发出去了」当独立证据：**点了就说明按钮是活的**，
+    // 至于结果慢不慢是另一回事（那是「慢」，不是「死」）。
+    let netHits = 0;
+    page.on("request", (r) => { if (r.url().indexOf("/api/") >= 0) { netHits += 1; } });
     await page.goto(srv.url, { waitUntil: "networkidle" });
     await page.waitForTimeout(1200);
 
@@ -246,20 +399,23 @@ const FINGERPRINT = () => {
     console.log("[clickaudit] 枚举到可点元素 " + items.length + " 个（分 " +
                 PHASES.length + " 个相位逐层扫）");
 
-    // 🔴 用 ElementHandle 定位，**不用索引**。
-    // 实测踩出来的坑：按 `querySelectorAll(sel)[idx]` 重新查，
-    // 一旦前面某次点击改变了 DOM（展开面板 / 收起左栏 / 换视图），
-    // 索引就漂移到别的元素上 ⇒ 点到的完全是另一个东西，
-    // 判出来的「被 titlebar 遮住」是**我们自己点歪了**，不是界面死链。
+    // 🔴 定位元素**按 data-audit-id 标记重新查**，不用初始快照的下标。
+    // 实测踩出来的坑：原先 `page.$$(sel)` 一次性取回全部句柄，
+    // 之后按 handles[i] 使用。可相位里 DOM 一直在变（展开面板插新按钮 /
+    // 换视图重建卡片 / 列表刷新换节点），下标就漂了 ⇒ 拿到的句柄
+    // 根本不是本次要测的元素。症状很迷惑：三个 Tab 被报「被 titlebar 遮住」
+    // （实测它们明明能点），#drawerRefresh 被报「元素已不在 DOM」。
     // 假绿比假红更坏：它会让「死链清零」这个结论失去意义。
-    const handles = await page.$$(CLICKABLE_SEL);
+    // 改成按标记重查后，元素真被删就如实记「元素已不在 DOM」。
 
     const phaseStats = [];
     for (const phase of PHASES) {
-      // 打开这一层，再枚举
+      // 打开这一层，再枚举。
+      // 🔴 真实入口会**异步拉接口**渲染内容（Tab 卡片、名册、连接器墙），
+      // 所以要多等一轮，等内容真的画出来再枚举——否则枚举到的是空壳。
       await page.evaluate(phase.setup);
-      await page.waitForTimeout(300);
-      const phItems = await page.evaluate(ENUMERATE);
+      await page.waitForTimeout(900);
+      const phItems = await page.evaluate(ENUMERATE, phase.name);
       const visible = phItems.filter((x) => x.visible);
       const pAlive = [], pDead = [], pSkip = [];
       console.log("\n[clickaudit] 相位「" + phase.name + "」可见可点 " +
@@ -274,9 +430,23 @@ const FINGERPRINT = () => {
           pSkip.push({ ...it, phase: phase.name, why: "按钮是 disabled 状态（现在不能点，不是死链）" });
           continue;
         }
-        const node = handles[i];
+        const node = await page.$('[data-audit-id="' + it.auditId + '"]');
         if (!node) {
           pSkip.push({ ...it, phase: phase.name, why: "元素已不在 DOM" });
+          continue;
+        }
+        // 🔴 「已经是当前选中项」的元素点下去**本来就不该有变化**。
+        // 实测案例：三 Tab 里「专家」是默认激活的那个（class="tab on"），
+        // 点它页面当然不变 ⇒ 被判成死链。**那是正确行为，不是死链。**
+        // 判据：带 .on / .active / [aria-selected=true] / [aria-current] 的元素。
+        const isCurrent = await node.evaluate((n) => {
+          const cs = n.classList || "";
+          return /(^|\s)(on|active|selected|current)(\s|$)/.test(cs) ||
+                 n.getAttribute("aria-selected") === "true" ||
+                 n.getAttribute("aria-current") === "true";
+        });
+        if (isCurrent) {
+          pSkip.push({ ...it, phase: phase.name, why: "已经是当前选中项（点了没变化是正确行为，不是死链）" });
           continue;
         }
         // 点之前：把目标滚进视野，并确认「鼠标那个点上确实命中的是它」——
@@ -288,8 +458,28 @@ const FINGERPRINT = () => {
         // ⇒ 明明可见的按钮被判成「被 titlebar 遮住」。
         // 那是**审计工具自己造的假遮挡**，不是界面死链。
         // 改用 block:"nearest"：已经在视野内就不动它。
+        //
+        // 🔴 但「nearest」对**滚动容器内**的元素不够：它只保证元素在自己
+        // 那个滚动容器里露出来，不保证露出来的那部分**没被别的层盖住**。
+        // 能力面板的 68 个「执行」按钮就在这种容器里。
+        // ⇒ 先把元素滚到**容器可视区的中间**，再判遮挡。
         const hit = await node.evaluate((node) => {
-          node.scrollIntoView({ block: "nearest", inline: "nearest" });
+          // 找到最近的可滚动祖先，让元素滚到它可视区的中间
+          let sc = null, p = node.parentElement;
+          while (p && p !== document.body) {
+            const pcs = getComputedStyle(p);
+            if (/(auto|scroll)/.test(pcs.overflowY + " " + pcs.overflowX) &&
+                p.scrollHeight > p.clientHeight + 2) { sc = p; break; }
+            p = p.parentElement;
+          }
+          if (sc) {
+            const nr = node.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+            sc.scrollTop += (nr.top + nr.height / 2) - (sr.top + sr.height / 2);
+            // 滚动后必须让浏览器把布局算完
+            void sc.offsetHeight;
+          } else {
+            node.scrollIntoView({ block: "nearest", inline: "nearest" });
+          }
           const r = node.getBoundingClientRect();
           const x = r.x + r.width / 2, y = r.y + r.height / 2;
           const top = document.elementFromPoint(x, y);
@@ -297,22 +487,46 @@ const FINGERPRINT = () => {
             ok: true, x, y,
             covered: !(top === node || node.contains(top) || (top && top.contains(node))),
             coveredBy: top ? (top.tagName + "." + (typeof top.className === "string" ? top.className : "")) : "",
+            scrolled: !!sc,
           };
         });
         if (!hit.covered) {
           const before = await page.evaluate(FINGERPRINT);
+          const netBefore = netHits;
           try {
             await page.mouse.click(hit.x, hit.y, { timeout: 1500 });
           } catch (e) {
             pDead.push({ ...it, phase: phase.name, why: "点击报错：" + e.message });
             continue;
           }
-          await page.waitForTimeout(SETTLE);
-          const after = await page.evaluate(FINGERPRINT);
-          if (before.hash !== after.hash) {
+          // 🔴 等「有反应」要**轮询**，不能只等一个固定时长。
+          // 实测踩出来的坑：能力面板里的「执行」按钮点下去是
+          // POST /api/call（异步）⇒ 审批弹窗要过一会儿才出现。
+          // 固定等 350ms 时弹窗还没来 ⇒ 指纹没变 ⇒ 被判成
+          // 「点了页面无任何变化」的假死链。
+          // 实测：等 1500ms 就能看到 body 长度从 33794 变成 34059。
+          // ⇒ 改成：先等一小会儿，之后**轮询到指纹变了就停**，
+          // 最多等 ASYNC_WAIT。变了一定算有反应；到点还没变才算死链。
+          let changed = false;
+          const deadline = Date.now() + ASYNC_WAIT;
+          while (Date.now() < deadline) {
+            await page.waitForTimeout(SETTLE);
+            const after = await page.evaluate(FINGERPRINT);
+            if (before.hash !== after.hash) { changed = true; break; }
+          }
+          // 🔴 「发了请求」也是**独立的活性证据**。
+          // 能力面板的「执行」按钮点下去是 POST /api/call，后端要真调一次
+          // 能力（探设备可能要好几秒）⇒ 等 2 秒页面还没变。
+          // 但**请求确实发出去了** ⇒ 按钮是活的，慢 ≠ 死。
+          // 判死链的前提是：既没等到页面变化，也没发出任何请求。
+          const netFired = netHits > netBefore;
+          if (changed) {
             pAlive.push({ ...it, phase: phase.name, note: "有反应" });
+          } else if (netFired) {
+            pAlive.push({ ...it, phase: phase.name, note: "有反应（发出请求了，结果还没回来——慢，不是死）" });
           } else {
-            pDead.push({ ...it, phase: phase.name, why: "点了页面无任何变化" });
+            pDead.push({ ...it, phase: phase.name, why: "点了页面无任何变化（等了 " +
+                        ASYNC_WAIT + "ms 也没变，也没发出任何请求）" });
           }
         } else {
           // 被别的层盖住 —— 记为「被遮挡（需先关掉覆盖层）」，不算死链。
@@ -323,8 +537,18 @@ const FINGERPRINT = () => {
         // 后面每一个元素都变成「点不到」⇒ 审计把 80 多个元素全记成
         // 「被遮住」，最后报「死链 0」——那是**假绿**。
         // 一次点击污染后续所有测量，比漏判更坏。
+        //
+        // 🔴 恢复要**两步**：清副作用 + 重新打开相位那一层。
+        // 实测踩出来的坑（这一条比上一条更阴）：RESTORE 只清了抽屉/面板/左栏，
+        // **没把视图切回本相位的那一层**。而相位里枚举的可点元素包含侧栏
+        // `.sb-item`——点它会真的切视图（切到聊天/助理/定时任务…），
+        // 于是该相位后续所有元素都在**错误的视图**里测：
+        // 「专家·技能·连接器」的三个 Tab 于是变成不可见，
+        // elementFromPoint 落在 titlebar 上 ⇒ 报「被 titlebar 遮住」。
+        // 实测证明那是假象：Tab 的 y=94，titlebar 只到 y=38，命中的是它自己。
         await page.evaluate(RESTORE);
-        await page.waitForTimeout(120);
+        await page.evaluate(phase.restore);
+        await page.waitForTimeout(150);
       }
       alive.push(...pAlive);
       dead.push(...pDead);
@@ -348,10 +572,22 @@ const FINGERPRINT = () => {
     // 🔴 覆盖度必须一起报出来。
     // 「死链 0」如果是在只测了 20/102 的情况下得出的，那是假绿。
     // 门禁红绿要能一眼看出「测全了没有」。
+    //
+    // 🔴 分母用「各相位枚举到的元素数之和」，**不是**首次那个全量 items.length。
+    // 实测踩出来的坑：加了「元素归属」后，同一个元素只由一个相位负责，
+    // 各相位的 phItems 互不重叠 ⇒ 相加才是真正该测的总数。
+    // 用全量 items.length 当分母会算出一个**永远到不了**的覆盖率
+    // （归属过滤后只测 32 个，分母却是 103 ⇒ 31%，看着像漏测一大半）。
     const covered = alive.length + dead.length;
-    const enumerated = items.length;
-    console.log("[clickaudit] 覆盖：" + covered + " / " + enumerated + " 个可点元素被真点过" +
-                "（" + (enumerated ? Math.round(covered / enumerated * 100) : 0) + "%）");
+    const enumerated = phaseStats.reduce((a, p) => a + p.total, 0);
+    const pct = enumerated ? Math.round(covered / enumerated * 100) : 0;
+    console.log("[clickaudit] 覆盖：" + covered + " / " + enumerated +
+                " 个该测元素被真点过（" + pct + "%）");
+    // 🔴 覆盖率不到 90% 要**如实说**，不能默默报「死链 0」让人以为测全了。
+    if (pct < 90) {
+      console.log("[clickaudit] ⚠️ 覆盖率 " + pct + "% 不到 90% —— 「死链 0」只覆盖了这些，" +
+                  "其余没测到的不能算「没问题」");
+    }
     if (skipped.length) {
       console.log("\n  跳过（不是死链，是点不到/不可见）：");
       skipped.forEach((d) => {
@@ -370,7 +606,7 @@ const FINGERPRINT = () => {
     if (JSON_OUT) {
       fs.writeFileSync(JSON_OUT, JSON.stringify(
         { alive, dead, skipped, phases: phaseStats,
-          coverage: { enumerated: items.length, clicked: alive.length + dead.length } },
+          coverage: { enumerated, clicked: covered, pct } },
         null, 2));
       console.log("\n[clickaudit] 明细已存 " + JSON_OUT);
     }
