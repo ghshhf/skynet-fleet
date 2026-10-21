@@ -295,13 +295,17 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 byte[] wav = null;
+                String ext = "wav";
                 String err = null;
                 try {
-                    wav = Net.say(base, token, text);
+                    Net.SayResult r = Net.say(base, token, text);
+                    wav = r.data;
+                    ext = r.ext;
                 } catch (Exception e) {
                     err = e.getMessage();
                 }
                 final byte[] data = wav;
+                final String fmt = ext;
                 final String why = err;
                 ui.post(new Runnable() {
                     @Override
@@ -312,16 +316,18 @@ public class MainActivity extends Activity {
                             say2("它说：" + text + "\n（合成失败，没出声：" + why + "）");
                             return;
                         }
-                        play(data, text);
+                        play(data, fmt, text);
                     }
                 });
             }
         });
     }
 
-    private void play(byte[] wav, final String text) {
+    private void play(byte[] wav, String ext, final String text) {
         try {
-            File f = new File(getCacheDir(), "tts.wav");
+            // 后缀必须跟真实容器一致：MIUI 的 MediaPlayer 会看后缀决定解复用器，
+            // 把 mp3 存成 tts.wav 在部分 ROM 上直接 error(1, -2147483648)。
+            File f = new File(getCacheDir(), "tts." + (ext == null ? "wav" : ext));
             FileOutputStream fo = new FileOutputStream(f);
             fo.write(wav);
             fo.close();

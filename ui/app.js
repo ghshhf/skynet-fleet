@@ -1431,7 +1431,7 @@
      后端两个接口（server.py 新增；内部走**仓库根**的 voice.py，不是
      fleet/gui/voice.py 那套命令式语音）：
        POST /api/voice/recognize   裸 wav 进 → {ok, text} 出
-       POST /api/voice/say         {text} 进 → audio/wav 出（音色随当前角色卡）
+       POST /api/voice/say         {text} 进 → 音频出（格式看 X-Voice-Format，音色随当前角色卡）
 
      录音走 getUserMedia + AudioContext 采 PCM 再自己封 WAV：不用 MediaRecorder，
      是因为它给的是 webm/opus，后端还得 ffmpeg 转一道；能省一次转码就省，
@@ -1805,7 +1805,7 @@
         a.onerror = function () {
           URL.revokeObjectURL(url);
           VV.audio = null;
-          reject(new Error("播放失败：音频解不开（浏览器不支持该 wav 编码？）"));
+          reject(new Error("播放失败：音频解不开（格式 " + (blob.type || "未知") + "）"));
         };
         var p = a.play();
         if (p && p.catch) {
