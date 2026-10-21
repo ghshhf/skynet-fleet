@@ -21,7 +21,11 @@
     </div>
     <div class="tb-spacer"></div>
     <button class="tb-theme" id="themeBtn" title="明暗切换">◐</button>
-    <div class="tb-win"><i>—</i><i>▢</i><i class="close">✕</i></div>
+    <div class="tb-win">
+      <i id="tbMin" role="button" tabindex="0" title="收起左栏">—</i>
+      <i id="tbMax" role="button" tabindex="0" title="全屏">▢</i>
+      <i class="close" id="tbClose" role="button" tabindex="0" title="关闭">✕</i>
+    </div>
   </div>
 
   <div class="body">
@@ -37,12 +41,12 @@
       </div>
 
       <nav class="sb-nav">
-        <div class="sb-item on"><span class="ic">◉</span>新建任务</div>
-        <div class="sb-item"><span class="ic">◐</span>助理<span class="tag">BETA</span></div>
-        <div class="sb-item"><span class="ic">⌘</span>专家技能·连接器</div>
-        <div class="sb-item"><span class="ic">⏱</span>定时任务</div>
-        <div class="sb-item"><span class="ic">▤</span>资料库</div>
-        <div class="sb-item"><span class="ic">⋯</span>更多<span class="tag">灵感</span></div>
+        <div class="sb-item on" data-view="chat" data-act="new"><span class="ic">◉</span>新建任务</div>
+        <div class="sb-item" data-view="crew"><span class="ic">◐</span>助理<span class="tag">BETA</span></div>
+        <div class="sb-item" data-view="assets"><span class="ic">⌘</span>专家技能·连接器</div>
+        <div class="sb-item" data-view="todo"><span class="ic">⏱</span>定时任务</div>
+        <div class="sb-item" data-view="lib"><span class="ic">▤</span>资料库</div>
+        <div class="sb-item" data-view="more"><span class="ic">⋯</span>更多<span class="tag">灵感</span></div>
       </nav>
 
       <div class="sb-sec"><span>任务</span><span class="cnt">(0)</span></div>
@@ -52,7 +56,8 @@
       <div class="sb-sec"><span>会话</span><span class="cnt" id="sessCount">(0)</span></div>
       <div class="sb-list" id="sessionList" style="flex:0 0 auto;max-height:180px"></div>
 
-      <div class="sb-foot">
+      <div class="sb-foot" id="personaFoot" role="button" tabindex="0"
+           title="人格抽屉（角色卡 / 情绪 / 记忆）">
         <span class="ava" id="personaAva">编</span>
         <span class="grow" id="personaName">读取中…</span>
         <span style="color:var(--fg-3)">⚙</span>
@@ -62,16 +67,23 @@
     <!-- 中栏 -->
     <main class="main">
       <div class="main-head">
-        <h1>设备编队</h1>
+        <h1 id="viewTitle">设备编队</h1>
         <span class="sub" id="regStat">registry: —</span>
         <span class="grow"></span>
         <div class="apprflag" id="apprFlag" hidden>
           <span class="dot"></span><b id="apprCount">0</b> 项在等审批
         </div>
         <div class="hbtn" id="capBtn" title="能力面板">◫</div>
-        <div class="hbtn" title="搜索">⌕</div>
-        <div class="hbtn" title="分享">↗</div>
+        <input class="hsearch" id="searchInput" type="search" hidden
+               placeholder="搜能力 / 设备 / 技能 / 角色卡…" autocomplete="off">
+        <div class="searchres" id="searchResults" hidden></div>
+        <div class="hbtn" id="searchBtn" title="搜索">⌕</div>
+        <div class="hbtn" id="shareBtn" title="分享">↗</div>
       </div>
+
+      <!-- 视图容器：聊天 / 专家技能连接器 / 其它 -->
+      <div class="views" id="views">
+        <div class="view view-chat on" id="viewChat">
 
       <div class="stream" id="stream">
         <div class="stream-in" id="streamIn"></div>
@@ -87,7 +99,7 @@
           <b style="height:16px"></b><b style="height:10px"></b><b style="height:5px"></b>
         </span>
         <span class="grow"></span>
-        <span class="hint">W4 才接真录音 · 现在只是界面占位</span>
+        <span class="hint">语音暂未接（缺麦克风硬件）</span>
       </div>
 
       <!-- 能力调用的真实结果 -->
@@ -101,9 +113,9 @@
               <textarea id="input" rows="1" placeholder="在这里输入，或按住说话……（Enter 发送 / Shift+Enter 换行）"></textarea>
             </div>
             <div class="comp-row">
-              <span class="cbtn" title="添加附件（W3 开放）">＋</span>
-              <span class="cbtn" title="浏览访问权限（W3 开放）">⊘ 允许浏览访问 <span class="kbd">⌄</span></span>
-              <span class="cbtn mic" id="micBtn" title="语音输入（W4 开放）">🎙</span>
+              <span class="cbtn" id="attachBtn" title="添加附件">＋</span>
+              <span class="cbtn" id="permBtn" title="浏览访问权限">⊘ 允许浏览访问 <span class="kbd">⌄</span></span>
+              <span class="cbtn mic" id="micBtn" title="语音输入（缺麦克风硬件，暂未接）">🎙</span>
               <button class="cbtn send" id="sendBtn" disabled>发送</button>
             </div>
           </div>
@@ -111,6 +123,30 @@
             <span>◈</span><b id="modelName">读取中…</b>
             <span class="m" id="modelId"></span><span>⌄</span>
           </div>
+        </div>
+      </div>
+        </div>
+
+        <!-- 专家 · 技能 · 连接器（X1 三 Tab） -->
+        <div class="view view-assets" id="viewAssets">
+          <div class="tabbar" id="tabBar" role="tablist">
+            <button class="tab on" data-tab="cards" role="tab">专家</button>
+            <button class="tab" data-tab="skills" role="tab">技能</button>
+            <button class="tab" data-tab="conns" role="tab">连接器</button>
+            <span class="grow"></span>
+            <button class="hbtn" id="assetsRefresh" title="刷新">↻</button>
+          </div>
+          <div class="tabbody" id="tabBody"></div>
+        </div>
+
+        <!-- 助理：无限智能体名册（真读 cards/ 下的角色卡）-->
+        <div class="view view-crew" id="viewCrew">
+          <div class="tabbar">
+            <span class="tabhead">助理 · 角色编队</span>
+            <span class="grow"></span>
+            <button class="hbtn" id="crewRefresh" title="刷新">↻</button>
+          </div>
+          <div class="tabbody" id="crewBody"></div>
         </div>
       </div>
     </main>
@@ -187,6 +223,26 @@
       <span class="hint">不点就等着，超时（默认 120 秒）算拒绝</span>
       <span class="grow"></span>
       <button class="hbtn" id="apprRefresh" title="刷新待审批列表">↻</button>
+    </div>
+  </div>
+</div>
+
+<!-- 人格抽屉（X2）：点侧栏底部 .sb-foot 弹出来。
+     内容全部真读：角色卡名/情绪三值来自 persona_state.json，
+     记忆条目来自 fleet_context.db，并且**逐条可删**（E-7）。 -->
+<div class="apprmask" id="drawerMask" hidden>
+  <div class="apprbox drawer">
+    <div class="apprhead">
+      <span>人格</span>
+      <span class="grow"></span>
+      <span class="badge" id="drwBadge">—</span>
+      <button class="hbtn" id="drawerClose" title="关闭">✕</button>
+    </div>
+    <div class="apprlist" id="drawerBody"></div>
+    <div class="apprfoot">
+      <span class="hint" id="drawerHint">—</span>
+      <span class="grow"></span>
+      <button class="hbtn" id="drawerRefresh" title="刷新">↻</button>
     </div>
   </div>
 </div>

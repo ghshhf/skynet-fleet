@@ -337,6 +337,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, **f.persona.snapshot()})
         if path == "/api/cards":
             return self._json(self._cards())
+        if path == "/api/skills":
+            return self._json(self._skills())
+        if path == "/api/connectors":
+            return self._json(self._connectors())
+        if path == "/api/memory":
+            return self._json(self._memory())
+        if path == "/api/roster":
+            return self._json(self._roster())
         if path == "/api/approvals":
             return self._json(self._approvals())
         if path == "/api/host":
@@ -361,6 +369,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_card_use(body)
         if path == "/api/approval/respond":
             return self._post_approval_respond(body)
+        if path == "/api/memory/delete":
+            return self._post_memory_delete(body)
         self._err(404, f"没有这个接口: {path}")
 
     # ---------------- 各接口的实现 ----------------
@@ -412,6 +422,135 @@ class _Handler(BaseHTTPRequestHandler):
             cards.append({"file": c["file"], "ok": c["ok"], "name": s.get("name", ""),
                           "spec": s.get("spec", ""), "error": c.get("error", "")})
         return {"ok": True, "cards": cards}
+
+    def _skills(self):
+        """技能清单（SKILL.md）。
+
+        为什么技能单独一个接口而不塞进 /api/caps：
+        **能力是「能做什么」**（要过闸门），**技能是「怎么做」**（方法论，
+        自己不动手）。混在一起就会出现「技能要不要审批」这种没法答的问题。
+        """
+        from .. import skills as SK
+        try:
+            return SK.summary()
+        except Exception as e:
+            return {"ok": False, "count": 0, "skills": [],
+                    "error": f"{type(e).__name__}: {e}"}
+
+    def _connectors(self):
+        """连接器清单：**内建设备 + 外部 MCP server，统一成一张表**。
+
+        为什么统一：
+        「设备也是 MCP」——设备本质上就是内置的 MCP server。
+        于是「连接器」这个 Tab 不是「设备页的另一个马甲」，
+        而是「我能通过 MCP 用到的所有 server」，来源不同（内建/外接）而已。
+
+        每行的形状：
+          {name, source(builtin|external), kind, ok, reason, tools, caps, via}
+        tools 对内建行 = 这台设备支持的只读能力数；
+        对外接行 = 外部 MCP server 真列出来的工具数（真起进程探的）。
+        """
+        from ..mcp.client import build_clients
+
+        reg = self.fleet.registry
+        rows = []
+
+        # ---- 内建：每台设备就是一个 MCP server ----
+        for dev in reg.availability():
+            caps = list(dev.get("caps") or [])
+            read_only = 0
+            for cn in caps:
+                c = reg.capability(cn)
+                if c is not None and not (c.side_effect or c.destructive):
+                    read_only += 1
+            rows.append({
+                "name": dev.get("name", ""),
+                "source": "builtin",
+                "kind": dev.get("kind", ""),
+                "ok": bool(dev.get("ok")),
+                "reason": dev.get("reason", ""),
+                "tools": read_only,
+                "caps": caps,
+                "via": dev.get("via", ""),
+            })
+
+        # ---- 外接：用户挂的第三方 MCP server ----
+        # 真探（起进程 + tools/list）——不探就不知道它死没死，
+        # 而「摆着但不响应」是本仓明确禁止的界面骗人形态。
+        try:
+            clients = build_clients()
+        except Exception as e:
+            clients = []
+            cfg_reason = f"{type(e).__name__}: {e}"
+        else:
+            cfg_reason = ""
+        for cl in clients:
+            st = cl.status()
+            st.update({"source": "external", "kind": "mcp", "caps": [],
+                       "via": "stdio", "reason": st.get("reason", "")})
+            rows.append(st)
+
+        rows.sort(key=lambda r: (r["source"] != "builtin", r["name"]))
+        out = {"ok": True, "count": len(rows), "connectors": rows,
+               "builtin": sum(1 for r in rows if r["source"] == "builtin"),
+               "external": sum(1 for r in rows if r["source"] == "external")}
+        if cfg_reason:
+            out["error"] = f"外部 MCP 配置有问题：{cfg_reason}"
+        if out["external"] == 0 and not cfg_reason:
+            out["note"] = ("还没挂任何外部 MCP server。"
+                           "要挂就写 ~/.fleet/mcp.json（格式见 fleet/mcp/client.py）")
+        return out
+
+    def _memory(self):
+        """她的记忆条目（人格抽屉用）。
+
+        🔴 E-7 落点：**个人数据绝不进被训练参数，只进可寻址可删的记忆层**。
+        所以这里给的是「可寻址」的列表（ns + key + ts），
+        前端据此可以**逐条删**（POST /api/memory/delete）。
+
+        记忆库路径与 commander 一致（FLEET_CTX 环境变量，默认仓库根下
+        fleet_context.db）——两处读同一份，才叫「同一份记忆」。
+        """
+        try:
+            import memory as mem
+        except Exception as e:
+            return {"ok": False, "count": 0, "items": [],
+                    "error": f"记忆模块用不了：{type(e).__name__}: {e}"}
+        path = os.environ.get("FLEET_CTX", os.path.join(ROOT, "fleet_context.db"))
+        try:
+            ctx = mem.SharedContext(path)
+            try:
+                items = ctx.items(k=100)
+            finally:
+                ctx.close()
+        except Exception as e:
+            return {"ok": False, "count": 0, "items": [],
+                    "error": f"记忆库读不出来：{type(e).__name__}: {e}"}
+        return {"ok": True, "count": len(items), "items": items, "path": path}
+
+    def _roster(self):
+        """无限智能体名册（人格抽屉的「她是谁」那一栏旁边）。
+
+        真读 `cards/` 下的角色卡，不硬编码名字。
+        """
+        try:
+            from ..agents import roster
+            profiles = roster.load_all()
+            rows = roster.summary(profiles)
+            try:
+                active = roster.active_name()
+            except Exception as e:
+                active = ""
+                active_reason = f"{type(e).__name__}: {e}"
+            else:
+                active_reason = ""
+        except Exception as e:
+            return {"ok": False, "count": 0, "roles": [],
+                    "error": f"名册读不出来：{type(e).__name__}: {e}"}
+        out = {"ok": True, "count": len(rows), "roles": rows, "active": active}
+        if active_reason:
+            out["reason"] = active_reason
+        return out
 
     def _approvals(self):
         """当前在等主人确认的清单（给 UI 显示「哪些能力在等审批」）。
@@ -572,6 +711,38 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json({"ok": True, "card": {"name": data.get("name"),
                                                 "spec": data.get("_spec")},
                            **self.fleet.persona.snapshot()})
+
+    def _post_memory_delete(self, body):
+        """逐条删一条记忆（E-7）。
+
+        🔴 只认 (ns, key) 这一对**可寻址**坐标，不接受模糊删除。
+        删不掉就说删不掉——不许返回「已删除」却什么都没删。
+        """
+        ns = (body.get("ns") or "").strip()
+        key = (body.get("key") or "").strip()
+        if not ns or not key:
+            return self._err(400, "缺少 ns 或 key（记忆条目靠这两个坐标寻址）")
+        try:
+            import memory as mem
+        except Exception as e:
+            return self._err(500, f"记忆模块用不了：{type(e).__name__}: {e}")
+        path = os.environ.get("FLEET_CTX", os.path.join(ROOT, "fleet_context.db"))
+        try:
+            ctx = mem.SharedContext(path)
+            try:
+                before = ctx.get(ns, key)
+                if not before.get("ok"):
+                    return self._err(404, f"没有这条记忆：{ns}/{key}")
+                ctx.delete(ns, key)
+                after = ctx.get(ns, key)
+            finally:
+                ctx.close()
+        except Exception as e:
+            return self._err(500, f"删记忆失败：{type(e).__name__}: {e}")
+        if after.get("ok"):
+            return self._err(500, f"说删了但它还在：{ns}/{key}")
+        return self._json({"ok": True, "deleted": {"ns": ns, "key": key},
+                            "remaining": self._memory().get("count", 0)})
 
     # ---------------- SSE 对话 ----------------
 
