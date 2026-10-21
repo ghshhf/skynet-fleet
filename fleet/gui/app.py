@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 
+from .approval import ApprovalBroker
 from .server import FleetServer
 
 WIN_TITLE = "设备编队"
@@ -48,7 +49,10 @@ def main(argv=None):
                     help="初始主题")
     args = ap.parse_args(argv)
 
-    srv = FleetServer(port=args.port)
+    # W2：注入审批中枢。有副作用的能力会被注册表拦在闸门上，挂起等主人在
+    # 弹窗里点确认。判定权始终在注册表层（要不要审批、几级、要不要双确认），
+    # 这里只是把「这次要问主人」这件事接上。
+    srv = FleetServer(port=args.port, approval=ApprovalBroker())
     port = srv.start()
     url = srv.page_url(args.theme)
     print(f"[fleet-gui] 本地服务已起：{srv.base_url}", flush=True)

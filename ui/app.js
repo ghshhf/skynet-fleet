@@ -214,6 +214,14 @@
             tags.appendChild(el("span", "badge", c.devices.length + " 个设备"));
           }
           row.appendChild(tags);
+          // 「执行」按钮：点它 → POST /api/call → 后端走 registry.call。
+          // 副作用/ask 档的能力会在闸门上挂起，等主人在审批弹窗里点确认
+          // （前端只是把「点了确认」这个信号回传，判定权在注册表层）。
+          var go = el("button", "hbtn go", "执行");
+          go.addEventListener("click", function () {
+            runCap(c.name, {}, (c.devices && c.devices[0]) || "");
+          });
+          row.appendChild(go);
           body.appendChild(row);
         });
     });
@@ -315,10 +323,129 @@
     bar.textContent = txt;
   }
 
+  /* ------------------------------------------------------------------ 审批（W2） */
+  // 这一段只做一件事：把「主人点了确认/拒绝」这个信号回传给后端。
+  //
+  // **前端不判定要不要审批**——那是注册表层的活（side_effect / approval=ask
+  // / destructive）。前端连「这项能力危不危险」都不自己算：
+  // 后端把待审批清单推过来，前端原样显示，点确认就回传 request_id。
+  // 这样换个前端、手敲一条 HTTP，也绕不过「要审批」的判定。
+  var SESSION = "";        // 本页面会话标识（只在内存里；刷新即换）
+  var APPR_TAG = 0;        // 自增标签：把待审批认领回自己发起的那次调用
+  var APPR_STEP = {};      // request_id -> 破坏性操作已点过第一次确认
+  var APPR_TIMER = null;   // 轮询待审批清单的定时器
+  var APPR_ROWS = [];      // 最近一次拉到的待审批清单
+
+  function newSession() {
+    // 只是「这次页面会话」的标识，用来拒绝别的会话来回应我们的审批。
+    // 它不是凭据（凭据是 X-Fleet-Token），也不落盘。
+    return "ui-" + Math.random().toString(36).slice(2) +
+      "-" + Date.now().toString(36);
+  }
+
+  function renderApprovals(payload) {
+    var rows = (payload && payload.pending) || [];
+    APPR_ROWS = rows;
+    var list = $("apprList");
+    var flag = $("apprFlag");
+    var n = rows.length;
+    $("apprCount").textContent = String(n);
+    $("apprCount2").textContent = String(n);
+    flag.hidden = n === 0;
+    $("apprMask").hidden = n === 0;
+    list.textContent = "";
+    if (!n) {
+      list.appendChild(el("div", "apprnone", "（没有能力在等审批）"));
+      return;
+    }
+    rows.forEach(function (r) {
+      var row = el("div", "apprrow");
+      var head = el("div", "ah");
+      head.appendChild(el("span", "nm", r.cap || "?"));
+      if (r.title) { head.appendChild(el("span", "tt", r.title)); }
+      if (r.level >= 2) { head.appendChild(el("span", "badge deny", "二级审批")); }
+      if (r.destructive) { head.appendChild(el("span", "badge deny", "不可逆")); }
+      if (r.device) { head.appendChild(el("span", "badge", r.device)); }
+      row.appendChild(head);
+      if (r.args_preview) { row.appendChild(el("div", "ap", r.args_preview)); }
+      row.appendChild(el("div", "ap",
+        "剩余 " + Math.max(0, Math.round(r.expires_in || 0)) + " 秒"));
+
+      var acts = el("div", "acts");
+      var no = el("button", "hbtn no", "拒绝");
+      no.addEventListener("click", function () { respondApproval(r, false); });
+      var ok = el("button", "hbtn yes",
+        (r.destructive && !APPR_STEP[r.request_id]) ? "确认（不可逆）" : "确认执行");
+      ok.addEventListener("click", function () { respondApproval(r, true); });
+      acts.appendChild(no);
+      acts.appendChild(ok);
+      row.appendChild(acts);
+      list.appendChild(row);
+    });
+  }
+
+  function respondApproval(r, approve) {
+    if (!requireToken()) { return; }
+    var double = false;
+    if (approve && r.destructive) {
+      if (!APPR_STEP[r.request_id]) {
+        // 不可逆动作要点两次：第一次只是「我知道你要做什么」，
+        // 第二次才真发出去。判定仍在后端（后端也要求 double=true），
+        // 这里只是不把两次点击压成一次。
+        APPR_STEP[r.request_id] = true;
+        toast("这是不可逆动作，再点一次「确认执行」才生效");
+        renderApprovals({ pending: APPR_ROWS });
+        return;
+      }
+      double = true;
+    }
+    api("/api/approval/respond", {
+      method: "POST",
+      body: { request_id: r.request_id, approve: approve, double: double,
+              session: SESSION, reason: approve ? "" : "主人拒绝了这次操作" }
+    }).then(function () {
+      delete APPR_STEP[r.request_id];
+      toast(approve ? "已确认：这次调用继续往下走" : "已拒绝：这次调用不做了");
+      pollApprovals();
+    }).catch(function (e) {
+      toast("回应没送达：" + e.message, true);
+      pollApprovals();
+    });
+  }
+
+  function pollApprovals() {
+    if (!TOKEN) { return; }
+    api("/api/approvals").then(function (d) {
+      renderApprovals(d);
+    }).catch(function (e) {
+      // 拉不到清单要说清楚，但不许刷屏（轮询会一直重试）。
+      if (!APPR_TIMER) { toast("读不到待审批清单：" + e.message, true); }
+    });
+    APPR_TIMER = setTimeout(pollApprovals, 1000);
+  }
+
+  // 发起一次能力调用。后端会在闸门上挂起（等审批），所以这里的 promise
+  // 要过一会儿才 resolve —— 中间用户看到的是待审批弹窗。
+  function runCap(cap, args, device) {
+    if (!requireToken()) { return; }
+    APPR_TAG += 1;
+    var tag = "call-" + APPR_TAG;
+    var body = { cap: cap, args: args || {}, device: device || "",
+                 tag: tag, session: SESSION };
+    api("/api/call", { method: "POST", body: body }).then(function (res) {
+      showResult(res);
+      pollApprovals();
+    }).catch(function (e) {
+      showResult({ ok: false, cap: cap, code: "error", err: e.message });
+      pollApprovals();
+    });
+  }
+
   /* ------------------------------------------------------------------ 引导 */
   function bootstrap() {
     var info = readTokenFromHash();
     TOKEN = info.token;
+    SESSION = newSession();
     if (info.theme === "dark" || info.theme === "light") { applyTheme(info.theme); }
     if (!TOKEN) {
       toast("这个页面必须从设备编队的窗口里打开（缺令牌）", true);
@@ -356,6 +483,9 @@
     api("/api/caps").then(renderCaps).catch(function (e) {
       toast("读取能力清单失败：" + e.message, true);
     });
+
+    // 待审批清单：轮询。这是「界面上能看出哪些能力在等审批」的实现。
+    pollApprovals();
 
     renderSessions();
   }

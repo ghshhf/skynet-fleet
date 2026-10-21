@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from ..catalog import build
+from .approval import ApprovalBroker
 
 # 仓库根（fleet/gui/server.py → 上三级）。角色卡、人格状态这些平铺模块都在根下。
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -110,12 +111,15 @@ class FleetServer:
     """本机 GUI 后端。构造即生成 token；start() 之后端口才定下来。"""
 
     def __init__(self, registry=None, gate=None, persona=None, host="127.0.0.1",
-                 port=0, chat_gate_fn=chat_gate):
+                 port=0, chat_gate_fn=chat_gate, approval=None):
         self.registry = registry if registry is not None else build()
         # 闸门在服务端：/api/call 走它。默认 None —— 于是注册表按 fail-closed
         # 拒绝一切有副作用的能力，答复里带明确原因（这是 W1 的真实状态，
         # 不是兜底：审批弹窗还没做，就先不许动手）。
+        # W2 起：给了 approval（审批中枢）就改走它——注册表判定「要审批」时
+        # 把这次调用挂起，等主人在弹窗里点确认。判定权始终在注册表层。
         self.gate = gate
+        self.approval = approval
         self.chat_gate = chat_gate_fn
         self.persona = persona if persona is not None else Persona()
         self.token = secrets.token_urlsafe(32)      # 一次性，只在内存里
@@ -160,12 +164,24 @@ class FleetServer:
 
     # ---------------- 能力调用（唯一入口） ----------------
 
-    def call(self, cap, args=None, device=""):
+    def call(self, cap, args=None, device="", tag="", session=""):
         """走 registry.call。返回 DeviceResult 的字典形态。
 
-        闸门没配时：有副作用的能力会被注册表拒成 denied，err 里写明原因。
+        闸门怎么来的（两种，互斥）：
+          · 给了 approval（审批中枢）→ 闸门就是它：注册表判定「这项要审批」时
+            把这次调用挂起，等主人在弹窗里点确认。判定权始终在注册表层，
+            UI 只能投「同意/不同意」这一票。
+          · 没给 approval → 用构造时传入的 gate；再没有就是 None，于是注册表
+            按 fail-closed 拒绝一切有副作用的能力，err 里写明原因。
+
+        `tag` / `session` 是**回显与归属**用的，不参与判定：
+          tag     —— UI 拿去把「这条待审批」认领回自己那次调用（客户端自己生成）。
+          session —— 归属哪个客户端会话；别的会话拿着同一个 request_id 回应会被拒。
         """
-        r = self.registry.call(cap, device=device, args=args or {}, gate=self.gate)
+        gate = self.gate
+        if self.approval is not None:
+            gate = self.approval.gate_for(tag=tag, session=session)
+        r = self.registry.call(cap, device=device, args=args or {}, gate=gate)
         self.calls.append({"cap": cap, "code": r.code, "ms": round(r.ms, 1),
                            "at": time.time()})
         return r.as_dict()
@@ -243,13 +259,20 @@ class _Handler(BaseHTTPRequestHandler):
         return obj
 
     def _authorized(self):
-        """校验 X-Fleet-Token。失败一律 401 + 明确原因。"""
+        """校验 X-Fleet-Token。
+
+        401 = 压根没带凭据；403 = 带了但不是本次启动发的那枚。
+        分开是为了让「调用方忘了加头」和「有人拿着旧令牌来敲」在日志里
+        长得不一样——这两种事的处置不一样（前者是 bug，后者是可疑行为）。
+        比对一律走 secrets.compare_digest（常数时间，防时序侧信道）。
+        """
         got = self.headers.get(TOKEN_HEADER) or ""
         if not got:
-            return False, f"缺少 {TOKEN_HEADER} 头：这个服务只认本窗口启动时注入的令牌"
+            return False, 401, (f"缺少 {TOKEN_HEADER} 头："
+                                "这个服务只认本窗口启动时注入的令牌")
         if not secrets.compare_digest(got, self.fleet.token):
-            return False, "令牌不对：不是本次启动注入的那枚"
-        return True, ""
+            return False, 403, "令牌不对：不是本次启动注入的那枚"
+        return True, 200, ""
 
     # ---------------- 路由 ----------------
 
@@ -272,9 +295,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._err(404, f"没有这个路径: {path}")
 
     def _api_get(self, path):
-        ok, why = self._authorized()
+        ok, code, why = self._authorized()
         if not ok:
-            return self._err(401, why)
+            return self._err(code, why)
         f = self.fleet
         if path == "/api/health":
             return self._json(self._health())
@@ -286,12 +309,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, **f.persona.snapshot()})
         if path == "/api/cards":
             return self._json(self._cards())
+        if path == "/api/approvals":
+            return self._json(self._approvals())
         self._err(404, f"没有这个接口: {path}")
 
     def _api_post(self, path):
-        ok, why = self._authorized()
+        ok, code, why = self._authorized()
         if not ok:
-            return self._err(401, why)
+            return self._err(code, why)
         try:
             body = self._read_json()
         except ValueError as e:
@@ -302,6 +327,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_chat(body)
         if path == "/api/card/use":
             return self._post_card_use(body)
+        if path == "/api/approval/respond":
+            return self._post_approval_respond(body)
         self._err(404, f"没有这个接口: {path}")
 
     # ---------------- 各接口的实现 ----------------
@@ -354,6 +381,51 @@ class _Handler(BaseHTTPRequestHandler):
                           "spec": s.get("spec", ""), "error": c.get("error", "")})
         return {"ok": True, "cards": cards}
 
+    def _approvals(self):
+        """当前在等主人确认的清单（给 UI 显示「哪些能力在等审批」）。
+
+        没开审批中枢时也给答复（pending 为空），并说明为什么是空的——
+        不静默返回一个空数组让人以为「没人等审批」。
+        """
+        f = self.fleet
+        if f.approval is None:
+            return {"ok": True, "enabled": False, "count": 0, "pending": [],
+                    "reason": "这个服务没开审批中枢（没注入 approval），"
+                              "有副作用的能力一律被注册表拒成 denied"}
+        rows = f.approval.pending()
+        return {"ok": True, "enabled": True, "count": len(rows), "pending": rows,
+                "reason": ""}
+
+    def _post_approval_respond(self, body):
+        """主人对一条待审批表态（同意 / 拒绝）。
+
+        只负责**送达一次表态**；判定（要不要审批、几级、要不要双确认）全在
+        注册表层与审批中枢里，这里不重做一遍。
+        """
+        f = self.fleet
+        if f.approval is None:
+            return self._err(409, "这个服务没开审批中枢，没有什么可回应的")
+        rid = (body.get("request_id") or "").strip()
+        if not rid:
+            return self._err(400, "缺少 request_id 字段（回应哪一条审批）")
+        if "approve" not in body:
+            return self._err(400, "缺少 approve 字段（true=同意，false=拒绝）")
+        approve = body.get("approve")
+        if not isinstance(approve, bool):
+            return self._err(400, "approve 必须是布尔值（true/false）")
+        double = bool(body.get("double"))
+        reason = (body.get("reason") or "").strip()
+        session = body.get("session")
+        if session is not None and not isinstance(session, str):
+            return self._err(400, "session 必须是字符串")
+        ok, why = f.approval.respond(rid, approve, reason=reason,
+                                      session=session, double=double)
+        if not ok:
+            # 409 = 「这条已经结束了/不属于你」；不是 500，也不是假装成功。
+            return self._err(409, why)
+        return self._json({"ok": True, "request_id": rid,
+                           "decision": "approved" if approve else "denied"})
+
     def _post_call(self, body):
         cap = (body.get("cap") or "").strip()
         if not cap:
@@ -363,7 +435,12 @@ class _Handler(BaseHTTPRequestHandler):
         args = body.get("args") or {}
         if not isinstance(args, dict):
             return self._err(400, "args 必须是 JSON 对象")
-        res = self.fleet.call(cap, args=args, device=(body.get("device") or ""))
+        tag = (body.get("tag") or "").strip()
+        session = body.get("session")
+        if session is not None and not isinstance(session, str):
+            return self._err(400, "session 必须是字符串")
+        res = self.fleet.call(cap, args=args, device=(body.get("device") or ""),
+                              tag=tag, session=session or "")
         return self._json(res)
 
     def _post_card_use(self, body):
