@@ -29,8 +29,37 @@ import sys
 import time
 import wave
 
+def _pick_tmp_dir():
+    """语音临时目录：环境变量 > 按盘存在性探测（E→D→G 兼容）> 系统 temp。
+
+    历史上这里写死 `G:/_tmp/fleet_voice`，换到没有 G 盘的机器时
+    makedirs 被 except 静默吞掉，直到写盘才炸出一个看不懂的 Errno 2——
+    典型的「静默失败最阴」。现在：探测时真写一个探针文件，确认可写
+    才采用；全部候选都不可用时退系统 temp。
+    """
+    env = os.environ.get("FLEET_VOICE_TMP")
+    cands = ([env] if env else []) + [
+        "E:/_tmp/fleet_voice", "D:/_tmp/fleet_voice",
+        "G:/_tmp/fleet_voice",                     # 兼容老配置
+        os.path.join(os.environ.get("TEMP") or ".", "fleet_voice"),
+    ]
+    for c in cands:
+        if not c:
+            continue
+        try:
+            os.makedirs(c, exist_ok=True)
+            probe = os.path.join(c, ".probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            return c
+        except Exception:
+            continue
+    return os.path.join(os.environ.get("TEMP") or ".", "fleet_voice")
+
+
 # ---- 全局常量（可被环境变量覆盖）----
-TMP_DIR = os.environ.get("FLEET_VOICE_TMP", "G:/_tmp/fleet_voice")
+TMP_DIR = _pick_tmp_dir()
 KEEP_TMP = os.environ.get("FLEET_VOICE_KEEP", "") == "1"
 SAMPLE_RATE = 16000
 BLOCK_SEC = 0.03                       # 30ms 一块：够短做 VAD，够长不空转
@@ -137,11 +166,13 @@ def _have(mod_name):
 
 
 def _tmp_dir():
-    """临时目录（不存在就建）。"""
+    """临时目录（不存在就建）。建失败必须带原因抛，不许静默。"""
     try:
         os.makedirs(TMP_DIR, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        raise RuntimeError(
+            "语音临时目录不可用：%s（%s）。设 FLEET_VOICE_TMP 指向一个存在的盘。"
+            % (TMP_DIR, e))
     return TMP_DIR
 
 
@@ -337,9 +368,12 @@ def _ffmpeg():
     cand = os.environ.get("FLEET_FFMPEG")
     if cand and os.path.isfile(cand):
         return cand
-    fixed = "G:/dev/ffmpeg/bin/ffmpeg.exe"
-    if os.path.isfile(fixed):
-        return fixed
+    for fixed in ("E:/dev/ffmpeg/bin/ffmpeg.exe",
+                  "E:/_tools/ffmpeg/bin/ffmpeg.exe",
+                  "D:/tools/ffmpeg/bin/ffmpeg.exe",
+                  "G:/dev/ffmpeg/bin/ffmpeg.exe"):     # 兼容老配置
+        if os.path.isfile(fixed):
+            return fixed
     return shutil.which("ffmpeg")
 
 
@@ -562,8 +596,8 @@ def record(max_s=15.0, samplerate=16000, silence_end=0.8, no_speech_timeout=3.0,
     pcm = b"".join(frames[start:end + 1])
     if vad.gain > 1.001:
         pcm = _agc_boost_pcm(pcm, vad.gain)
-    path = os.path.join(_tmp_dir(), "rec_%d.wav" % int(time.time() * 1000))
     try:
+        path = os.path.join(_tmp_dir(), "rec_%d.wav" % int(time.time() * 1000))
         _write_wav(path, pcm, samplerate=samplerate)
     except Exception as e:
         return None, {"reason": "audio_error", "error": "写 wav 失败：%s" % e}
@@ -617,7 +651,13 @@ def _load_whisper(model, device):
 
     # 镜像与落盘位置：必须在 import faster_whisper 之前设好
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-    root = os.environ.get("FLEET_WHISPER_DIR", "G:/_models/whisper")
+    env_root = os.environ.get("FLEET_WHISPER_DIR")
+    if env_root:
+        root = env_root
+    else:
+        root = next((c for c in ("E:/_models/whisper", "D:/work/_local_ai/whisper",
+                                 "G:/_models/whisper")      # 兼容老配置
+                     if os.path.isdir(c)), "E:/_models/whisper")
     local_only = os.environ.get("FLEET_WHISPER_LOCAL", "") == "1"
 
     try:
@@ -841,7 +881,11 @@ def _say_edge(text, voice=None, rate=0, play=True, style=None, pitch=None, volum
         print("[voice] edge_tts 不可用：%s" % e)
         return None
 
-    d = _tmp_dir()
+    try:
+        d = _tmp_dir()
+    except RuntimeError as e:
+        print("[voice] edge_tts 跳过：%s" % e)
+        return None
     stamp = int(time.time() * 1000)
     mp3 = os.path.join(d, "tts_%d.mp3" % stamp)
     wav = os.path.join(d, "tts_%d.wav" % stamp)
@@ -940,7 +984,11 @@ def _say_kokoro(text, voice=None, rate=0, play=True):
         print("[voice] kokoro 不可用：%s" % e)
         return None
 
-    d = _tmp_dir()
+    try:
+        d = _tmp_dir()
+    except RuntimeError as e:
+        print("[voice] kokoro 跳过：%s" % e)
+        return None
     wav = os.path.join(d, "kokoro_%d.wav" % int(time.time() * 1000))
     try:
         speed = 1.0 + (float(rate) / 100.0 if rate else 0.0)
@@ -1035,7 +1083,11 @@ def _selftest():
         ok = False
         print("[FAIL] caps():", e)
 
-    d = _tmp_dir()
+    try:
+        d = _tmp_dir()
+    except RuntimeError as e:
+        print("[FAIL] 临时目录：", e)
+        return False
 
     # 2) VAD：用 numpy 合成 静音0.5s + 1kHz正弦1.0s + 静音1.2s，验证能切出约 1.0s 话段
     try:

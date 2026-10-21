@@ -34,7 +34,12 @@ def load_all(cards_dir=None, known_caps=None):
     for fn in sorted(os.listdir(d)):
         if not fn.endswith((".json", ".png")):
             continue
-        if fn == "active.json":      # 指针文件，不是角色卡
+        if fn in ("active.json", "index.json"):
+            # active.json 是指针、index.json 是卡登记簿，都不是角色卡。
+            # 🔴 2026-10-22：远程语音端那批提交带来了 cards/index.json
+            #    （3 张 .md 卡的登记簿），本文件的跳过规则没同步更新 ⇒
+            #    它被当成角色卡读 ⇒「没有 name」⇒ 整个名册加载失败
+            #    （t13_agent_crew 连红 7 项）。
             continue
         # 🔴 点开头的都是本仓的内部文件（下载账 .downloads.json 等），
         #    不是角色卡。实测踩过：.downloads.json 以 .json 结尾 ⇒
@@ -86,6 +91,17 @@ def active_name(cards_dir=None):
     fn = obj.get("file")
     if not fn:
         raise RosterError("active.json 里没有 file 字段")
+    # 🔴 2026-10-22：active.json 也可能指向 .md 源卡（人格卡编译路线）。
+    #    老代码对非 .json 后缀硬拼 ".json" ⇒ whale_girl.md 变成
+    #    whale_girl.md.json ⇒ FileNotFoundError。.md 走 persona_card
+    #    的公开编译接口（那是读卡的唯一真相），.json 保持原路径。
+    if fn.lower().endswith(".md"):
+        import persona_card as pc
+        stem = os.path.splitext(fn)[0]
+        try:
+            return pc.compile_card(stem, directory=d)["meta"]["name"] or stem
+        except Exception as e:
+            raise RosterError(f"active.json 指向的 .md 卡读不了：{fn}（{e}）")
     if not fn.endswith(".json"):
         fn += ".json"
     card = _read_json(os.path.join(d, fn))

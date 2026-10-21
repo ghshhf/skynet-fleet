@@ -32,13 +32,20 @@ def run(model, prompt, model_dir="models"):
 
 
 def selftest():
-    """离线自检：占位后端也能端到端返回，不吞 prompt、不静默空串。"""
+    """离线自检：任一后端都能端到端返回，不吞 prompt、不静默空串。"""
     b = backend()
-    out = run(None, "用一句话说明你是什么")
+    out, actual = llm_mod.complete("用一句话说明你是什么")
     assert isinstance(out, str) and out.strip(), out
-    assert "占位" in out or b != "placeholder", (b, out)
-    print(f"[selftest] 后端={b}（无环境变量时为 placeholder，设 FLEET_LLM_CMD/URL 即接真模型）")
-    print(f"[selftest] 推理返回: {out[:60]}…")
+    # 🔴 2026-10-22：口径对齐——必须用 **complete 返回的实际后端**，
+    #    不是 backend() 的名义值。llm.py 引入 mock 层后二者会分裂：
+    #    名义 placeholder（没配本地端点）+ 实际 mock（FLEET_USE_MOCK 默认开），
+    #    老断言拿名义 placeholder 对 mock 输出 ⇒ 必红。
+    #    现在：实际不是 placeholder（真接了本地/mock），或确实走了占位
+    #    （文案里必须带「占位」二字，不许静默）。
+    assert actual != "placeholder" or "占位" in out, (b, actual, out)
+    print(f"[selftest] 名义后端={b} 实际后端={actual}"
+          f"（无环境变量时走 mock 模拟层，设 FLEET_LLM_CMD/URL 即接真模型）")
+    print(f"[selftest] 推理返回: {out[:60]}")
     print("[selftest] PASS")
 
 
