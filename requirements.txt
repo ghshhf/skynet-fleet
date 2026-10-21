@@ -43,6 +43,13 @@ edge-tts==7.3.1
 faster-whisper==1.2.1
 ctranslate2==4.8.3
 huggingface-hub==2.2.0
+# 🔴 av 必须 <13：faster_whisper/audio.py 第 46 行是
+#      av.open(input_file, mode="r", metadata_errors="ignore")
+#    这个参数 PyAV 13 起就被删了。不钉的话 CI 装到 av-19，冻扁包里 ASR 必然报
+#      open() got an unexpected keyword argument 'metadata_errors'
+#    而 TTS 照样正常 —— 看起来像"模型没下好"，其实是解码器参数对不上。
+#    本机 av-12.3.0 实测可用。
+av==12.3.0
 
 # —— 终端版（TUI）依赖，这里一并列出，便于单文件安装 ——
 rich>=13
