@@ -119,6 +119,15 @@ CASES = [
     # ④ 写 MP4 是副作用 ⇒ 没闸门时 fail-closed 拒绝。
     # 环境齐不齐都如实：缺 node/Playwright/Chromium 就 skip 并说明缺什么。
     ("eval_t23_html_render", ["evals/t23_html_render.py"], HERE, 600),
+    # T15：角色卡商店（浏览 / 下载 / 体检 / 入库 / 切换）
+    # 钉六件事：① 陌生 spec 抛明确原因（不许降级读空）；
+    # ② 体检判据是「拼得出人设」不是「字段在不在」（personality 空不误伤好卡）；
+    # ③ 下载必须完整（本机会中途截断 ⇒ 半张 PNG 不许入库、不许留半成品）；
+    # ④ 下载有 30 分钟冷却（重复打要如实说冷却多久）；
+    # ⑤ 内部记账文件不许被当成角色卡；
+    # ⑥ 下载/入库是副作用 ⇒ 没闸门时 fail-closed 拒绝。
+    # 全离线：下载层打桩，不连真网络。
+    ("eval_t15_card_store", ["evals/t15_card_store.py"], HERE, 180),
 ]
 
 

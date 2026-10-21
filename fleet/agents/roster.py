@@ -32,13 +32,18 @@ def load_all(cards_dir=None, known_caps=None):
     out = {}
     problems = []
     for fn in sorted(os.listdir(d)):
-        if not fn.endswith(".json"):
+        if not fn.endswith((".json", ".png")):
             continue
         if fn == "active.json":      # 指针文件，不是角色卡
             continue
+        # 🔴 点开头的都是本仓的内部文件（下载账 .downloads.json 等），
+        #    不是角色卡。实测踩过：.downloads.json 以 .json 结尾 ⇒
+        #    被当角色卡读 ⇒ 报「角色卡里没有 name」⇒ 整个名册加载失败。
+        if fn.startswith("."):
+            continue
         path = os.path.join(d, fn)
         try:
-            prof = from_card(_read_json(path), source=path, known_caps=known_caps)
+            prof = from_card(_read_card(path), source=path, known_caps=known_caps)
         except ProfileError as e:
             problems.append(str(e))
             continue
@@ -53,6 +58,20 @@ def _read_json(path):
     import json
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _read_card(path):
+    """读一张角色卡（.json 或 .png）。
+
+    🔴 PNG 也收：从卡商店下载的卡是 PNG 格式（卡数据在 tEXt 块里），
+    名册只认 .json 的话，下载来的卡就进不了名册、不能当执行角色。
+    统一走 `persona_card.load_card` —— 那是本仓读卡的唯一真相，
+    它认 V1/V2/V3 与已知私有 schema，陌生 schema 会**明确报错**而不是读空。
+    """
+    if path.lower().endswith(".png"):
+        import persona_card as pc
+        return pc.load_card(path)
+    return _read_json(path)
 
 
 def active_name(cards_dir=None):

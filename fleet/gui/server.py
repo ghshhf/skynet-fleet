@@ -337,6 +337,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, **f.persona.snapshot()})
         if path == "/api/cards":
             return self._json(self._cards())
+        if path == "/api/cardstore":
+            return self._json(self._cardstore())
+        if path == "/api/cardstore/search":
+            return self._json(self._cardstore_search())
+        if path == "/api/cardstore/detail":
+            return self._json(self._cardstore_detail())
+        if path == "/api/card/lint":
+            return self._json(self._card_lint())
         if path == "/api/skills":
             return self._json(self._skills())
         if path == "/api/connectors":
@@ -367,6 +375,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_chat(body)
         if path == "/api/card/use":
             return self._post_card_use(body)
+        if path == "/api/card/fetch":
+            return self._post_card_fetch(body)
+        if path == "/api/card/ingest":
+            return self._post_card_ingest(body)
         if path == "/api/approval/respond":
             return self._post_approval_respond(body)
         if path == "/api/memory/delete":
@@ -422,6 +434,96 @@ class _Handler(BaseHTTPRequestHandler):
             cards.append({"file": c["file"], "ok": c["ok"], "name": s.get("name", ""),
                           "spec": s.get("spec", ""), "error": c.get("error", "")})
         return {"ok": True, "cards": cards}
+
+    # ---------------- 角色卡商店（浏览 / 下载 / 体检） ----------------
+    #
+    # 🔴 读的动作（浏览/搜索/详情/体检）直接走只读能力；
+    # 🔴 写的动作（下载/入库）走 registry.call —— 它们是副作用能力，
+    #    闸门在服务端，前端绕不过去，主人会看到审批弹窗。
+    #    **不许在这里直接调 card_store.fetch_card**：那会绕过闸门，
+    #    等于「点一下就偷偷换掉她的人格」。
+
+    def _cardstore(self):
+        """卡源清单 + 本地卡库概况 + 投递口位置。"""
+        r = self.fleet.call("card.sources", args={})
+        if not r.get("ok"):
+            return {"ok": False, "err": r.get("err", "读不到卡源"),
+                    "sources": [], "cards": self._cards().get("cards", [])}
+        d = r.get("data") or {}
+        return {
+            "ok": True,
+            "sources": d.get("sources", []),
+            "card_dir": d.get("card_dir", ""),
+            "inbox": d.get("inbox", ""),
+            "cards": self._cards().get("cards", []),
+        }
+
+    def _cardstore_search(self):
+        """在卡源上搜卡。只读，不改任何东西。"""
+        q = urlparse(self.path).query
+        p = parse_qs(q)
+        args = {
+            "source": (p.get("source") or ["aicc"])[0],
+            "query": (p.get("query") or p.get("q") or [""])[0],
+            "skip": int((p.get("skip") or ["0"])[0] or 0),
+            "limit": int((p.get("limit") or ["24"])[0] or 24),
+        }
+        r = self.fleet.call("card.search", args=args)
+        if not r.get("ok"):
+            return {"ok": False, "err": r.get("err", "搜不到"),
+                    "items": [], "total": 0, "source": args["source"]}
+        d = r.get("data") or {}
+        return {"ok": True, "source": d.get("source", args["source"]),
+                "query": d.get("query", ""), "total": d.get("total", 0),
+                "items": d.get("items", []), "skip": d.get("skip", 0),
+                "limit": d.get("limit", 24)}
+
+    def _cardstore_detail(self):
+        q = urlparse(self.path).query
+        p = parse_qs(q)
+        cid = (p.get("id") or [""])[0]
+        if not cid:
+            return self._err(400, "缺少 id（要查哪张卡）")
+        r = self.fleet.call("card.detail", args={
+            "source": (p.get("source") or ["aicc"])[0], "id": cid})
+        if not r.get("ok"):
+            return self._err(400, r.get("err", "查不到这张卡"))
+        return self._json({"ok": True, **(r.get("data") or {})})
+
+    def _card_lint(self):
+        q = urlparse(self.path).query
+        p = parse_qs(q)
+        path = (p.get("path") or [""])[0]
+        if not path:
+            return self._err(400, "缺少 path（要体检哪张卡）")
+        r = self.fleet.call("card.lint", args={"path": path})
+        if not r.get("ok"):
+            return self._err(400, r.get("err", "体检失败"))
+        return self._json({"ok": True, **(r.get("data") or {})})
+
+    def _post_card_fetch(self, body):
+        """下载一张卡。**走 registry.call**（副作用 ⇒ 要审批）。"""
+        cid = (body.get("id") or "").strip()
+        if not cid:
+            return self._err(400, "缺少 id（要下哪张卡）")
+        args = {"source": (body.get("source") or "aicc").strip(), "id": cid}
+        if body.get("force"):
+            args["force"] = True
+        r = self.fleet.call("card.fetch", args=args, tag=body.get("tag", ""),
+                             session=body.get("session", ""))
+        if not r.get("ok"):
+            return self._json({"ok": False, "err": r.get("err", "下载失败")}, 200)
+        return self._json({"ok": True, **(r.get("data") or {})})
+
+    def _post_card_ingest(self, body):
+        """把投递口里的卡入库。**走 registry.call**（副作用 ⇒ 要审批）。"""
+        r = self.fleet.call("card.ingest",
+                            args={"move": bool(body.get("move", True))},
+                            tag=body.get("tag", ""),
+                            session=body.get("session", ""))
+        if not r.get("ok"):
+            return self._json({"ok": False, "err": r.get("err", "入库失败")}, 200)
+        return self._json({"ok": True, **(r.get("data") or {})})
 
     def _skills(self):
         """技能清单（SKILL.md）。

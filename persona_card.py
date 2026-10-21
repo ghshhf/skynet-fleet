@@ -37,7 +37,13 @@ _ALLOWED = ("name", "nickname", "description", "personality", "scenario",
             "first_mes", "mes_example", "system_prompt", "post_history_instructions",
             "creator", "creator_notes", "tags", "character_version", "alternate_greetings")
 
-DEFAULT_CARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cards")
+#: 卡目录：**唯一真相**。GUI 后端、命令行、卡商店（card_store.py）、
+#: 注册表里的 cardstore 设备，全都以这里为准。
+#: 🔴 之前三处各自算一遍（各自 join 各自的 __file__），结果环境变量
+#: 改不动、测试临时目录也传不进去 ⇒ 卡下到 A 目录、界面读 B 目录。
+#: 现在统一：环境变量 FLEET_CARD_DIR 优先，否则是仓库里的 cards/。
+DEFAULT_CARD_DIR = os.environ.get("FLEET_CARD_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cards")
 ACTIVE_CARD_PATH = os.path.join(DEFAULT_CARD_DIR, "active.json")
 
 
@@ -510,7 +516,13 @@ def list_cards(directory=None):
         return []
     out = []
     for fn in sorted(os.listdir(d)):
-        if fn == "active.json" or not fn.lower().endswith((".json", ".png")):
+        # 只认角色卡文件：active.json 是指针、.downloads.json 是下载账、
+        # 其余点开头的都是本仓的内部记账/临时文件。
+        # 🔴 之前只跳过 active.json ⇒ 记账文件被当成一张卡列进界面，
+        #    界面上出现一张「（无名）· v1」的假卡。
+        if fn == "active.json" or fn.startswith("."):
+            continue
+        if not fn.lower().endswith((".json", ".png")):
             continue
         p = os.path.join(d, fn)
         try:

@@ -15,6 +15,7 @@ from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
 from .kinds.adb_wifi import AdbWifi
+from .kinds.card_store import CardStore
 from .kinds.host import Host
 from .kinds.fleet_node import FleetNode, load_nodes
 from .kinds.internet import Internet
@@ -352,6 +353,34 @@ CAPABILITIES = [
                note="Video as Code：可寻址动画 → 确定性逐帧 → MP4。"
                     "不许用 Date.now()/Math.random()/渲染时发网络请求，"
                     "否则每次渲出来的不一样（会被拒绝）"),
+    # ---- 角色卡商店（kind=cardstore）：浏览 / 下载 / 入库 / 体检 ----
+    Capability("card.sources", "列出可用的角色卡源",
+               note="只读：返回每个源的 id、名字与说明"),
+    Capability("card.search", "在角色卡源上搜卡（浏览）",
+               params=(Param("source", "str", doc="源 id，默认 aicc"),
+                       Param("query", "str", doc="搜索词，留空 = 全部"),
+                       Param("skip", "int", doc="跳过前 N 条，默认 0"),
+                       Param("limit", "int", doc="要几条，默认 24")),
+               note="只读：只发网络请求，不改任何本地东西"),
+    Capability("card.detail", "查一张卡的详情",
+               params=(Param("source", "str", doc="源 id，默认 aicc"),
+                       Param("id", "str", True, "卡的 id")),
+               note="只读：目前只有 aicc 有详情接口"),
+    Capability("card.lint", "给一张角色卡做体检",
+               params=(Param("path", "str", True, "卡的路径（相对 card_dir 或绝对）")),
+               note="只读：体检不通过不是调用失败——答复里 ok 字段说清过没过"),
+    Capability("card.fetch", "从角色卡源下载一张卡并入库",
+               params=(Param("source", "str", doc="源 id，默认 aicc"),
+                       Param("id", "str", True, "卡的 id"),
+                       Param("force", "bool", doc="忽略 30 分钟冷却重下，默认 false")),
+               side_effect=True,
+               note="往 cards/ 写文件 = 改「她是谁」这一层 ⇒ 要过审批闸门。"
+                    "下载后先体检，没通过就不入库（不装一个不会说话的卡）"),
+    Capability("card.ingest", "把本地投递口里的卡体检后入库",
+               params=(Param("move", "bool", doc="true=移走原件，默认 true")),
+               side_effect=True,
+               note="Chub/JanitorAI 等不可程序化拉的源走这条路："
+                    "主人自己下好的卡扔进 cards_inbox/，本仓负责体检与入库"),
 ]
 
 
@@ -374,6 +403,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(PcControl())
     reg.add(VoiceDevice())
     reg.add(Render())
+    reg.add(CardStore())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:
