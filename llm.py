@@ -1,17 +1,25 @@
-"""本地推理适配层：让「她」从占位回声变成真会说话（stdlib-only，多后端，优雅降级）。
+"""推理适配层：让「她」从占位回声变成真会说话（stdlib-only，多后端，优雅降级）。
 
-不绑定任何框架：三个后端按环境变量优先，**改环境变量即可切换，业务代码零改动**
-（这正是「代码即通用胶水」——AI 让所有设备都用同一套可替换的胶水说话）：
+不绑定任何框架：**后端链**按顺序试，第一个能用的就赢，改环境变量即可切换，
+业务代码零改动。
 
-  1) FLEET_LLM_CMD   自定义命令行。命令里含 {prompt} 占位则替换后执行；否则把 prompt
-                     经 stdin 喂入，stdout 即回复（逐行回调=流式）。
-                     例：FLEET_LLM_CMD='ollama run qwen3:4b'
-                         FLEET_LLM_CMD='llama-cli -m models/qwen3-4b.gguf -p {prompt}'
-  2) FLEET_LLM_URL   本地 OpenAI 兼容端点（llama.cpp server / MLC / Ollama / vLLM 均暴露它）。
-                     POST {url}/v1/chat/completions；FLEET_LLM_MODEL 指定模型名。
-  3) 都没有           -> 占位实现（backend=placeholder），分片模拟流式，链路仍可端到端跑通。
+## 后端链（今晚定下来的双脑结构）
 
-统一入口（node_agent 的 compute / ai 通道都用它）：
+实测教训：0.6B（北极星 v13）**载不动**完整人格卡——体检结果
+「你是谁？」答"要不换个写法？"、多轮问名字直接吐出 python 代码。
+这就是计划书里那句「卡救不了 0.6B」的实证，不是玄学。
+
+所以链路是：
+
+1. **云端增强**（`FLEET_CLOUD_URL` + `FLEET_CLOUD_KEY` + `FLEET_CLOUD_MODEL`）
+   —— 免费端点，人格承载力实测远好于本地小模型（自称、口癖、动作都对）。
+   联网、有隐私代价，所以默认**不自动开**，要显式配置才生效。
+2. **本地**（`FLEET_LLM_URL` / `FLEET_LLM_CMD`）—— 离线、隐私、快，是保底。
+3. **占位** —— 什么都没配时的回声，链路仍可端到端跑通。
+
+链内每一步失败自动落到下一步；**云端先失败不会影响本地接管**。
+
+统一入口：
   complete(prompt, model=None, system=None)                 -> (text, backend)
   stream(prompt, model=None, system=None, on_delta=None)    -> (text, backend)
 
@@ -24,6 +32,10 @@ import subprocess
 import urllib.request
 
 TIMEOUT = float(os.environ.get("FLEET_LLM_TIMEOUT", "120"))
+CLOUD_TIMEOUT = float(os.environ.get("FLEET_CLOUD_TIMEOUT", "45"))
+# 云端连续失败几次后本会话内不再重试（避免每次对话都等它超时）
+_CLOUD_FAIL = {"n": 0}
+_CLOUD_MAX_FAIL = int(os.environ.get("FLEET_CLOUD_MAX_FAIL", "3"))
 
 
 def backend():
@@ -33,6 +45,18 @@ def backend():
     if os.environ.get("FLEET_LLM_URL"):
         return "http"
     return "placeholder"
+
+
+def backends():
+    """后端链（全量），供体检/状态展示。"""
+    chain = []
+    if os.environ.get("FLEET_CLOUD_URL"):
+        chain.append("cloud")
+    b = backend()
+    if b != "placeholder":
+        chain.append(b)
+    chain.append("mock")
+    return chain
 
 
 def _placeholder_text(prompt):
@@ -89,18 +113,68 @@ def _chat_payload(prompt, model, system, do_stream):
             "temperature": float(os.environ.get("FLEET_LLM_TEMP", "0.7"))}
 
 
+def _post_json(url, payload, key=None, timeout=None):
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout or TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _chat_url(base):
+    """把 base 规整成 OpenAI 兼容的 chat/completions 完整地址。
+
+    要能吃下这几种写法（用户/脚本给的地址形式很杂）：
+        http://h:p/v1
+        http://h:p/v1/chat/completions
+        http://h:p
+        http://h:p/
+    """
+    base = (base or "").rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    return base + "/v1/chat/completions"
+
+
+def _cloud_complete(prompt, model, system):
+    """云端增强后端。返回 (text, 'cloud')，失败抛异常让链子往下走。"""
+    if _CLOUD_FAIL["n"] >= _CLOUD_MAX_FAIL:
+        raise RuntimeError("云端后端本会话已连续失败 %d 次，暂时跳过"
+                           % _CLOUD_FAIL["n"])
+    url = _chat_url(os.environ["FLEET_CLOUD_URL"])
+    payload = _chat_payload(prompt, model or os.environ.get("FLEET_CLOUD_MODEL"),
+                            system, False)
+    obj = _post_json(url, payload,
+                     key=os.environ.get("FLEET_CLOUD_KEY"),
+                     timeout=CLOUD_TIMEOUT)
+    text = (obj.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    if not text.strip():
+        raise RuntimeError("云端返回空内容")
+    _CLOUD_FAIL["n"] = 0
+    return text.strip()
+
+
 def _stream_http(prompt, model, system, on_delta, do_stream):
-    url = os.environ["FLEET_LLM_URL"].rstrip("/")
-    if not url.endswith("/v1/chat/completions"):
-        url += "/v1/chat/completions"
+    url = _chat_url(os.environ["FLEET_LLM_URL"])
+    headers = {"Content-Type": "application/json"}
+    # 带 key 的端点（免费 AI 中继 / 商业 API）：只认环境变量，不落盘、不进产物
+    key = os.environ.get("FLEET_LLM_KEY")
+    if key:
+        headers["Authorization"] = "Bearer " + key
     req = urllib.request.Request(
         url, data=json.dumps(_chat_payload(prompt, model, system, do_stream)).encode("utf-8"),
-        headers={"Content-Type": "application/json"})
+        headers=headers)
     parts = []
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         if not do_stream:
             obj = json.loads(resp.read().decode("utf-8", "replace"))
-            text = (obj.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            text = (obj.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+            if not text.strip():
+                raise RuntimeError("本地端点返回空内容")
             parts.append(text)
             _emit(on_delta, text)
             return text.strip()
@@ -116,14 +190,34 @@ def _stream_http(prompt, model, system, on_delta, do_stream):
                 obj = json.loads(data)
             except ValueError:
                 continue
-            delta = (obj.get("choices") or [{}])[0].get("delta", {}).get("content", "")
+            delta = ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+            if not delta:
+                continue
             parts.append(delta)
             _emit(on_delta, delta)
+    if not "".join(parts).strip():
+        raise RuntimeError("本地端点流式返回为空")
     return "".join(parts).strip()
 
 
+def _mock_complete(prompt, model, system, on_delta=None):
+    """宿主模拟后端：真模型没接上时，让「她」先按人设开口。"""
+    try:
+        import mock_brain
+        text, b = mock_brain.complete(prompt, model, system)
+    except Exception:
+        text = _placeholder_text(prompt)
+        b = "mock"
+    if on_delta:
+        on_delta(text)
+    return text
+
+
 def stream(prompt, model=None, system=None, on_delta=None):
-    """流式推理：逐段回调 on_delta，最后返回 (完整文本, 后端名)。任何后端都不抛。"""
+    """流式推理：逐段回调 on_delta，最后返回 (完整文本, 后端名)。任何后端都不抛。
+
+    后端链：云端增强 -> 本地 -> 占位。
+    """
     b = backend()
     emitted = []
 
@@ -132,6 +226,20 @@ def stream(prompt, model=None, system=None, on_delta=None):
         if on_delta:
             on_delta(x)
 
+    # ---- 1) 云端增强（可选，配了才走）----
+    if os.environ.get("FLEET_CLOUD_URL"):
+        try:
+            text = _cloud_complete(prompt, model, system)
+            _d(text)
+            return text, "cloud"
+        except Exception as e:
+            _CLOUD_FAIL["n"] += 1
+            if not emitted:
+                _d("〔她〕云端没接上，先用本地接着说。")
+                emitted.clear()          # 这句是状态播报，不算正文
+            print("[llm] 云端后端失败：%s" % e)
+
+    # ---- 2) 本地 ----
     try:
         if b == "cmd":
             text = _stream_cmd(prompt, model, _d)
@@ -143,10 +251,16 @@ def stream(prompt, model=None, system=None, on_delta=None):
                     raise          # 已吐过片段，不再回退，避免重复
                 text = _stream_http(prompt, model, system, _d, False)
         else:
-            text = _stream_placeholder(prompt, _d)
+            # 没配本地后端：默认走宿主模拟（今晚先能聊），可用 FLEET_USE_MOCK=0 关掉
+            if os.environ.get("FLEET_USE_MOCK", "1") == "0":
+                text = _stream_placeholder(prompt, _d)
+            else:
+                text = _mock_complete(prompt, model, system, _d)
+                return text, "mock"
     except Exception as e:
-        text = f"〔她·出错〕本地推理失败：{e}"
-        _emit(on_delta, text)
+        print("[llm] 本地后端失败：%s" % e)
+        text = _mock_complete(prompt, model, system, _d)
+        return text, "mock"
     return text, b
 
 

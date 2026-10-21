@@ -1,0 +1,28 @@
+{
+  "cards": [
+    {
+      "id": "beijixing",
+      "name": "北极星",
+      "group": "core",
+      "path": "cards/beijixing.md",
+      "summary": "手机端本地陪伴模型，主人的同谋",
+      "voice": "zh-CN-XiaoxiaoNeural"
+    },
+    {
+      "id": "tianshu",
+      "name": "天枢",
+      "group": "core",
+      "path": "cards/tianshu.md",
+      "summary": "本地视觉模型，只负责看见",
+      "voice": "zh-CN-YunxiNeural"
+    },
+    {
+      "id": "tianwang_default",
+      "name": "天网默认",
+      "group": "core",
+      "path": "cards/tianwang_default.md",
+      "summary": "天网统一控制面，统管记忆与设备操控",
+      "voice": "zh-CN-XiaoyiNeural"
+    }
+  ]
+}
