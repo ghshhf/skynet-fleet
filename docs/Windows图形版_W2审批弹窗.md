@@ -1,6 +1,6 @@
 # Windows 图形版 · W2 审批弹窗
 
-> 状态：已实现并接入门禁 `evals/t9_approval.py`（全量 48/48）。
+> 状态：已实现并接入门禁 `evals/t9_approval.py`。
 > 依赖 W1（`docs/Windows图形版_W1实现说明.md`）——本地后端 + 三栏 UI + 一次性令牌。
 
 ## 一句话
@@ -167,7 +167,7 @@ D:/tools/python/python.exe -m fleet.gui.app --no-window
 
 ```bash
 D:/tools/python/python.exe evals/t9_approval.py     # 只跑这一条
-D:/tools/python/python.exe run_selftests.py         # 全量（48 项）
+D:/tools/python/python.exe run_selftests.py         # 全量（当前 49 项）
 ```
 
 > 用 `D:/tools/python/python.exe`，**不要**用系统 `python`（WindowsApps 存根会静默 exit=49）。
@@ -201,7 +201,7 @@ t9 门禁**完全离线**：假设备、假注册表，网络 I/O 一律假掉 �
 | `ui/app.css` | 审批弹窗与徽标样式 |
 | `evals/t9_approval.py` | **新增**。W2 门禁（完全离线） |
 | `evals/t7_gui_backend.py` | 错 token 的断言从 401 改为 403（与新鉴权口径对齐） |
-| `run_selftests.py` | 接入 `eval_t9_approval`（全量 47 → 48 项） |
+| `run_selftests.py` | 接入 `eval_t9_approval`（全量 47 → 48 项；仓库另有并行任务新增 t10，现为 49 项） |
 
 **没有**改 `fleet/catalog.py`（另一个 agent 正在改，会冲突）。本任务不需要新增能力登记 ——
 W2 只加审批链路，不动能力清单。
