@@ -535,10 +535,16 @@ class _Handler(BaseHTTPRequestHandler):
     #    不许在这里直接调 audio_synth.synth 绕过闸门。
 
     def _audio_presets(self):
-        """音频预设清单（只读）。"""
+        """音频预设清单（只读）。
+
+        🔴 返回形状：与同类只读端点（/api/skills、/api/connectors、/api/memory）
+        保持一致——失败时把原因放在 **`error` 键**里（前端 `renderAudioTab`
+        读的就是 `d.error`，拼成 `err` 它认不到，失败就只剩一句没原因的空话）。
+        成功时给 `ok/presets/note`，前端依赖 `d.presets`。
+        """
         r = self.fleet.call("audio.presets", args={})
         if not r.get("ok"):
-            return {"ok": False, "err": r.get("err", "读不到音频预设"),
+            return {"ok": False, "error": r.get("err", "读不到音频预设"),
                     "presets": []}
         d = r.get("data") or {}
         return {"ok": True, "presets": d.get("presets", []),
@@ -558,8 +564,11 @@ class _Handler(BaseHTTPRequestHandler):
                              tag=body.get("tag", ""),
                              session=body.get("session", ""))
         if not r.get("ok"):
-            return self._json({"ok": False, "err": r.get("err", "合成失败")}, 200)
-        return self._json({"ok": True, **(r.get("data") or {})})
+            # 失败时也要带上 code/err：前端 doSynth 靠 `res.code === "denied"`
+            # 判断结果，靠 `res.err` 显示原因。拍平 data 会丢掉这些字段
+            # ⇒ 直接返回完整结果信封（与 /api/call 同形状，showResult 也认）。
+            return self._json(r)
+        return self._json(r)
 
     def _skills(self):
         """技能清单（SKILL.md）。

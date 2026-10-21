@@ -54,16 +54,25 @@ class AudioSynth(BaseDevice):
                 out = (args.get("out") or "").strip()
                 spec = args.get("spec") or args.get("preset") or "chime"
                 custom = args.get("custom") or None
+                # 🔴 没给 out ⇒ 落默认目录（仓库内 audio_out，gitignore 了）。
+                #   文件名带 spec+seed：相同种子 ⇒ 相同路径（覆盖，符合「同种子可复现」）；
+                #   换种子 ⇒ 换文件名 ⇒ 不互相覆盖。
+                if not out:
+                    out = os.path.join(
+                        _default_out_dir(),
+                        "%s-%s.wav" % (spec, _slug(args.get("seed") or "fleet")))
                 r = SY.synth(
                     spec,
                     seed=args.get("seed"),
-                    out=out or None,
+                    out=out,
                     sample_rate=int(args.get("sample_rate") or SY.DEFAULT_SAMPLE_RATE),
                     fmt=(args.get("format") or "wav"),
                     custom=custom,
                 )
+                # 🔴 副作用恒为真：audio.synth **一定写文件**（哪怕落默认目录），
+                #   原来 `bool(out)` 在 out 为空时谎报 False，会骗过上层「有没有副作用」判定。
                 return R.success(cap, self.name, via=self.via,
-                                 side_effect=bool(out),
+                                 side_effect=True,
                                  data=r)
             return super().invoke(cap, args)
         except SY.SynthError as e:
@@ -73,17 +82,24 @@ class AudioSynth(BaseDevice):
                            device=self.name, via=self.via)
 
 
+def _slug(seed):
+    """把种子压成文件名安全字符串（非字母数字统一成下划线）。"""
+    s = str(seed or "fleet")
+    out_chars = []
+    for ch in s:
+        out_chars.append(ch if (ch.isalnum() or ch in "._-") else "_")
+    return "".join(out_chars)[:64] or "fleet"
+
+
 def _default_out_dir():
-    """默认输出目录。存在就复用，不存在才建（probe 不许有副作用）。"""
-    d = os.environ.get("FLEET_AUDIO_DIR") or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "audio_out")
+    """默认输出目录（仓库内 audio_out，gitignore 了）。
+
+    存在就复用，不存在才建——probe 不许有副作用，这里只在真写文件时才会被调用。
+    """
+    d = os.environ.get("FLEET_AUDIO_DIR")
+    if not d:
+        # fleet/kinds/audio.py → 往上三层是仓库根
+        d = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "audio_out")
     return d
-
-
-def synth_to_dir(spec, seed=None, name=None):
-    """便捷入口：合成到默认输出目录（给 GUI 用）。"""
-    d = _default_out_dir()
-    if not os.path.isdir(d):
-        os.makedirs(d, exist_ok=True)
-    fn = (name or str(spec)).replace("/", "_") + ".wav"
-    return SY.synth(spec, seed=seed, out=os.path.join(d, fn))

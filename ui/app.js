@@ -612,8 +612,14 @@
       card.appendChild(top);
       card.appendChild(el("div", "cdesc", p.desc || ""));
       var meta = el("div", "cmeta");
+      var seed = el("input", "seedin");
+      seed.type = "text";
+      seed.value = "fleet";
+      seed.title = "种子：决定音色。相同种子 = 同一条声音（重启后也一样）；换种子 = 换音色";
+      seed.setAttribute("aria-label", "合成种子");
       var btn = el("button", "hbtn go", "合成");
-      btn.addEventListener("click", function () { doSynth(p, btn); });
+      btn.addEventListener("click", function () { doSynth(p, btn, seed.value); });
+      meta.appendChild(seed);
       meta.appendChild(btn);
       meta.appendChild(el("span", "", p.id));
       card.appendChild(meta);
@@ -622,7 +628,7 @@
     body.appendChild(wall);
   }
 
-  function doSynth(p, btn) {
+  function doSynth(p, btn, seed) {
     if (!requireToken()) { return; }
     APPR_TAG += 1;
     var tag = "audio-" + p.id + "-" + APPR_TAG;
@@ -630,7 +636,10 @@
     btn.textContent = "合成中…";
     api("/api/audio/synth", {
       method: "POST",
-      body: { spec: p.id, seed: "fleet", tag: tag, session: SESSION }
+      // 🔴 seed 从卡片输入框来（默认 fleet）。空种子回落到 "fleet"，
+      //    后端按 spec+seed 命名文件：同种子覆盖同路径（可复现），换种子换新文件。
+      body: { spec: p.id, seed: (seed || "fleet").trim() || "fleet",
+              tag: tag, session: SESSION }
     }).then(function (res) {
       showResult(res);
       pollApprovals();
@@ -638,8 +647,11 @@
         var d = res.data || {};
         toast("「" + p.id + "」合成好了：" + (d.seconds || "?") + " 秒 / "
           + (d.bytes || 0) + " 字节 → " + (d.path || ""));
-      } else if (res && res.code === "denied") {
-        toast("没合成：" + (res.err || "被拒绝"), true);
+      } else {
+        // 🔴 不只判 denied：超时、闸门拒绝、能力报 error 都要显示原因。
+        // 失败分支后端现在带 code/err（完整结果信封），所以这里取 res.err；
+        // 兜底给一句明话，不许显示空字符串（静默失败最阴）。
+        toast("没合成：" + ((res && res.err) || "原因未返回"), true);
       }
       btn.disabled = false;
       btn.textContent = "合成";
@@ -789,15 +801,21 @@
   /* ------------------------------------------------------------------ 结果条 */
   function showResult(res) {
     if (!res) { return; }
-    var bar = $("resBar");
-    bar.hidden = false;
-    bar.classList.toggle("err", !res.ok);
     var head = res.ok ? "✓" : "✕";
     var txt = head + " " + (res.cap || "") + " · " + (res.code || "") +
       " · " + (res.ms !== undefined ? res.ms + "ms" : "");
     if (res.err) { txt += " · " + res.err; }
     if (res.via) { txt += " · via " + res.via; }
-    bar.textContent = txt;
+    // 🔴 更新所有结果条（聊天视图的 #resBar 与资产视图的 #resBarAssets）。
+    // 每条所在视图不可见时是 display:none，那条即使 unhide 也看不见，
+    // 所以「不重复显示」靠父容器可见性自动解决，这里统一写就行。
+    var bars = document.querySelectorAll(".resbar");
+    for (var i = 0; i < bars.length; i++) {
+      var b = bars[i];
+      b.hidden = false;
+      b.classList.toggle("err", !res.ok);
+      b.textContent = txt;
+    }
   }
 
   /* ------------------------------------------------------------------ 审批（W2） */
