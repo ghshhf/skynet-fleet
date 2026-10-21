@@ -26,6 +26,36 @@ WIN_HEIGHT = 900
 WIN_MIN = (1080, 680)
 
 
+def _smoke():
+    """CI / 打包冒烟：起服务 → 带 token 探 /api/health → 退。
+
+    不开窗、不阻塞、不需要显示器、不依赖 webview（webview 只在开窗那条路才 import）。
+    冻扁包出来后也用同一个 --smoke 做「产物真能跑」的落地检查。
+    """
+    import json
+    import urllib.request
+
+    srv = FleetServer(port=0, approval=ApprovalBroker())
+    port = srv.start()
+    url = srv.page_url("light")
+    token = url.split("#t=", 1)[1].split("&")[0]   # token 在片段里，抽出
+    try:
+        req = urllib.request.Request(
+            srv.base_url + "/api/health",
+            headers={"X-Fleet-Token": token})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        ok = data.get("ok") is True and "devices" in data
+        print(("SMOKE OK" if ok else "SMOKE FAIL") + ": " +
+              json.dumps(data, ensure_ascii=False)[:200])
+        return 0 if ok else 1
+    except Exception as e:
+        print("SMOKE FAIL: %s: %s" % (type(e).__name__, e))
+        return 1
+    finally:
+        srv.stop()
+
+
 def _require_webview():
     """拿 pywebview；没有就报明确原因并退出，不许静默失败。"""
     try:
@@ -43,11 +73,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="设备编队 · Windows 图形版")
     ap.add_argument("--no-window", action="store_true",
                     help="只跑本地服务，不开窗口（无 GUI 环境用）")
+    ap.add_argument("--smoke", action="store_true",
+                    help="起服务探 /api/health 后退出（CI / 打包冒烟，不开窗）")
     ap.add_argument("--port", type=int, default=0,
                     help="端口；0 = 随机端口（默认，防冲突也防被外部扫到）")
     ap.add_argument("--theme", default="light", choices=["light", "dark"],
                     help="初始主题")
     args = ap.parse_args(argv)
+
+    if args.smoke:
+        return _smoke()
 
     # W2：注入审批中枢。有副作用的能力会被注册表拦在闸门上，挂起等主人在
     # 弹窗里点确认。判定权始终在注册表层（要不要审批、几级、要不要双确认），
