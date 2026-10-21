@@ -13,8 +13,8 @@ set MODE=%1
 REM 后端配置（云端 key、语音设置都在这儿）
 if exist "%~dp0fleet_env.bat" call "%~dp0fleet_env.bat"
 
-set LLAMA_DIR=G:\_tools\llama.cpp-b11483\bin
-set MODEL=G:\_train_qwen06b\v13-Q8_0.gguf
+set LLAMA_DIR=E:\_tools\llama.cpp-b11483\bin
+set MODEL=E:\_train_qwen06b\v13-Q8_0.gguf
 set TEMPLATE=%~dp0..\templates\qwen3_thinkblock.jinja
 set PORT=8080
 
@@ -48,14 +48,14 @@ echo [1/2] 本地模型就绪。
 
 :desktop
 echo [2/2] 启动天网桌面端 ...
-G:\Python312\python.exe "%~dp0..\desktop.py"
+E:\Python312\python.exe "%~dp0..\desktop.py"
 goto end
 
 :web
 echo 启动天网 Web 版 ...
 echo   本机访问： http://127.0.0.1:8765
 echo   局域网其他电脑： http://本机IP:8765
-G:\Python312\python.exe "%~dp0..\web.py"
+E:\Python312\python.exe "%~dp0..\web.py"
 goto end
 
 :end

@@ -299,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
         if not raw:
             self._json({"error": "空音频"}, 400)
             return
-        tmp = os.path.join("G:/_tmp/fleet_voice", "web_%d.wav" % int(time.time() * 1000))
+        tmp = os.path.join(voice.TMP_DIR, "web_%d.wav" % int(time.time() * 1000))
         try:
             os.makedirs(os.path.dirname(tmp), exist_ok=True)
             with open(tmp, "wb") as f:

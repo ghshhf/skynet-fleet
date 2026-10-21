@@ -29,6 +29,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import struct
 import zlib
 
@@ -506,30 +507,268 @@ def first_message(data):
 
 
 # --------------------------------------------------------------------------
+# Markdown 源卡编译（桌面端计划书 v2 §6.4，规则写死）
+# --------------------------------------------------------------------------
+# cards/*.md 是**源卡**（人写的显式字段），chara_card JSON 是事实标准形态。
+# 编译规则：
+#   * 只取显式字段（`# 标题` + `- 字段：值`），**不做语义总结、不做扩写**
+#     ——总结就是另一个模型的臆测；
+#   * 单卡编译后 ≤800 字（超了如实报，不静默截断——截断就是丢人设）；
+#   * 产物缓存 cards/compiled/<id>.json，按源文件 mtime 失效重编。
+
+#: .md 显式字段 → chara_card data 字段分组（原文逐字进，不改写）
+_MD_TO_DESC = ("定位", "阵营", "立场", "核心冲突", "关系", "底色", "世界观")
+_MD_TO_PERS = ("性格", "口癖")
+_MD_TO_SP = ("说话方式", "自称", "装备", "禁止")
+
+#: 编译产物缓存目录
+COMPILED_CARD_DIR = os.path.join(DEFAULT_CARD_DIR, "compiled")
+
+
+def _parse_md_card(text):
+    """解析 Markdown 源卡 -> {"title", "fields": {字段: 原文}, "extras": [(节, 原文)]}。
+
+    只认显式字段：`# 标题` 与 `- 字段：值`。`## 协议映射` 这类整节
+    原文进 extras（卡要求原样出现的令牌在其中，不许总结）。
+    """
+    title = ""
+    fields = {}
+    extras = []
+    section = ""
+    buf = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.startswith("# ") and not title:
+            title = line[2:].strip()
+            continue
+        if line.startswith("## "):
+            if section and buf:
+                extras.append((section, "\n".join(buf).strip()))
+            section = line[3:].strip()
+            buf = []
+            continue
+        m = re.match(r"^-\s*([^：:]{1,12})[：:]\s*(.+)$", line)
+        if m and not section:
+            fields[m.group(1).strip()] = m.group(2).strip()
+            continue
+        if section:
+            buf.append(line)
+    if section and buf:
+        extras.append((section, "\n".join(buf).strip()))
+    return {"title": title, "fields": fields, "extras": extras}
+
+
+def _compile_md_data(path):
+    """把 .md 源卡编译成 chara_card_v2 data（只取显式字段）。"""
+    text = open(path, encoding="utf-8").read()
+    parsed = _parse_md_card(text)
+    fields = parsed["fields"]
+
+    def _join(keys):
+        out = []
+        for k in keys:
+            v = fields.get(k)
+            if v:
+                out.append("【%s】%s" % (k, v))
+        return "\n".join(out)
+
+    data = {
+        "name": parsed["title"] or os.path.splitext(os.path.basename(path))[0],
+        "description": _join(_MD_TO_DESC),
+        "personality": _join(_MD_TO_PERS),
+        "system_prompt": _join(_MD_TO_SP),
+        "creator": "本地源卡（.md 编译）",
+        "tags": ["md_source"],
+    }
+    # 协议节等整节原文附进人设补充区（保留卡里要求原样出现的令牌）
+    for sec, body in parsed["extras"]:
+        if body:
+            data["system_prompt"] = (
+                data["system_prompt"] + "\n\n【%s】\n%s" % (sec, body)).strip()
+    data["_spec"] = "md_compiled"
+    data["_source"] = os.path.basename(path)
+    return data
+
+
+def _voice_for(stem):
+    """查 index.json 登记表里的音色（没有就空串，调用方有自己的兜底）。"""
+    try:
+        idx = json.load(open(os.path.join(DEFAULT_CARD_DIR, "index.json"),
+                             encoding="utf-8"))
+        for c in idx.get("cards") or []:
+            if c.get("id") == stem:
+                return c.get("voice") or ""
+    except Exception:
+        pass
+    return ""
+
+
+def compile_card(card_id, directory=None, use_cache=True):
+    """编译一张卡 -> {"system": str, "meta": {...}}。
+
+    card_id 是文件名去扩展名（whale_girl / 大肥鱼）：
+    .json/.png 直接读；.md 源卡按 §6.4 编译，产物缓存
+    cards/compiled/<id>.json，按源 mtime 失效重编。
+    🔴 找不到卡不许猜——报明确错误并列出可用卡。
+    """
+    d = directory or DEFAULT_CARD_DIR
+    if not card_id:
+        raise ValueError("card_id 为空：没有可编译的卡")
+    stem = os.path.splitext(os.path.basename(str(card_id)))[0]
+
+    # 1) 直接就是 .json/.png 卡
+    for ext in (".json", ".png"):
+        p = os.path.join(d, stem + ext)
+        if os.path.isfile(p):
+            data = load_card(p)
+            meta = {"name": data.get("name") or "(无名)",
+                    "spec": data.get("_spec"),
+                    "source": os.path.basename(p),
+                    "chars": len(build_system(data)),
+                    "voice": _voice_for(stem)}
+            return {"system": build_system(data), "meta": meta}
+
+    # 2) .md 源卡（带编译缓存）
+    p = os.path.join(d, stem + ".md")
+    if os.path.isfile(p):
+        cached = os.path.join(COMPILED_CARD_DIR, stem + ".json")
+        if use_cache and os.path.isfile(cached):
+            try:
+                if os.path.getmtime(cached) >= os.path.getmtime(p):
+                    obj = json.load(open(cached, encoding="utf-8"))
+                    data = dict(obj.get("data") or {})
+                    data["_spec"] = "md_compiled"
+                    meta = {"name": data.get("name") or stem,
+                            "spec": "md_compiled",
+                            "source": os.path.basename(p) + "(缓存)",
+                            "chars": len(build_system(data)),
+                            "voice": _voice_for(stem)}
+                    return {"system": build_system(data), "meta": meta}
+            except Exception:
+                pass        # 缓存坏了当没有，重编
+        data = _compile_md_data(p)
+        if use_cache:
+            try:
+                os.makedirs(COMPILED_CARD_DIR, exist_ok=True)
+                with open(cached, "w", encoding="utf-8") as f:
+                    json.dump({"spec": "chara_card_v2", "spec_version": "2.0",
+                               "data": {k: v for k, v in data.items()
+                                        if not k.startswith("_")}},
+                              f, ensure_ascii=False, indent=2)
+            except OSError:
+                pass        # 缓存写不了不阻塞编译
+        meta = {"name": data.get("name") or stem, "spec": "md_compiled",
+                "source": os.path.basename(p),
+                "chars": len(build_system(data)),
+                "voice": _voice_for(stem)}
+        return {"system": build_system(data), "meta": meta}
+
+    # 3) 找不到：明确报错，列出可用卡
+    avail = sorted({c["id"] for c in list_cards(d) if c.get("ok")})
+    raise ValueError(
+        "卡库裏没有 id=%r 的卡（可用：%s）。卡 id 是文件名去扩展名。"
+        % (card_id, "、".join(avail) or "（空）"))
+
+
+def current(directory=None):
+    """当前生效的 card_id（唯一性单例，存 cards/active.json）。
+
+    没选过返回 None——不是错误，上层该有默认行为。
+    """
+    d = directory or DEFAULT_CARD_DIR
+    ptr = os.path.join(d, "active.json")
+    if not os.path.exists(ptr):
+        return None
+    try:
+        rec = json.load(open(ptr, encoding="utf-8"))
+        fn = rec.get("file") or ""
+        if not fn or not os.path.exists(os.path.join(d, fn)):
+            return None
+        return os.path.splitext(fn)[0]
+    except Exception:
+        return None
+
+
+def switch(card_id, directory=None):
+    """显式切卡 -> {"ok": bool, ...}。
+
+    v2 计划书 §6.2：切卡 = 换自称与口癖（+情绪基线）；
+    **记忆、刹车、授权门不碰**——「切卡清空历史」是错的，
+    本函数绝不碰记忆层。
+    """
+    d = directory or DEFAULT_CARD_DIR
+    try:
+        res = compile_card(card_id, directory=d)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    stem = os.path.splitext(os.path.basename(str(card_id)))[0]
+    fn = None
+    for ext in (".json", ".png", ".md"):
+        if os.path.isfile(os.path.join(d, stem + ext)):
+            fn = stem + ext
+            break
+    if fn is None:
+        return {"ok": False, "error": "切卡后定位文件名失败：%s" % stem}
+    try:
+        set_active(fn, directory=d)
+    except Exception as e:
+        return {"ok": False, "error": "写 active.json 失败：%s" % e}
+    return {"ok": True, "card": stem, "system": res["system"],
+            "meta": res["meta"]}
+
+
+# --------------------------------------------------------------------------
 # 卡库：列出 / 选中 / 当前生效
 # --------------------------------------------------------------------------
 
 def list_cards(directory=None):
-    """列出卡库里的角色卡（文件名 + 摘要）。坏卡不拖垮整库，摘要里标出来。"""
+    """列出卡库里的角色卡（.md 源卡 + .json/.png 卡）。
+
+    坏卡不拖垮整库，摘要里标出来。
+    🔴 登记/记账文件不是卡：index.json（登记簿）、active.json（指针）、
+    .downloads.json（下载账）、点开头、IMPORT_NOTES.md、compiled/（编译缓存）。
+    上一版只跳过 active.json，结果 index.json 被当成一张假卡列进界面。
+    """
     d = directory or DEFAULT_CARD_DIR
     if not os.path.isdir(d):
         return []
     out = []
     for fn in sorted(os.listdir(d)):
-        # 只认角色卡文件：active.json 是指针、.downloads.json 是下载账、
-        # 其余点开头的都是本仓的内部记账/临时文件。
-        # 🔴 之前只跳过 active.json ⇒ 记账文件被当成一张卡列进界面，
-        #    界面上出现一张「（无名）· v1」的假卡。
-        if fn == "active.json" or fn.startswith("."):
+        if fn.startswith("."):
             continue
-        if not fn.lower().endswith((".json", ".png")):
+        if fn in ("index.json", "active.json", "IMPORT_NOTES.md"):
+            continue
+        if fn in ("compiled", "_protocols"):
+            continue
+        if not fn.lower().endswith((".json", ".png", ".md")):
+            continue
+        if fn.endswith((".downloads.json", ".probe")):
             continue
         p = os.path.join(d, fn)
+        stem = os.path.splitext(fn)[0]
+        if fn.lower().endswith(".md"):
+            try:
+                data = _compile_md_data(p)
+                nm = data.get("name") or stem
+                out.append({"file": fn, "path": p, "ok": True,
+                            "id": stem, "name": nm,
+                            "summary": {"name": nm, "spec": "md_source",
+                                        "creator": data.get("creator") or "",
+                                        "tags": data.get("tags") or [],
+                                        "chars": {"description": len(data.get("description") or ""),
+                                                  "mes_example": 0}}})
+            except Exception as e:
+                out.append({"file": fn, "path": p, "ok": False,
+                            "id": stem, "error": str(e)})
+            continue
         try:
+            data = load_card(p)
+            summ = card_summary(data)
             out.append({"file": fn, "path": p, "ok": True,
-                        "summary": card_summary(load_card(p))})
+                        "id": stem, "name": summ["name"], "summary": summ})
         except Exception as e:
-            out.append({"file": fn, "path": p, "ok": False, "error": str(e)})
+            out.append({"file": fn, "path": p, "ok": False,
+                        "id": stem, "error": str(e)})
     return out
 
 
@@ -537,7 +776,10 @@ def set_active(filename, directory=None):
     """选中当前生效的卡（写 active.json）。"""
     d = directory or DEFAULT_CARD_DIR
     p = os.path.join(d, filename)
-    data = load_card(p)                      # 坏卡在这里就报出来
+    if filename.lower().endswith(".md"):
+        data = _compile_md_data(p)          # 坏卡在这里就报出来
+    else:
+        data = load_card(p)                  # 坏卡在这里就报出来
     os.makedirs(d, exist_ok=True)
     # 只存文件名，不存绝对路径：绝对路径会随机器变，写进文件没意义还容易外泄
     with open(os.path.join(d, "active.json"), "w", encoding="utf-8") as f:
@@ -556,6 +798,8 @@ def active_card(directory=None):
         p = os.path.join(d, rec.get("file") or "")
         if not os.path.exists(p):
             return None
+        if (rec.get("file") or "").lower().endswith(".md"):
+            return _compile_md_data(p)
         return load_card(p)
     except Exception:
         return None
