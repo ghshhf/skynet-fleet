@@ -960,22 +960,15 @@ class _Handler(BaseHTTPRequestHandler):
             with open(src, "wb") as f:
                 f.write(raw)
             # whisper 只吃 wav；手机 MediaRecorder 给的是 webm/opus，
-            # 别的客户端也可能直传任意容器 ⇒ 非 RIFF 一律先 ffmpeg 转 16k 单声道。
+            # edge_tts 给的是 mp3，别的客户端也可能直传任意容器。
+            # 2026-10-22：改走 v.any_to_wav —— 内部优先 PyAV（faster-whisper
+            # 自带，冻扁包里一定有），外部 ffmpeg 只做兜底。之前硬依赖
+            # ffmpeg，冻扁包里没有 ⇒ 回喂 TTS 产物一律 503。
             if raw[:4] != b"RIFF":
                 wav = os.path.join(tmp_dir, "api_%d.wav" % stamp)
-                ff = v._ffmpeg()
-                if not ff:
-                    return self._err(503, "收到非 wav 音频（头 %s），但找不到 ffmpeg 转码"
+                if not v.any_to_wav(src, wav):
+                    return self._err(503, "收到非 wav 音频（头 %s），PyAV 与 ffmpeg 都不可用"
                                      % raw[:4].hex())
-                import subprocess
-                r = subprocess.run(
-                    [ff, "-y", "-loglevel", "error", "-i", src,
-                     "-ar", "16000", "-ac", "1", "-f", "wav", wav],
-                    capture_output=True, timeout=120)
-                if r.returncode != 0 or not os.path.isfile(wav):
-                    msg = (r.stderr or b"").decode("utf-8", "replace")[:200]
-                    return self._err(400, "音频转码失败（ffmpeg 退出码 %d）：%s"
-                                     % (r.returncode, msg or "无输出"))
             text, meta = v.transcribe(wav, language="zh")
         except Exception as e:
             return self._err(500, "识别失败：%s: %s" % (type(e).__name__, e))
@@ -1023,6 +1016,7 @@ class _Handler(BaseHTTPRequestHandler):
                                  "所以只能走 edge_tts（在线）。检查 ①edge-tts 是否装了 "
                                  "②这台机器能不能连微软的语音服务")
             return self._err(500, "合成失败：后端 %r 没有产出文件" % (backend,))
+        ctype = v.audio_kind(path)
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -1034,10 +1028,14 @@ class _Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         self.send_response(200)
-        self.send_header("Content-Type", "audio/wav")
+        # 按真实字节给 MIME：冻扁包没有 ffmpeg ⇒ edge_tts 的 mp3 转不成 wav，
+        # 之前一律声称 audio/wav 是撒谎。浏览器靠嗅探还能放，但 X-Voice-Format
+        # 骗人的话，客户端做缓存/拼接就会出错。
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Voice-Backend", backend or "")
+        self.send_header("X-Voice-Format", ctype.split("/")[-1])
         self.send_header("X-Voice-Card", card_id or "")
         self.end_headers()
         self.wfile.write(data)

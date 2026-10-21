@@ -114,8 +114,24 @@ public final class Net {
         }
     }
 
-    /** {text} 进 → audio/wav 出 */
-    public static byte[] say(String base, String token, String text) throws IOException {
+    /** 合成结果：字节 + 真实容器后缀。
+     *
+     * 为什么不假设是 wav：电脑端有 ffmpeg 时 edge_tts 的 mp3 会被转成 wav；
+     * 冻扁包里没有外部 ffmpeg，拿到的就是 mp3。以前这里硬校验 RIFF 开头，
+     * 换个后端就整条链路哑掉——格式由服务端的 X-Voice-Format 说了算。
+     */
+    public static final class SayResult {
+        public final byte[] data;
+        public final String ext;
+
+        SayResult(byte[] data, String ext) {
+            this.data = data;
+            this.ext = ext;
+        }
+    }
+
+    /** {text} 进 → 音频出（wav 或 mp3，看服务端能力） */
+    public static SayResult say(String base, String token, String text) throws IOException {
         byte[] payload;
         try {
             JSONObject req = new JSONObject();
@@ -132,20 +148,47 @@ public final class Net {
             if (code != 200) {
                 throw new IOException(friendly(code, readText(c)));
             }
+            String ctype = c.getHeaderField("Content-Type");
+            String fmt = c.getHeaderField("X-Voice-Format");
             InputStream in = c.getInputStream();
             ByteArrayOutputStream bo = new ByteArrayOutputStream(1 << 16);
             byte[] buf = new byte[8192];
             int n;
             while ((n = in.read(buf)) > 0) { bo.write(buf, 0, n); }
             in.close();
-            byte[] wav = bo.toByteArray();
-            if (wav.length < 44 || wav[0] != 'R' || wav[1] != 'I') {
-                throw new IOException("合成返回的不是 wav（" + wav.length + " 字节）");
+            byte[] data = bo.toByteArray();
+            String ext = guessExt(fmt, ctype, data);
+            if (data.length < 1024) {
+                throw new IOException("合成返回的音频太小（" + data.length + " 字节，格式 " + ext + "）");
             }
-            return wav;
+            return new SayResult(data, ext);
         } finally {
             c.disconnect();
         }
+    }
+
+    /** 服务端头优先；头缺失就按字节头嗅探，最后才退回 wav。 */
+    private static String guessExt(String fmt, String ctype, byte[] d) {
+        if (fmt != null && fmt.length() > 0) {
+            String f = fmt.trim().toLowerCase();
+            if (f.equals("mpeg") || f.equals("mp3")) { return "mp3"; }
+            if (f.equals("wav") || f.equals("x-wav")) { return "wav"; }
+            if (f.equals("ogg")) { return "ogg"; }
+            if (f.equals("mp4") || f.equals("m4a")) { return "m4a"; }
+        }
+        if (ctype != null) {
+            String t = ctype.toLowerCase();
+            if (t.contains("mpeg")) { return "mp3"; }
+            if (t.contains("ogg")) { return "ogg"; }
+            if (t.contains("mp4")) { return "m4a"; }
+        }
+        if (d != null && d.length > 4) {
+            if (d[0] == 'R' && d[1] == 'I' && d[2] == 'F' && d[3] == 'F') { return "wav"; }
+            if (d[0] == 'O' && d[1] == 'g' && d[2] == 'g') { return "ogg"; }
+            if (d[0] == 'I' && d[1] == 'D' && d[2] == '3') { return "mp3"; }
+            if ((d[0] & 0xFF) == 0xFF && (d[1] & 0xE0) == 0xE0) { return "mp3"; }
+        }
+        return "wav";
     }
 
     /** 探活：/api/health 不带鉴权，用来判断"电脑那头起了没"。 */

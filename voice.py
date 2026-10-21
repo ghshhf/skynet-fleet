@@ -384,6 +384,80 @@ def _run_hidden(cmd):
                           creationflags=flags, check=False)
 
 
+def any_to_wav(src, dst, sr=16000):
+    """任意音频容器（mp3/webm/opus/ogg/m4a…）→ 16k 单声道 s16 wav。
+
+    为什么不用 ffmpeg：冻扁包里没有外部 ffmpeg，但 **PyAV 一定在**——
+    faster-whisper 自己就依赖它解音频。2026-10-22 实测：手机端上行的是
+    16k wav（能过），但把 edge_tts 产出的 mp3 回喂给 /api/voice/recognize
+    就报「收到非 wav 音频（头 fff3），但找不到 ffmpeg 转码」。用 av 一条
+    路径覆盖所有格式，外部 ffmpeg 只作为 av 缺失时的兜底。
+
+    返回 True 表示 dst 已写好；False 表示两种解码器都不可用。
+    """
+    try:
+        import av
+        from av.audio.resampler import AudioResampler
+    except Exception:
+        return _any_to_wav_ffmpeg(src, dst, sr)
+
+    try:
+        res = AudioResampler(format="s16", layout="mono", rate=sr)
+        chunks = []
+        with av.open(src, mode="r") as cont:
+            if not cont.streams.audio:
+                return False
+            stream = cont.streams.audio[0]
+            for frame in cont.decode(stream):
+                for out in res.resample(frame):
+                    chunks.append(out.to_ndarray().tobytes())
+            for out in res.resample(None):        # flush 尾巴
+                chunks.append(out.to_ndarray().tobytes())
+        data = b"".join(chunks)
+        if not data:
+            return False
+        import wave
+        with wave.open(dst, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(data)
+        return True
+    except Exception as e:
+        print("[voice] av 解码失败（%s: %s），退回 ffmpeg" % (type(e).__name__, e))
+        return _any_to_wav_ffmpeg(src, dst, sr)
+
+
+def _any_to_wav_ffmpeg(src, dst, sr=16000):
+    """av 不可用时的兜底：外部 ffmpeg。"""
+    ff = _ffmpeg()
+    if not ff:
+        return False
+    r = _run_hidden([ff, "-y", "-loglevel", "error", "-i", src,
+                     "-ar", str(sr), "-ac", "1", "-f", "wav", dst])
+    return r.returncode == 0 and os.path.isfile(dst)
+
+
+def audio_kind(path):
+    """按文件头猜真实容器，给 Content-Type 用。不猜扩展名——扩展名会骗人。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return "application/octet-stream"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "audio/wav"
+    if head[:4] == b"OggS":
+        return "audio/ogg"
+    if head[:4] == b"fLaC":
+        return "audio/flac"
+    if head[4:8] == b"ftyp":
+        return "audio/mp4"
+    if head[:3] == b"ID3" or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "audio/mpeg"
+    return "application/octet-stream"
+
+
 # ============================ 能力探测 ============================
 
 def caps():
