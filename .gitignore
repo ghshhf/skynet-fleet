@@ -21,6 +21,9 @@ fleet_journal.db-wal
 fleet_audit.jsonl
 persona_state.json
 cards/active.json
+
+# 代码生成音频的落盘目录（audio.synth 默认写这里，纯本地产物）
+audio_out/
 # 卡商店：下载账本是本机状态，不入库。
 # 🔴 只排 store_ 前缀的卡（= 从商店/投递口进来的），**不排其它 png** ——
 #    主人自己放进来的卡（含手写 png）应该能进库。

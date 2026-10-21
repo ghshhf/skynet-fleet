@@ -162,6 +162,24 @@ def main():
     check("只认这几种" in (r.get("err") or ""),
           "能力层的错误里带原因（说清只认哪几种）")
 
+    # ---------- ⑥b 默认落盘目录 + 副作用恒真 ----------
+    # 不给 out 时也必须落进仓库内 audio_out（不是 %TEMP%），且结果里
+    # side_effect 恒为 True——它**每次都写文件**，原来 `bool(out)` 会在
+    # out 为空时谎报 False，骗过上层「有没有副作用」判定。
+    r = reg.call("audio.synth", args={"spec": "chime", "seed": "t17-default"},
+                 gate=lambda c, d, a_, l: (True, ""))
+    check(r.get("ok") is True, "audio.synth 不给 out 也能合成（err=%r）" % r.get("err"))
+    out_path = (r.get("data") or {}).get("path") or ""
+    check(bool(out_path) and "audio_out" in out_path,
+          "不给 out 默认落进仓库 audio_out（%s）" % out_path)
+    check(r.get("side_effect") is True,
+          "audio.synth 即便不给 out 也标了 side_effect=True（每次都写文件）")
+    if out_path and os.path.exists(out_path):
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+
     # ---------- ⑦ 能力是四个面都能看见的（注册表是唯一真相）----------
     check(len([c for c in allcaps if c.startswith("audio.")]) == 2,
           "注册表里 audio.* 恰好 2 项（不重名）")

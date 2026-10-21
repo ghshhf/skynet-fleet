@@ -373,6 +373,10 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   color:var(--fg-2);font-family:inherit;white-space:nowrap}
 .card .cmeta .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
 .card .cmeta .hbtn.go:disabled{opacity:.55;cursor:default}
+.card .cmeta .seedin{width:104px;font-size:11px;padding:2px 7px;border-radius:6px;
+  background:var(--panel-2);border:1px solid var(--line);color:var(--fg);
+  font-family:var(--mono)}
+.card .cmeta .seedin:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .card .cdesc:empty{display:none}
 
 /* 状态点：在线/离线 */
