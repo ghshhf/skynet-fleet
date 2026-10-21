@@ -20,6 +20,7 @@ from .kinds.fleet_node import FleetNode, load_nodes
 from .kinds.internet import Internet
 from .kinds.lan_scanner import LanScanner
 from .kinds.pc_control import PcControl
+from .kinds.render import Render
 from .kinds.windows_pc import WindowsPC
 from .transports import get as get_transport
 
@@ -320,6 +321,37 @@ CAPABILITIES = [
     Capability("voice.interpret", "把一段文字解析成能力意图（不执行）",
                params=(Param("text", "str", True, "要解析的文字"),),
                note="只读：只给意图与复述话术，执行要走两段式（复述+口头确认）"),
+    # ---- 渲染（kind=render）：用代码画出新的图与片子 ----
+    Capability("render.styles", "列出可用的渲染风格牌（抽签用）",
+               note="只读：返回 16 张风格牌的 id 与说明"),
+    Capability("render.frame", "渲染某一拍的单帧 PNG",
+               params=(Param("at", "str", doc="拍点 scene:time，如 1:1.20，默认 1:1.20"),
+                       Param("style", "str", doc="风格牌 id，如 swiss-editorial，默认 random（抽签）"),
+                       Param("workdir", "str", doc="工程目录，留空则用临时目录"),
+                       Param("keep", "bool", doc="true=保留临时目录，默认 false")),
+               side_effect=True,
+               note="会写 PNG 文件（算副作用）；引擎不在时如实说缺什么，不返回空图"),
+    Capability("render.reel", "渲染整条 15 秒动效片（1920×1080/30fps）",
+               params=(Param("outdir", "str", True, "片子落在哪（必填）"),
+                       Param("style", "str", doc="风格牌 id，默认 random（抽签）"),
+                       Param("timeout", "int", doc="秒，默认 3600")),
+               side_effect=True, approval="ask",
+               note="写 MP4 文件，要过审批闸门；需要 ffmpeg，缺了会明说"),
+    Capability("render.html", "把 HTML 渲染成 MP4（写 HTML，代码出片）",
+               params=(Param("html", "str", doc="HTML 源码（与 template/src 三选一）"),
+                       Param("template", "str", doc="用内置模板，如 reel_demo"),
+                       Param("src", "str", doc="本地 .html 文件路径"),
+                       Param("outdir", "str", True, "片子落在哪（必填）"),
+                       Param("name", "str", doc="成片文件名（不含 .mp4），默认 reel"),
+                       Param("width", "int", doc="像素宽，默认 1920"),
+                       Param("height", "int", doc="像素高，默认 1080"),
+                       Param("fps", "int", doc="帧率，默认 30"),
+                       Param("duration", "float", doc="时长秒，默认 5"),
+                       Param("keep_frames", "bool", doc="true=保留中间帧，默认 false")),
+               side_effect=True, approval="ask",
+               note="Video as Code：可寻址动画 → 确定性逐帧 → MP4。"
+                    "不许用 Date.now()/Math.random()/渲染时发网络请求，"
+                    "否则每次渲出来的不一样（会被拒绝）"),
 ]
 
 
@@ -341,6 +373,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(AdbWifi())
     reg.add(PcControl())
     reg.add(VoiceDevice())
+    reg.add(Render())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:

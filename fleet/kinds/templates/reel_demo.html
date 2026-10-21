@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<!--
+  设备编队 · HTML 渲染模板（四场景演示）
+  ==================================================
+  这份文件是 **render.html 能力的样例**，同时也是「怎么写一条片」的说明书。
+
+  怎么用
+  ------
+  1. 复制这份文件，改内容；
+  2. 调 `render.html` 能力（html= 内容 或 src= 这个文件路径）；
+  3. 出片：<outdir>/<name>.mp4（1920×1080 / 30fps）。
+
+  铁律（不遵守就会被后端拒绝渲染）
+  --------------------------------
+  渲染要「可复现」：同一份 HTML 渲两次必须逐字节一样。
+  这三条都会破坏它 ——
+  * 墙上时钟（取当前时刻的函数）—— 每次渲出来画面不一样
+  * 随机数（不播种的随机函数）      —— 同上
+  * 渲染时发网络请求拿视觉状态      —— 同上
+  后果是：片子没法进 git、没法 diff、没法做像素回归。
+  （后端会先做一次静态检查，命中就拒绝渲染并说明是哪一条。）
+
+  动画的写法
+  ----------
+  * 只用 **CSS animation**（Web Animations API 能把它变成可寻址的钟）；
+    别用 setTimeout / requestAnimationFrame 驱动（那些靠真实时间走，
+    逐帧渲染时拨不动）。
+  * **display 不会随 animation 变**，只有 opacity / transform 会。
+    所以场景切换要靠 opacity 动画，不要靠 display:none 切换。
+  * 场景之间的内部动画要对齐：给场景一个 `--s`（第几个场景），
+    内部元素的 animation-delay 用 `calc(var(--s) * <场景时长> + <自己的偏移>)`。
+  * 每个场景的时长 = 总时长 / 场景数；这里 1.875s × 4 = 7.5s。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {
+    margin: 0; width: 1920px; height: 1080px;
+    overflow: hidden; background: #0a0e13;
+  }
+
+  /* 场景容器：全部叠在一起，可见性只由 opacity 动画管。
+     序号用 --s 传进去，内部元素靠它对齐时间轴。 */
+  .scene {
+    position: absolute; inset: 0; opacity: 0;
+    animation: sceneShow 1.875s linear both;
+    animation-delay: calc(var(--s) * 1.875s);
+  }
+  @keyframes sceneShow {
+    0%   { opacity: 0; }
+    2%   { opacity: 1; }
+    98%  { opacity: 1; }
+    100% { opacity: 0; }
+  }
+
+  /* ---- 场景 1：标题飞入 + 下划线拉开 ---- */
+  .s1 h1 {
+    position: absolute; left: 160px; top: 400px; margin: 0; color: #fff;
+    font: 800 92px/1.12 "Segoe UI", system-ui; letter-spacing: -2px;
+    animation: t1 1.875s cubic-bezier(.2,.8,.2,1) both;
+    animation-delay: calc(var(--s) * 1.875s);
+  }
+  .s1 h1 em {
+    font-style: normal;
+    background: linear-gradient(90deg, #22c55e, #7c3aed);
+    -webkit-background-clip: text; color: transparent;
+  }
+  @keyframes t1 {
+    from { transform: translateX(-140px); opacity: 0; }
+    to   { transform: none; opacity: 1; }
+  }
+  .s1 .rule {
+    position: absolute; left: 160px; top: 640px; width: 0; height: 5px;
+    border-radius: 3px; background: linear-gradient(90deg, #22c55e, #7c3aed);
+    animation: t1b 1.875s ease-out both;
+    animation-delay: calc(var(--s) * 1.875s);
+  }
+  @keyframes t1b { from { width: 0; } to { width: 640px; } }
+
+  /* ---- 场景 2：数据条依次增长 ---- */
+  .s2 .row {
+    position: absolute; left: 160px; width: 1180px; height: 62px;
+    border-radius: 16px; background: #161b22; overflow: hidden;
+  }
+  .s2 .row i {
+    display: block; height: 100%; border-radius: 16px;
+    animation: t2 1.875s ease-out both;
+    animation-delay: calc(var(--s) * 1.875s);
+  }
+  .s2 .lbl {
+    position: absolute; left: 1380px; color: #c9d1d9; font: 600 32px system-ui;
+    animation: t2l 1.875s ease-out both;
+    animation-delay: calc(var(--s) * 1.875s);
+  }
+  @keyframes t2  { from { width: 0; } to { width: var(--w); } }
+  @keyframes t2l { from { opacity: 0; transform: translateX(24px); }
+                   to   { opacity: 1; transform: none; } }
+
+  /* ---- 场景 3：点阵铺开（位置写死，--d 给每个点一点错峰） ---- */
+  .s3 .dot {
+    position: absolute; width: 26px; height: 26px; border-radius: 50%;
+    background: #22c55e;
+    animation: t3 1.875s ease-out both;
+    animation-delay: calc(var(--s) * 1.875s + var(--d));
+  }
+  @keyframes t3 {
+    from { transform: scale(0); opacity: 0; }
+    to   { transform: scale(1); opacity: 1; }
+  }
+
+  /* ---- 场景 4：文字幕 ---- */
+  .s4 p {
+    position: absolute; left: 160px; top: 420px; margin: 0; color: #fff;
+    font: 700 72px/1.5 system-ui;
+    animation: t4 1.875s ease-out both;
+    animation-delay: calc(var(--s) * 1.875s);
+  }
+  @keyframes t4 {
+    from { opacity: 0; transform: translateY(34px); }
+    to   { opacity: 1; transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="scene s1" style="--s:0">
+  <h1>设备编队<br><em>一切皆 MCP</em></h1>
+  <div class="rule"></div>
+</div>
+
+<div class="scene s2" style="--s:1">
+  <div class="row" style="top:300px">
+    <i style="--w:86%; background:linear-gradient(90deg,#22c55e,#16a34a)"></i>
+    <span class="lbl" style="top:312px">70 能力</span>
+  </div>
+  <div class="row" style="top:430px">
+    <i style="--w:64%; background:linear-gradient(90deg,#7c3aed,#a78bfa)"></i>
+    <span class="lbl" style="top:442px">29 MCP 工具</span>
+  </div>
+  <div class="row" style="top:560px">
+    <i style="--w:48%; background:linear-gradient(90deg,#f59e0b,#fbbf24)"></i>
+    <span class="lbl" style="top:572px">37 技能</span>
+  </div>
+</div>
+
+<div class="scene s3" id="grid" style="--s:2"></div>
+
+<div class="scene s4" style="--s:3">
+  <p>把设备当 MCP server<br>把协议当同一件事</p>
+</div>
+
+<script>
+  // 点阵：位置写死（确定性），只让 scale / opacity 动。
+  // 🔴 不要用不播种的随机数来撒点：那样每次渲染画面不一样（后端会拒）。
+  (function () {
+    var g = document.getElementById('grid');
+    for (var i = 0; i < 150; i++) {
+      var d = document.createElement('div');
+      d.className = 'dot';
+      d.style.left = (120 + (i % 15) * 124) + 'px';
+      d.style.top = (150 + Math.floor(i / 15) * 110) + 'px';
+      d.style.setProperty('--d',
+        ((i % 15) * 0.012 + Math.floor(i / 15) * 0.020).toFixed(3) + 's');
+      g.appendChild(d);
+    }
+  })();
+</script>
+</body>
+</html>
