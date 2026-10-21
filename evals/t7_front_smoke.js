@@ -141,7 +141,10 @@ setTimeout(() => {
   const sbItems = document.querySelectorAll(".sb-item");
   check(sbItems.length >= 5, "选择器 .sb-item 找得到左栏导航项（实际 " + sbItems.length + " 个）");
   const tabs = document.querySelectorAll("#tabBar .tab");
-  check(tabs.length === 3, "后代选择器 #tabBar .tab 找得到三个 Tab（实际 " + tabs.length + " 个）");
+  /* 用 >= 3 而不是 === 3：Tab 会随功能增加（声音/音频页就是第 4 个），
+     门禁要钉的是「选择器找得到 Tab」，不是「Tab 恰好几个」——
+     写死个数会让每加一个功能页就红一次，那是门禁自己该修的脆弱点。 */
+  check(tabs.length >= 3, "后代选择器 #tabBar .tab 找得到 Tab（实际 " + tabs.length + " 个）");
   const sidebar = document.querySelector(".sidebar");
   check(!!sidebar, "querySelector('.sidebar') 找得到左栏");
   const crewView = document.getElementById("viewCrew");

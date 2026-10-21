@@ -345,6 +345,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(self._cardstore_detail())
         if path == "/api/card/lint":
             return self._json(self._card_lint())
+        if path == "/api/audio/presets":
+            return self._json(self._audio_presets())
         if path == "/api/skills":
             return self._json(self._skills())
         if path == "/api/connectors":
@@ -379,6 +381,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_card_fetch(body)
         if path == "/api/card/ingest":
             return self._post_card_ingest(body)
+        if path == "/api/audio/synth":
+            return self._post_audio_synth(body)
         if path == "/api/approval/respond":
             return self._post_approval_respond(body)
         if path == "/api/memory/delete":
@@ -523,6 +527,38 @@ class _Handler(BaseHTTPRequestHandler):
                             session=body.get("session", ""))
         if not r.get("ok"):
             return self._json({"ok": False, "err": r.get("err", "入库失败")}, 200)
+        return self._json({"ok": True, **(r.get("data") or {})})
+
+    # ---------------- 代码生成音频 ----------------
+    #
+    # 🔴 合成是**副作用**（要写 WAV 文件）⇒ 走 registry.call ⇒ 会过审批闸门。
+    #    不许在这里直接调 audio_synth.synth 绕过闸门。
+
+    def _audio_presets(self):
+        """音频预设清单（只读）。"""
+        r = self.fleet.call("audio.presets", args={})
+        if not r.get("ok"):
+            return {"ok": False, "err": r.get("err", "读不到音频预设"),
+                    "presets": []}
+        d = r.get("data") or {}
+        return {"ok": True, "presets": d.get("presets", []),
+                "note": d.get("note", "")}
+
+    def _post_audio_synth(self, body):
+        """合成一段声音。**走 registry.call**（副作用 ⇒ 要审批）。"""
+        spec = (body.get("spec") or "").strip()
+        if not spec:
+            return self._err(400, "缺少 spec（要合成哪种声音）")
+        args = {"spec": spec, "seed": body.get("seed") or ""}
+        if body.get("out"):
+            args["out"] = str(body["out"]).strip()
+        if body.get("sample_rate"):
+            args["sample_rate"] = int(body["sample_rate"])
+        r = self.fleet.call("audio.synth", args=args,
+                             tag=body.get("tag", ""),
+                             session=body.get("session", ""))
+        if not r.get("ok"):
+            return self._json({"ok": False, "err": r.get("err", "合成失败")}, 200)
         return self._json({"ok": True, **(r.get("data") or {})})
 
     def _skills(self):

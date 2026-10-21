@@ -139,6 +139,16 @@ CASES = [
     # ⑥ 不许 vendoring（只 import，不复制源码）。
     # 全离线：门禁自造假 skynet 包，不连真网络。
     ("eval_t16_skynet_bridge", ["evals/t16_skynet_bridge.py"], HERE, 120),
+    # T17：代码生成音频（procedural audio）
+    # 钉六件事：① 每个预设都要真的合成出非空 WAV（能下到声音≠能出到声音）；
+    # ② 同 seed ⇒ 逐字节相同，且**跨进程**也一样（str hash 每进程加盐，
+    #    用 hash() 会让声音每次都变 ⇒ 不可复现）；
+    # ③ 不同 seed ⇒ 不同声音（每台设备声音不同，重启后一样）；
+    # ④ 陌生预设必须抛明确错误并说清「只认哪几种」（不许静默退回默认）；
+    # ⑤ 零第三方依赖（本仓是后端进程，不引入 Tone.js/SDL/numpy）；
+    # ⑥ audio.synth 写文件 ⇒ 副作用 ⇒ 没闸门时 fail-closed。
+    # 全离线：合成全在内存与临时目录里完成。
+    ("eval_t17_audio_synth", ["evals/t17_audio_synth.py"], HERE, 180),
 ]
 
 

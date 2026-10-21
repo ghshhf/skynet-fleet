@@ -243,7 +243,7 @@
      ================================================================== */
 
   var ASSET_TAB = "cards";
-  var ASSET_CACHE = { cards: null, skills: null, conns: null, caps: null };
+  var ASSET_CACHE = { cards: null, skills: null, conns: null, caps: null, audio: null };
 
   function setAssetTab(tab) {
     ASSET_TAB = tab;
@@ -270,6 +270,13 @@
         ASSET_CACHE.skills = d;
         renderSkillsTab(d);
       }).catch(function (e) { renderTabErr(body, "读不到技能清单：" + e.message); });
+      return;
+    }
+    if (tab === "audio") {
+      api("/api/audio/presets").then(function (d) {
+        ASSET_CACHE.audio = d;
+        renderAudioTab(d);
+      }).catch(function (e) { renderTabErr(body, "读不到音频预设：" + e.message); });
       return;
     }
     api("/api/connectors").then(function (d) {
@@ -572,6 +579,76 @@
       wall.appendChild(card);
     });
     return wall;
+  }
+
+  /* ---------------- 声音（代码生成音频） ----------------
+     这里的每个声音都是**代码算出来的波形**，不是采样库回放。
+     合成会写 WAV 文件 ⇒ 走 /api/call ⇒ 会弹审批（闸门在服务端，绕不过去）。
+  */
+
+  function renderAudioTab(d) {
+    var body = $("tabBody");
+    body.textContent = "";
+    if (d.error) { body.appendChild(el("div", "why", d.error)); }
+    var list = d.presets || [];
+
+    body.appendChild(el("div", "sec", "代码生成音频 · " + list.length + " 个预设"));
+    body.appendChild(el("div", "why",
+      "波形由代码算出来（纯标准库，零第三方依赖，RTF≈0.009）——"
+      + "同一个种子逐字节可复现，不同设备用不同种子就有自己的声音。"
+      + "这是**功能性声音**（上线/告警/确认），不是人声（人声走「语音」那条线）。"));
+
+    if (!list.length) {
+      body.appendChild(el("div", "empty", "没有可用的音频预设。"));
+      return;
+    }
+
+    var wall = el("div", "wall");
+    list.forEach(function (p) {
+      var card = el("div", "card");
+      var top = el("div", "ctop");
+      top.appendChild(el("span", "dot-ok"));
+      top.appendChild(el("div", "cname", p.id));
+      card.appendChild(top);
+      card.appendChild(el("div", "cdesc", p.desc || ""));
+      var meta = el("div", "cmeta");
+      var btn = el("button", "hbtn go", "合成");
+      btn.addEventListener("click", function () { doSynth(p, btn); });
+      meta.appendChild(btn);
+      meta.appendChild(el("span", "", p.id));
+      card.appendChild(meta);
+      wall.appendChild(card);
+    });
+    body.appendChild(wall);
+  }
+
+  function doSynth(p, btn) {
+    if (!requireToken()) { return; }
+    APPR_TAG += 1;
+    var tag = "audio-" + p.id + "-" + APPR_TAG;
+    btn.disabled = true;
+    btn.textContent = "合成中…";
+    api("/api/audio/synth", {
+      method: "POST",
+      body: { spec: p.id, seed: "fleet", tag: tag, session: SESSION }
+    }).then(function (res) {
+      showResult(res);
+      pollApprovals();
+      if (res && res.ok) {
+        var d = res.data || {};
+        toast("「" + p.id + "」合成好了：" + (d.seconds || "?") + " 秒 / "
+          + (d.bytes || 0) + " 字节 → " + (d.path || ""));
+      } else if (res && res.code === "denied") {
+        toast("没合成：" + (res.err || "被拒绝"), true);
+      }
+      btn.disabled = false;
+      btn.textContent = "合成";
+    }).catch(function (e) {
+      showResult({ ok: false, cap: "audio.synth", code: "error", err: e.message });
+      pollApprovals();
+      btn.disabled = false;
+      btn.textContent = "合成";
+    });
   }
 
   /* ---------------- 连接器（MCP server 清单） ---------------- */
