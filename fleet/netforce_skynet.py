@@ -72,8 +72,16 @@ def netforce_home():
     return ""
 
 
-def _skynet():
-    """import skynet 包。失败抛 ImportError（消息说清怎么装）。"""
+def _ensure_path():
+    """把 netforce 仓库塞进 sys.path。没塞就 import skynet ⇒ ModuleNotFoundError。
+
+    🔴 **这里曾经漏了**：只有 `available()` 会走 `_skynet()` 注入路径，
+    而 `search()`/`probe()`/`fetch_text()` 等直接 `from skynet import ...`
+    ⇒ 首次调用时 netforce 明明在 `D:\\code\\netforce`，却报
+    「No module named 'skynet'」（真机实测踩到）。
+    门禁用假 skynet 包、路径已在 sys.path 里，所以没抓出来。
+    教训：**注入路径的副作用必须发生在每个使用点**，不能只放在"检查"函数里。
+    """
     home = netforce_home()
     if not home:
         raise ImportError(
@@ -82,6 +90,12 @@ def _skynet():
             f"或放到 {' / '.join(DEFAULT_NETFORCE_DIRS)} 之一")
     if home not in sys.path:
         sys.path.insert(0, home)
+    return home
+
+
+def _skynet():
+    """import skynet 包。失败抛 ImportError（消息说清怎么装）。"""
+    _ensure_path()
     import skynet  # noqa: F401
     return sys.modules["skynet"]
 
@@ -111,6 +125,7 @@ def search(query, wiki_tag=None, only=None, min_rel=None, limit=20,
     `min_rel` 低于此相关度的结果被丢掉（skynet 默认阈值 0.18 已够严）。
     `wiki_tag` 是 MediaWiki 站点的标签——**不给就不跑 wiki 引擎**（needs_tag）。
     """
+    _ensure_path()
     from skynet import search as S
     kwargs = {"wiki_tag": wiki_tag, "only": only,
               "workers": workers, "budget": budget}
@@ -139,6 +154,7 @@ def engine_health():
     🔴 skynet 的 `HEALTH` 字典键是 `引擎名` 或 `引擎名|语言桶`，
     字段是 `in/out/calls`（提交数/存活数/调用次数）——不是 submitted/alive。
     """
+    _ensure_path()
     from skynet import search as S
     S.bootstrap_health()
     out = []
@@ -167,6 +183,7 @@ def fetch_text(url, timeout=15.0, budget=25.0, gap=0.8, force_channel=None):
     `url/ok/status/size/final_url/channel/elapsed/text/data/error/cached/hops`。
     这里把它拍平成 dict，好让上层能力信封直接 JSON 化。
     """
+    _ensure_path()
     from skynet import net as N
     res = N.fetch_text(url, timeout=timeout, budget=budget, gap=gap,
                        force_channel=force_channel)
@@ -191,6 +208,7 @@ def download(url, dest, timeout=60.0, max_bytes=200 * 1024 * 1024, dedupe=True):
     skynet 的 `net.download()` 落盘后按内容 sha256 去重（同内容硬链接），
     这对音频资源很有用：不同 URL 常常指向同一份字节。
     """
+    _ensure_path()
     from pathlib import Path
     from skynet import net as N
     res = N.download(url, Path(dest), timeout=timeout,
@@ -222,6 +240,7 @@ def probe(url, timeout=15.0, gap=0.6):
     `content` 是 `Content`（含 text_chars/text_density/candidates/audio_links…）。
     这里全部拍平，别让上层去猜属性名。
     """
+    _ensure_path()
     from skynet import probe as P
     res = P.probe(url, timeout=timeout, gap=gap)
     c = getattr(res, "content", None)
@@ -262,6 +281,7 @@ def structure(url, max_urls=1500):
       feed 可能是 **None**（站上没有 feed），不是空串。
     这里统一拍平成稳定类型：计数用 int，列表用 list，缺失用空值。
     """
+    _ensure_path()
     from skynet import discover as D
     res = D.structure(url, max_urls=max_urls)
     if not isinstance(res, dict):
