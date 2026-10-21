@@ -484,6 +484,9 @@
       toast("读取能力清单失败：" + e.message, true);
     });
 
+    // W3 设备页
+    loadHost();
+
     // 待审批清单：轮询。这是「界面上能看出哪些能力在等审批」的实现。
     pollApprovals();
 
@@ -554,6 +557,155 @@
           (st.catchphrase ? " · 口癖「" + st.catchphrase + "」" : "");
         toast(txt);
       }).catch(function (e) { toast("读取人格状态失败：" + e.message, true); });
+    });
+
+    // ---- W3 设备页 ----
+    $("dpRefresh").addEventListener("click", function () {
+      loadHost().then(function () { toast("设备页已刷新"); });
+    });
+    $("dpShotBtn").addEventListener("click", function () {
+      $("dpShotBtn").disabled = true;
+      $("dpShotBtn").textContent = "截图中…";
+      loadHost().then(function () {
+        $("dpShotBtn").disabled = false;
+        $("dpShotBtn").textContent = "截屏";
+      });
+    });
+  }
+
+  /* ------------------------------------------------------------------ 设备页（W3）
+     数据全部来自后端 /api/host（它走 registry.call，闸门在服务端）。
+     🔴 界面不许自己算一套状态 —— 「这台设备现在能不能用」只有注册表知道。
+     🔴 拿不到就显示原因，不显示假的 0 或空表格。 */
+  var PROC_SORT = { key: "cpu", dir: -1 };     // 默认按 CPU 降序
+  var PROC_ROWS = [];
+
+  function fmtBytes(n) {
+    if (n === undefined || n === null) { return "—"; }
+    var u = ["B", "KB", "MB", "GB", "TB"], i = 0, v = Number(n);
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
+  }
+
+  function setBar(barId, valId, pct, text) {
+    var bar = $(barId);
+    if (bar) { bar.style.width = Math.max(0, Math.min(100, pct)) + "%"; }
+    if (valId) { $(valId).textContent = text; }
+  }
+
+  function renderNotes(notes) {
+    var box = $("dpNotes");
+    box.textContent = "";
+    (notes || []).forEach(function (n) {
+      box.appendChild(el("div", "dpnote", n));
+    });
+  }
+
+  function renderProcs(rows) {
+    PROC_ROWS = rows || [];
+    var box = $("dpProcs");
+    box.textContent = "";
+    if (!PROC_ROWS.length) {
+      $("dpProcHint").textContent = "（空）";
+      box.appendChild(el("div", "hint", "没有进程数据"));
+      return;
+    }
+    var key = PROC_SORT.key, dir = PROC_SORT.dir;
+    var sorted = PROC_ROWS.slice().sort(function (a, b) {
+      if (key === "name") {
+        return String(a.name || "").localeCompare(String(b.name || "")) * dir;
+      }
+      if (key === "pid") { return (Number(a.pid) - Number(b.pid)) * dir; }
+      return (Number(a.cpu) - Number(b.cpu)) * dir;
+    });
+    $("dpProcHint").textContent = sorted.length + " 个";
+    sorted.forEach(function (p) {
+      var row = el("div", "prow");
+      row.appendChild(el("span", "sortarrow",
+        key === "cpu" ? (dir < 0 ? "▼" : "▲") : ""));
+      var name = el("span", "pname", p.name || "?");
+      name.title = (p.name || "?") + "（pid " + p.pid + "）";
+      row.appendChild(name);
+      row.appendChild(el("span", "ppid", p.pid));
+      row.appendChild(el("span", "pcpu", (p.cpu === undefined ? "" : p.cpu + "%")));
+      // 点表头区域排序：点名字按名字，点 CPU 按 CPU
+      row.addEventListener("click", function () { procSort("name"); });
+      box.appendChild(row);
+    });
+  }
+
+  function procSort(key) {
+    if (PROC_SORT.key === key) {
+      PROC_SORT.dir = -PROC_SORT.dir;            // 再点一次换方向
+    } else {
+      PROC_SORT.key = key; PROC_SORT.dir = (key === "name") ? 1 : -1;
+    }
+    renderProcs(PROC_ROWS);
+  }
+
+  function renderHost(d) {
+    $("dpDevice").textContent = d.device || "—";
+    renderNotes(d.notes || []);
+
+    var m = d.monitor;
+    if (m) {
+      setBar("barCpu", "valCpu", m.cpu, (m.cpu === undefined ? "—" : m.cpu + "%"));
+      setBar("barMem", "valMem", m.mem,
+        (m.mem === undefined ? "—" : m.mem + "% · " + fmtBytes(m.mem_used) + "/" + fmtBytes(m.mem_total)));
+      setBar("barDisk", "valDisk", m.disk, (m.disk === undefined ? "—" : m.disk + "%"));
+      // 网络：上下行各画一条，宽度按 KB/s 归一（1000KB/s 满格）
+      var up = $( "barUp"), down = $("barDown");
+      if (up) { up.style.width = Math.min(100, (m.net_up || 0) / 10) + "%"; }
+      if (down) { down.style.width = Math.min(100, (m.net_down || 0) / 10) + "%"; }
+      $("valNet").textContent = "↑" + (m.net_up || 0) + " ↓" + (m.net_down || 0) + " KB/s";
+      renderProcs(m.procs || []);
+    } else {
+      setBar("barCpu", "valCpu", 0, "—");
+      setBar("barMem", "valMem", 0, "—");
+      setBar("barDisk", "valDisk", 0, "—");
+      setBar("barUp", "valNet", 0, "—");
+      renderProcs([]);
+    }
+
+    if (d.apps && d.apps.length) {
+      // 应用清单（host.apps）；进程表优先用 monitor 里的（带 CPU）
+      if (!(m && m.procs && m.procs.length)) {
+        renderProcs(d.apps.map(function (a) { return { pid: a.pid, name: a.name }; }));
+      }
+    }
+
+    var s = d.screen;
+    var box = $("dpShotBox");
+    if (s && s.shot_id) {
+      box.textContent = "";
+      var img = new Image();
+      img.alt = "屏幕预览";
+      // 鉴权头：图片走 <img src> 没法带自定义头 ⇒ 用 fetch + blob
+      fetch("/api/shot?id=" + encodeURIComponent(s.shot_id), {
+        headers: { "X-Fleet-Token": TOKEN }, cache: "no-store"
+      }).then(function (r) {
+        if (!r.ok) { throw new Error("HTTP " + r.status); }
+        return r.blob();
+      }).then(function (blob) {
+        box.textContent = "";
+        var im = new Image();
+        im.src = URL.createObjectURL(blob);
+        im.alt = "屏幕预览";
+        box.appendChild(im);
+      }).catch(function (e) {
+        box.textContent = "";
+        box.appendChild(el("span", "hint", "取图失败：" + e.message));
+      });
+    } else {
+      box.textContent = "";
+      box.appendChild(el("span", "hint", "点「截屏」看真图"));
+    }
+  }
+
+  function loadHost() {
+    return api("/api/host").then(renderHost).catch(function (e) {
+      $("dpDevice").textContent = "—";
+      renderNotes(["设备页取不到数据：" + e.message]);
     });
   }
 

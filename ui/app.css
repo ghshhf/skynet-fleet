@@ -270,3 +270,60 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .caprow .hbtn.go{font-size:10.5px;padding:2px 9px;border-radius:6px;
   border:1px solid var(--line);color:var(--fg-2);margin-top:6px}
 .caprow .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ==========================================================================
+   右栏：设备页（W3·主机可视化）
+   规则同全篇：数据全部来自后端（/api/host），界面不许自己算一套；
+   拿不到就显示原因，不显示假的 0 或空表格。
+   ========================================================================== */
+.devpanel{
+  width:296px;flex:0 0 296px;background:var(--sidebar);
+  border-left:1px solid var(--line);display:flex;flex-direction:column;
+  min-height:0;overflow:auto;
+}
+.dp-head{display:flex;align-items:center;gap:7px;padding:10px 12px;
+  border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--sidebar);z-index:2}
+.dp-title{font-size:13px;font-weight:600}
+.dp-head .grow{flex:1}
+.dp-dev{font-family:var(--mono);font-size:11px;color:var(--fg-2);
+  max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dp-sec{padding:10px 12px;border-bottom:1px solid var(--line-soft)}
+.dp-sech{display:flex;align-items:center;gap:6px;font-size:11.5px;
+  font-weight:600;color:var(--fg-2);margin-bottom:8px}
+.dp-sech .grow{flex:1}
+
+/* 资源条：真进度条 */
+.bars{display:flex;flex-direction:column;gap:6px}
+.bar-row{display:flex;align-items:center;gap:7px}
+.bl{font-size:11px;color:var(--fg-3);width:26px;flex:0 0 26px}
+.btrack{flex:1;height:7px;border-radius:4px;background:var(--panel-2);
+  overflow:hidden;display:flex;border:1px solid var(--line-soft)}
+.btrack i{display:block;height:100%;background:var(--accent);
+  transition:width .25s ease;min-width:0}
+.btrack.net{overflow:hidden}
+.btrack.net i:first-child{background:var(--ok)}
+.btrack.net i:last-child{background:var(--accent)}
+.bv{font-family:var(--mono);font-size:10.5px;color:var(--fg-2);
+  width:74px;flex:0 0 74px;text-align:right}
+
+/* 屏幕预览：真图 */
+.shotbox{border:1px solid var(--line);border-radius:8px;background:var(--panel);
+  min-height:96px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.shotbox img{max-width:100%;display:block}
+.shotbox .hint{font-size:11px;color:var(--fg-3);padding:14px 0}
+
+/* 进程表：可排序 */
+.proctable{display:flex;flex-direction:column;max-height:240px;overflow:auto}
+.prow{display:flex;align-items:center;gap:6px;font-size:11.5px;
+  padding:3px 4px;border-radius:5px;cursor:pointer}
+.prow:hover{background:var(--panel-2)}
+.prow .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prow .ppid{font-family:var(--mono);font-size:10px;color:var(--fg-3);width:44px;text-align:right}
+.prow .pcpu{font-family:var(--mono);font-size:10.5px;color:var(--fg-2);width:42px;text-align:right}
+.prow .sortarrow{font-size:9px;color:var(--accent);width:9px}
+
+/* 失败原因：说清楚为什么空着 */
+.dp-notes{padding:8px 12px 14px;display:flex;flex-direction:column;gap:6px}
+.dpnote{font-size:11px;color:var(--warn);background:var(--panel);
+  border:1px solid var(--line);border-left:2px solid var(--warn);
+  border-radius:6px;padding:6px 8px;line-height:1.5;word-break:break-word}

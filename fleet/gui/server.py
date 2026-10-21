@@ -28,7 +28,7 @@ import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from ..catalog import build
 from .approval import ApprovalBroker
@@ -129,6 +129,34 @@ class FleetServer:
         self._thread = None
         self.started_at = 0.0
         self.calls = []                              # 调用流水（给 /api/health 看）
+        self._shots = {}                            # 截图登记：id -> 路径（W3）
+        self._shot_seq = 0
+        self._shot_lk = threading.Lock()
+
+    # ---------------- 截图登记（W3 的屏幕预览）----------------
+
+    def register_shot(self, path):
+        """登记一张截图，返回可回取的 id。
+
+        🔴 为什么要登记而不是让前端直接传路径？
+        因为那等于开了一个**任意文件读取**的洞——前端传 `C:\\...\\任何文件`
+        服务端就给他读。登记制把「能看哪些图」限制在服务端自己截出来的那几张。
+        """
+        if not path:
+            return ""
+        with self._shot_lk:
+            self._shot_seq += 1
+            sid = "s%d" % self._shot_seq
+            self._shots[sid] = path
+            # 只留最近 16 张：截图是临时文件，存久了只是占地方
+            if len(self._shots) > 16:
+                for k in list(self._shots)[:-16]:
+                    self._shots.pop(k, None)
+        return sid
+
+    def shot_path(self, sid):
+        with self._shot_lk:
+            return self._shots.get(sid)
 
     # ---------------- 生命周期 ----------------
 
@@ -311,6 +339,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(self._cards())
         if path == "/api/approvals":
             return self._json(self._approvals())
+        if path == "/api/host":
+            return self._json(self._host_panel())
+        if path == "/api/shot":
+            return self._shot_png()
         self._err(404, f"没有这个接口: {path}")
 
     def _api_post(self, path):
@@ -395,6 +427,91 @@ class _Handler(BaseHTTPRequestHandler):
         rows = f.approval.pending()
         return {"ok": True, "enabled": True, "count": len(rows), "pending": rows,
                 "reason": ""}
+
+    # ---------------- W3 设备页（主机可视化）----------------
+
+    def _host_panel(self):
+        """设备页的聚合数据：资源条 / 进程表 / 应用清单 / 屏幕预览。
+
+        🔴 **一切能力调用都走 `registry.call`**，前端不许直接调设备——
+        闸门在服务端，前端绕不过去（红灯 5）。
+        🔴 **状态一律取自 `reg.availability()`**，界面不许自己算一套：
+        「这台设备现在能不能用」只有注册表知道（它在探测、它在解释失败原因）。
+        界面自己判断就会出现「界面说在线、实际调不动」的鬼故事。
+        """
+        f = self.fleet
+        reg = f.registry
+        rows = reg.availability()
+        # 选哪台设备展示：优先本机（kind=host），否则第一台
+        target = ""
+        for r in rows:
+            if r.get("kind") == "host":
+                target = r["name"]
+                break
+        if not target and rows:
+            target = rows[0]["name"]
+
+        panel = {"ok": True, "device": target, "devices": rows,
+                 "avail": None, "monitor": None, "apps": None, "screen": None,
+                 "notes": []}
+
+        if not target:
+            panel["notes"].append("注册表里一台设备都没有：先让节点上线")
+            return panel
+
+        dev_row = next((r for r in rows if r["name"] == target), None)
+        panel["avail"] = dev_row
+        if dev_row is not None and not dev_row.get("ok"):
+            panel["notes"].append(
+                "这台设备现在不可用：%s" % (dev_row.get("reason") or "原因不明"))
+            return panel
+
+        # 资源快照（host.monitor）——失败就明说，不给假 0
+        r = reg.call("host.monitor", args={}, gate=f.gate)
+        if r.ok:
+            panel["monitor"] = r.data
+        else:
+            panel["notes"].append("取不到资源快照：%s" % (r.err or "原因不明"))
+
+        r = reg.call("host.apps", args={}, gate=f.gate)
+        if r.ok:
+            panel["apps"] = (r.data or {}).get("apps") or []
+        else:
+            panel["notes"].append("取不到进程清单：%s" % (r.err or "原因不明"))
+
+        r = reg.call("host.screen", args={}, gate=f.gate)
+        if r.ok:
+            d = r.data or {}
+            panel["screen"] = {"path": d.get("path"),
+                               "shot_id": self.fleet.register_shot(d.get("path"))}
+        else:
+            panel["notes"].append("取不到屏幕：%s" % (r.err or "原因不明"))
+        return panel
+
+    def _shot_png(self):
+        """把注册过的截图发回浏览器（W3 的屏幕预览要真图，不是盲文点阵）。
+
+        只能发**注册表里登记过的**那张图（`fleet.register_shot` 登记的 id）——
+        不接受任意路径参数，否则这个端点就成了任意文件读取的洞。
+        """
+        q = urlparse(self.path)
+        sid = parse_qs(q.query).get("id", [""])[0]
+        if not sid:
+            return self._err(400, "缺少 id 参数（要哪张截图）")
+        path = self.fleet.shot_path(sid)
+        if not path:
+            return self._err(404, f"没有这张截图（id={sid}）：可能已过期或从未登记")
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+        except OSError as e:
+            return self._err(500, f"读截图失败：{e}")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _post_approval_respond(self, body):
         """主人对一条待审批表态（同意 / 拒绝）。

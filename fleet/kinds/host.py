@@ -79,14 +79,37 @@ class Host(BaseDevice):
         n2 = psutil.net_io_counters()
         up = (n2.bytes_sent - n1.bytes_sent) / 0.5 / 1024
         down = (n2.bytes_recv - n1.bytes_recv) / 0.5 / 1024
+        # 🔴 进程 CPU 必须**采样两次**才有真值（2026-10-21 实测）：
+        # psutil 的 process_iter(cpu_percent=...) 第一次调用恒返回 0.0
+        # （它需要两次采样之间的间隔来算差值）。只采一次 ⇒ 进程表整列是 0
+        # ⇒ 界面显示的是**假数据**（而且看起来很正常，最坏的一种假）。
+        # 实测：第一次全 0；隔 0.5s 再采才有真值（WorkBuddy 97.1% 等）。
         procs = []
         try:
-            for p in sorted(psutil.process_iter(["pid", "name", "cpu_percent"]),
-                            key=lambda x: x.info.get("cpu_percent") or 0,
-                            reverse=True)[:12]:
-                procs.append({"pid": p.info["pid"],
-                              "name": p.info.get("name") or "?",
-                              "cpu": round(p.info.get("cpu_percent") or 0, 1)})
+            for p in psutil.process_iter(["pid", "name"]):
+                try:
+                    p.cpu_percent(None)      # 第一次：只打时间戳
+                except Exception:
+                    pass
+            time.sleep(0.3)
+            rows = []
+            for p in psutil.process_iter(["pid", "name", "cpu_percent"]):
+                try:
+                    name = p.info.get("name") or "?"
+                    # 🔴 内核/空闲进程要排除（2026-10-21 实测）：
+                    # `System Idle Process` 的 cpu_percent 实测 713% —— 它不是
+                    # 「某个程序在烧 CPU」，而是「CPU 有多闲」，多核下会超过 100。
+                    # 把它排进「占用最高的进程」榜，界面就显示了一个没有意义的数，
+                    # 还会把真正的热点挤下去。
+                    if name in ("System Idle Process", "System", "Registry",
+                                "Memory Compression", "Secure System"):
+                        continue
+                    rows.append({"pid": p.info["pid"], "name": name,
+                                 "cpu": round(p.info.get("cpu_percent") or 0, 1)})
+                except Exception:
+                    continue
+            for r in sorted(rows, key=lambda x: x["cpu"], reverse=True)[:12]:
+                procs.append(r)
         except Exception:
             procs = []
         return {"cpu": round(cpu, 1), "mem": round(mem.percent, 1),
