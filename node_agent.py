@@ -23,6 +23,12 @@ import common
 
 _DEBUG = bool(os.environ.get("FLEET_DEBUG"))
 
+# 停机开关：让后台节点停止重连（干净下机）。见 stop_all()。
+_STOP = threading.Event()
+# 按名字停机的集合：只停指定节点，不影响其它节点（见 stop_node）。
+_STOPPED_NAMES = set()
+_STOP_NAMES_LK = threading.Lock()
+
 PENDING = {}
 _PENDING_LK = threading.Lock()
 _ID = threading.Lock()
@@ -77,13 +83,23 @@ def run_node(host, port, name, password, platform="windows",
         models = models.split(",")
 
     def _loop():
-        while True:
+        while not _STOP.is_set():
+            with _STOP_NAMES_LK:
+                if name in _STOPPED_NAMES:
+                    break
             try:
                 _session(host, port, name, password, platform, caps, sandbox, cap_req,
                          session, models, gpu, ram_gb)
             except OSError as e:
+                if _STOP.is_set():
+                    break
                 print(f"[{name}] 连接失败: {e}，3s 后重连", flush=True)
-            time.sleep(3)
+            # 停机时别再等满 3 秒
+            if _STOP.wait(3):
+                break
+            with _STOP_NAMES_LK:
+                if name in _STOPPED_NAMES:
+                    break
 
     if bg:
         threading.Thread(target=_loop, daemon=True).start()
@@ -91,10 +107,46 @@ def run_node(host, port, name, password, platform="windows",
         _loop()
 
 
+def stop_all():
+    """让所有后台节点停止重连（干净下机）。
+
+    为什么需要（2026-10-21 真事故的连带发现）：临时节点「下机即清」这条语义
+    **没法验证**——node_agent 的重连循环是无限的，测试想模拟「拔线」，
+    客户端 3 秒后就重连并同名接管，于是测的其实是「重连」而不是「下机」。
+    真实部署里也缺一个「让这台节点干净下线」的手段。
+    """
+    _STOP.set()
+
+
+def stop_node(name):
+    """只让**指定**的节点停止重连。
+
+    为什么不能只用 stop_all()：自检里 PC-A / Box / Her-Phone 等节点在后面阶段还要用，
+    全局停机会把它们一起停掉 ⇒ 后面阶段全崩（实测「统一意图编排」阶段就报 probe 失败）。
+    """
+    _STOPPED_NAMES.add(name)
+
+
+def reset_stop():
+    """解除停机（给自检在多个阶段之间复位用）。"""
+    _STOP.clear()
+    _STOPPED_NAMES.clear()
+
+
 def _session(host, port, name, password, platform, caps, sandbox, cap_req,
              session, models, gpu, ram_gb):
     os.makedirs(sandbox, exist_ok=True)
-    s = socket.create_connection((host, port), timeout=10)
+    # 🔴 建连超时与读超时是两回事，**必须分开**（2026-10-21 真踩）：
+    #   create_connection(timeout=N) 留下的 timeout 会**一直留在 socket 上**，
+    #   于是每 N 秒没收到任何消息就抛 socket.timeout。而心跳是 **15 秒**一次
+    #   —— 比超时长 ⇒ 每个节点**必然**每 ~13 秒断开重连一次（与网络无关）。
+    #   后果链：周期性重连 → 同名覆盖服务端注册表 → 旧连接的 finally 找不到自己
+    #   → session 清理被整段跳过 → 临时节点「下机即清」失效（钥匙留在门上）。
+    # 双保险（两道都做，缺一道就复发）：
+    #   ① 建连超时取 30 秒（> 心跳 15s），即使后面那行 settimeout 被删也不会周期性重连；
+    #   ② 建连后立刻回到阻塞模式，读超时交给心跳/看门狗判断，不靠 socket 报。
+    s = socket.create_connection((host, port), timeout=30)
+    s.settimeout(None)
     common.send_msg(s, {"t": common.AUTH, "name": name, "password": password})
     resp = common.recv_msg(s)
     if not resp or resp.get("t") != common.AUTH_OK:

@@ -46,6 +46,20 @@ _PENDING_LK = threading.Lock()
 _ID = threading.Lock()
 _counter = 0
 
+# 连接世代号：每次注册发一个递增号，用来分辨「同名重连后谁接管了」。
+# 为什么需要（2026-10-21 真事故）：node_agent 断线后 3s 重连且**同名** REGISTER，
+# 注册表按名覆盖 ⇒ 旧连接断开时已分不清「我还在线吗」⇒ session 清理被整段跳过。
+_GEN_ID = threading.Lock()
+_GEN_SEQ = 0
+
+
+def _next_gen():
+    global _GEN_SEQ
+    with _GEN_ID:
+        _GEN_SEQ += 1
+        return _GEN_SEQ
+
+
 OFFLINE_QUEUE = {}                       # name -> [{id, cmd}]  （离线排队，上线重放）
 _QUEUE_LK = threading.Lock()
 QUEUE_PATH = os.environ.get(
@@ -227,12 +241,30 @@ def _fire(event, name=""):
     return hits
 
 
-def _drop_node(name):
-    node = REGISTRY.with_lock(lambda d: d.pop(name, None))
-    if node and (node.get("info") or {}).get("session"):
+def _drop_node(name, expect_gen=None):
+    """摘除节点。
+
+    🔴 expect_gen：**只摘「指定世代」的那一条**，不许按名字盲pop（2026-10-21 真事故）。
+      同名重连后新连接已接管 ⇒ 旧连接的收尾若按名字 pop，会把**活得好好的新连接**
+      一起摘掉，新连接从此变成幽灵节点（心跳判死、路由全错）。
+      世代对不上 ⇒ 说明已经换代了 ⇒ 什么都不做（那不是下线，是换代）。
+    """
+    def _pop(d):
+        cur = d.get(name)
+        if cur is None:
+            return None
+        if expect_gen is not None and cur.get("gen") != expect_gen:
+            return None          # 已换代：不摘（否则误杀新连接）
+        return d.pop(name, None)
+
+    node = REGISTRY.with_lock(_pop)
+    if node is None:
+        return None
+    if (node.get("info") or {}).get("session"):
         # 临时节点（网吧等）下机：先走清理策略，再走掉线策略
         _fire({"event": "session_end", "mode": "session"}, name)
     _fire({"event": "node_offline", "node": name}, name)
+    return node
 
 
 def _drop_node_silent(name):
@@ -555,6 +587,7 @@ def _auth_ok(name, pw, global_pw):
 
 
 def _handle_node(conn, password):
+    _gen = None            # 注册成功才有世代号；认证阶段就断开的不算下线
     try:
         auth = common.recv_msg(conn)
         if not auth or auth.get("t") != common.AUTH:
@@ -568,8 +601,15 @@ def _handle_node(conn, password):
         if not reg or reg.get("t") != common.REGISTER:
             return
         name = reg.get("name")
+        # 🔴 同名重连要能区分「谁接管了」——2026-10-21 真事故：
+        #   node_agent 断线后 3s 重连且**同名** REGISTER，而这里是 d.__setitem__ 直接覆盖。
+        #   于是旧连接的 finally 里 `v["sock"] is conn` 匹配不上 → nm=None →
+        #   **整段 _drop_node → session_end 策略 → _session_cleanup 被跳过**。
+        #   临时节点「下机即清」在最常见的场景（断线重连）下失效 ⇒ 钥匙留在门上。
+        #   现在给每次注册发一个世代号 GEN，连接断开时只认「自己是当前世代」。
+        _gen = _next_gen()
         REGISTRY.with_lock(lambda d: d.__setitem__(name, {
-            "sock": conn, "token": token,
+            "sock": conn, "token": token, "gen": _gen,
             "platform": reg.get("platform", "?"),
             "info": reg.get("info", {}),
             "capabilities": reg.get("capabilities", []),
@@ -631,9 +671,15 @@ def _handle_node(conn, password):
     except OSError:
         pass
     finally:
-        nm = REGISTRY.with_lock(lambda d: next((k for k, v in d.items() if v["sock"] is conn), None))
+        # 🔴 只有「自己仍是这个节点的当前持有者」才算下线（2026-10-21 真事故）。
+        #   同名重连后新连接已接管 ⇒ 旧连接断开**不是**下线：
+        #     · 绝不能把新连接摘掉（那会变成幽灵节点，心跳判死/路由全错）；
+        #     · 也不能触发 session 清理（节点还在线，没下机）。
+        #   真正的下机 = 这个名字的所有连接都没了 ⇒ 此时才清理（钥匙不留门上）。
+        nm = REGISTRY.with_lock(lambda d: next(
+            (k for k, v in d.items() if v.get("gen") == _gen), None)) if _gen else None
         if nm:
-            _drop_node(nm)
+            _drop_node(nm, expect_gen=_gen)
             print(f"[-] 节点下线: {nm}", flush=True)
             audit.log("node.down", node=nm)
 
@@ -671,12 +717,18 @@ def _route_capability_request(name, m, conn):
                        topic=_followups().her_topic(cap))
 
 
-def serve(host, port, password):
+def serve(host, port, password, sock=None):
     global SERVE_HOST, SERVE_PORT
     SERVE_HOST, SERVE_PORT = host, port
     # 监听走路径层：host 给 0.0.0.0/空 时自动双栈（v4+v6），本机的公网 IPv6 才用得上。
     # 原来写死 AF_INET，等于把运营商给的公网 v6 白扔——跨网络只能借道第三方。
-    srv, note = netpath.listen(host, port)
+    if sock is None:
+        srv, note = netpath.listen(host, port)
+    else:
+        # 外部已绑好的套接字（自检用随机端口）：端口以套接字实际绑定为准。
+        srv, note = sock, "已绑定套接字"
+        port = srv.getsockname()[1]
+        SERVE_PORT = port
     show = host or "0.0.0.0"
     print(f"[*] Commander 监听 {show}:{port}（{note}，密码认证已启用）", flush=True)
     if note.startswith("双栈"):
@@ -761,6 +813,22 @@ def _cmd_seen(n=20):
         print(f"  {r['name']:12} {mark}  {(r.get('platform') or '?'):8} caps={caps:<24}"
               f" 最后见 {pv.ago(age)}前")
     return rows
+
+
+def _wait_online(name, timeout=10.0, poll=0.05):
+    """轮询等某个节点出现在注册表里，返回是否等到了。
+
+    🔴 为什么不用固定 sleep（2026-10-21 真踩）：
+      固定 sleep 到点就断言 ⇒ 机器一慢（门禁并行跑、磁盘慢）就打出**假阴性**
+      （实测见过「上线: False（session 模式已上报）」这种自相矛盾的话）。
+      等待不够久会**稳定**失败；等到了就是等到了，没等到要说清等的是谁、等了多久。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if REGISTRY.with_lock(lambda d: d.get(name)):
+            return True
+        time.sleep(poll)
+    return False
 
 
 def _cmd_exec(name, cmd):
@@ -1869,7 +1937,14 @@ def self_test(host, port, password):
         _fh = open(os.path.join(tdir, f"fleet_stacks_{os.getpid()}.txt"), "a", encoding="utf-8")
         faulthandler.dump_traceback_later(45, repeat=True, file=_fh)
         print(f"[dbg] 线程栈会写到 {_fh.name}", flush=True)
-    threading.Thread(target=serve, args=(host, port, password), daemon=True).start()
+    # 自检用**随机端口**（2026-10-21 实测修的偶发红）：
+    # 原来固定 9000，多个自检实例并发时，Windows 的 SO_REUSEADDR 允许第二个
+    # 进程绑上同一端口并抢走连接 ⇒ 后启动实例的节点注册进了先启动那个的注册表
+    # ⇒ 自己的进程永远等不到节点上线（条件永不成立，不是等得不够久）。
+    # 端口 0 = 让系统分配；拿到真实端口后再拿它去起节点。
+    _srv, _ = netpath.listen(host, 0)
+    port = _srv.getsockname()[1]
+    threading.Thread(target=serve, args=(host, port, password, _srv), daemon=True).start()
     time.sleep(0.4)
 
     # 两台 Windows 常驻节点
@@ -1883,10 +1958,9 @@ def self_test(host, port, password):
     node_agent.run_node(host, port, "Box", password, "android",
                          caps=["exec", "ctx", "compute"], sandbox="sandbox_box", bg=True,
                          models="polaris-0.4b,qwen3-4b", gpu=True, ram_gb=8)
-    for _ in range(50):
-        if REGISTRY.with_lock(lambda d: len(d)) >= 3:
-            break
-        time.sleep(0.1)
+    # 等三台都注册上：按名字轮询，不靠固定 sleep（机器一慢就会假阴性）
+    for _nm in ("PC-A", "Her-Phone", "Box"):
+        assert _wait_online(_nm), f"{_nm} 在 10 秒内没有上线"
 
     # 先写共享上下文，确保她的节点注册后能跨设备读到（L3 一体）
     _ctx_put("her", "game_lastnight", "昨晚那局还没玩完，说到第3关")
@@ -1938,7 +2012,9 @@ def self_test(host, port, password):
     print("  （PC-Ghost 尚未上线，命令已排队）", flush=True)
     node_agent.run_node(host, port, "PC-Ghost", password, "windows",
                          caps=["exec"], sandbox="sandbox_ghost", bg=True)
-    time.sleep(1.0)  # 等其上线->重放
+    if not _wait_online("PC-Ghost"):
+        raise AssertionError(f"PC-Ghost 在 10 秒内没有上线（等它注册完成再测重放）")
+    time.sleep(0.3)  # 上线后重放是异步的，给它一小会儿把排队命令跑掉
 
     print("\n=== 离线队列持久化（控制面重启也不丢「上线自动补」这个承诺）===", flush=True)
     _enqueue("PC-Restart", "echo 重启后命令还在")
@@ -1953,8 +2029,9 @@ def self_test(host, port, password):
     print("\n=== 临时节点（网吧）：下机即清，不留凭据 ===", flush=True)
     node_agent.run_node(host, port, "PC-Net", password, "windows", caps=["exec"],
                         sandbox="sandbox_net", bg=True, session=True)
-    time.sleep(0.9)
-    print(f"  上线: {bool(REGISTRY.with_lock(lambda d: d.get('PC-Net')))}（session 模式已上报）")
+    if not _wait_online("PC-Net"):
+        raise AssertionError("PC-Net 在 10 秒内没有上线（session 模式应已上报）")
+    print("  上线: True（session 模式已上报）")
     # 预置「能再进来」的东西：一枚入网凭据 + 一条排队命令 + 一枚卸载令牌。
     # 不预置就分不清「清理跑过了」和「本来就没东西可清」。
     _psk = "psk-" + os.urandom(6).hex()
@@ -1963,18 +2040,20 @@ def self_test(host, port, password):
     _net_tok = _issue_token("PC-Net", "uninstall")
     print(f"  预置：凭据 1 枚 / 排队 1 条 / 令牌 1 个 -> 下机应全清")
     sk = REGISTRY.with_lock(lambda d: (d.get("PC-Net") or {}).get("sock"))
+    # 🔴 要测的是「**真下机**」这条路径 ⇒ 必须先让客户端**别再重连**。
+    #   否则 node_agent 3 秒后就重连并同名接管服务端注册表，
+    #   那测到的其实是「同名重连」而不是「下机」——两者的清理语义正好相反：
+    #     · 重连：节点还在线 ⇒ **不该**清理（否则活着的节点凭据被误撤）
+    #     · 下机：节点没了 ⇒ **必须**清理（钥匙不许留在门上）
+    #   node_agent.stop_all() 就是为此加的（见 node_agent.stop_all 注释）。
+    node_agent.stop_node("PC-Net")
     if sk:
         try:
             sk.close()                 # 模拟下机（拔线/关浏览器）
         except OSError:
             pass
-    # 🔴 这里**不能**用固定 sleep 等清理（2026-10-21 真踩过）：
-    #   清理动作发生在 _handle_node 那个线程的 finally 里（socket 关闭 → recv 返回
-    #   None → break → finally → _drop_node → session_end 策略 → _session_cleanup）。
-    #   那是**另一个线程**，机器一忙（门禁并行跑、磁盘慢）它就还没轮到，
-    #   固定 sleep 0.9s 到了就断言 —— 于是「代码没坏但门禁红了」。
-    #   2026-10-21 实测：全量门禁跑到这条时红过一次，单跑却是绿的。
-    #   正确写法：**轮询等条件成立**，并给一个明确的上限；到点还没成立就是真坏了。
+    # 轮询等清理条件成立（不用固定 sleep）：清理动作在 _handle_node 线程的 finally 里，
+    # 那是**另一个线程**，机器一忙就还没轮到 ⇒ 等不到就说明真坏了。
     deadline = time.time() + 10.0
     while time.time() < deadline:
         _left_psk = [r for r in enroll.list_psks(ENROLL_LEDGER) if r["node"] == "PC-Net"]
@@ -2000,9 +2079,65 @@ def self_test(host, port, password):
     print(f"  审计留痕：流水里有 {len(_audit)} 条清理记录（E-7 可逐条删）")
     assert _audit, "清理必须留痕，否则事后无法核对到底清没清"
 
+    print("\n=== 同名重连：节点还在线 ⇒ 绝不能清理（2026-10-21 真事故的正面验证）===", flush=True)
+    # 这条路径原来**测不到**，缺陷才潜伏到线上：
+    #   node_agent 断线后 3s 重连且同名 REGISTER ⇒ 服务端注册表被覆盖 ⇒
+    #   旧连接的 finally 按 sock 找自己找不到 ⇒ nm=None ⇒ 整段清理被跳过。
+    #   而「跳过」在**下机**场景是灾难（钥匙留在门上）。
+    # 现在要求：重连接管时，旧连接断开**不得**误杀新连接，也**不得**触发清理。
+    #
+    # 🔴 手法说明（第一次写这��测试时踩过）：**不许篡改真实注册表里的 sock**——
+    #   那个 socket 还被服务端的 _handle_node 线程持有，替换它会让那个线程永远
+    #   读不到东西、finally 又因世代不匹配而不下线 ⇒ 节点条目永久残留，
+    #   污染后面所有阶段（实测「统一意图编排」阶段就报 probe 失败）。
+    #   正确做法：用**隔离的名字**直接验证 _drop_node 的世代语义（真代码真行为）。
+    _TESTNAME = "PC-Rejoin-Sem"
+    _gen_old = _next_gen()
+    _gen_new = _next_gen()
+    # 1) 先放一个「旧世代」的节点条目
+    REGISTRY.with_lock(lambda d: d.__setitem__(_TESTNAME, {
+        "sock": None, "token": "t-old", "gen": _gen_old,
+        "platform": "windows", "info": {"session": True},
+        "capabilities": ["exec"], "last_hb": time.time(),
+    }))
+    _r_psk = "psk-" + os.urandom(6).hex()
+    enroll.register_psk(ENROLL_LEDGER, _r_psk, _TESTNAME)
+    _r_tok = _issue_token(_TESTNAME, "uninstall")
+    # 2) 同名重连：新世代接管（这正是 node_agent 重连时发生的事）
+    REGISTRY.with_lock(lambda d: d.__setitem__(_TESTNAME, {
+        "sock": None, "token": "t-new", "gen": _gen_new,
+        "platform": "windows", "info": {"session": True},
+        "capabilities": ["exec"], "last_hb": time.time(),
+    }))
+    # 3) 旧连接这时才走 finally：_drop_node(旧世代) 必须**什么都不做**
+    _dropped = _drop_node(_TESTNAME, expect_gen=_gen_old)
+    _still_here = bool(REGISTRY.with_lock(lambda d: d.get(_TESTNAME)))
+    _cur_gen = REGISTRY.with_lock(lambda d: (d.get(_TESTNAME) or {}).get("gen"))
+    _r_left_psk = [r for r in enroll.list_psks(ENROLL_LEDGER) if r["node"] == _TESTNAME]
+    with _TOKEN_LK:
+        _r_left_tok = sum(1 for v in TOKENS.values() if v.get("node") == _TESTNAME)
+    print(f"  旧连接收尾后仍在册: {_still_here}（应 True：新连接没被误杀）")
+    print(f"  当前世代: {_cur_gen}（应等于新世代 {_gen_new}）")
+    print(f"  重连后凭据余 {len(_r_left_psk)} / 令牌余 {_r_left_tok}（应各 1：节点还在线，不该清）")
+    assert _dropped is None, "旧世代的收尾不该摘掉新世代的节点"
+    assert _still_here, "旧连接的收尾把新连接误杀了（会变成幽灵节点）"
+    assert _cur_gen == _gen_new, "节点条目被旧世代覆盖了"
+    assert len(_r_left_psk) == 1, "节点还在线却把凭据清了（重连 ≠ 下机）"
+    assert _r_left_tok == 1, "节点还在线却把令牌清了（重连 ≠ 下机）"
+    # 4) 现在真下机：新世代的连接断开 ⇒ 必须清理
+    _drop_node(_TESTNAME, expect_gen=_gen_new)
+    _r2 = [r for r in enroll.list_psks(ENROLL_LEDGER) if r["node"] == _TESTNAME]
+    with _TOKEN_LK:
+        _r2t = sum(1 for v in TOKENS.values() if v.get("node") == _TESTNAME)
+    print(f"  真下机后：凭据余 {len(_r2)} / 令牌余 {_r2t}（应各 0：钥匙不许留在门上）")
+    assert not _r2, "真下机了凭据却没清（钥匙留在门上）"
+    assert not _r2t, "真下机了令牌却没清"
+
     print("\n=== 反向推送 bootstrap（第三原则，loopback 校验）===", flush=True)
-    srv = boot.start_server(".", host, 9100)
-    b = boot.fetch_bytes(f"http://{host}:9100", "node_agent.py")
+    # 端口 0 = 系统随机分配：并发自检时固定 9100 会直接撞 10048。
+    srv = boot.start_server(".", host, 0)
+    _bport = srv.server_address[1]
+    b = boot.fetch_bytes(f"http://{host}:{_bport}", "node_agent.py")
     local = open("node_agent.py", "rb").read()
     print(f"  bootstrap 分发 node_agent.py: {len(b)}B，与本地一致={b == local}")
     srv.shutdown()
