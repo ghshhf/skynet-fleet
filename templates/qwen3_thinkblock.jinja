@@ -1,0 +1,59 @@
+{#-
+  Qwen3 修正版 chat template（天网 · 桌面端）
+
+  为什么需要它（2026-10-21 实测）：
+    北极星 GGUF（v13 / v1 等）里存的还是官方模板的**条件块**：
+        {%- if enable_thinking is defined and enable_thinking is false %}
+            {{- '<think>\n\n</think>\n\n' }}
+        {%- endif %}
+    推理端不传 enable_thinking 时，这个块不渲染，提示里就**少了 think 段**，
+    而模型训练时每条 assistant 前面是 `<think>\n\n</think>\n\n` ⇒ 格式错位
+    ⇒ 实测每条回答开头泄漏一个 "</think>"（这就是 0.6B「不能正常交流、
+      前后逻辑错」的根因之一，见 TOPIC-beijixing-persona.md §四）。
+
+  本模板的修法：把 think 块**无条件**插在生成提示之后，与训练格式逐字对齐。
+  历史 assistant 消息不插 think 块（与训练侧模板行为一致：只有最后一条插）。
+
+  用法：llama-server --chat-template <本文件路径>
+  注意：本文件用 UTF-8 保存；jinja 里不要用中文注释以外的变量名。
+-#}
+{%- if tools %}<|im_start|>system
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{{- tools }}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{%- endif %}
+{%- if messages[0]['role'] == 'system' %}
+<|im_start|>system
+{{ messages[0]['content'] }}<|im_end|>
+{%- else %}
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+{%- endif %}
+{%- for message in messages %}
+{%- if message.role == "user" %}
+<|im_start|>user
+{{ message['content'] }}<|im_end|>
+<|im_start|>assistant
+{%- elif message.role == "system" %}
+<|im_start|>system
+{{ message['content'] }}<|im_end|>
+<|im_start|>assistant
+{%- elif message.role == "assistant" %}
+<|im_start|>assistant
+{{ message['content'] }}<|im_end|>
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{{- '<think>\n\n</think>\n\n' }}
+{%- endif %}
