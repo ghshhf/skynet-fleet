@@ -416,6 +416,67 @@ def t_exclusive_bind_real():
             pass
 
 
+# ------------------------------------- ⑥ 硬断线的 session 清理缺口（钥匙留在门上）
+
+@check("硬断线判死：临时节点的凭据照样清（钥匙不许留在门上）")
+def t_hard_disconnect_cleans_session():
+    """🔴 硬断线（拔网线/休眠/交换机清表）时服务端收不到 FIN，
+    走不到 `_handle_node` 的 finally ⇒ 只能等心跳判死（180s）走 `_drop_node_silent`。
+
+    而原来 `_drop_node_silent` 只是 `d.pop(name)` 就完事 ⇒ **临时节点（网吧/借用设备）
+    的 PSK 永远留在账本里** ⇒ 那台机器换人用，下一个人照样能认证进来。
+    「钥匙留在门上」是这个项目最不能犯的错。
+    """
+    reg = _fresh_registry()
+    import enroll
+    tdir = tempfile.mkdtemp(prefix="fleet_t11_hard_")
+    led = os.path.join(tdir, "ledger.json")
+    commander.ENROLL_LEDGER = led
+    psk = "psk-" + os.urandom(6).hex()
+    enroll.register_psk(led, psk, "HARD-1")
+    reg.with_lock(lambda d: d.__setitem__("HARD-1", {
+        "sock": None, "token": "t1", "gen": commander._next_gen(),
+        "platform": "windows", "info": {"session": True},
+        "capabilities": ["exec"], "last_hb": time.time()}))
+    commander._issue_token("HARD-1", "uninstall")
+    with commander._QUEUE_LK:
+        commander.OFFLINE_QUEUE["HARD-1"] = [{"id": "q", "cmd": "echo hi"}]
+    assert len([r for r in enroll.list_psks(led) if r["node"] == "HARD-1"]) == 1
+    # 心跳判死路径
+    commander._drop_node_silent("HARD-1")
+    assert not reg.with_lock(lambda d: d.get("HARD-1")), "判死后节点还挂在注册表里"
+    left_psk = [r for r in enroll.list_psks(led) if r["node"] == "HARD-1"]
+    assert not left_psk, (
+        "硬断线判死后临时节点凭据没清（钥匙留在门上）: %r" % left_psk)
+    with commander._TOKEN_LK:
+        left_tok = sum(1 for v in commander.TOKENS.values() if v.get("node") == "HARD-1")
+    assert not left_tok, "硬断线判死后令牌没清"
+    with commander._QUEUE_LK:
+        left_q = len(commander.OFFLINE_QUEUE.get("HARD-1", []))
+    assert not left_q, "硬断线判死后离线队列没清"
+
+
+@check("硬断线判死：常驻节点不该被清凭据（它还要再上线）")
+def t_hard_disconnect_keeps_persistent():
+    """反过来也要钉死：常驻节点断线只是掉线，**不是下机**。
+    清了它的凭据 ⇒ 它下次上线就进不来了。
+    """
+    reg = _fresh_registry()
+    import enroll
+    tdir = tempfile.mkdtemp(prefix="fleet_t11_keep_")
+    led = os.path.join(tdir, "ledger.json")
+    commander.ENROLL_LEDGER = led
+    psk = "psk-" + os.urandom(6).hex()
+    enroll.register_psk(led, psk, "KEEP-1")
+    reg.with_lock(lambda d: d.__setitem__("KEEP-1", {
+        "sock": None, "token": "t1", "gen": commander._next_gen(),
+        "platform": "windows", "info": {"session": False},
+        "capabilities": ["exec"], "last_hb": time.time()}))
+    commander._drop_node_silent("KEEP-1")
+    left = [r for r in enroll.list_psks(led) if r["node"] == "KEEP-1"]
+    assert left, "常驻节点判死后凭据被清了（它还得再上线，凭据不该撤）"
+
+
 def main():
     ok = 0
     bad = 0
