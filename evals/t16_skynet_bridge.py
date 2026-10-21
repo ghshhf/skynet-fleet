@@ -253,6 +253,23 @@ def main():
         check(NS.netforce_home() == home,
               "netforce_home 找到的是 NETFORCE_HOME 指的地方")
 
+        # ---------- ①b 路径注入必须在**使用点**，不能只在 available() 里 ----------
+        # 🔴 真机实测踩到：只 available() 往 sys.path 塞了 netforce 路径，
+        #    而 probe()/search()/fetch_text() 直接 `from skynet import ...`
+        #    ⇒ 报「No module named 'skynet'」，netforce 明明在 D:\code\netforce。
+        #    门禁原来只在 available() 之后调用，所以没抓到（假包已在 sys.path）。
+        #    这里模拟真机：**先不调 available()**，把 netforce 路径从 sys.path 拿掉、
+        #    清掉已 import 的 skynet，然后直接调 probe()。
+        for k in [k for k in sys.modules if k == "skynet" or k.startswith("skynet.")]:
+            del sys.modules[k]
+        sys.path[:] = [p for p in sys.path if p != home]
+        try:
+            d2 = NS.probe("https://fake.example/x")
+            check(d2.get("alive") is True,
+                  "不先调 available() 直接 probe 也能通（路径在使用点注入）")
+        except ImportError as e:
+            check(False, "不先调 available() 直接 probe 报 ImportError：%s" % e)
+
         # ---------- ② probe 包装：字段名不许猜 ----------
         d = NS.probe("https://fake.example/x")
         check(d.get("alive") is True, "probe 包装读到了 alive（不是 ok）")
