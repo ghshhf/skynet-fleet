@@ -35,6 +35,14 @@ def _smoke():
     import json
     import urllib.request
 
+    # CI 的 Windows runner 控制台默认 charmap 编码，打印中文会 UnicodeEncodeError。
+    # 统一强制 UTF-8 + 容错替换，本地/CI/冻扁包三种环境都不再挑编码。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     srv = FleetServer(port=0, approval=ApprovalBroker())
     port = srv.start()
     url = srv.page_url("light")
