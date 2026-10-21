@@ -1092,6 +1092,11 @@
         Array.prototype.forEach.call(document.querySelectorAll(".sb-item"), function (o) {
           o.classList.toggle("on", o === item);
         });
+        if (view === "voice") {
+          showView("voice", "语音对话");
+          vvHint(VV.hands ? "免手已开" : "");
+          return;
+        }
         if (view === "assets") {
           showView("assets", "专家 · 技能 · 连接器");
           setAssetTab(ASSET_TAB);
@@ -1418,11 +1423,452 @@
     });
   }
 
+  /* ================================================================ 语音对话（光球）
+     与 chat 视图的分工：chat 是「打字聊天 + 设备工作台」，这里是「张嘴就聊」。
+     光球不是装饰，它是状态机本身——语音交互最大的焦虑是「它到底收到没有」，
+     呼吸、波纹、脉冲就是在回答这个焦虑。形态照 desktop.py 的独立语音模式。
+
+     后端两个接口（server.py 新增；内部走**仓库根**的 voice.py，不是
+     fleet/gui/voice.py 那套命令式语音）：
+       POST /api/voice/recognize   裸 wav 进 → {ok, text} 出
+       POST /api/voice/say         {text} 进 → audio/wav 出（音色随当前角色卡）
+
+     录音走 getUserMedia + AudioContext 采 PCM 再自己封 WAV：不用 MediaRecorder，
+     是因为它给的是 webm/opus，后端还得 ffmpeg 转一道；能省一次转码就省，
+     也少一个失败点。
+
+     🔴 失败一律写进字幕位并说清原因（权限 / 设备 / 超时 / HTTP 码），
+        不许「转圈到底」——那是最难查的那种坏。
+  */
+
+  var VV = {
+    state: "idle",        // idle | listen | think | speak
+    hands: false,         // 免手连续
+    ac: null, src: null, stream: null, node: null,
+    chunks: [], sampleRate: 48000, t0: 0, timer: 0,
+    audio: null, raf: 0, busy: false
+  };
+
+  var ORB_LABEL = { idle: "空闲", listen: "在听", think: "在想", speak: "在说" };
+
+  function hexA(hex, a) {
+    var h = String(hex || "").trim();
+    if (h.charAt(0) === "#" && h.length === 4) {
+      h = "#" + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2) + h.charAt(3) + h.charAt(3);
+    }
+    if (h.charAt(0) !== "#" || h.length !== 7) { return "rgba(47,107,216," + a + ")"; }
+    var n = parseInt(h.slice(1), 16);
+    return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
+  }
+
+  function orbAccent() {
+    try {
+      var v = getComputedStyle(document.documentElement).getPropertyValue("--accent");
+      return (v || "").trim() || "#2f6bd8";
+    } catch (e) { return "#2f6bd8"; }
+  }
+
+  function orbDraw() {
+    var cv = $("orbCanvas");
+    if (!cv || !cv.getContext) { return; }
+    var ctx = cv.getContext("2d");
+    var dpr = window.devicePixelRatio || 1;
+    var w = cv.clientWidth || 260, h = cv.clientHeight || 260;
+    var pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+    // 只在尺寸真变了才重设（重设会清空画布，每帧都设会闪）
+    if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    var cx = w / 2, cy = h / 2;
+    var base = Math.min(w, h) * 0.24;      // 核心球基准半径
+    var t = performance.now() / 1000;
+    var col = orbAccent();
+
+    // 底光晕：让球"发光"，不是贴纸
+    var glow = ctx.createRadialGradient(cx, cy, base * 0.2, cx, cy, base * 2.6);
+    glow.addColorStop(0, hexA(col, 0.28));
+    glow.addColorStop(1, hexA(col, 0));
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.arc(cx, cy, base * 2.6, 0, Math.PI * 2); ctx.fill();
+
+    // 听：波纹一圈圈往外扩，扩到边就淡掉
+    if (VV.state === "listen") {
+      for (var i = 0; i < 3; i++) {
+        var p = (t * 0.55 + i / 3) % 1;
+        ctx.strokeStyle = hexA(col, 0.40 * (1 - p));
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(cx, cy, base + p * base * 1.9, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+
+    // 想：两段弧反向转
+    if (VV.state === "think") {
+      for (var k = 0; k < 2; k++) {
+        var a0 = t * 2.2 + k * Math.PI;
+        ctx.strokeStyle = hexA(col, 0.75 - k * 0.35);
+        ctx.lineWidth = 3;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.arc(cx, cy, base + 10 + k * 9, a0, a0 + Math.PI * 0.55);
+        ctx.stroke();
+      }
+    }
+
+    // 核心球：呼吸节奏随状态变（idle 慢而浅 / speak 快而深）
+    var amp = 0.06, speed = 0.8;
+    if (VV.state === "speak") { amp = 0.20; speed = 5.2; }
+    else if (VV.state === "listen") { amp = 0.10; speed = 2.4; }
+    else if (VV.state === "think") { amp = 0.04; speed = 1.6; }
+    var r0 = base * (1 + Math.sin(t * speed) * amp);
+
+    var core = ctx.createRadialGradient(
+      cx - r0 * 0.30, cy - r0 * 0.35, r0 * 0.15, cx, cy, r0);
+    core.addColorStop(0, hexA(col, 0.95));
+    core.addColorStop(0.65, hexA(col, 0.55));
+    core.addColorStop(1, hexA(col, 0.22));
+    ctx.fillStyle = core;
+    ctx.beginPath(); ctx.arc(cx, cy, r0, 0, Math.PI * 2); ctx.fill();
+  }
+
+  function orbLoop() {
+    // 视图不可见就不画（rAF 空转开销极小，但画布不白画）
+    var v = $("viewVoice");
+    if (v && v.classList.contains("on")) {
+      // 画布不可用（离线 canvas mock / 极小窗口）时只跳过这一帧，
+      // 绝不让光球把整个视图带崩——语音功能不依赖它。
+      try { orbDraw(); } catch (e) { /* 跳过本帧 */ }
+    }
+    // 门禁的模拟 DOM 里没有 requestAnimationFrame：不循环，也不抛
+    if (typeof requestAnimationFrame === "function") {
+      VV.raf = requestAnimationFrame(orbLoop);
+    }
+  }
+
+  function setOrbState(s) {
+    VV.state = s;
+    var hint = $("vvHint");
+    if (hint && !hint.dataset.err) { hint.textContent = ORB_LABEL[s] || s; }
+  }
+
+  function vvSub(text) {
+    var n = $("vvSub");
+    if (n) { n.textContent = text || ""; }
+  }
+
+  function vvHint(text, isErr) {
+    var n = $("vvHint");
+    if (!n) { return; }
+    n.textContent = text || "";
+    n.style.color = isErr ? "var(--danger)" : "";
+    if (isErr) { n.dataset.err = "1"; } else { delete n.dataset.err; }
+  }
+
+  function vvFail(msg) {
+    vvHint("✕ " + msg, true);
+    setOrbState("idle");
+    $("vvMic").classList.remove("rec");
+    VV.busy = false;
+  }
+
+  /* ---- 录音 ---- */
+
+  function vvCloseRec() {
+    try { if (VV.node) { VV.node.disconnect(); } } catch (e) { /* 已断 */ }
+    try { if (VV.src) { VV.src.disconnect(); } } catch (e) { /* 已断 */ }
+    try { if (VV.stream) { VV.stream.getTracks().forEach(function (tr) { tr.stop(); }); } } catch (e) { /* 已停 */ }
+    try { if (VV.ac && VV.ac.close) { VV.ac.close(); } } catch (e) { /* 已关 */ }
+    VV.node = VV.src = VV.stream = VV.ac = null;
+  }
+
+  function vvStartRec() {
+    if (VV.state === "listen") { return vvStopRec(); }
+    if (VV.busy) { return; }
+    if (!requireToken()) { return; }
+    // 正在说话就打断——语音交互里「不想听了」必须立刻生效
+    if (VV.audio) { try { VV.audio.pause(); } catch (e) { /* 已停 */ } VV.audio = null; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return vvFail("这个窗口拿不到麦克风接口（navigator.mediaDevices 缺失）");
+    }
+    navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    }).then(function (stream) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) {
+        stream.getTracks().forEach(function (tr) { tr.stop(); });
+        return vvFail("这个窗口没有 AudioContext，录不了音");
+      }
+      VV.stream = stream;
+      VV.ac = new AC();
+      VV.sampleRate = VV.ac.sampleRate || 48000;
+      VV.src = VV.ac.createMediaStreamSource(stream);
+      VV.node = VV.ac.createScriptProcessor(4096, 1, 1);
+      VV.chunks = [];
+      VV.node.onaudioprocess = function (ev) {
+        VV.chunks.push(new Float32Array(ev.inputBuffer.getChannelData(0)));
+      };
+      VV.src.connect(VV.node);
+      VV.node.connect(VV.ac.destination);
+      VV.t0 = Date.now();
+      setOrbState("listen");
+      vvSub("在听……说完点一下麦克风。");
+      vvHint("麦克风已开（采样率 " + VV.sampleRate + " Hz）");
+      $("vvMic").classList.add("rec");
+      // 60 秒兜底：忘了停就一直录会吃满内存
+      clearTimeout(VV.timer);
+      VV.timer = setTimeout(function () {
+        if (VV.state === "listen") { vvStopRec(); }
+      }, 60000);
+    }).catch(function (e) {
+      var n = (e && e.name) || "Error";
+      var why = n === "NotAllowedError"
+        ? "麦克风被拒绝：允许后重试（地址栏旁的权限图标）"
+        : n === "NotFoundError" ? "系统里找不到麦克风设备"
+          : n === "NotReadableError" ? "麦克风被别的程序占着"
+            : ((e && e.message) || String(e));
+      vvFail("拿不到麦克风：" + why);
+    });
+  }
+
+  // 48k → 16k：取平均而不是抽点，避免混叠
+  function vvDown(buf, from, to) {
+    if (!to || to >= from) { return buf; }
+    var ratio = from / to;
+    var n = Math.floor(buf.length / ratio);
+    var out = new Float32Array(n);
+    for (var i = 0; i < n; i++) {
+      var a = Math.floor(i * ratio);
+      var b = Math.min(Math.floor((i + 1) * ratio), buf.length);
+      var s = 0;
+      for (var j = a; j < b; j++) { s += buf[j]; }
+      out[i] = s / Math.max(1, b - a);
+    }
+    return out;
+  }
+
+  function vvEncodeWav(samples, rate) {
+    var n = samples.length;
+    var ab = new ArrayBuffer(44 + n * 2);
+    var dv = new DataView(ab);
+    function ws(off, s) {
+      for (var i = 0; i < s.length; i++) { dv.setUint8(off + i, s.charCodeAt(i)); }
+    }
+    ws(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); ws(8, "WAVE");
+    ws(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
+    dv.setUint16(22, 1, true); dv.setUint32(24, rate, true);
+    dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    ws(36, "data"); dv.setUint32(40, n * 2, true);
+    for (var i = 0; i < n; i++) {
+      var v = Math.max(-1, Math.min(1, samples[i]));
+      dv.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    }
+    return new Blob([ab], { type: "audio/wav" });
+  }
+
+  function vvStopRec() {
+    if (VV.state !== "listen") { return Promise.resolve(null); }
+    clearTimeout(VV.timer);
+    var total = 0;
+    VV.chunks.forEach(function (c) { total += c.length; });
+    var sr = VV.sampleRate || 48000;
+    var pcm = new Float32Array(total);
+    var off = 0;
+    VV.chunks.forEach(function (c) { pcm.set(c, off); off += c.length; });
+    VV.chunks = [];
+    vvCloseRec();
+    $("vvMic").classList.remove("rec");
+    var durMs = Date.now() - VV.t0;
+
+    if (!total) { vvFail("没录到声音（0 个采样点）：检查系统默认输入设备"); return Promise.resolve(null); }
+    if (durMs < 400) { vvFail("录得太短（" + durMs + "ms），再说一次"); return Promise.resolve(null); }
+
+    vvHint("录到 " + (durMs / 1000).toFixed(1) + " 秒，送回本机识别……");
+    return Promise.resolve(vvEncodeWav(vvDown(pcm, sr, 16000), 16000)).then(function (blob) {
+      return vvRecognize(blob);
+    }).then(function (d) {
+      var text = (d.text || "").trim();
+      if (!text) { throw new Error("识别结果为空（后端没听出字来）"); }
+      vvSub(text);
+      vvHint("识别：" + (d.meta && d.meta.backend ? d.meta.backend : "whisper"));
+      return vvAsk(text);
+    }).catch(function (e) {
+      vvFail(e.message || String(e));
+    });
+  }
+
+  /* ---- 后端三趟：识别 → 对话(SSE) → 合成 ---- */
+
+  function vvRecognize(blob) {
+    setOrbState("think");
+    vvSub("……");
+    return fetch("/api/voice/recognize", {
+      method: "POST",
+      headers: { "X-Fleet-Token": TOKEN, "Content-Type": "audio/wav" },
+      body: blob,
+      cache: "no-store"
+    }).then(function (r) {
+      return r.text().then(function (txt) {
+        var d = null;
+        try { d = JSON.parse(txt); } catch (e) { d = null; }
+        if (!r.ok || !d || !d.ok) {
+          throw new Error("识别失败（HTTP " + r.status + "）："
+            + ((d && d.err) || txt.slice(0, 160) || "无响应体"));
+        }
+        return d;
+      });
+    });
+  }
+
+  // 收集 SSE 的完整回答文本（不往 chat 视图渲染，两个视图互不污染）
+  function vvAsk(prompt) {
+    VV.busy = true;
+    setOrbState("think");
+    return fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Fleet-Token": TOKEN },
+      body: JSON.stringify({ prompt: prompt }),
+      cache: "no-store"
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.text().then(function (t) {
+          var why = t;
+          try { why = JSON.parse(t).err || t; } catch (e) { /* 原样带出 */ }
+          throw new Error(why || ("HTTP " + r.status));
+        });
+      }
+      var reader = r.body.getReader();
+      var dec = new TextDecoder("utf-8");
+      var buf = "", text = "", err = "";
+      function handle(frame) {
+        if (!frame) { return; }
+        frame.split("\n").forEach(function (line) {
+          if (line.indexOf("data:") !== 0) { return; }
+          var payload = line.slice(5).trim();
+          if (!payload) { return; }
+          var ev = null;
+          try { ev = JSON.parse(payload); } catch (e) { return; }
+          if (ev.type === "line" && ev.text) {
+            text += ev.text;
+            vvSub(text);              // 边收边显示，不等全说完
+          } else if (ev.type === "error") {
+            err = ev.err || "后端报了错但没给原因";
+          }
+        });
+      }
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) { handle(buf); return; }
+          buf += dec.decode(chunk.value, { stream: true });
+          var parts = buf.split("\n\n");
+          buf = parts.pop();
+          parts.forEach(handle);
+          return pump();
+        });
+      }
+      return pump().then(function () {
+        if (err) { throw new Error(err); }
+        if (!text.trim()) { throw new Error("模型没返回任何文字"); }
+        return text.trim();
+      });
+    });
+  }
+
+  function vvSpeak(text) {
+    setOrbState("speak");
+    return fetch("/api/voice/say", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Fleet-Token": TOKEN },
+      body: JSON.stringify({ text: text }),
+      cache: "no-store"
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.text().then(function (t) {
+          var why = t;
+          try { why = JSON.parse(t).err || t; } catch (e) { /* 原样带出 */ }
+          throw new Error("合成失败（HTTP " + r.status + "）：" + (why || "").slice(0, 160));
+        });
+      }
+      var backend = r.headers.get("X-Voice-Backend") || "?";
+      var card = r.headers.get("X-Voice-Card") || "默认";
+      vvHint("出声：" + backend + " · 卡 " + card);
+      return r.blob();
+    }).then(function (blob) {
+      return new Promise(function (resolve, reject) {
+        var url = URL.createObjectURL(blob);
+        var a = new Audio(url);
+        VV.audio = a;
+        a.onended = function () {
+          URL.revokeObjectURL(url);
+          VV.audio = null;
+          resolve(true);
+        };
+        a.onerror = function () {
+          URL.revokeObjectURL(url);
+          VV.audio = null;
+          reject(new Error("播放失败：音频解不开（浏览器不支持该 wav 编码？）"));
+        };
+        var p = a.play();
+        if (p && p.catch) {
+          p.catch(function (e) {
+            reject(new Error("播放被拦：" + ((e && e.message) || "浏览器要求先有一次用户操作")));
+          });
+        }
+      });
+    });
+  }
+
+  // 一轮完整对话：文字进 → 文字 + 出声
+  function vvTurn(text) {
+    if (VV.busy) { return; }
+    vvFail("");                    // 清掉上一条错误提示
+    vvHint(ORB_LABEL.think || "");
+    vvAsk(text).then(function (answer) {
+      vvSub(answer);
+      return vvSpeak(answer);
+    }).then(function () {
+      VV.busy = false;
+      setOrbState("idle");
+      if (VV.hands) {
+        // 免手：说完自动回到听
+        setTimeout(function () { if (VV.hands && VV.state === "idle") { vvStartRec(); } }, 260);
+      }
+    }).catch(function (e) {
+      vvFail(e.message || String(e));
+    });
+  }
+
+  function initVoice() {
+    if (!$("viewVoice")) { return; }
+    $("vvMic").addEventListener("click", function () { vvStartRec(); });
+    $("vvSend").addEventListener("click", function () {
+      var inp = $("vvInput");
+      var t = (inp.value || "").trim();
+      if (!t) { vvHint("输入框是空的", true); return; }
+      inp.value = "";
+      vvSub(t);
+      vvTurn(t);
+    });
+    $("vvInput").addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        $("vvSend").click();
+      }
+    });
+    $("vvHands").addEventListener("click", function () {
+      VV.hands = !VV.hands;
+      $("vvHands").classList.toggle("on", VV.hands);
+      vvHint(VV.hands ? "免手已开：说完自动再听" : "免手已关");
+      if (VV.hands && VV.state === "idle") { vvStartRec(); }
+    });
+    orbLoop();
+  }
+
   /* ------------------------------------------------------------------ 视图切换 */
   function showView(name, title) {
     $("viewChat").classList.toggle("on", name === "chat");
     $("viewAssets").classList.toggle("on", name === "assets");
     $("viewCrew").classList.toggle("on", name === "crew");
+    if ($("viewVoice")) { $("viewVoice").classList.toggle("on", name === "voice"); }
     if (title) { $("viewTitle").textContent = title; }
   }
 
@@ -1643,9 +2089,12 @@
 
   /* ------------------------------------------------------------------ 起 */
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", function () { bind(); bootstrap(); });
+    document.addEventListener("DOMContentLoaded", function () {
+      bind(); bootstrap(); initVoice();
+    });
   } else {
     bind();
     bootstrap();
+    initVoice();
   }
 })();
