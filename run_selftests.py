@@ -105,6 +105,20 @@ CASES = [
     # 深度是独立于容量的第二个闸；角色卡写错能力名必须当场红。
     # 全离线：不连网络、不调真模型，角色执行用假 exec_fn。
     ("eval_t13_agent_crew", ["evals/t13_agent_crew.py"], HERE, 120),
+    # T14：MCP 出口 + 技能装载 + 渲染能力
+    # 钉四件事：① MCP 按规范应答（协议版本/三方法/错误码/脏行不退出）；
+    # ② 动手能力在 MCP 路径上照样过闸门（默认不导出；include_unsafe 也没 gate
+    #   ⇒ 注册表 fail-closed 拒绝）；③ 不许静默失败（「压根没这个工具」与
+    #   「存在但没导出」不许混成一句）；④ 技能 frontmatter 坏了要带行号。
+    # 渲染层：引擎在不在都如实；引擎在而单帧渲染炸了 = 代码坏了，必须红。
+    ("eval_t14_mcp_and_skills", ["evals/t14_mcp_and_skills.py"], HERE, 300),
+    # T23：HTML 渲染后端（Video as Code）
+    # 钉四件事：① 真能出一条能播的 MP4（分辨率/帧数/时长/帧率都对）；
+    # ② **确定性**：同一份 HTML 渲两次要逐字节一致（不然没法进 git、没法 diff）；
+    # ③ 确定性 lint：Date.now()/Math.random()/渲染时发网络请求 ⇒ 拒绝渲染并说清原因；
+    # ④ 写 MP4 是副作用 ⇒ 没闸门时 fail-closed 拒绝。
+    # 环境齐不齐都如实：缺 node/Playwright/Chromium 就 skip 并说明缺什么。
+    ("eval_t23_html_render", ["evals/t23_html_render.py"], HERE, 600),
 ]
 
 

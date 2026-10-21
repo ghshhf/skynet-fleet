@@ -14,6 +14,7 @@
 
 const path = require("path");
 const fs = require("fs");
+const mini = require("./minidom.js");
 
 const UI = path.join(__dirname, "..", "ui");
 const TOKEN = "t7-smoke-token";
@@ -23,50 +24,42 @@ function check(cond, msg) {
   if (cond) { console.log("  ok", msg); } else { console.log("  x ", msg); FAIL.push(msg); }
 }
 
-/* ---------------- 假 DOM ---------------- */
+/* ---------------- 假 DOM（真 DOM 树 + 真选择器） ----------------
+ * 用真 index.html 建树，而不是手搓几个假元素：
+ * app.js 里有 `querySelectorAll(".sb-item")` 这类按选择器找元素的代码，
+ * 假 DOM 只会 getElementById 的话这些代码永远返回空 ⇒ 门禁测不到它们。
+ */
+const html = fs.readFileSync(path.join(UI, "index.html"), "utf-8");
+const domRoot = mini.parseHTML(html);
+global.__domRoot = domRoot;
+
+const els = {};
+// 真 DOM 里存在的元素，getElementById 要能找到它（不许凭空造一个替身）
+(function indexIds(node) {
+  for (const c of node.children) {
+    if (c.id) { els[c.id] = c; }
+    indexIds(c);
+  }
+})(domRoot);
+
 function makeEl(id) {
-  const el = {
-    id: id || "",
-    _text: "",
-    value: "",
-    hidden: false,
-    disabled: false,
-    style: {},
-    title: "",
-    children: [],
-    scrollTop: 0,
-    scrollHeight: 40,
-    classList: {
-      _s: new Set(),
-      add(c) { this._s.add(c); },
-      remove(c) { this._s.delete(c); },
-      contains(c) { return this._s.has(c); },
-      toggle(c, f) { if (f === undefined) { this._s.has(c) ? this._s.delete(c) : this._s.add(c); } else if (f) { this._s.add(c); } else { this._s.delete(c); } }
-    },
-    addEventListener(type, fn) { (this._h || (this._h = {}))[type] = fn; },
-    removeEventListener() { },
-    appendChild(c) { this.children.push(c); return c; },
-    removeChild(c) { this.children = this.children.filter((x) => x !== c); },
-    querySelector() { return null; },
-    focus() { }
-  };
-  // 跟真 DOM 一致：textContent = "" 会清掉所有子节点。
-  // 不做这一条，假 DOM 会把旧内容留在 children 里，测试就会骗人。
-  Object.defineProperty(el, "textContent", {
-    get() { return this._text; },
-    set(v) { this._text = String(v); this.children = []; }
-  });
+  const el = mini.makeEl(id || "div", {});
+  el.id = id || "";
   return el;
 }
 
-const els = {};
 global.document = {
   readyState: "complete",
-  documentElement: { getAttribute: () => "light", setAttribute() { } },
+  documentElement: { getAttribute: () => "light", setAttribute() { }, requestFullscreen: () => Promise.resolve() },
   getElementById(id) { if (!els[id]) { els[id] = makeEl(id); } return els[id]; },
   createElement(tag) { return makeEl(tag); },
-  addEventListener() { }
+  querySelector(sel) { return global.__docQ(sel)[0] || null; },
+  querySelectorAll(sel) { return global.__docQ(sel); },
+  addEventListener() { },
+  fullscreenElement: null,
+  exitFullscreen() { },
 };
+global.__docQ = (sel) => mini.queryAllDoc(domRoot, sel);
 global.location = { hash: "#t=" + TOKEN + "&theme=dark" };
 global.setTimeout = setTimeout;
 global.clearTimeout = clearTimeout;
@@ -133,11 +126,32 @@ setTimeout(() => {
   /* ---- 走一遍发送：回车 → SSE → 消息流里长出内容 ---- */
   const input = els["input"];
   input.value = "你好";
-  const keydown = input._h && input._h.keydown;
+  // 真 DOM 的 addEventListener 允许绑多个 handler，所以存的是数组。
+  // 这里取第一个来触发（app.js 对 input 只绑一个 keydown）。
+  const kd = input._h && input._h.keydown;
+  const keydown = Array.isArray(kd) ? kd[0] : kd;
   check(!!keydown, "输入框绑了回车处理");
   if (keydown) {
     keydown({ key: "Enter", shiftKey: false, isComposing: false, preventDefault() { } });
   }
+
+  /* ---- 选择器能力：app.js 大量用 querySelectorAll 找元素，
+         假 DOM 若不支持，这些代码就永远返回空 ⇒ 门禁测不到 ⇒
+         页面真坏时门禁照样绿。所以这里把「选择器找到了东西」钉死。 */
+  const sbItems = document.querySelectorAll(".sb-item");
+  check(sbItems.length >= 5, "选择器 .sb-item 找得到左栏导航项（实际 " + sbItems.length + " 个）");
+  const tabs = document.querySelectorAll("#tabBar .tab");
+  check(tabs.length === 3, "后代选择器 #tabBar .tab 找得到三个 Tab（实际 " + tabs.length + " 个）");
+  const sidebar = document.querySelector(".sidebar");
+  check(!!sidebar, "querySelector('.sidebar') 找得到左栏");
+  const crewView = document.getElementById("viewCrew");
+  check(!!crewView, "getElementById 找得到 viewCrew（真 DOM 树里解析出来的）");
+  check(!!crewView && crewView.classList.contains("view-crew"),
+    "viewCrew 带着 view-crew 类（属性解析对了）");
+  // 左栏「助理」那项的 data-view 必须是 crew（导航接线对不对就靠这个）
+  const crewItem = sbItems.filter((x) => x.getAttribute("data-view") === "crew")[0];
+  check(!!crewItem, "左栏有 data-view=crew 的项");
+  check(!!crewItem && !!crewItem._h.click, "助理项绑了点击（不是死链）");
   setTimeout(() => {
     const chat = seen.find((s) => s.url === "/api/chat");
     check(!!chat, "回车会 POST /api/chat");
