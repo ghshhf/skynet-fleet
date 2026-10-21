@@ -93,6 +93,11 @@ CASES = [
     # 客户端 socket 建连超时(10s) < 心跳间隔(15s) ⇒ **必然**每 ~13 秒周期性重连。
     # 完全离线：不开真端口、不发真密码、不启动真节点。
     ("eval_t11_node_lifecycle", ["evals/t11_node_lifecycle.py"], HERE, 120),
+    # W3 设备页（主机可视化）：
+    # 截图端点不许变成任意文件读取的洞（登记制 + 路径穿越必须 404）；
+    # 设备页只走 registry.call（前端绕不过闸门）；
+    # 状态取自 reg.availability()（界面不自己算一套）；取不到必须说原因。
+    ("eval_t12_device_panel", ["evals/t12_device_panel.py"], HERE, 120),
 ]
 
 

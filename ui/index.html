@@ -114,6 +114,52 @@
         </div>
       </div>
     </main>
+
+    <!-- 右栏：设备页（W3·主机可视化） -->
+    <aside class="devpanel" id="devPanel">
+      <div class="dp-head">
+        <span class="dp-title">设备</span>
+        <span class="grow"></span>
+        <span class="dp-dev" id="dpDevice">—</span>
+        <button class="hbtn" id="dpRefresh" title="刷新">↻</button>
+      </div>
+
+      <!-- 资源条：真进度条，数据来自 reg.availability() + host.monitor -->
+      <div class="dp-sec" id="dpResSec">
+        <div class="dp-sech">资源</div>
+        <div class="bars" id="dpBars">
+          <div class="bar-row"><span class="bl">CPU</span><span class="btrack"><i id="barCpu"></i></span><span class="bv" id="valCpu">—</span></div>
+          <div class="bar-row"><span class="bl">内存</span><span class="btrack"><i id="barMem"></i></span><span class="bv" id="valMem">—</span></div>
+          <div class="bar-row"><span class="bl">磁盘</span><span class="btrack"><i id="barDisk"></i></span><span class="bv" id="valDisk">—</span></div>
+          <div class="bar-row"><span class="bl">网络</span><span class="btrack net"><i id="barUp"></i><i id="barDown"></i></span><span class="bv" id="valNet">—</span></div>
+        </div>
+      </div>
+
+      <!-- 屏幕预览：真图（W3 的验收点之一） -->
+      <div class="dp-sec" id="dpShotSec">
+        <div class="dp-sech">
+          <span>屏幕</span>
+          <span class="grow"></span>
+          <button class="hbtn" id="dpShotBtn" title="截一张屏">截屏</button>
+        </div>
+        <div class="shotbox" id="dpShotBox">
+          <span class="hint">点「截屏」看真图</span>
+        </div>
+      </div>
+
+      <!-- 进程表：可排序 -->
+      <div class="dp-sec" id="dpProcSec">
+        <div class="dp-sech">
+          <span>进程</span>
+          <span class="grow"></span>
+          <span class="hint" id="dpProcHint">—</span>
+        </div>
+        <div class="proctable" id="dpProcs"></div>
+      </div>
+
+      <!-- 不可用/失败原因：说清楚为什么空着 -->
+      <div class="dp-notes" id="dpNotes"></div>
+    </aside>
   </div>
 </div>
 

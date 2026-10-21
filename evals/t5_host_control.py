@@ -186,6 +186,35 @@ check(not _heavy, f"host.py 顶层不 import 重依赖（发现 {_heavy or '无'
 check("_INJECT_DEFENSE" in _src and "不可信数据" in _src,
       "源码里保留 _INJECT_DEFENSE 注入防御句")
 
+# ⑩ 进程 CPU 必须采样两次（psutil 的坑：第一次恒为 0）
+#     实测：process_iter(cpu_percent=...) 第一次调用返回 0.0（它要两次采样之间的
+#     间隔来算差值）⇒ 只采一次，进程表整列是 0 ⇒ **界面显示的是假数据**，
+#     而且看起来很正常（0% 是合理的数）——最坏的一种假。
+#     这条用 AST 钉死：源码里必须有「先 cpu_percent(None) 打时间戳 → 睡 → 再采」的结构。
+_fn = next((n for n in ast.walk(ast.parse(_src))
+            if isinstance(n, ast.FunctionDef) and n.name == "_monitor_snapshot"), None)
+check(_fn is not None, "host.py 里有 _monitor_snapshot")
+if _fn is not None:
+    _calls = [n for n in ast.walk(_fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "cpu_percent"]
+    check(len(_calls) >= 2,
+          "进程 CPU 要采样两次（psutil 第一次恒 0，只采一次=整列假数据）")
+    _has_none_stamp = any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "cpu_percent"
+        and n.args and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value is None
+        for n in ast.walk(_fn))
+    check(_has_none_stamp,
+          "先调 cpu_percent(None) 打时间戳，再隔一会儿采才有真值")
+
+# ⑪ 内核/空闲进程必须排除（实测 System Idle Process 的 cpu 是 713%）
+#     它不是「某个程序在烧 CPU」而是「CPU 有多闲」，多核下超过 100。
+#     排进「占用最高的进程」榜 = 显示了一个没有意义的数，还把真热点挤下去。
+check("System Idle Process" in _src,
+      "进程表排除 System Idle Process（实测它的 CPU 是 713%，不是占用）")
+
 # 清理临时目录
 try:
     for f in os.listdir(_tmp):
