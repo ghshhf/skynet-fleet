@@ -7,8 +7,10 @@
     call        调一项能力（--args 传 JSON）
     save        把「这设备是什么」落盘（绝不含凭据）
     crew        角色编队：名册 / 容量闸 / 五段式契约
+    mcp        把本仓变成 MCP server（--serve 起 stdio；--list 列工具表）
+    skills     列出可用的技能（SKILL.md）
 
-为什么先用纯文本而不用 rich：这份输出要被 evals 与自测断言（`fleet list | grep`），
+为什么用纯文本而不用 rich：这份输出要被 evals 与自测断言（`fleet list | grep`），
 ANSI 与框线会让断言变脆。终端（fleet/shell.py）才是给人看的，那里才上 rich。
 """
 import argparse

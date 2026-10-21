@@ -197,6 +197,7 @@
   function renderCaps(payload) {
     var body = $("capBody");
     body.textContent = "";
+    ASSET_CACHE.caps = payload.caps || [];
     $("capCount").textContent = String(payload.count);
     var domains = payload.domains || {};
     Object.keys(domains).forEach(function (dom) {
@@ -225,6 +226,193 @@
           body.appendChild(row);
         });
     });
+  }
+
+  /* ==================================================================
+     X1 · 专家 / 技能 / 连接器（三 Tab）
+
+     语义（2026-10-21 定，取代旧计划书里「连接器 = 设备」的写法）：
+       专家     = 角色卡（chara_card_v3）——人格 + 边界
+       技能     = SKILL.md——「怎么做」的方法论，自己不动手
+       连接器   = MCP server 清单——**设备也是 MCP**，
+                  所以内建设备与外接 MCP server 是同一张表，
+                  用 source 字段区分（builtin / external）
+
+     🔴 前端零硬编码：能力名、设备名、技能名、连接器名全部来自后端接口。
+     🔴 空状态不许装作有：拉不到就显示原因。
+     ================================================================== */
+
+  var ASSET_TAB = "cards";
+  var ASSET_CACHE = { cards: null, skills: null, conns: null, caps: null };
+
+  function setAssetTab(tab) {
+    ASSET_TAB = tab;
+    Array.prototype.forEach.call(document.querySelectorAll("#tabBar .tab"), function (b) {
+      b.classList.toggle("on", b.getAttribute("data-tab") === tab);
+    });
+    loadAssetTab(tab);
+  }
+
+  function loadAssetTab(tab) {
+    var body = $("tabBody");
+    body.textContent = "";
+    body.appendChild(el("div", "empty", "读取中…"));
+
+    if (tab === "cards") {
+      api("/api/cards").then(function (d) {
+        ASSET_CACHE.cards = d;
+        renderCardsTab(d);
+      }).catch(function (e) { renderTabErr(body, "读不到角色卡：" + e.message); });
+      return;
+    }
+    if (tab === "skills") {
+      api("/api/skills").then(function (d) {
+        ASSET_CACHE.skills = d;
+        renderSkillsTab(d);
+      }).catch(function (e) { renderTabErr(body, "读不到技能清单：" + e.message); });
+      return;
+    }
+    api("/api/connectors").then(function (d) {
+      ASSET_CACHE.conns = d;
+      renderConnsTab(d);
+    }).catch(function (e) { renderTabErr(body, "读不到连接器清单：" + e.message); });
+  }
+
+  function renderTabErr(body, why) {
+    body.textContent = "";
+    body.appendChild(el("div", "why", why));
+  }
+
+  /* ---------------- 专家（角色卡） ---------------- */
+
+  function renderCardsTab(d) {
+    var body = $("tabBody");
+    body.textContent = "";
+    var cards = d.cards || [];
+    body.appendChild(el("div", "sec", "角色卡 · " + cards.length + " 张"));
+    if (!cards.length) {
+      body.appendChild(el("div", "empty",
+        "还没有角色卡。角色卡是 <b>chara_card_v3</b> 格式的 JSON，放进 cards/ 目录即可。"));
+      return;
+    }
+    var wall = el("div", "wall");
+    cards.forEach(function (c) {
+      var card = el("div", "card");
+      var top = el("div", "ctop");
+      top.appendChild(el("span", c.ok ? "dot-ok" : "dot-bad"));
+      top.appendChild(el("div", "cname", c.name || c.file));
+      if (c.spec) { top.appendChild(el("span", "badge-role", c.spec)); }
+      card.appendChild(top);
+      if (c.ok) {
+        card.appendChild(el("div", "cdesc", "角色卡 " + c.file + "（" + c.spec + " 格式）"));
+      } else {
+        card.appendChild(el("div", "creason err", c.error || "这张卡读不出来"));
+      }
+      var meta = el("div", "cmeta");
+      meta.appendChild(el("span", "", c.file));
+      card.appendChild(meta);
+      wall.appendChild(card);
+    });
+    body.appendChild(wall);
+  }
+
+  /* ---------------- 技能（SKILL.md） ---------------- */
+
+  function renderSkillsTab(d) {
+    var body = $("tabBody");
+    body.textContent = "";
+    if (d.error) { body.appendChild(el("div", "why", d.error)); }
+    var skills = d.skills || [];
+
+    // 按来源分组：仓内技能在前，用户级在后。
+    var repo = skills.filter(function (s) { return s.source === "repo"; });
+    var user = skills.filter(function (s) { return s.source !== "repo"; });
+
+    body.appendChild(el("div", "sec", "技能 · " + skills.length + " 个（SKILL.md）"));
+    if (!skills.length) {
+      body.appendChild(el("div", "empty",
+        "还没读到任何技能。技能是带 frontmatter 的 <b>SKILL.md</b> 文件，"
+        + "放在仓内 <b>skills/</b> 或用户级 <b>~/.workbuddy/skills/</b> 目录下。"));
+      return;
+    }
+    if (repo.length) { body.appendChild(el("div", "sec", "本仓")); body.appendChild(skillWall(repo)); }
+    if (user.length) { body.appendChild(el("div", "sec", "用户级")); body.appendChild(skillWall(user)); }
+  }
+
+  function skillWall(list) {
+    var wall = el("div", "wall");
+    list.forEach(function (s) {
+      var card = el("div", "card");
+      var top = el("div", "ctop");
+      top.appendChild(el("span", s.error ? "dot-bad" : "dot-ok"));
+      top.appendChild(el("div", "cname", s.name));
+      card.appendChild(top);
+      if (s.error) {
+        card.appendChild(el("div", "creason err", s.error));
+      } else {
+        card.appendChild(el("div", "cdesc", s.description || s.heading || ""));
+      }
+      var meta = el("div", "cmeta");
+      meta.appendChild(el("span", "", s.file || "SKILL.md"));
+      if (s.body_len) { meta.appendChild(el("span", "", s.body_len + " 字符")); }
+      if (s.agent_created) { meta.appendChild(el("span", "badge-role", "agent_created")); }
+      card.appendChild(meta);
+      wall.appendChild(card);
+    });
+    return wall;
+  }
+
+  /* ---------------- 连接器（MCP server 清单） ---------------- */
+
+  function renderConnsTab(d) {
+    var body = $("tabBody");
+    body.textContent = "";
+    if (d.error) { body.appendChild(el("div", "why", d.error)); }
+    if (d.note) { body.appendChild(el("div", "why", d.note)); }
+
+    var rows = d.connectors || [];
+    var builtin = rows.filter(function (r) { return r.source === "builtin"; });
+    var external = rows.filter(function (r) { return r.source === "external"; });
+
+    body.appendChild(el("div", "sec",
+      "连接器 · " + rows.length + " 个（内建 " + (d.builtin || builtin.length)
+      + " / 外接 " + (d.external || external.length) + "）"));
+    body.appendChild(el("div", "why",
+      "设备也是 MCP：内建每一台设备都是一个 MCP server，"
+      + "外接的是你自己挂的第三方 MCP server。它们在协议层是同一件事，"
+      + "所以放在同一张表里。"));
+
+    if (builtin.length) {
+      body.appendChild(el("div", "sec", "内建（本仓设备）"));
+      body.appendChild(connWall(builtin));
+    }
+    if (external.length) {
+      body.appendChild(el("div", "sec", "外接（第三方 MCP server）"));
+      body.appendChild(connWall(external));
+    }
+  }
+
+  function connWall(list) {
+    var wall = el("div", "wall");
+    list.forEach(function (r) {
+      var card = el("div", "card");
+      var top = el("div", "ctop");
+      top.appendChild(el("span", r.ok ? "dot-ok" : (r.reason ? "dot-bad" : "dot-off")));
+      top.appendChild(el("div", "cname", r.name));
+      top.appendChild(el("span", "badge-src" + (r.source === "external" ? " ext" : ""),
+        r.source === "external" ? "external" : "builtin"));
+      card.appendChild(top);
+      var meta = el("div", "cmeta");
+      if (r.kind) { meta.appendChild(el("span", "", r.kind)); }
+      if (r.via) { meta.appendChild(el("span", "", r.via)); }
+      meta.appendChild(el("span", "", r.tools + " 个只读工具"));
+      card.appendChild(meta);
+      if (r.reason) {
+        card.appendChild(el("div", "creason" + (r.ok ? "" : " err"), r.reason));
+      }
+      wall.appendChild(card);
+    });
+    return wall;
   }
 
   /* ------------------------------------------------------------------ 聊天（SSE） */
@@ -561,7 +749,22 @@
 
     // ---- W3 设备页 ----
     $("dpRefresh").addEventListener("click", function () {
-      loadHost().then(function () { toast("设备页已刷新"); });
+      // 🔴 点击必须**立刻**有反馈：loadHost() 是异步的，
+      // 等它回来才 toast 的话，中间那几百毫秒页面毫无变化 ⇒
+      // 真浏览器点审计会判它「点了页面无任何变化」（死链）。
+      // 所以先转圈（同步可见变化），回来再落定。
+      var btn = $("dpRefresh");
+      btn.disabled = true;
+      btn.textContent = "…";
+      loadHost().then(function () {
+        btn.disabled = false;
+        btn.textContent = "↻";
+        toast("设备页已刷新");
+      }).catch(function (e) {
+        btn.disabled = false;
+        btn.textContent = "↻";
+        toast("刷新失败：" + e.message, true);
+      });
     });
     $("dpShotBtn").addEventListener("click", function () {
       $("dpShotBtn").disabled = true;
@@ -570,6 +773,418 @@
         $("dpShotBtn").disabled = false;
         $("dpShotBtn").textContent = "截屏";
       });
+    });
+
+    // ---- 左栏导航：切视图 ----
+    // 规矩：每个导航项点进去必须**有反应**——要么切到真视图，
+    // 要么明确说「这个还没做」。摆着不响应就是界面骗人。
+    Array.prototype.forEach.call(document.querySelectorAll(".sb-item"), function (item) {
+      item.addEventListener("click", function () {
+        var view = item.getAttribute("data-view");
+        var act = item.getAttribute("data-act");
+        Array.prototype.forEach.call(document.querySelectorAll(".sb-item"), function (o) {
+          o.classList.toggle("on", o === item);
+        });
+        if (view === "assets") {
+          showView("assets", "专家 · 技能 · 连接器");
+          setAssetTab(ASSET_TAB);
+          return;
+        }
+        if (view === "crew") {
+          showView("crew", "助理 · 角色编队");
+          loadCrew();
+          return;
+        }
+        if (view === "chat") {
+          showView("chat", "设备编队");
+          if (act === "new") { newTask(); }
+          return;
+        }
+        // 还没建的视图：明说，不假装
+        showView("chat", "设备编队");
+        toast("「" + item.textContent.trim() + "」这一页还没做（不假装）", true);
+      });
+    });
+
+    // ---- 助理（角色编队） ----
+    $("crewRefresh").addEventListener("click", function () {
+      loadCrew();
+      toast("已刷新名册");
+    });
+
+    // ---- 新建任务：清场，不是假按钮 ----
+    // 「新建任务」和「助理」以前都指向 chat ⇒ 点了没区别（死链）。
+    // 现在「新建任务」真的清空当前会话并聚焦输入框。
+    function newTask() {
+      var box = $("streamIn");
+      if (box) { box.textContent = ""; }
+      addUserMsg("（新任务开始）");
+      var inp = $("input");
+      if (inp) { inp.focus(); inp.value = ""; }
+      toast("新任务已开（上一段对话清掉了）");
+    }
+
+    // ---- 三 Tab ----
+    Array.prototype.forEach.call(document.querySelectorAll("#tabBar .tab"), function (b) {
+      b.addEventListener("click", function () {
+        setAssetTab(b.getAttribute("data-tab"));
+      });
+    });
+    $("assetsRefresh").addEventListener("click", function () {
+      loadAssetTab(ASSET_TAB);
+      toast("已刷新");
+    });
+
+    // ---- 顶栏按钮 ----
+    // 搜索：以前用 window.prompt —— headless 下浏览器会自动 dismiss 它，
+    // 于是真浏览器点一遍判它「没反应」。而且 prompt 也谈不上好交互。
+    // 现在改成**内联输入框**（真元素、真能输入、真出结果）。
+    $("searchBtn").addEventListener("click", function () {
+      var box = $("searchInput");
+      box.hidden = !box.hidden;
+      if (!box.hidden) { box.focus(); box.value = ""; runSearch(""); }
+      else { $("searchResults").hidden = true; }
+    });
+    $("searchInput").addEventListener("input", function () {
+      runSearch(this.value);
+    });
+    $("searchInput").addEventListener("keydown", function (e) {
+      if (e.key === "Escape") {
+        this.hidden = true;
+        $("searchResults").hidden = true;
+      }
+      if (e.key === "Enter") { e.preventDefault(); runSearch(this.value); }
+    });
+    $("shareBtn").addEventListener("click", function () {
+      var st = $("regStat").textContent || "";
+      toast("本机状态：" + st + "（导出功能还没做，不假装）", true);
+    });
+    $("attachBtn").addEventListener("click", function () {
+      toast("附件上传还没做（不假装）", true);
+    });
+    $("permBtn").addEventListener("click", function () {
+      toast("权限设置还没做（不假装）", true);
+    });
+
+    // ---- 人格抽屉（X2） ----
+    $("personaFoot").addEventListener("click", openDrawer);
+    $("personaFoot").addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openDrawer(); }
+    });
+    $("drawerClose").addEventListener("click", closeDrawer);
+    $("drawerRefresh").addEventListener("click", function () {
+      loadDrawer();
+      toast("已刷新");
+    });
+    $("drawerMask").addEventListener("click", function (e) {
+      if (e.target === this) { closeDrawer(); }
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !$("drawerMask").hidden) { closeDrawer(); }
+    });
+
+    // ---- 窗口三键：给真反应，不许摆着 ----
+    // 以前这三个是纯装饰的死链。现在：
+    //   最小化 = 收起左栏（真布局变化）
+    //   最大化 = 真全屏（requestFullscreen，真 API）
+    //   关闭   = 关不掉浏览器页 ⇒ 明说，不假装
+    function bindWinBtn(id, fn) {
+      var b = $(id);
+      b.addEventListener("click", fn);
+      b.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(); }
+      });
+    }
+    bindWinBtn("tbMin", function () {
+      var side = document.querySelector(".sidebar");
+      if (!side) { return; }
+      var hidden = side.classList.toggle("collapsed");
+      toast(hidden ? "左栏已收起（再点一次展开）" : "左栏已展开");
+    });
+    bindWinBtn("tbMax", function () {
+      if (document.fullscreenElement) {
+        if (document.exitFullscreen) { document.exitFullscreen(); }
+        toast("已退出全屏");
+        return;
+      }
+      var el = document.documentElement;
+      if (el.requestFullscreen) {
+        el.requestFullscreen().then(function () { toast("已全屏"); })
+          .catch(function (e) { toast("进不了全屏：" + e.message, true); });
+      } else {
+        toast("这个浏览器不支持全屏（不假装）", true);
+      }
+    });
+    bindWinBtn("tbClose", function () {
+      toast("浏览器里关不掉这一页（关标签页才行）——真桌面版才有真关闭", true);
+    });
+  }
+
+  /* ==================================================================
+     助理 · 角色编队
+
+     真读 `cards/` 下的角色卡名册（/api/roster），
+     当前激活的那个高亮。**零硬编码**——角色名来自后端。
+     ================================================================== */
+
+  function loadCrew() {
+    var body = $("crewBody");
+    body.textContent = "";
+    body.appendChild(el("div", "empty", "读取中…"));
+    api("/api/roster").then(function (d) {
+      renderCrew(d);
+    }).catch(function (e) {
+      body.textContent = "";
+      body.appendChild(el("div", "why", "读不到名册：" + e.message));
+    });
+  }
+
+  function renderCrew(d) {
+    var body = $("crewBody");
+    body.textContent = "";
+    if (d.error) { body.appendChild(el("div", "why", d.error)); }
+    var roles = d.roles || [];
+    body.appendChild(el("div", "sec", "名册 · " + roles.length + " 个角色"));
+    if (!roles.length) {
+      body.appendChild(el("div", "empty",
+        "cards/ 目录下还没有角色卡。放 JSON 进去（chara_card_v3 格式）就有。"));
+      return;
+    }
+    body.appendChild(el("div", "why",
+      "当前激活：" + (d.active || "（读不到）")
+      + (d.reason ? "　—— " + d.reason : "")
+      + "。激活角色就是「谁在跟你说话」；其余是子角色（exec 角色）。"));
+    var wall = el("div", "wall");
+    roles.forEach(function (r) {
+      var card = el("div", "card");
+      var top = el("div", "ctop");
+      var on = r.name === d.active;
+      top.appendChild(el("span", on ? "dot-ok" : "dot-off"));
+      top.appendChild(el("div", "cname", r.name));
+      if (on) { top.appendChild(el("span", "badge-role", "激活")); }
+      card.appendChild(top);
+      var meta = el("div", "cmeta");
+      meta.appendChild(el("span", "", r.provider || "(默认)"));
+      meta.appendChild(el("span", "", "深度 " + (r.max_depth === undefined ? "—" : r.max_depth)));
+      meta.appendChild(el("span", "",
+        "可用能力 " + (r.cap_allow === "全部" ? "全部" : r.cap_allow + " 项")));
+      if (r.source) { meta.appendChild(el("span", "", r.source)); }
+      card.appendChild(meta);
+      if (r.unknown_caps && r.unknown_caps.length) {
+        card.appendChild(el("div", "creason err",
+          "这张卡点了不存在的能力：" + r.unknown_caps.join("、")));
+      }
+      wall.appendChild(card);
+    });
+    body.appendChild(wall);
+  }
+
+  /* ==================================================================
+     人格抽屉（X2）
+
+     点侧栏底部的 .sb-foot 弹出来。三块内容，全部真读：
+       ① 角色卡名 + 情绪三值（persona_state.json）
+       ② 记忆条目（fleet_context.db），**逐条可删**（E-7）
+       ③ 名册（哪个角色在跟你说话）
+     🔴 拿不到就显示原因，不显示假的 0 或空列表。
+     ================================================================== */
+
+  function openDrawer() {
+    $("drawerMask").hidden = false;
+    loadDrawer();
+  }
+
+  function closeDrawer() {
+    $("drawerMask").hidden = true;
+  }
+
+  function loadDrawer() {
+    var body = $("drawerBody");
+    body.textContent = "";
+    body.appendChild(el("div", "empty", "读取中…"));
+
+    var jobs = [
+      api("/api/persona").then(function (d) { return { kind: "persona", d: d }; }),
+      api("/api/memory").then(function (d) { return { kind: "memory", d: d }; }),
+      api("/api/roster").then(function (d) { return { kind: "roster", d: d }; })
+    ];
+    Promise.all(jobs).then(function (res) {
+      body.textContent = "";
+      res.forEach(function (r) {
+        if (r.kind === "persona") { drawerPersona(body, r.d); }
+        else if (r.kind === "memory") { drawerMemory(body, r.d); }
+        else { drawerRoster(body, r.d); }
+      });
+    }).catch(function (e) {
+      body.textContent = "";
+      body.appendChild(el("div", "why", "读不到人格信息：" + e.message));
+    });
+  }
+
+  function drawerPersona(body, d) {
+    body.appendChild(el("div", "sec", "她是谁"));
+    if (d.error) {
+      body.appendChild(el("div", "why", d.error));
+      return;
+    }
+    var card = d.card || {};
+    var st = d.state || {};
+    body.appendChild(el("div", "drow",
+      "角色卡：" + (card.name || "（没加载到）")
+      + (card.spec ? "（" + card.spec + "）" : "")));
+    if (!d.card_loaded) {
+      body.appendChild(el("div", "creason err",
+        "没有角色卡：现在是「没有人格的裸助手」，不会假装有设定。"));
+    }
+    var mood = st.mood || {};
+    body.appendChild(el("div", "drow",
+      "口癖：" + (st.catchphrase || "（没有）")
+      + "　情绪：" + (st.name || "她")));
+    body.appendChild(el("dmood"));
+    var bars = body.lastChild;
+    [["valence", "心情"], ["energy", "精力"], ["cling", "黏人"]].forEach(function (p) {
+      var v = mood[p[0]];
+      var line = el("div", "dmoodrow");
+      line.appendChild(el("span", "dml", p[1]));
+      var track = el("span", "dmtrack");
+      var bar = el("i");
+      var pct = (typeof v === "number") ? Math.max(0, Math.min(1, v)) : 0;
+      bar.style.width = (pct * 100).toFixed(0) + "%";
+      track.appendChild(bar);
+      line.appendChild(track);
+      line.appendChild(el("span", "dmv",
+        (typeof v === "number") ? v.toFixed(2) : "—"));
+      bars.appendChild(line);
+    });
+    if (st.obsessions && st.obsessions.length) {
+      body.appendChild(el("div", "drow", "执念 " + st.obsessions.length + " 条"));
+    }
+  }
+
+  function drawerMemory(body, d) {
+    body.appendChild(el("div", "sec", "她记得什么 · " + (d.count || 0) + " 条"));
+    if (d.error) {
+      body.appendChild(el("div", "why", d.error));
+      return;
+    }
+    body.appendChild(el("div", "why",
+      "记忆是个人数据：只进可寻址可删的记忆层，不进任何被训练的参数。"
+      + "每条都能单独删。"));
+    var items = d.items || [];
+    if (!items.length) {
+      body.appendChild(el("div", "empty", "还没有记忆条目。"));
+      return;
+    }
+    items.forEach(function (it) {
+      var row = el("div", "drow");
+      row.appendChild(el("span", "grow", it.key));
+      row.appendChild(el("span", "dmemo", String(it.val || "").slice(0, 60)));
+      var del = el("button", "hbtn", "删");
+      del.title = "删掉这一条（" + it.ns + "/" + it.key + "）";
+      del.addEventListener("click", function () {
+        if (!window.confirm("删掉这条记忆？\n" + it.ns + "/" + it.key)) { return; }
+        api("/api/memory/delete", { method: "POST", body: { ns: it.ns, key: it.key } })
+          .then(function () { toast("已删：" + it.key); loadDrawer(); })
+          .catch(function (e) { toast("删不掉：" + e.message, true); });
+      });
+      row.appendChild(del);
+      body.appendChild(row);
+    });
+  }
+
+  function drawerRoster(body, d) {
+    body.appendChild(el("div", "sec", "名册 · " + (d.count || 0) + " 个角色"));
+    if (d.error) {
+      body.appendChild(el("div", "why", d.error));
+      return;
+    }
+    var roles = d.roles || [];
+    if (!roles.length) {
+      body.appendChild(el("div", "empty", "cards/ 目录下没有角色卡。"));
+      return;
+    }
+    roles.forEach(function (r) {
+      body.appendChild(el("div", "drow",
+        (r.name === d.active ? "● " : "○ ") + r.name
+        + "（深度 " + r.max_depth + "，能力 "
+        + (r.cap_allow === "全部" ? "全部" : r.cap_allow) + "）"));
+    });
+  }
+
+  /* ------------------------------------------------------------------ 视图切换 */
+  function showView(name, title) {
+    $("viewChat").classList.toggle("on", name === "chat");
+    $("viewAssets").classList.toggle("on", name === "assets");
+    $("viewCrew").classList.toggle("on", name === "crew");
+    if (title) { $("viewTitle").textContent = title; }
+  }
+
+  /* ------------------------------------------------------------------ 搜索
+     搜四个真实来源：能力、设备、技能、角色卡。
+     全部来自后端接口的结果缓存，前端不硬编码任何名字。 */
+  function searchAll(kw) {
+    var out = [];
+    (ASSET_CACHE.caps || []).forEach(function (c) {
+      if ((c.name || "").toLowerCase().indexOf(kw) >= 0
+        || (c.title || "").toLowerCase().indexOf(kw) >= 0) {
+        out.push("能力 " + c.name);
+      }
+    });
+    (ASSET_CACHE.conns && ASSET_CACHE.conns.connectors || []).forEach(function (r) {
+      if ((r.name || "").toLowerCase().indexOf(kw) >= 0) { out.push("连接器 " + r.name); }
+    });
+    (ASSET_CACHE.skills && ASSET_CACHE.skills.skills || []).forEach(function (s) {
+      if ((s.name || "").toLowerCase().indexOf(kw) >= 0
+        || (s.description || "").toLowerCase().indexOf(kw) >= 0) {
+        out.push("技能 " + s.name);
+      }
+    });
+    (ASSET_CACHE.cards && ASSET_CACHE.cards.cards || []).forEach(function (c) {
+      if ((c.name || "").toLowerCase().indexOf(kw) >= 0
+        || (c.file || "").toLowerCase().indexOf(kw) >= 0) {
+        out.push("专家 " + c.name);
+      }
+    });
+    return out;
+  }
+
+  /* 搜索结果面板：真输入、真出结果。
+     数据可能还没拉（用户没点过三 Tab）⇒ 先把四类源都拉一遍再搜。 */
+  function runSearch(raw) {
+    var panel = $("searchResults");
+    panel.hidden = false;
+    panel.textContent = "";
+    var kw = (raw || "").trim().toLowerCase();
+    var need = [];
+    if (!ASSET_CACHE.caps) { need.push(api("/api/caps").then(function (d) { ASSET_CACHE.caps = d.caps || []; })); }
+    if (!ASSET_CACHE.conns) { need.push(api("/api/connectors").then(function (d) { ASSET_CACHE.conns = d; })); }
+    if (!ASSET_CACHE.skills) { need.push(api("/api/skills").then(function (d) { ASSET_CACHE.skills = d; })); }
+    if (!ASSET_CACHE.cards) { need.push(api("/api/cards").then(function (d) { ASSET_CACHE.cards = d; })); }
+    if (!need.length) { paintSearch(kw); return; }
+    panel.appendChild(el("div", "why", "正在拉取可搜的内容…"));
+    Promise.all(need).then(function () { paintSearch(kw); })
+      .catch(function (e) {
+        panel.textContent = "";
+        panel.appendChild(el("div", "why", "搜索失败：" + e.message));
+      });
+  }
+
+  function paintSearch(kw) {
+    var panel = $("searchResults");
+    panel.textContent = "";
+    if (!kw) {
+      panel.appendChild(el("div", "why",
+        "搜能力 / 设备 / 技能 / 角色卡。输入即搜。"));
+      return;
+    }
+    var hits = searchAll(kw);
+    panel.appendChild(el("div", "why", "命中 " + hits.length + " 条"));
+    if (!hits.length) {
+      panel.appendChild(el("div", "empty", "没找到「" + kw + "」"));
+      return;
+    }
+    hits.slice(0, 40).forEach(function (h) {
+      panel.appendChild(el("div", "srow", h));
     });
   }
 
