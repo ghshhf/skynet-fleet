@@ -268,13 +268,34 @@ def _drop_node(name, expect_gen=None):
 
 
 def _drop_node_silent(name):
-    """摘除节点但不触发 node_offline（心跳判死路径用，避免动作重复）。"""
-    node = REGISTRY.with_lock(lambda d: d.pop(name, None))
-    if node:
-        try:
+    """摘除节点但不触发 node_offline（心跳判死路径用，避免动作重复）。
+
+    🔴 但**临时节点必须照样清凭据**（2026-10-21 补的已知缺口）：
+    硬断线（拔网线/机器休眠/交换机清 MAC 表）时，服务端的连接收不到 FIN，
+    走不到 `_handle_node` 的 finally ⇒ 只能等心跳判死（180s）走这条路。
+    而原来这里只是 `d.pop(name)` 就完事 ⇒ **临时节点（网吧/借用设备）的 PSK
+    永远留在账本里** —— 那台机器换人用，下一个人照样能认证进来。
+    「钥匙留在门上」正是这个项目最不能犯的错。
+
+    所以：摘之前先看它是不是临时节点（info.session），是就先补一个 session_end
+    事件，让「临时节点-下机即清」策略照常执行（撤 PSK / 作废令牌 / 丢队列）。
+
+    与 `_drop_node` 的差别只在**要不要发 node_offline**：硬断线时连接已经没了，
+    再发一次 node_offline 会重复降级告警。
+    """
+    def _pop(d):
+        return d.pop(name, None)
+    node = REGISTRY.with_lock(_pop)
+    if not node:
+        return None
+    if (node.get("info") or {}).get("session"):
+        _fire({"event": "session_end", "mode": "session"}, name)
+    try:
+        if node.get("sock") is not None:
             node["sock"].close()
-        except OSError:
-            pass
+    except OSError:
+        pass
+    return node
 
 
 WATCHDOG_STOP = threading.Event()
