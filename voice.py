@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import wave
 
@@ -700,6 +701,57 @@ def record(max_s=15.0, samplerate=16000, silence_end=0.8, no_speech_timeout=3.0,
 
 # ============================ 语音识别 ============================
 
+def _whisper_root():
+    """决定 whisper 模型落盘目录。
+
+    2026-10-22 实测事故：兜底值写死 `E:/_models/whisper`，E 盘一拔，
+    ctranslate2 建目录直接 `[WinError 3] 系统找不到指定的路径: 'E:\\'`，
+    ASR 全哑——而且报错里只有盘符，完全看不出是模型目录的问题。
+
+    规则改成：① 显式环境变量最优先（仍会建目录）；
+    ② 老位置**只在真存在时**才用（不再硬造）；
+    ③ 都没有就落到用户可写目录 `%LOCALAPPDATA%/fleet/whisper`；
+    ④ 连那儿都不行就退系统临时目录。
+    任何一步都带原因返回，不再静默。
+    """
+    def _try_make(p):
+        if not p:
+            return None
+        try:
+            os.makedirs(p, exist_ok=True)
+            # 建完要真能写：只读盘上 makedirs 可能"成功"
+            probe = os.path.join(p, ".w")
+            with open(probe, "wb") as f:
+                f.write(b"1")
+            os.remove(probe)
+            return p
+        except OSError:
+            return None
+
+    env_root = os.environ.get("FLEET_WHISPER_DIR")
+    if env_root:
+        got = _try_make(env_root)
+        if got:
+            return got
+        print("[voice] FLEET_WHISPER_DIR=%r 不可写，改用默认位置" % env_root)
+
+    for c in ("E:/_models/whisper", "G:/_models/whisper",
+              "D:/work/_local_ai/whisper"):
+        if os.path.isdir(c):
+            got = _try_make(c)
+            if got:
+                return got
+
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
+    for c in (os.path.join(local, "fleet", "whisper"),
+              os.path.join(os.path.expanduser("~"), ".cache", "fleet", "whisper"),
+              os.path.join(tempfile.gettempdir(), "fleet_whisper")):
+        got = _try_make(c)
+        if got:
+            return got
+    return None
+
+
 def _load_whisper(model, device):
     """懒加载 faster_whisper 模型（模块级单例，只加载一次）。
 
@@ -725,13 +777,7 @@ def _load_whisper(model, device):
 
     # 镜像与落盘位置：必须在 import faster_whisper 之前设好
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-    env_root = os.environ.get("FLEET_WHISPER_DIR")
-    if env_root:
-        root = env_root
-    else:
-        root = next((c for c in ("E:/_models/whisper", "D:/work/_local_ai/whisper",
-                                 "G:/_models/whisper")      # 兼容老配置
-                     if os.path.isdir(c)), "E:/_models/whisper")
+    root = _whisper_root()
     local_only = os.environ.get("FLEET_WHISPER_LOCAL", "") == "1"
 
     try:
@@ -739,6 +785,13 @@ def _load_whisper(model, device):
     except Exception as e:
         _WHISPER_CACHE[key] = (None, "none", "缺少 faster_whisper：%s" % e)
         return None, "none", "缺少 faster_whisper：%s" % e
+
+    if root is None:
+        msg = ("找不到可写的 whisper 模型目录（试过 FLEET_WHISPER_DIR、"
+               "E:/_models/whisper、%LOCALAPPDATA%/fleet/whisper 与临时目录）。"
+               "请设环境变量 FLEET_WHISPER_DIR 指到一个可写目录")
+        _WHISPER_CACHE[key] = (None, "none", msg)
+        return None, "none", msg
 
     def _mk(dev, compute):
         kw = {"download_root": root}
