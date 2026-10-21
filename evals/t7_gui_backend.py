@@ -307,15 +307,28 @@ try:
     srv2.stop()
 
     # ================================================================ ① token
+    # 两档语义分别测，**不许合并成一条**：
+    #   401 = 压根没带凭据（调用方忘了加头，是 bug）
+    #   403 = 带了但不是本次启动发的那枚（有人拿旧令牌来敲，可疑行为）
+    # 这两种事的处置不一样，状态码也就不一样。
     st, js, _ = http_json(f"{BASE}/api/health")
     check(st == 401, f"不带 token → 401（实际 {st}）")
     check(bool(js and js.get("err")), "401 答复带明确原因（err 非空）")
     check(bool(js and "token" in json.dumps(js, ensure_ascii=False).lower()),
           "401 原因里点明是令牌问题")
+    check(bool(js and "缺少" in (js.get("err") or "")),
+          "401 原因说清是「缺少凭据」而不是「凭据不对」（%s）" % (js.get("err") if js else ""))
 
     st, js, _ = http_json(f"{BASE}/api/health", token="wrong-token")
     check(st == 403, f"带错 token → 403（实际 {st}）")
     check(bool(js and js.get("err")), "错 token 的 403 也带原因")
+    check(bool(js and "不对" in (js.get("err") or "")),
+          "403 原因说清是「令牌不对」而不是「缺少令牌」（%s）" % (js.get("err") if js else ""))
+
+    # 401 与 403 必须是两个不同的状态码（合并成一条就退回了糊涂语义）。
+    st401, _, _ = http_json(f"{BASE}/api/health")
+    st403, _, _ = http_json(f"{BASE}/api/health", token="wrong-token")
+    check(st401 != st403, f"401 与 403 是两档（实际 {st401} / {st403}）")
 
     st, js, _ = http_json(f"{BASE}/api/health", token=TOKEN)
     check(st == 200, f"带对 token → 200（实际 {st}）")
