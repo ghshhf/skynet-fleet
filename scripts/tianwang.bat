@@ -28,11 +28,10 @@ if not exist "%MODEL%" (
   goto desktop
 )
 echo [1/2] 启动 llama-server (port %PORT%) ...
-start "tianwang-llama" /min cmd /c ^
-  "%LLAMA_DIR%\llama-server.exe" -m "%MODEL%" --port %PORT% ^
-  --host 127.0.0.1 -c 4096 -ngl 99 -dev Vulkan1 ^
-  --jinja --chat-template "%TEMPLATE%" --reasoning-budget 0 ^
-  -t 8 --no-webui 2^>^&1"
+REM 无窗启动：pythonw + 三件套（STARTF_USESHOWWINDOW/SW_HIDE + CREATE_NO_WINDOW）
+REM 方案来自 netforce 爬虫内核 _hidden_startupinfo()。原 /min cmd /c 会留一个
+REM 最小化黑窗；start /b 不建窗但不解析 > 重定向（1>file 会被当参数传给 llama-server）
+E:\Python312\pythonw.exe "%~dp0start_llm_hidden.py"
 
 set /a tries=0
 :wait
