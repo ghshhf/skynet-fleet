@@ -15,6 +15,7 @@ from .core import Capability, Param, Registry
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
+from .kinds.audio import AudioSynth
 from .kinds.adb_wifi import AdbWifi
 from .kinds.card_store import CardStore
 from .kinds.host import Host
@@ -358,6 +359,19 @@ CAPABILITIES = [
     Capability("voice.interpret", "把一段文字解析成能力意图（不执行）",
                params=(Param("text", "str", True, "要解析的文字"),),
                note="只读：只给意图与复述话术，执行要走两段式（复述+口头确认）"),
+    # ---- 音频（kind=audio）：代码生成声音，不是采样也不是神经网络 ----
+    Capability("audio.presets", "列出可用的代码合成音频预设",
+               note="只读：功能性声音（上线/告警/确认/倒计时/氛围床）的波形清单"),
+    Capability("audio.synth", "用代码合成一段声音（落成 WAV）",
+               params=(Param("spec", "str", doc="预设名，如 chime/alarm/boot/confirm/error/tick/ambient"),
+                       Param("seed", "str", doc="种子，通常给设备 ID——同种子逐字节可复现，不同设备声音不同"),
+                       Param("out", "str", doc="输出路径；不给就落临时目录"),
+                       Param("sample_rate", "int", doc="采样率，默认 24000"),
+                       Param("format", "str", doc="目前只支持 wav"),
+                       Param("custom", "dict", doc="自定义波形 {freq,dur,wave:sine|tri|square}")),
+               side_effect=True,
+               note="纯标准库合成，零第三方依赖，RTF≈0.009。"
+                    "写文件 ⇒ 要过闸门。这是**功能性声音**，不是人声（人声走 voice.speak）"),
     # ---- 渲染（kind=render）：用代码画出新的图与片子 ----
     Capability("render.styles", "列出可用的渲染风格牌（抽签用）",
                note="只读：返回 16 张风格牌的 id 与说明"),
@@ -440,6 +454,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(VoiceDevice())
     reg.add(Render())
     reg.add(CardStore())
+    reg.add(AudioSynth())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:
