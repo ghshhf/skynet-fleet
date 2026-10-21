@@ -77,6 +77,11 @@ CASES = [
     # 门禁红 = 代码坏了（识别失败没带原因 / 简体 prompt 没传 / token 预算没减
     # / 两段式闸门松了 / STT 文本被当指令）。
     ("eval_t8_voice", ["evals/t8_voice.py"], HERE, 120),
+    # ---- T10：PC 端操控电脑（kind=pc_control）----
+    # 必须完全离线：鼠标键盘注入、进程操作、屏幕抓取一律假掉，
+    # **绝不真动用户桌面**。门禁红 = 代码坏了（审批档写错 / caps 返对象 /
+    # 失败不带原因 / 高危动作没标风险与可逆性 / 键盘注入闷声注入）。
+    ("eval_t10_pc_control", ["evals/t10_pc_control.py"], HERE, 120),
 ]
 
 
