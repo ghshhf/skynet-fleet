@@ -65,6 +65,9 @@
         <h1>设备编队</h1>
         <span class="sub" id="regStat">registry: —</span>
         <span class="grow"></span>
+        <div class="apprflag" id="apprFlag" hidden>
+          <span class="dot"></span><b id="apprCount">0</b> 项在等审批
+        </div>
         <div class="hbtn" id="capBtn" title="能力面板">◫</div>
         <div class="hbtn" title="搜索">⌕</div>
         <div class="hbtn" title="分享">↗</div>
@@ -122,6 +125,24 @@
     <button class="hbtn" id="capClose" title="关闭">✕</button>
   </div>
   <div class="capbody" id="capBody"></div>
+</div>
+
+<!-- 审批弹窗（W2）：哪些能力在等审批，主人点确认才执行。
+     判定权不在前端：前端只负责把「用户点了确认」这个信号回传给后端。 -->
+<div class="apprmask" id="apprMask" hidden>
+  <div class="apprbox">
+    <div class="apprhead">
+      <span>需要你确认</span>
+      <span class="grow"></span>
+      <span class="badge" id="apprCount2">0</span>
+    </div>
+    <div class="apprlist" id="apprList"></div>
+    <div class="apprfoot">
+      <span class="hint">不点就等着，超时（默认 120 秒）算拒绝</span>
+      <span class="grow"></span>
+      <button class="hbtn" id="apprRefresh" title="刷新待审批列表">↻</button>
+    </div>
+  </div>
 </div>
 
 <!-- 右下角悬浮助手（桌宠位） -->

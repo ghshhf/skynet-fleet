@@ -3,8 +3,10 @@
 锁死的是真会发生的形状，不是假想：
 
   ① **token 鉴权是一道真门**。
-     缺 X-Fleet-Token 头 → 401 且带原因；带错 token → 401 且带原因。
+     缺 X-Fleet-Token 头 → 401 且带原因；带错 token → 403 且带原因。
      这条必须钉死：一个「能点鼠标键盘的 HTTP 接口」没锁，就是给局域网开了后门。
+     （W2 起把「没带凭据」与「凭据不对」分开：前者是调用方忘了加头，后者是
+     有人拿着旧令牌来敲——处置不一样，所以状态码也不一样。）
 
   ② **只绑 127.0.0.1 + 随机端口**。
      固定端口会被同机别的程序撞上或被外部扫到；绑 0.0.0.0 等于把这台机器
@@ -312,8 +314,8 @@ try:
           "401 原因里点明是令牌问题")
 
     st, js, _ = http_json(f"{BASE}/api/health", token="wrong-token")
-    check(st == 401, f"带错 token → 401（实际 {st}）")
-    check(bool(js and js.get("err")), "错 token 的 401 也带原因")
+    check(st == 403, f"带错 token → 403（实际 {st}）")
+    check(bool(js and js.get("err")), "错 token 的 403 也带原因")
 
     st, js, _ = http_json(f"{BASE}/api/health", token=TOKEN)
     check(st == 200, f"带对 token → 200（实际 {st}）")
