@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  一屏到底，不分页：
+    顶栏（标题 / 状态 / 设置）
+    光球（吃掉所有剩余空间，它是这台端子的"表情"）
+    字幕（你说的 + 它答的，同一行滚）
+    输入行 + 大圆按钮
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/bg"
+    android:fitsSystemWindows="true"
+    android:paddingLeft="16dp"
+    android:paddingRight="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/app_name"
+            android:textColor="@color/text"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.12" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="12dp"
+            android:text="未连接"
+            android:textColor="@color/text_dim"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:ellipsize="end" />
+
+        <TextView
+            android:id="@+id/btnSettings"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_settings"
+            android:textColor="@color/text_dim"
+            android:textSize="13sp"
+            android:padding="8dp" />
+    </LinearLayout>
+
+    <app.skynet.tianwang.OrbView
+        android:id="@+id/orb"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <TextView
+        android:id="@+id/subtitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="72dp"
+        android:paddingTop="8dp"
+        android:paddingBottom="8dp"
+        android:text="@string/idle_sub"
+        android:textColor="@color/text"
+        android:textSize="15sp"
+        android:lineSpacingExtra="4dp"
+        android:maxLines="4"
+        android:ellipsize="end" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="8dp">
+
+        <EditText
+            android:id="@+id/input"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_input"
+            android:hint="@string/hint_input"
+            android:inputType="text"
+            android:imeOptions="actionSend"
+            android:maxLines="1"
+            android:paddingLeft="14dp"
+            android:paddingRight="14dp"
+            android:textColor="@color/text"
+            android:textColorHint="@color/text_dim"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/btnSend"
+            android:layout_width="56dp"
+            android:layout_height="44dp"
+            android:layout_marginStart="8dp"
+            android:background="@drawable/bg_send"
+            android:gravity="center"
+            android:text="@string/btn_send"
+            android:textColor="@color/text"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <!-- 大圆：按一下开录，再按一下结束（也支持按住-松手，两种都认） -->
+    <TextView
+        android:id="@+id/btnMic"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/bg_mic"
+        android:gravity="center"
+        android:text="@string/mic_idle"
+        android:textColor="@color/text"
+        android:textSize="15sp"
+        android:textStyle="bold" />
+</LinearLayout>

@@ -60,3 +60,9 @@ dist/
 *.spec
 *.exe
 cards/compiled/
+
+# 手机端：构建产物与签名密钥不入库
+tianwang_android/build/
+tianwang_android/keystore.jks
+android_bridge/build/
+android_bridge/keystore.jks
