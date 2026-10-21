@@ -7,14 +7,23 @@
   ③ 每个技能随附 _audit.json，并在 MANIFEST.json 登记来源/license/审查结论/日期——
      以后审计「这个技能哪来的、安不安全」一眼可查，不许静默混入。
 
-不自动联网拉 ClawHub：避免盲拉带脚本的未知源。联网拉作为后续能力，
-且必须显式带 --insecure-ok 才允许从 URL 拉（本期不实现 URL 拉取）。
+关于联网拉（ClawHub 等）：
+  🔴 **绝不猜第三方市场的 API 路径**（记忆铁律：ClawHub/角色卡站都是 SPA，curl 猜路径必错）。
+  所以这里只做**通用的 URL / git 拉取器**：用户给一个具体的归档（.zip/.tar.gz）
+  或 git 仓库 URL，我们下载/克隆到临时目录，**再走和本地完全相同的审计→登记→落盘闭环**。
+  URL 拉取**默认关闭**，必须显式 `--insecure-ok`（盲拉带脚本的未知源 = ClawHavoc 风险，
+  开之前你自己确认来源可信）。ClawHub 的具体技能 URL 由调用方提供，本模块不内置任何站点专属 API。
 """
 import datetime
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tarfile
+import tempfile
+import urllib.request
+import zipfile
 
 from . import skills as SK
 from . import skills_audit as SA
@@ -84,28 +93,119 @@ def acquire(src_dir, source_label, force=False):
                   "manifest_entry": manifest["entries"][-1]}
 
 
+def _locate_skill_root(tmp):
+    """从下载/克隆目录里找含 SKILL.md 的根：优先 tmp 直接含，否则第一个含的子目录。"""
+    if os.path.isfile(os.path.join(tmp, "SKILL.md")):
+        return tmp
+    for root, _dirs, files in os.walk(tmp):
+        if "SKILL.md" in files:
+            return root
+    return tmp
+
+
+def _download_archive(url, insecure_ok):
+    """下载 .zip / .tar.gz 归档到临时目录并解压，返回 (skill_root, error)。"""
+    if not insecure_ok:
+        return None, {"error": "URL 拉取默认关闭，须显式 --insecure-ok（盲拉带脚本未知源 = ClawHavoc 风险）"}
+    tmp = tempfile.mkdtemp(prefix="skill_dl_")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "device-fleet-skills/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+        arc = os.path.join(tmp, "dl")
+        with open(arc, "wb") as f:
+            f.write(data)
+    except Exception as e:  # noqa: BLE001 — 网络错误如实回传，不静默
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, {"error": "下载失败：%s" % e}
+    try:
+        if url.endswith(".zip"):
+            with zipfile.ZipFile(arc) as z:
+                z.extractall(tmp)
+        else:
+            with tarfile.open(arc) as t:
+                t.extractall(tmp)
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, {"error": "解压失败：%s" % e}
+    return _locate_skill_root(tmp), {}
+
+
+def _clone_repo(url, insecure_ok):
+    """git clone --depth 1 到临时目录，返回 (skill_root, error)。"""
+    if not insecure_ok:
+        return None, {"error": "URL 拉取默认关闭，须显式 --insecure-ok（盲拉带脚本未知源 = ClawHavoc 风险）"}
+    tmp = tempfile.mkdtemp(prefix="skill_git_")
+    try:
+        subprocess.run(["git", "clone", "--depth", "1", url, tmp],
+                       check=True, capture_output=True, timeout=120)
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, {"error": "git clone 失败：%s" % e}
+    return _locate_skill_root(tmp), {}
+
+
+def acquire_from_url(url, source_label, force=False, insecure_ok=False):
+    """从 URL 拉取技能并 vendoring 进仓。
+
+    - url 为 .zip/.tar.gz 归档 → 下载解压；
+    - url 为 git 仓库（.git 或 github.com 仓库根）→ clone；
+    - 其余类型拒绝。
+    拉取默认关闭，须 insecure_ok=True（--insecure-ok）。拉到后走 acquire 的审计→登记→落盘。
+    返回 (ok, report)。
+    """
+    if url.endswith((".zip", ".tar.gz", ".tgz")):
+        root, err = _download_archive(url, insecure_ok)
+    elif url.endswith(".git") or ("github.com" in url and "/archive/" not in url
+                                  and not url.endswith((".zip", ".tar.gz", ".tgz"))):
+        root, err = _clone_repo(url, insecure_ok)
+    else:
+        return False, {"error": "不支持的 URL 类型（仅支持 .zip/.tar.gz 归档或 git 仓库 URL）"}
+    if root is None:
+        return False, err
+    # 拉到的内容交给与本地完全相同的闭环
+    ok, rep = acquire(root, source_label or url, force=force)
+    if not ok:
+        shutil.rmtree(root, ignore_errors=True)
+    return ok, rep
+
+
 def _main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
-        print("用法：python -m fleet.skills_acquire <src_dir> --source <label> [--force]")
+        print("用法：")
+        print("  本地：python -m fleet.skills_acquire <src_dir> --source <label> [--force]")
+        print("  URL：python -m fleet.skills_acquire --url <url> --source <label> [--force] --insecure-ok")
         sys.exit(2)
     src = None
+    url = None
     source = "manual"
     force = False
+    insecure_ok = False
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--force":
             force = True
+        elif a == "--insecure-ok":
+            insecure_ok = True
         elif a == "--source":
             i += 1
             source = args[i]
         elif a.startswith("--source="):
             source = a.split("=", 1)[1]
-        elif src is None:
+        elif a == "--url":
+            i += 1
+            url = args[i]
+        elif a.startswith("--url="):
+            url = a.split("=", 1)[1]
+        elif src is None and url is None:
             src = a
         i += 1
-    ok, rep = acquire(src, source or "manual", force=force)
+    if url:
+        ok, rep = acquire_from_url(url, source or url, force=force, insecure_ok=insecure_ok)
+    else:
+        ok, rep = acquire(src, source or "manual", force=force)
     print(json.dumps(rep, ensure_ascii=False, indent=2))
     sys.exit(0 if ok else 1)
 
