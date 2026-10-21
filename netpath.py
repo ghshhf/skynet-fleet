@@ -158,12 +158,28 @@ def listen(host, port, backlog=32):
 
     双栈规则：host 为 "0.0.0.0" / "" / "*" 时绑 :: 并关掉 IPV6_V6ONLY，这样 v4 和
     v6 一次全吃；系统不支持 v6 时退回 v4，不让「没有 v6」把服务搞挂。
+
+    Windows 上的坑（2026-10-21 实测）：SO_REUSEADDR 在 Windows 上允许**第二个
+    进程绑上同一个端口**，且新 socket 会抢走后来者的连接（Linux 上不是这个语义）。
+    后果实测过：四个 commander 自检并发跑，三个的节点注册进了第一个实例的
+    注册表 ⇒ 自己的进程永远等不到节点上线 ⇒ 偶发红。
+    所以 Windows 上改用 SO_EXCLUSIVEADDRUSE：端口被占就抛 10048 明确报错，
+    绝不静默抢连接。端口重复是调用方的错，让它响。
+
+    端口 0 = 让系统随机分配，配合 getsockname() 取真实端口。
     """
     want_v6 = (":" in (host or "")) or (host or "") in ("", "*", "0.0.0.0")
+
+    def _prep(s):
+        if IS_WIN and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s
+
     if want_v6 and socket.has_ipv6:
         try:
-            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s = _prep(socket.socket(socket.AF_INET6, socket.SOCK_STREAM))
             if hasattr(socket, "IPV6_V6ONLY"):
                 try:
                     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -176,8 +192,7 @@ def listen(host, port, backlog=32):
             if host and ":" in host:
                 raise
             _v6_err = e
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s = _prep(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
     s.bind((host if (host and host not in ("*",)) else "0.0.0.0", port))
     s.listen(backlog)
     return s, "仅 v4"

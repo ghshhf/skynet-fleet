@@ -21,7 +21,11 @@ import sys
 
 
 def _git(*args):
-    return subprocess.run(["git"] + list(args), capture_output=True, text=True,
+    # core.quotepath=false：中文路径必须原样输出。
+    # git 默认把非 ASCII 路径转义成八进制（"docs/\350\212\213..."），
+    # 那样脚本认不出「这就是我列出的那个文件」，会同时误报多与漏。
+    return subprocess.run(["git", "-c", "core.quotepath=false"] + list(args),
+                          capture_output=True, text=True,
                           encoding="utf-8", errors="replace").stdout.strip()
 
 
@@ -41,10 +45,11 @@ def main(argv):
         print(f"[commit-guard] 共 {len(staged)} 个文件。逐条核对是否都是你的活。")
         return 0
 
-    wanted = {p.rstrip("/\\").replace("\\", "/") for p in argv}
+    wanted = {p.strip('"').rstrip("/\\").replace("\\", "/") for p in argv}
 
     staged = [l for l in _git("diff", "--cached", "--name-only").splitlines() if l]
-    staged_set = {s.replace("\\", "/") for s in staged}
+    # 双保险：万一 git 仍带引号（路径含空格等特殊字符时会加），去掉。
+    staged_set = {s.strip('"').replace("\\", "/") for s in staged}
 
     missing = sorted(wanted - staged_set)
     extra = sorted(staged_set - wanted)

@@ -57,7 +57,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 def start_server(root, host="127.0.0.1", port=9100):
-    """起分发服务（后台线程）。返回 server 对象。"""
+    """起分发服务（后台线程）。返回 server 对象。
+
+    port 传 0 = 让系统随机分配（2026-10-21 实测修的偶发红）：
+    固定端口在并发场景会直接撞 10048，且撞了之后报错点离真正的原因很远。
+    真实端口从 httpd.server_address[1] 取。
+    """
     _Handler.root = root
     httpd = socketserver.TCPServer((host, port), _Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
