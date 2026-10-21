@@ -80,6 +80,12 @@ for h in HIDDEN:
 for e in EXCLUDES:
     args += ["--exclude-module", e]
 args += ["--collect-submodules", "fleet"]
+# faster_whisper 带的是 tokenizer 资产、ctranslate2 带一串 dll/vc runtime，
+# 光 --hidden-import 只收 .py，收不到这些东西 —— 冻扁后一 import 就炸。
+# 用 collect-all 把 data/binaries 一起带走（2026-10-22 补）。
+args += ["--collect-all", "faster_whisper"]
+args += ["--collect-all", "ctranslate2"]
+# edge_tts 是纯 py，没有资产，hidden-import 够了（但它得真装上，见 requirements.txt）
 # 前端静态资源：整个 ui/ 目录 -> 冻扁后的 ui/
 args += ["--add-data", UI_DIR + os.pathsep + "ui"]
 # 角色卡源卡：整个 cards/ -> 冻扁后的 cards/
