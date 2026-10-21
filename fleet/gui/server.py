@@ -25,6 +25,7 @@ import json
 import os
 import queue
 import secrets
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -122,7 +123,11 @@ class FleetServer:
         self.approval = approval
         self.chat_gate = chat_gate_fn
         self.persona = persona if persona is not None else Persona()
-        self.token = secrets.token_urlsafe(32)      # 一次性，只在内存里
+        # 默认每次启动现生成一枚，只活在内存里。手机端必须能改令牌就是为了这个：
+        # 跨设备没法共享一个内存里的随机串。显式设 FLEET_GUI_TOKEN 才固定，
+        # 不设就永远走随机——安全默认不变，只是多了一扇给联调用的门。
+        self.token = (os.environ.get("FLEET_GUI_TOKEN") or "").strip() \
+            or secrets.token_urlsafe(32)
         self.host = host
         self.port = port
         self._httpd = None
@@ -367,10 +372,16 @@ class _Handler(BaseHTTPRequestHandler):
         ok, code, why = self._authorized()
         if not ok:
             return self._err(code, why)
+        # 语音识别收的是**裸二进制 wav/webm**，不是 JSON。必须赶在 _read_json 之前
+        # 分流，否则会被判成「请求体不是合法 JSON」。
+        if path == "/api/voice/recognize":
+            return self._post_voice_recognize()
         try:
             body = self._read_json()
         except ValueError as e:
             return self._err(400, str(e))
+        if path == "/api/voice/say":
+            return self._post_voice_say(body)
         if path == "/api/call":
             return self._post_call(body)
         if path == "/api/chat":
@@ -892,6 +903,131 @@ class _Handler(BaseHTTPRequestHandler):
                             "remaining": self._memory().get("count", 0)})
 
     # ---------------- SSE 对话 ----------------
+
+    # ---------------- 语音（对话面：光球视图用） ----------------
+    #
+    # 与 fleet/gui/voice.py 的「命令式语音」不是一回事，两者别混：
+    #   那边 = 把「打开浏览器」听成能力调用、走 Polaris，服务于操控电脑；
+    #   这边 = 陪伴对话，识别 → 人格 → 合成，服务于光球界面。
+    # 所以这里要的是**仓库根目录的 voice.py**（kokoro/edge-tts + faster-whisper）。
+    # 同名风险：本包内也有 voice.py，`import voice` 可能命中它 ⇒ 取到后校验
+    # __file__ 必须落在 ROOT，拿错就带原因抛，不静默降级。
+
+    def _dialog_voice(self):
+        if ROOT not in sys.path:
+            sys.path.insert(0, ROOT)
+        import voice as v
+        got = os.path.dirname(os.path.abspath(getattr(v, "__file__", "") or ""))
+        if got != os.path.abspath(ROOT):
+            raise RuntimeError(
+                "拿到的是 %s 的 voice（命令式那套），不是仓库根的对话语音模块" % got)
+        return v
+
+    def _read_raw(self, limit=32 * 1024 * 1024):
+        """读二进制请求体。上限 32MB：一两分钟的 wav 远到不了。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("Content-Length 不是整数")
+        if n <= 0:
+            return b""
+        if n > limit:
+            raise ValueError("音频太大：%d 字节（上限 %d）" % (n, limit))
+        return self.rfile.read(n)
+
+    def _post_voice_recognize(self):
+        try:
+            raw = self._read_raw()
+        except ValueError as e:
+            return self._err(400, str(e))
+        if not raw:
+            return self._err(400, "空音频：请求体是 0 字节")
+        try:
+            v = self._dialog_voice()
+        except Exception as e:
+            return self._err(503, "语音模块不可用：%s" % e)
+
+        tmp_dir = v.TMP_DIR
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+        except OSError as e:
+            return self._err(500, "临时目录不可用：%s（%s）" % (tmp_dir, e))
+
+        stamp = int(time.time() * 1000)
+        src = os.path.join(tmp_dir, "api_%d.bin" % stamp)
+        wav = src
+        try:
+            with open(src, "wb") as f:
+                f.write(raw)
+            # whisper 只吃 wav；手机 MediaRecorder 给的是 webm/opus，
+            # 别的客户端也可能直传任意容器 ⇒ 非 RIFF 一律先 ffmpeg 转 16k 单声道。
+            if raw[:4] != b"RIFF":
+                wav = os.path.join(tmp_dir, "api_%d.wav" % stamp)
+                ff = v._ffmpeg()
+                if not ff:
+                    return self._err(503, "收到非 wav 音频（头 %s），但找不到 ffmpeg 转码"
+                                     % raw[:4].hex())
+                import subprocess
+                r = subprocess.run(
+                    [ff, "-y", "-loglevel", "error", "-i", src,
+                     "-ar", "16000", "-ac", "1", "-f", "wav", wav],
+                    capture_output=True, timeout=120)
+                if r.returncode != 0 or not os.path.isfile(wav):
+                    msg = (r.stderr or b"").decode("utf-8", "replace")[:200]
+                    return self._err(400, "音频转码失败（ffmpeg 退出码 %d）：%s"
+                                     % (r.returncode, msg or "无输出"))
+            text, meta = v.transcribe(wav, language="zh")
+        except Exception as e:
+            return self._err(500, "识别失败：%s: %s" % (type(e).__name__, e))
+        finally:
+            for p in {src, wav}:
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+        return self._json({"ok": True, "text": (text or "").strip(), "meta": meta})
+
+    def _post_voice_say(self, body):
+        text = (body.get("text") or "").strip()
+        if not text:
+            return self._err(400, "缺少 text（或 text 是空的）")
+        card_id = body.get("card_id")
+        if not card_id:
+            # 没指定就用当前生效的卡 ⇒ 「换卡换音色」自动成立，前端不必自己传。
+            try:
+                import persona_card as pc
+                card_id = pc.current()
+            except Exception:
+                card_id = None
+        try:
+            v = self._dialog_voice()
+        except Exception as e:
+            return self._err(503, "语音模块不可用：%s" % e)
+        try:
+            backend, path = v.say_for_card(text, card_id=card_id, play=False)
+        except Exception as e:
+            return self._err(500, "合成失败：%s: %s" % (type(e).__name__, e))
+        if not path or not os.path.isfile(path):
+            return self._err(500, "合成失败：后端 %r 没有产出文件" % (backend,))
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return self._err(500, "读不到合成产物 %s：%s" % (path, e))
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Voice-Backend", backend or "")
+        self.send_header("X-Voice-Card", card_id or "")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _post_chat(self, body):
         prompt = (body.get("prompt") or "").strip()

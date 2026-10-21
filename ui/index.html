@@ -41,7 +41,8 @@
       </div>
 
       <nav class="sb-nav">
-        <div class="sb-item on" data-view="chat" data-act="new"><span class="ic">◉</span>新建任务</div>
+        <div class="sb-item on" data-view="voice"><span class="ic">◎</span>语音对话</div>
+        <div class="sb-item" data-view="chat" data-act="new"><span class="ic">◉</span>新建任务</div>
         <div class="sb-item" data-view="crew"><span class="ic">◐</span>助理<span class="tag">BETA</span></div>
         <div class="sb-item" data-view="assets"><span class="ic">⌘</span>专家技能·连接器</div>
         <div class="sb-item" data-view="todo"><span class="ic">⏱</span>定时任务</div>
@@ -67,7 +68,7 @@
     <!-- 中栏 -->
     <main class="main">
       <div class="main-head">
-        <h1 id="viewTitle">设备编队</h1>
+        <h1 id="viewTitle">语音对话</h1>
         <span class="sub" id="regStat">registry: —</span>
         <span class="grow"></span>
         <div class="apprflag" id="apprFlag" hidden>
@@ -83,7 +84,7 @@
 
       <!-- 视图容器：聊天 / 专家技能连接器 / 其它 -->
       <div class="views" id="views">
-        <div class="view view-chat on" id="viewChat">
+        <div class="view view-chat" id="viewChat">
 
       <div class="stream" id="stream">
         <div class="stream-in" id="streamIn"></div>
@@ -125,6 +126,27 @@
           </div>
         </div>
       </div>
+        </div>
+
+        <!-- 语音对话（光球视图）
+             照 desktop.py 的独立语音模式做的：一屏一个光球 + 一行字幕，不堆历史。
+             光球是状态机本身：IDLE 慢呼吸 / LISTEN 波纹 / THINK 转圈 / SPEAK 脉冲。
+             为什么要有光球：语音交互最大的焦虑是「它到底收没收到我的话」，
+             呼吸和波纹就是在回答这个焦虑。
+             🔴 只显示最近一句字幕，不堆聊天记录——堆了就退化成聊天窗口，失去语音优先的意义。 -->
+        <div class="view view-voice on" id="viewVoice">
+          <div class="vv-wrap">
+            <canvas class="vv-orb" id="orbCanvas" width="300" height="300"></canvas>
+            <div class="vv-sub" id="vvSub">点麦克风说一句，或打开「免手」连续聊。</div>
+            <div class="vv-hint" id="vvHint"></div>
+          </div>
+          <div class="vv-bar">
+            <button class="vv-mic" id="vvMic" title="开始 / 停止说话" aria-label="麦克风">🎙</button>
+            <input class="vv-input" id="vvInput" placeholder="说点什么…（也可直接打字）"
+                   autocomplete="off" aria-label="文字输入">
+            <button class="vv-send" id="vvSend">发送</button>
+            <button class="vv-hands" id="vvHands" title="免手连续对话">免手</button>
+          </div>
         </div>
 
         <!-- 专家 · 技能 · 连接器（X1 三 Tab） -->
