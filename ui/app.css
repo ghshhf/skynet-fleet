@@ -7,8 +7,8 @@
 :root{
   --bg:#f7f8fa; --panel:#ffffff; --panel-2:#f2f3f5; --sidebar:#f4f5f7;
   --line:#e3e5e8; --line-soft:#edeef0;
-  --fg:#1b1d21; --fg-2:#5c626d; --fg-3:#8f959e;
-  --accent:#2f6bd8; --accent-soft:#e8effc;
+  --fg:#1b1d21; --fg-2:#5c626d; --fg-3:#666e78;
+  --accent:#2f6bd8; --accent-soft:#f1f5fd;
   --user:#eef0f3; --danger:#d8453c; --ok:#1f9d55; --warn:#c98a00;
   --radius:10px; --radius-lg:14px;
   --shadow:0 1px 2px rgba(16,20,28,.06),0 8px 24px rgba(16,20,28,.06);
@@ -17,8 +17,8 @@
 html[data-theme="dark"]{
   --bg:#15171a; --panel:#1b1e22; --panel-2:#22262b; --sidebar:#181b1f;
   --line:#2b3036; --line-soft:#24282d;
-  --fg:#e6e8eb; --fg-2:#a2a9b3; --fg-3:#6f7681;
-  --accent:#5b8def; --accent-soft:#1e2a3f;
+  --fg:#e6e8eb; --fg-2:#a2a9b3; --fg-3:#8f97a5;
+  --accent:#5b8def; --accent-soft:#182338;
   --user:#242930; --warn:#d0a63c;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
 }
@@ -31,6 +31,10 @@ body{
 }
 .app{display:flex;flex-direction:column;height:100vh}
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+
+/* 键盘焦点可见：所有可聚焦元素统一焦点环（Q3 键盘可达） */
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.proctable:focus-visible,.sb-list:focus-visible{outline-offset:-2px}
 
 /* ---------- 顶部菜单条 ---------- */
 .titlebar{
