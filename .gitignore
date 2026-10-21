@@ -21,6 +21,13 @@ fleet_journal.db-wal
 fleet_audit.jsonl
 persona_state.json
 cards/active.json
+# 卡商店：下载账本是本机状态，不入库。
+# 🔴 只排 store_ 前缀的卡（= 从商店/投递口进来的），**不排其它 png** ——
+#    主人自己放进来的卡（含手写 png）应该能进库。
+cards/.downloads.json
+cards/store_*.png
+cards/store_*.json
+cards_inbox/
 models/
 ui_automation/adskip_rules.json
 ui_automation/adskip_rules.json.tmp

@@ -259,7 +259,7 @@
     body.appendChild(el("div", "empty", "读取中…"));
 
     if (tab === "cards") {
-      api("/api/cards").then(function (d) {
+      api("/api/cardstore").then(function (d) {
         ASSET_CACHE.cards = d;
         renderCardsTab(d);
       }).catch(function (e) { renderTabErr(body, "读不到角色卡：" + e.message); });
@@ -283,37 +283,249 @@
     body.appendChild(el("div", "why", why));
   }
 
-  /* ---------------- 专家（角色卡） ---------------- */
+  /* ---------------- 专家（角色卡） ----------------
+     两段：
+       ① 我的卡库 —— cards/ 下已有的卡，**可以随时切换**（切 = 她是谁变了）
+       ② 卡库商店 —— 联网搜卡、下载入库（写卡 = 副作用 ⇒ 会过审批闸门）
+
+     🔴 切换不走 /api/call：切卡是**主人自己的决定**，不是「能力调用」，
+        不该弹审批框。后端 /api/card/use 也不绕闸门（它改的是 active.json，
+        不是外部世界）。但**下载会改 cards/ 目录**，那是往磁盘写东西 ⇒ 走闸门。
+  */
 
   function renderCardsTab(d) {
     var body = $("tabBody");
     body.textContent = "";
     var cards = d.cards || [];
-    body.appendChild(el("div", "sec", "角色卡 · " + cards.length + " 张"));
+
+    body.appendChild(el("div", "sec", "我的卡库 · " + cards.length + " 张"));
     if (!cards.length) {
       body.appendChild(el("div", "empty",
-        "还没有角色卡。角色卡是 <b>chara_card_v3</b> 格式的 JSON，放进 cards/ 目录即可。"));
-      return;
+        "还没有角色卡。往下从商店下几张，或把卡文件放进 cards/ 目录。"));
+    } else {
+      var wall = el("div", "wall");
+      cards.forEach(function (c) {
+        var card = el("div", "card");
+        var top = el("div", "ctop");
+        top.appendChild(el("span", c.ok ? "dot-ok" : "dot-bad"));
+        top.appendChild(el("div", "cname", c.name || c.file));
+        if (c.spec) { top.appendChild(el("span", "badge-role", c.spec)); }
+        card.appendChild(top);
+        if (c.ok) {
+          card.appendChild(el("div", "cdesc", "角色卡 " + c.file + "（" + c.spec + " 格式）"));
+        } else {
+          card.appendChild(el("div", "creason err", c.error || "这张卡读不出来"));
+        }
+        var meta = el("div", "cmeta");
+        meta.appendChild(el("span", "", c.file));
+        if (c.ok) {
+          var use = el("button", "hbtn go", "切换到这张");
+          use.addEventListener("click", function () { useCard(c.file, c.name || c.file); });
+          meta.appendChild(use);
+        }
+        card.appendChild(meta);
+        wall.appendChild(card);
+      });
+      body.appendChild(wall);
     }
-    var wall = el("div", "wall");
-    cards.forEach(function (c) {
-      var card = el("div", "card");
-      var top = el("div", "ctop");
-      top.appendChild(el("span", c.ok ? "dot-ok" : "dot-bad"));
-      top.appendChild(el("div", "cname", c.name || c.file));
-      if (c.spec) { top.appendChild(el("span", "badge-role", c.spec)); }
-      card.appendChild(top);
-      if (c.ok) {
-        card.appendChild(el("div", "cdesc", "角色卡 " + c.file + "（" + c.spec + " 格式）"));
-      } else {
-        card.appendChild(el("div", "creason err", c.error || "这张卡读不出来"));
-      }
-      var meta = el("div", "cmeta");
-      meta.appendChild(el("span", "", c.file));
-      card.appendChild(meta);
-      wall.appendChild(card);
+
+    body.appendChild(el("div", "sec", "卡库商店 · 联网搜与下载"));
+    body.appendChild(renderStorePanel(d));
+  }
+
+  /* 切换角色卡：这是主人自己的决定，不走审批。 */
+  function useCard(file, name) {
+    if (!requireToken()) { return; }
+    api("/api/card/use", { method: "POST", body: { file: file } })
+      .then(function (r) {
+        if (!r.ok) { toast("切卡失败：" + (r.err || "不知道原因"), true); return; }
+        toast("已切到「" + (name || file) + "」");
+        ASSET_CACHE.cards = null;
+        loadAssetTab("cards");
+        if (typeof refreshPersona === "function") { refreshPersona(); }
+      })
+      .catch(function (e) { toast("切卡失败：" + e.message, true); });
+  }
+
+  /* ---------------- 卡库商店面板 ---------------- */
+
+  var STORE_STATE = { source: "aicc", query: "", items: [], total: 0, busy: false };
+
+  function renderStorePanel(d) {
+    var box = el("div", "store");
+
+    // ---- 源选择 + 搜索框 ----
+    var bar = el("div", "storebar");
+    var srcs = d.sources || [];
+    if (srcs.length) {
+      var sel = el("select", "storesel");
+      srcs.forEach(function (s) {
+        var o = el("option", "", s.name + (s.note ? "　（" + s.note + "）" : ""));
+        o.value = s.id;
+        if (s.id === STORE_STATE.source) { o.selected = true; }
+        sel.appendChild(o);
+      });
+      sel.addEventListener("change", function () {
+        STORE_STATE.source = sel.value;
+        STORE_STATE.query = "";
+        doStoreSearch("");
+      });
+      bar.appendChild(sel);
+    } else {
+      bar.appendChild(el("div", "why", "没有可用的卡源（注册表里 card.sources 没答上来）"));
+    }
+
+    var inp = el("input", "storeinput");
+    inp.type = "search";
+    inp.placeholder = "搜卡（标题 / 作者 / 标签）· 回车搜索";
+    inp.value = STORE_STATE.query;
+    inp.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") { doStoreSearch(inp.value); }
     });
-    body.appendChild(wall);
+    bar.appendChild(inp);
+    var go = el("button", "hbtn go", "搜索");
+    go.addEventListener("click", function () { doStoreSearch(inp.value); });
+    bar.appendChild(go);
+    box.appendChild(bar);
+
+    // ---- 投递口（手动下载的卡）----
+    var inbox = el("div", "storeinbox");
+    inbox.appendChild(el("span", "", "手动下载的卡放这里 → " + (d.inbox || "(未指定)")));
+    var ing = el("button", "hbtn go", "体检并入库");
+    ing.addEventListener("click", doIngest);
+    inbox.appendChild(ing);
+    box.appendChild(inbox);
+
+    // ---- 结果区 ----
+    var res = el("div", "storeres");
+    if (STORE_STATE.busy) {
+      res.appendChild(el("div", "why", "正在搜…"));
+    } else if (STORE_STATE.items.length) {
+      res.appendChild(el("div", "why", "共 " + STORE_STATE.total + " 张，显示 "
+        + STORE_STATE.items.length + " 张"));
+      var wall = el("div", "wall");
+      STORE_STATE.items.forEach(function (it) {
+        wall.appendChild(storeItem(it));
+      });
+      res.appendChild(wall);
+    } else {
+      res.appendChild(el("div", "empty",
+        "搜点什么吧。上面输入关键词回车，或直接点「搜索」看全部。"));
+    }
+    box.appendChild(res);
+    return box;
+  }
+
+  function storeItem(it) {
+    var card = el("div", "card");
+    var top = el("div", "ctop");
+    top.appendChild(el("span", "dot-off"));
+    top.appendChild(el("div", "cname", it.title || "(无名)"));
+    if (it.nsfw) { top.appendChild(el("span", "badge deny", "NSFW")); }
+    card.appendChild(top);
+    if (it.excerpt) { card.appendChild(el("div", "cdesc", it.excerpt)); }
+    var meta = el("div", "cmeta");
+    if (it.author) { meta.appendChild(el("span", "", "作者 " + it.author)); }
+    if (it.token_count) { meta.appendChild(el("span", "", it.token_count + " tok")); }
+    (it.tags || []).slice(0, 4).forEach(function (t) {
+      meta.appendChild(el("span", "badge-role", t));
+    });
+    var dl = el("button", "hbtn go", "下载");
+    dl.addEventListener("click", function () { doStoreFetch(it, dl); });
+    meta.appendChild(dl);
+    card.appendChild(meta);
+    return card;
+  }
+
+  function doStoreSearch(q) {
+    if (!requireToken()) { return; }
+    STORE_STATE.query = q || "";
+    STORE_STATE.busy = true;
+    var body = $("tabBody");
+    var keep = body.textContent;   // 重绘整段 Tab
+    void keep;
+    api("/api/cardstore/search?source=" + encodeURIComponent(STORE_STATE.source)
+        + "&query=" + encodeURIComponent(STORE_STATE.query) + "&limit=24")
+      .then(function (r) {
+        STORE_STATE.busy = false;
+        if (!r.ok) {
+          STORE_STATE.items = [];
+          STORE_STATE.total = 0;
+          toast("搜卡失败：" + (r.err || "不知道原因"), true);
+        } else {
+          STORE_STATE.items = r.items || [];
+          STORE_STATE.total = r.total || 0;
+        }
+        loadAssetTab("cards");
+      })
+      .catch(function (e) {
+        STORE_STATE.busy = false;
+        STORE_STATE.items = [];
+        toast("搜卡失败：" + e.message, true);
+        loadAssetTab("cards");
+      });
+  }
+
+  function doStoreFetch(it, btn) {
+    if (!requireToken()) { return; }
+    btn.disabled = true;
+    btn.textContent = "下载中…";
+    // 走 /api/call → registry.call → 副作用能力 ⇒ 会挂起等审批
+    // 主人点确认后这次调用才继续，答复回来时卡已经入库了。
+    fetchCardCap(it, btn);
+  }
+
+  /* 下载一张卡（走能力调用，副作用 ⇒ 要审批）。
+     审批通过 ⇒ 后端把卡下到 cards/ ⇒ 刷新专家 Tab。 */
+  function fetchCardCap(it, btn) {
+    if (!requireToken()) { return; }
+    APPR_TAG += 1;
+    var tag = "cardfetch-" + APPR_TAG;
+    var body = { cap: "card.fetch", device: "cards:store",
+                 args: { source: STORE_STATE.source, id: String(it.id) },
+                 tag: tag, session: SESSION };
+    api("/api/call", { method: "POST", body: body }).then(function (res) {
+      showResult(res);
+      pollApprovals();
+      if (res && res.ok) {
+        var data = res.data || {};
+        var lint = data.lint || {};
+        toast("「" + (it.title || it.id) + "」已入库"
+          + (lint.score !== undefined ? "（体检 " + lint.score + " 分）" : "")
+          + "　切过去用「切换到这张」");
+        ASSET_CACHE.cards = null;
+        loadAssetTab("cards");
+      } else if (res && res.code === "denied") {
+        toast("没下载：" + (res.err || "被拒绝"), true);
+      }
+      if (btn) { btn.disabled = false; btn.textContent = "下载"; }
+    }).catch(function (e) {
+      showResult({ ok: false, cap: "card.fetch", code: "error", err: e.message });
+      pollApprovals();
+      if (btn) { btn.disabled = false; btn.textContent = "下载"; }
+    });
+  }
+
+  function doIngest() {
+    if (!requireToken()) { return; }
+    APPR_TAG += 1;
+    var tag = "cardingest-" + APPR_TAG;
+    var body = { cap: "card.ingest", device: "cards:store", args: {},
+                 tag: tag, session: SESSION };
+    api("/api/call", { method: "POST", body: body }).then(function (res) {
+      showResult(res);
+      pollApprovals();
+      if (res && res.ok) {
+        var items = (res.data && res.data.items) || [];
+        var good = items.filter(function (i) { return i.ok; }).length;
+        toast("投递口入库完成：" + good + "/" + items.length + " 张通过体检");
+        ASSET_CACHE.cards = null;
+        loadAssetTab("cards");
+      }
+    }).catch(function (e) {
+      showResult({ ok: false, cap: "card.ingest", code: "error", err: e.message });
+      pollApprovals();
+    });
   }
 
   /* ---------------- 技能（SKILL.md） ---------------- */
