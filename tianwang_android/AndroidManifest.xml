@@ -6,30 +6,24 @@
   网络是 HttpURLConnection。唯一的后端依赖是电脑上那个 fleet/gui 服务，
   通过 adb reverse 把手机的回环口接到电脑上。
 -->
+<!-- versionCode / versionName 故意不写在这里：写死就会出现"代码改了包没换"
+     还说不清的状况。由 build.sh 每次构建 +1，经 aapt2 link 的
+     version-code / version-name 参数注入（manifest 里写了会覆盖参数，必须留空）。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="app.skynet.tianwang"
-    android:versionCode="1"
-    android:versionName="1.0">
+    package="app.skynet.tianwang">
 
-    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+    <!-- minSdk 28（Android 9）而不是 26：出图那条 libfleet_sd.so 用到
+         std::aligned_alloc，Android 的 libc 到 API 28 才提供。不抬的话老机器能装上、
+         loadLibrary 也会成功，但一真的出图就在 native 层崩，日志里只看得到信号，
+         看不出是 API 版本问题。抬到 28 后安装阶段就挡住，用户根本遇不到。 -->
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="35" />
 
     <!-- 只连 127.0.0.1（adb reverse 转出去），不主动外联 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- 录音：运行时申请 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- 出图：读 Termux 写进 Pictures/fleet 的结果图 -->
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
-    <!-- 出图：调用 Termux 跑本地 sd.cpp（F-Droid 版） -->
-    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
-
-    <!-- 让本 App 能"看到"并拉起 Termux（Android 11+ 包可见性） -->
-    <queries>
-        <package android:name="com.termux" />
-    </queries>
 
     <application
         android:allowBackup="false"
@@ -59,7 +53,18 @@
             android:exported="true"
             android:theme="@android:style/Theme.NoDisplay" />
 
-        <!-- 出图：本地 Termux 算力，不经过电脑。从主界面"出图"入口拉起。 -->
+        <!-- 设备检测：Vulkan 清单 / MemTotal / 基准 s/步，结果落盘当默认配置。
+             导出 + 支持 auto 参数，是为了让 PC 侧 am start 无人值守跑完，
+             不用人每次在手机上点。硬件不变，所以这个页面正常只跑一次。
+             （XML 注释里不能写连续两个连字符，所以这里不写命令行开关的原样） -->
+        <activity
+            android:name=".DeviceCheckActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 出图：手机本地 stable-diffusion.cpp（libfleet_sd.so，Vulkan），
+             不经过电脑、不借 Termux。从主界面"出图"入口拉起。 -->
         <activity
             android:name=".ImageActivity"
             android:exported="false"

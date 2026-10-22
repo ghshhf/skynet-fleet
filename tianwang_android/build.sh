@@ -85,6 +85,19 @@ echo "SDK      : $SDK"
 echo "build-tools: $BT_DIR"
 echo "platform : $PLATFORM (API $API)"
 echo "javac    : $JAVAC"
+
+# ---------------- 版本号：每次构建 +1 ----------------
+# 为什么要自动：主人要求"升级后能一眼看出换没换成功"。手动改 manifest 一定会忘，
+# 忘了就会出现"代码改了但包还是旧的"这种查半天的情况。
+# build/ 每次都 rm -rf，所以计数文件放项目根，跟着 git 走。
+VER_FILE="version.txt"
+# 首次构建 version.txt 不存在，cat 会失败；脚本开了 set -e，必须显式吃掉这个错。
+BUILD_NO="$(cat "$VER_FILE" 2>/dev/null | tr -dc '0-9' || true)"
+[ -n "$BUILD_NO" ] || BUILD_NO=0
+BUILD_NO=$((BUILD_NO + 1))
+echo "$BUILD_NO" > "$VER_FILE"
+VERSION_NAME="1.0.$BUILD_NO"
+echo "版本     : $VERSION_NAME (versionCode=$BUILD_NO)"
 echo "--------"
 
 rm -rf build
@@ -96,7 +109,8 @@ FLATS="$(find build/res -name '*.flat' | tr '\n' ' ')"
 # shellcheck disable=SC2086
 "$AAPT2" link -o build/base.apk -I "$PLATFORM" \
   --manifest AndroidManifest.xml \
-  --min-sdk-version 26 --target-sdk-version "$API" \
+  --version-code "$BUILD_NO" --version-name "$VERSION_NAME" \
+  --min-sdk-version 28 --target-sdk-version "$API" \
   --java build/gen \
   --auto-add-overlay $FLATS
 echo "[1/5] 资源编译完成"
@@ -110,7 +124,9 @@ echo "[2/5] javac 完成"
 # ---------------- ⑤ dex ----------------
 CLASSES="$(find build/classes -name '*.class')"
 # shellcheck disable=SC2086
-"$D8" --lib "$PLATFORM" --min-api 26 --release \
+# --min-api 28 跟着 manifest 的 minSdkVersion 走（理由见 AndroidManifest.xml 的注释：
+# libfleet_sd.so 要 API 28 的 aligned_alloc）。
+"$D8" --lib "$PLATFORM" --min-api 28 --release \
   --output build/dex $CLASSES
 echo "[3/5] d8 完成"
 
@@ -119,14 +135,14 @@ echo "[3/5] d8 完成"
 ( cd build/dex && "$AAPT" add -f ../base.apk classes.dex >/dev/null )
 echo "[4/5] classes.dex 已合入"
 
-# ---------------- ⑥b 本地语音的 .so ----------------
-# 不在这一步现场编（NDK 全套编一遍一分半，且大多数改动跟语音无关），
-# 用 jni/build/libfleet_whisper.so 这个已经 strip 过的产物（约 1.6MB）。
-# 要重编：bash jni/build.sh
-SO="$HERE/jni/build/libfleet_whisper.so"
-if [ -f "$SO" ]; then
-  PY="${PY:-/d/tools/python/python.exe}"
-  "$PY" - "$HERE/build/base.apk" "$SO" <<'PYEOF'
+# ---------------- ⑥b 本地 native 库（语音 whisper + 出图 sd）----------------
+# 不在这一步现场编（NDK 全套编一遍要几分钟，且大多数改动跟 native 无关），
+# 用 jni/build*/libfleet_*.so 这些已经 strip 过的产物。
+# 要重编：bash jni/build.sh（语音） / bash jni/build-sd.sh（出图）
+for SO in "$HERE/jni/build/libfleet_whisper.so" "$HERE/jni/build-sd/libfleet_sd.so"; do
+  if [ -f "$SO" ]; then
+    PY="${PY:-/d/tools/python/python.exe}"
+    "$PY" - "$HERE/build/base.apk" "$SO" <<'PYEOF'
 import sys, zipfile, os
 apk, so = sys.argv[1], sys.argv[2]
 # 用 STORED 存（不压缩）：Android 6+ 可以直接 mmap APK 里的库，
@@ -137,10 +153,11 @@ with zipfile.ZipFile(apk, "a", zipfile.ZIP_STORED) as z:
 print("      lib/arm64-v8a/%s  %.1f MB" % (os.path.basename(so),
                                           os.path.getsize(so) / 1048576))
 PYEOF
-  echo "[4/5b] libfleet_whisper.so 已合入"
-else
-  echo "[4/5b] 跳过本地语音（没有 jni/build/libfleet_whisper.so）"
-fi
+    echo "[4/5b] $(basename "$SO") 已合入"
+  else
+    echo "[4/5b] 跳过 $(basename "$SO")（没有这个 .so）"
+  fi
+done
 
 # ---------------- ⑦ 签名 ----------------
 KS="$HERE/keystore.jks"

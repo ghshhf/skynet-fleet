@@ -30,6 +30,16 @@
             android:textStyle="bold"
             android:letterSpacing="0.12" />
 
+        <!-- 版本号：每次构建自动 +1（见 build.sh）。有了它一眼就能看出
+             adb install 有没有真的换掉旧包，不用再去翻应用信息页。 -->
+        <TextView
+            android:id="@+id/ver"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:textColor="@color/text_dim"
+            android:textSize="11sp" />
+
         <TextView
             android:id="@+id/status"
             android:layout_width="0dp"
@@ -58,6 +68,17 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="出图"
+            android:textColor="@color/text_dim"
+            android:textSize="13sp"
+            android:padding="8dp" />
+
+        <!-- 设备检测：一次性测清这台机的 GPU/内存/基准，结果存下来当默认配置。
+             放在出图右边：它是"看清机器"，出图是"用机器"，先看清再用。 -->
+        <TextView
+            android:id="@+id/btnDev"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="检测"
             android:textColor="@color/text_dim"
             android:textSize="13sp"
             android:padding="8dp" />

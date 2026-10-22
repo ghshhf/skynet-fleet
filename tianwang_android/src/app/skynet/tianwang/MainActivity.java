@@ -18,6 +18,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.util.Log;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -35,6 +36,7 @@ import java.util.concurrent.Executors;
  */
 public class MainActivity extends Activity {
 
+    private static final String TAG = "tianwang";
     private static final int REQ_MIC = 41;
 
     private OrbView orb;
@@ -45,6 +47,7 @@ public class MainActivity extends Activity {
     private TextView btnSettings;
     private TextView btnPc;
     private TextView btnImg;
+    private TextView btnDev;
     private EditText input;
 
     private final WavRecorder recorder = new WavRecorder();
@@ -87,7 +90,21 @@ public class MainActivity extends Activity {
         btnSettings = findViewById(R.id.btnSettings);
         btnPc = findViewById(R.id.btnPc);
         btnImg = findViewById(R.id.btnImg);
+        btnDev = findViewById(R.id.btnDev);
         input = findViewById(R.id.input);
+
+        // 版本号来自 APK 本身（aapt2 link --version-name/--version-code），
+        // 不写死在代码里——写死就会出现「代码改了但包没换」还说不清的状况。
+        TextView ver = findViewById(R.id.ver);
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            final String v = pi.versionName + " (build " + pi.versionCode + ")";
+            ver.setText(v);
+            Log.i(TAG, "天网版本 " + v);
+        } catch (Exception e) {
+            ver.setText("");
+        }
 
         recorder.setLevelListener(new WavRecorder.LevelListener() {
             @Override
@@ -155,6 +172,13 @@ public class MainActivity extends Activity {
             }
         });
 
+        btnDev.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(MainActivity.this, DeviceCheckActivity.class));
+            }
+        });
+
         btnSettings.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -166,6 +190,90 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
         }
         probeHealth();
+
+        // 无人值守基准：PC 侧 am start 本 Activity（LAUNCHER，实测不会被小米的
+        // "后台弹出界面"拦掉）带 bench=true，这里直接开跑，结果进 logcat。
+        // 存在的意义：性能排查要跑很多轮，不能每轮都让人在手机上点一次。
+        if (getIntent().getBooleanExtra("bench", false)) {
+            startBench(getIntent().getIntExtra("steps", 2),
+                    getIntent().getIntExtra("size", 512),
+                    getIntent().getStringExtra("model"));
+        }
+        // 队列无人值守测试：`--es prompts "a cat;;a dog"`（用 ;; 分隔，命令行塞换行太麻烦）
+        if (getIntent().getBooleanExtra("queue", false)) {
+            startQueue(getIntent().getStringExtra("prompts"),
+                    getIntent().getIntExtra("steps", 4),
+                    getIntent().getIntExtra("size", 512));
+        }
+    }
+
+    private void startQueue(String prompts, final int steps, final int size) {
+        if (prompts == null || prompts.trim().isEmpty()) {
+            Log.e(TAG, "QUEUE_SKIP 没给 prompts");
+            return;
+        }
+        final java.util.List<QueueStore.Item> queue = new java.util.ArrayList<QueueStore.Item>();
+        String[] lines = prompts.split(";;");
+        ModelManager.Spec spec = ModelManager.current(this);
+        long base = System.currentTimeMillis();
+        for (int i = 0; i < lines.length; i++) {
+            String p = lines[i].trim();
+            if (p.isEmpty()) continue;
+            QueueStore.Item it = new QueueStore.Item();
+            it.id = base + i;
+            it.prompt = p;
+            it.size = size;
+            it.steps = steps;
+            it.seed = base + i;
+            it.cfg = spec.cfg;
+            it.sampler = spec.sampler;
+            it.model = spec.file;
+            it.tier = "STD";
+            it.status = QueueStore.PENDING;
+            it.createdAt = System.currentTimeMillis();
+            queue.add(it);
+        }
+        QueueStore.save(this, queue);
+        Log.i(TAG, "QUEUE_START " + queue.size() + " 张：" + QueueStore.summary(queue));
+        worker.execute(new Runnable() {
+            @Override public void run() {
+                boolean all = QueueRunner.run(MainActivity.this, queue, null, null,
+                        new QueueRunner.Sink() {
+                            @Override public void onProgress(String line) {
+                                Log.i(TAG, line);
+                            }
+                        });
+                Log.i(TAG, all ? "QUEUE_ALL_OK" : "QUEUE_HAD_FAILURE");
+            }
+        });
+    }
+
+    private void startBench(final int steps, final int size, final String model) {
+        java.util.List<ModelManager.Spec> av = ModelManager.available(this);
+        if (av.isEmpty()) {
+            Log.e(TAG, "BENCH_SKIP 没有可用模型");
+            return;
+        }
+        // 能指定模型才有 A/B 可言：同一个 steps 下 SD1.5 和 Turbo 差一个数量级，
+        // 不指定就只能测到"第一个"，比较不出东西。
+        ModelManager.Spec pick = av.get(0);
+        if (model != null) {
+            for (ModelManager.Spec s : av) {
+                if (s.file.equals(model)) { pick = s; break; }
+            }
+        }
+        final ModelManager.Spec spec = pick;
+        Log.i(TAG, "BENCH_START model=" + spec.file + " size=" + size + " steps=" + steps);
+        worker.execute(new Runnable() {
+            @Override public void run() {
+                BenchRunner.run(MainActivity.this, spec, size, steps,
+                        new BenchRunner.Sink() {
+                            @Override public void onLog(String line) {
+                                Log.i(TAG, line);
+                            }
+                        });
+            }
+        });
     }
 
     // ---------------- 录音 ----------------

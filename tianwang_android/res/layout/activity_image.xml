@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  手机出图界面（N+1c）：prompt + 步数 + 尺寸 + 生成 → 本地 Termux 出图 → 展示。
-  配色复用主界面：bg / text / text_dim。尺寸按钮选中态在 Java 里改背景色。
+  手机出图界面：prompt + 档位 + 尺寸/步数 → 本地 stable-diffusion.cpp（Vulkan）出图。
+
+  两处与旧版不同：
+    1. 步数不再是唯一旋钮——多了「快速/标准/精细」三档，档位由设备档案
+       （Vulkan / 内存 / 实测 s/步）算出，依据显示在档位下面，不许盲信自动选择。
+    2. prompt 支持多行，**一行一张**，进队列串行出（并发必 OOM：单张 RSS 峰值 2.67GB）。
+  配色复用主界面：bg / text / text_dim。选中态在 Java 里改背景色。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
@@ -18,14 +23,26 @@
         android:gravity="center_vertical">
 
         <TextView
-            android:layout_width="0dp"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
             android:text="出图"
             android:textColor="@color/text"
             android:textSize="17sp"
             android:textStyle="bold"
             android:letterSpacing="0.12" />
+
+        <TextView
+            android:id="@+id/btnModel"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="12dp"
+            android:text="模型"
+            android:textColor="@color/text_dim"
+            android:textSize="11sp"
+            android:singleLine="true"
+            android:ellipsize="middle"
+            android:padding="6dp" />
 
         <TextView
             android:id="@+id/btnBack"
@@ -41,13 +58,13 @@
         android:id="@+id/editPrompt"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:minHeight="56dp"
-        android:layout_marginTop="12dp"
+        android:minHeight="70dp"
+        android:layout_marginTop="10dp"
         android:background="@drawable/bg_input"
-        android:hint="想画什么？一句话描述"
+        android:hint="想画什么？一行一张（多行=排队出）"
         android:gravity="top"
         android:inputType="textMultiLine"
-        android:maxLines="3"
+        android:maxLines="6"
         android:padding="12dp"
         android:textColor="@color/text"
         android:textColorHint="@color/text_dim"
@@ -61,6 +78,93 @@
         android:layout_marginTop="10dp">
 
         <TextView
+            android:id="@+id/btnTierFast"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:gravity="center"
+            android:paddingLeft="12dp"
+            android:paddingRight="12dp"
+            android:text="快速"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnTierStd"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="8dp"
+            android:gravity="center"
+            android:paddingLeft="12dp"
+            android:paddingRight="12dp"
+            android:text="标准"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnTierFine"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="8dp"
+            android:gravity="center"
+            android:paddingLeft="12dp"
+            android:paddingRight="12dp"
+            android:text="精细"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="14dp"
+            android:text="尺寸"
+            android:textColor="@color/text_dim"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnSize512"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:gravity="center"
+            android:paddingLeft="10dp"
+            android:paddingRight="10dp"
+            android:text="512"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnSize768"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:gravity="center"
+            android:paddingLeft="10dp"
+            android:paddingRight="10dp"
+            android:text="768"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnSize1024"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:gravity="center"
+            android:paddingLeft="10dp"
+            android:paddingRight="10dp"
+            android:text="1024"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginTop="6dp">
+
+        <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="步数"
@@ -70,98 +174,95 @@
         <EditText
             android:id="@+id/editSteps"
             android:layout_width="64dp"
-            android:layout_height="40dp"
+            android:layout_height="36dp"
             android:layout_marginStart="8dp"
             android:background="@drawable/bg_input"
             android:inputType="number"
             android:maxLength="2"
-            android:text="10"
+            android:text="20"
             android:gravity="center"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/txtReason"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="12dp"
+            android:text=""
+            android:textColor="@color/text_dim"
+            android:textSize="10sp"
+            android:maxLines="2"
+            android:ellipsize="end" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="10dp">
+
+        <Button
+            android:id="@+id/btnGen"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="2"
+            android:background="@drawable/bg_send"
+            android:text="生成"
+            android:textColor="@color/text"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnStop"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:background="@drawable/bg_input"
+            android:text="停止"
             android:textColor="@color/text"
             android:textSize="14sp" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="16dp"
-            android:text="尺寸"
-            android:textColor="@color/text_dim"
-            android:textSize="13sp" />
-
-        <TextView
-            android:id="@+id/btnSize512"
-            android:layout_width="wrap_content"
-            android:layout_height="36dp"
+        <Button
+            android:id="@+id/btnRegen"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
             android:layout_marginStart="8dp"
-            android:gravity="center"
-            android:paddingLeft="12dp"
-            android:paddingRight="12dp"
-            android:text="512"
+            android:background="@drawable/bg_input"
+            android:text="换一张"
             android:textColor="@color/text"
-            android:textSize="13sp" />
-
-        <TextView
-            android:id="@+id/btnSize768"
-            android:layout_width="wrap_content"
-            android:layout_height="36dp"
-            android:layout_marginStart="8dp"
-            android:gravity="center"
-            android:paddingLeft="12dp"
-            android:paddingRight="12dp"
-            android:text="768"
-            android:textColor="@color/text"
-            android:textSize="13sp" />
-
-        <TextView
-            android:id="@+id/btnSize1024"
-            android:layout_width="wrap_content"
-            android:layout_height="36dp"
-            android:layout_marginStart="8dp"
-            android:gravity="center"
-            android:paddingLeft="12dp"
-            android:paddingRight="12dp"
-            android:text="1024"
-            android:textColor="@color/text"
-            android:textSize="13sp" />
+            android:textSize="14sp" />
     </LinearLayout>
-
-    <Button
-        android:id="@+id/btnGen"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:layout_marginTop="12dp"
-        android:background="@drawable/bg_send"
-        android:text="生成"
-        android:textColor="@color/text"
-        android:textSize="15sp"
-        android:textStyle="bold" />
 
     <TextView
         android:id="@+id/txtStatus"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="10dp"
-        android:minHeight="32dp"
+        android:layout_marginTop="8dp"
+        android:minHeight="30dp"
         android:text="准备就绪"
         android:textColor="@color/text_dim"
-        android:textSize="12sp" />
+        android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/txtQueue"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="@color/text_dim"
+        android:textSize="10sp"
+        android:maxLines="2"
+        android:ellipsize="end" />
 
     <ImageView
         android:id="@+id/imgResult"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:layout_marginTop="10dp"
+        android:layout_marginTop="8dp"
         android:scaleType="fitCenter"
         android:background="@color/bg" />
-
-    <Button
-        android:id="@+id/btnRegen"
-        android:layout_width="match_parent"
-        android:layout_height="44dp"
-        android:layout_marginTop="8dp"
-        android:background="@drawable/bg_input"
-        android:text="换一张（新种子）"
-        android:textColor="@color/text"
-        android:textSize="14sp" />
 </LinearLayout>
