@@ -159,6 +159,26 @@ class Journal:
             self.con.commit()
             return cur.rowcount
 
+    def exists(self, ids):
+        """给定 id 里哪些真的存在。
+
+        写记忆时要拿流水当证据，就必须能核验这些 id 不是编出来的。
+        返回集合而不是布尔：这样调用方能指出**具体哪几个**不存在。
+        """
+        ints = []
+        for i in ids:
+            try:
+                ints.append(int(i))
+            except (TypeError, ValueError):
+                continue
+        if not ints:
+            return set()
+        q = ",".join("?" * len(ints))
+        with self._lk:
+            rows = self.con.execute(
+                "SELECT id FROM journal WHERE id IN (%s)" % q, ints).fetchall()
+        return {r[0] for r in rows}
+
     def count(self):
         with self._lk:
             return self.con.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
