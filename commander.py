@@ -198,12 +198,15 @@ def _session_cleanup(name):
         if q:
             queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
         out["queued"] = len(q)
-    # 清完留痕：以后要查「那台机器到底清没清」只看这一条
+    # 清完留痕：以后要查「那台机器到底清没清」只看这一条。
+    # 写成**已闭环**：清理是当场做完的事，不是一笔待办；否则它会一直挂在
+    # 「未闭环」里，还会被记忆沉淀当成值得一提的事。
     try:
         _journal().log(
             "task", name,
             f"临时节点下机清理：凭据 {out['psk']} 枚 / 令牌 {out['tokens']} 个 / "
-            f"丢弃排队命令 {out['queued']} 条")
+            f"丢弃排队命令 {out['queued']} 条",
+            topic=f"node:forget:{name}", status="done")
     except Exception:
         pass
     return out

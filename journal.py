@@ -68,15 +68,22 @@ class Journal:
             self.con.commit()
 
     # ---------- 写 ----------
-    def log(self, kind, actor, body, topic=None, ref=None, ts=None):
-        """追加一条事件，返回自增 id（供上层引用为证据）。"""
+    def log(self, kind, actor, body, topic=None, ref=None, ts=None, status=OPEN_STATUS):
+        """追加一条事件，返回自增 id（供上层引用为证据）。
+
+        `status` 可以显式指定：有些事**写下来时就已经了结了**（比如「这台临时节点
+        已清理干净」）。默认 open 会让它变成一笔永远挂着的账，`followups` 和记忆
+        沉淀都会把它当成待办，纯属自找噪音。
+        """
         if kind not in KINDS:
             raise ValueError(f"未知事件类型: {kind}（应为 {KINDS} 之一）")
+        if status not in (OPEN_STATUS, DONE_STATUS):
+            raise ValueError(f"未知状态: {status}（应为 {OPEN_STATUS}/{DONE_STATUS}）")
         ts = time.time() if ts is None else ts
         with self._lk:
             cur = self.con.execute(
                 "INSERT INTO journal(ts,kind,actor,topic,body,ref,status) VALUES(?,?,?,?,?,?,?)",
-                (ts, kind, actor, topic, redact(body), ref, OPEN_STATUS))
+                (ts, kind, actor, topic, redact(body), ref, status))
             self.con.commit()
             self._trim()
             return cur.lastrowid

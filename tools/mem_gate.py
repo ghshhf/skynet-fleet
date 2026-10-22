@@ -202,6 +202,21 @@ def t10_extract_idempotent():
         s.close()
 
 
+def t11_done_not_distilled():
+    """已闭环的事不再沉淀成记忆（否则 160 条清理留痕会变成 160 条"记忆"）。"""
+    s = Sandbox()
+    try:
+        s.j.log("task", "N3", "临时节点下机清理：凭据 1 枚", topic="node:forget:N3",
+                ts=s.now - 3600, status="done")
+        s.j.log("task", "PC-A", "备份又失败：磁盘满", topic="intent:备份", ts=s.now - 1800)
+        made = s.mg.extract(now=s.now)
+        keys = [m["key"] for m in made]
+        ok = keys == ["intent:备份"]
+        return ok, "沉淀 %s（node:forget:N3 已闭环，必须不出现）" % keys
+    finally:
+        s.close()
+
+
 def main():
     for _s in (sys.stdout, sys.stderr):
         try:
@@ -218,6 +233,7 @@ def main():
     check(8, "待核项不许被往事唤醒当事实说", t8_pending_not_recalled)
     check(9, "流水按 topic 沉淀成记忆（证据齐全）", t9_extract)
     check(10, "抽取幂等（重跑不膨胀）", t10_extract_idempotent)
+    check(11, "已闭环的事不再沉淀成记忆", t11_done_not_distilled)
 
     bad = [r for r in RESULTS if not r["ok"]]
     print("\n合计 %d 项，通过 %d，失败 %d"

@@ -85,14 +85,17 @@ class MemGuard:
 
     # ---------------- 从流水沉淀成记忆 ----------------
 
-    def extract(self, now=None, hours=72, kinds=("task", "user", "her", "see"), limit=2000):
+    def extract(self, now=None, hours=72, kinds=("task", "user", "her", "see"),
+                limit=2000, statuses=("open",)):
         """把流水按 topic 聚成记忆条目——**确定性、无 LLM、每条必带证据**。
 
-        为什么需要这一步：真实库里流已有 187 条事件，L3 只有 1 条元状态。
+        为什么需要这一步：真实库里流水有 187 条事件，L3 只有 1 条元状态。
         缺的从来不是存储，而是「事件 → 记忆」这一跳。MemFlywheel 用子 Agent 干这活；
         我们没有模型可依赖，就用 topic 聚合这条可解释的规则顶上。
 
         规则（说得清、可复算）：
+          · **只沉淀还没闭环的事**。已经了结的事件由流水自己承载，再记一遍是噪音
+            （真实库里 160 条「临时节点下机清理」就是这类，全已闭环）。
           · 按 `topic` 分组，**没有 topic 的事件不沉淀**（随口一句话不指向任何事）；
           · 每组取最后一条正文当摘要，挂上这一组的全部流水 id 当证据；
           · ns 按事件类型定：task→workflow，user/her→context，see→see；
@@ -102,6 +105,8 @@ class MemGuard:
         rows = self.journal.recent(hours=hours, now=now, kinds=tuple(kinds), limit=limit)
         groups = {}
         for r in rows:
+            if statuses and r.get("status") not in statuses:
+                continue
             t = (r.get("topic") or "").strip()
             if not t:
                 continue
