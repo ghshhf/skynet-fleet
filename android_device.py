@@ -548,6 +548,87 @@ def bridge_cmd(serial, cmd, timeout=8):
         return {"ok": False, "err": f"桥通信失败：{e}"}
 
 
+def bridge_bulk(serial, cmd, timeout=25, max_bytes=1 << 20):
+    """给桥发一条「多行回复」的指令（目前只有 UI），读到 END 为止。
+
+    和 bridge_cmd 的区别：那条一问一答只用 readline 取一行，而 UI 树是多行，
+    必须按 END 哨兵收尾，否则后面的行会残留在 socket 里污染下一次读取。
+    """
+    tok = bridge_token()
+    if not tok:
+        return {"ok": False, "err": "找不到编队桥令牌（先跑 android_bridge/build.sh）"}
+    _run(serial, ["forward", f"tcp:{BRIDGE_LOCAL_PORT}", f"tcp:{BRIDGE_REMOTE_PORT}"])
+    try:
+        s = socket.create_connection(("127.0.0.1", BRIDGE_LOCAL_PORT), timeout=timeout)
+    except OSError as e:
+        return {"ok": False, "err": f"桥隧道连不上：{e}"}
+    try:
+        with s:
+            f = s.makefile("rwb")
+
+            def send(line):
+                f.write((line + "\n").encode("utf-8"))
+                f.flush()
+
+            def read():
+                raw = f.readline()
+                if not raw:
+                    return None
+                return raw.decode("utf-8", "replace").rstrip("\r\n")
+
+            send("AUTH " + tok)
+            auth = read()
+            if auth is None:
+                return {"ok": False, "err": "桥无应答（服务可能刚被杀，重试一次）"}
+            if not auth.startswith("OK"):
+                return {"ok": False, "err": f"鉴权失败：{auth}"}
+
+            send(cmd)
+            head = read()
+            if head is None:
+                return {"ok": False, "err": "桥无应答"}
+            if not head.startswith("OK ui"):
+                # 单行回复（如 ERR …）或非 UI 指令
+                return {"ok": head.startswith("OK"), "head": head,
+                        "err": "" if head.startswith("OK") else head, "lines": []}
+
+            lines, size = [], 0
+            while True:
+                ln = read()
+                if ln is None:
+                    return {"ok": False, "err": "桥在树传完之前断开（服务被杀或读超时）"}
+                if ln == "END":
+                    break
+                lines.append(ln)
+                size += len(ln.encode("utf-8")) + 1
+                if size > max_bytes:
+                    return {"ok": False,
+                            "err": f"UI 树超过 {max_bytes} 字节仍未结束，桥侧截断可能失效"}
+            parts = head.split()
+            ms = -1
+            if len(parts) > 4 and parts[4].endswith("ms"):
+                try:
+                    ms = int(parts[4][:-2])
+                except ValueError:
+                    pass
+            pkg = parts[5][4:] if len(parts) > 5 and parts[5].startswith("pkg=") else ""
+            return {"ok": True, "head": head, "lines": lines, "bytes": size,
+                    "ms": ms, "pkg": pkg, "err": ""}
+    except OSError as e:
+        return {"ok": False, "err": f"桥通信失败：{e}"}
+
+
+def bridge_ui(serial="", max_lines=150, timeout=20):
+    """经编队桥读当前窗口 UI 树（同进程直读，毫秒级）。
+
+    刻意**不做**自动回退到 uiautomator dump：两条路径的耗时差一个数量级，
+    静默回退会让人以为桥在正常工作，实际每次都慢在 dump 上。
+    要走 dump 的调用方自己去调 ui_xml()，那是显式选择。
+    """
+    return bridge_bulk(serial, f"UI {int(max_lines)}", timeout=timeout)
+
+
+
 def can_inject(serial):
     """探 B 档是否已开（「USB 调试（安全设置）」）。用 KEYCODE_UNKNOWN 探，无副作用。"""
     rc, txt = shell(serial, "input keyevent 0")
@@ -721,8 +802,11 @@ def main(argv=None):
     p = sub.add_parser("shot", help="截屏到本地")
     p.add_argument("path")
 
-    p = sub.add_parser("ui", help="列 UI 树（可带关键字过滤）")
+    p = sub.add_parser("ui", help="列 UI 树（默认走 uiautomator dump；--bridge 走编队桥，毫秒级）")
     p.add_argument("keyword", nargs="?", default="")
+    p.add_argument("--bridge", action="store_true",
+                   help="经编队桥直读（带层级、毫秒级）；需要桥已授权且 adb forward 可用")
+    p.add_argument("--max", type=int, default=150, help="--bridge 时最多输出多少行")
 
     p = sub.add_parser("launch", help="启动应用/intent")
     p.add_argument("target")
@@ -796,6 +880,18 @@ def main(argv=None):
         r = shot(serial, args.path)
         print(r.get("path") or r.get("err"))
     elif args.cmd == "ui":
+        if args.bridge:
+            got = bridge_ui(serial, max_lines=args.max)
+            if not got["ok"]:
+                print(got["err"], file=sys.stderr)
+                return 1
+            print(f"包名 {got['pkg'] or '?'} · {len(got['lines'])} 行 · "
+                  f"{got['bytes']} 字节 · 服务端遍历 {got['ms']}ms")
+            for ln in got["lines"]:
+                if args.keyword and args.keyword not in ln:
+                    continue
+                print(ln)
+            return 0
         got = ui_xml(serial)
         if not got["ok"]:
             print(got["err"], file=sys.stderr)

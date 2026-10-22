@@ -144,6 +144,8 @@ public class BridgeService extends AccessibilityService {
                     return global(GLOBAL_ACTION_NOTIFICATIONS);
                 case "FOCUS":
                     return focusInfo();
+                case "UI":
+                    return uiTree(rest);
                 case "IRINFO":
                     return irInfo();
                 case "IR":
@@ -247,6 +249,135 @@ public class BridgeService extends AccessibilityService {
         CharSequence cls = f.getClassName();
         CharSequence txt = f.getText();
         return "OK focus " + cls + " | " + (txt == null ? "" : txt);
+    }
+
+    // ------------------------------------------------------------ 读屏
+    //
+    // 为什么放在桥里，而不是继续用 `uiautomator dump`：
+    //   dump 要起外部 instrumentation 进程、等界面进入 idle，实测每次 1~3 秒，
+    //   动画/视频页常常等不到 idle 直接超时；桥里 getRootInActiveWindow() 是同进程直读，
+    //   毫秒级，且不受 idle 状态约束。
+    //
+    // 为什么输出要剪枝：一屏动辄上千节点、几十 KB，直接喂模型会撑爆上下文。
+    // 剪枝规则取自 Operit（ToolResultDataClasses.kt shouldKeepNode）：
+    //   关键类 ∪ 有文字/描述 ∪ 可点 ∪ 子孙里有值得留的。
+    // ⚠️ 照抄会带入他们一个静默失效的分支：他们拿全限定类名（android.widget.Button）
+    //    去比 "Button" 这类短名，`className in setOf("Button", ...)` 恒为 false，
+    //    所以"关键类"这条其实一直没生效。这里取最后一段类名比较，让这条真的起作用。
+    //
+    // 输出格式（两空格缩进表父子，▶可点 ◢不可点）：
+    //   ▶[Button]T:"发送"ID:btn_send⮞[100,200][300,400]
+    // 不给节点编序号：序号只在一次快照内有效，跨快照即失效，容易诱发"拿旧序号点错位置"。
+    // 寻址该用行里已有的 ID / 文字 / bounds。
+
+    private static final java.util.Set<String> KEY_CLASSES =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "Button", "TextView", "EditText", "ScrollView", "Switch",
+                    "ImageView", "CheckBox", "RadioButton", "SeekBar", "Spinner",
+                    "CompoundButton", "TabWidget"));
+
+    /** 一屏最多遍历多少节点：极端页面（长列表/网页）的硬闸，防止遍历本身卡住。 */
+    private static final int MAX_NODES = 3000;
+
+    private String uiTree(String rest) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) {
+            return "ERR no-window 当前没有活动窗口（锁屏、下拉状态栏或系统弹窗遮住时会出现）";
+        }
+        int maxLines = 150;
+        try {
+            if (!rest.trim().isEmpty()) {
+                maxLines = Math.max(20, Math.min(1200, Integer.parseInt(rest.trim().split("\\s+")[0])));
+            }
+        } catch (NumberFormatException ignored) {
+        }
+
+        long t0 = System.nanoTime();
+        StringBuilder body = new StringBuilder(8192);
+        int[] nodes = {0};
+        render(root, "", body, nodes);
+        long ms = (System.nanoTime() - t0) / 1000000L;
+
+        String[] lines = body.toString().split("\n");
+        int keep = Math.min(lines.length, maxLines);
+        StringBuilder out = new StringBuilder(body.length() + 128);
+        for (int i = 0; i < keep; i++) out.append(lines[i]).append('\n');
+        if (keep < lines.length) {
+            out.append("… 已截断 ").append(lines.length - keep)
+               .append(" 行（本次遍历 ").append(nodes[0]).append(" 节点）\n");
+        }
+
+        CharSequence pkg = root.getPackageName();
+        String head = "OK ui " + keep + " " + out.length() + " "
+                + ms + "ms pkg=" + (pkg == null ? "?" : pkg);
+        return head + "\n" + out + "END";
+    }
+
+    private void render(AccessibilityNodeInfo n, String indent, StringBuilder sb, int[] nodes) {
+        if (nodes[0] >= MAX_NODES) return;
+        nodes[0]++;
+
+        // 先渲染子孙（后序）：自己该不该留，要看子孙里有没有值得留的，
+        // 而父行必须排在子行前面，所以子行先收进临时 buffer。
+        StringBuilder kids = new StringBuilder();
+        int childCount = n.getChildCount();
+        for (int i = 0; i < childCount; i++) {
+            AccessibilityNodeInfo c = n.getChild(i);
+            if (c == null) continue;
+            render(c, indent + "  ", kids, nodes);
+        }
+
+        String cls = simpleName(n.getClassName());
+        String txt = clip(n.getText(), 30);
+        String desc = clip(n.getContentDescription(), 40);
+        String vid = n.getViewIdResourceName();
+        boolean clickable = n.isClickable();
+
+        // children.any { shouldKeepNode() } 的等价判断：kids 非空就说明子孙里有料
+        if (!KEY_CLASSES.contains(cls) && txt.isEmpty() && desc.isEmpty()
+                && !clickable && kids.length() == 0) {
+            return;                       // 布局壳子：自己和子孙都没内容，整支丢掉
+        }
+
+        android.graphics.Rect r = new android.graphics.Rect();
+        n.getBoundsInScreen(r);
+        if (r.isEmpty()) {
+            // 零尺寸 = 画不出来，写进树里只会让模型去点一个不存在的目标；
+            // 但子孙可能自带有效区域，所以不连带丢弃。
+            sb.append(kids);
+            return;
+        }
+
+        sb.append(indent).append(clickable ? '▶' : '◢').append('[').append(cls).append(']');
+        if (!txt.isEmpty()) sb.append("T:\"").append(txt).append('"');
+        if (!desc.isEmpty()) sb.append("D:\"").append(desc).append('"');
+        if (vid != null && !vid.isEmpty()) sb.append("ID:").append(vid);
+        sb.append("⮞[").append(r.left).append(',').append(r.top).append("][")
+          .append(r.right).append(',').append(r.bottom).append("]\n");
+        sb.append(kids);
+    }
+
+    /** 取类名最后一段：android.widget.Button -> Button。 */
+    private static String simpleName(CharSequence cls) {
+        if (cls == null) return "?";
+        String s = cls.toString();
+        int i = s.lastIndexOf('.');
+        return i >= 0 ? s.substring(i + 1) : s;
+    }
+
+    /**
+     * 压成单行：换行/制表会破坏"一行一个节点"，双引号会破坏 T:"…" 的边界。
+     * 超长按码点截断，避免把 emoji 这类代理对劈成半个字符。
+     */
+    private static String clip(CharSequence cs, int max) {
+        if (cs == null) return "";
+        String s = cs.toString().replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+                .replace('"', '\'').trim();
+        if (s.isEmpty()) return "";
+        if (s.length() <= max) return s;
+        int cut = max;
+        if (Character.isHighSurrogate(s.charAt(cut - 1))) cut--;
+        return s.substring(0, cut) + "…";
     }
 
     // ------------------------------------------------------------ 红外
