@@ -4,9 +4,12 @@
   浏览器里没有 Python，能力调用必须经过后端；但「能点鼠标键盘的 HTTP 接口」
   是个新引入的攻击面，所以这里钉死三条防线：
 
-    1. **只绑 127.0.0.1 + 随机端口**（port=0 让系统分配）。
+    1. **默认只绑 127.0.0.1 + 随机端口**（port=0 让系统分配）。
        不绑 0.0.0.0：局域网里的别的机器连进来就能驱动你的桌面。
        随机端口：固定端口会被同机别的程序撞上或被外部扫到。
+       两种例外都是**显式**选的：`--link` 固定端口但仍只绑 127.0.0.1（手机走
+       adb reverse 进来）；`--lan` 才绑 0.0.0.0，且 app.py 里守着一道硬闸——
+       没固定 FLEET_GUI_TOKEN 就拒绝启动。
     2. **一次性 token 鉴权**。启动时用 secrets 生成，只活在本进程内存里，
        由壳（app.py）通过 URL 片段注入页面，前端每次请求带 `X-Fleet-Token`。
        片段不进 HTTP 请求，所以 token 不会落到服务端日志、也不会进 Referer。
@@ -186,8 +189,18 @@ class FleetServer:
             self._httpd = None
 
     @property
+    def dial_host(self):
+        """对话框里能用的主机名。
+
+        `--lan` 下 self.host 是 0.0.0.0——那是「监听哪个网卡」的意思，不是
+        「连到哪」的地址。拿 0.0.0.0 去连（尤其喂给 webview）会连不上，
+        所以对外一律换成 127.0.0.1。
+        """
+        return "127.0.0.1" if self.host in ("0.0.0.0", "::", "") else self.host
+
+    @property
     def base_url(self):
-        return f"http://{self.host}:{self.port}"
+        return f"http://{self.dial_host}:{self.port}"
 
     def page_url(self, theme="light"):
         """给壳用的页面地址。token 放**片段**里：片段不会随 HTTP 请求发出，
@@ -219,8 +232,11 @@ class FleetServer:
                            "at": time.time()})
         return r.as_dict()
 
-    def chat(self, prompt):
+    def chat(self, prompt, backends=""):
         """对话：走 registry.call('ai.chat')，带 _on_line 回调。
+
+        backends：逗号分隔的后端白名单（空 = 全部后端，跟以前一样）。
+        手机语音一次只念一句，多后端一起回会串台，所以手机端固定传一个。
 
         reg.call 是阻塞的（生成完才返回），所以这里在**工作线程**里跑它，
         把 _on_line 收到的行推进队列；调用方（HTTP 线程）从队列取，边收边写 SSE。
@@ -235,7 +251,8 @@ class FleetServer:
             try:
                 r = self.registry.call(
                     "ai.chat",
-                    args={"prompt": prompt, "system": system, "_on_line": _on_line},
+                    args={"prompt": prompt, "system": system,
+                          "backends": backends, "_on_line": _on_line},
                     gate=self.chat_gate)
                 q.put({"type": "done", "result": r.as_dict()})
             except Exception as e:
@@ -1044,7 +1061,9 @@ class _Handler(BaseHTTPRequestHandler):
         prompt = (body.get("prompt") or "").strip()
         if not prompt:
             return self._err(400, "缺少 prompt（或 prompt 是空的）")
-        q = self.fleet.chat(prompt)
+        # backends 不传 = 空 = 全部后端（零回归）；传了就只走那几个。
+        backends = (body.get("backends") or "").strip()
+        q = self.fleet.chat(prompt, backends)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

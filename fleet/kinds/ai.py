@@ -109,7 +109,13 @@ class AI(BaseDevice):
                            device=self.name, via=self.via)
         bs = self._pick(args.get("backends") or "")
         if not bs:
-            return R.unavailable("ai.chat", "没有可用后端",
+            # 指名要某个后端却一个都没匹配上：必须把「你要的名字」和「现有名字」
+            # 都打出来。只回一句「没有可用后端」会让人以为是网络问题。
+            spec = (args.get("backends") or "").strip()
+            have = ", ".join(b["id"] for b in AB.backends()) or "(无)"
+            why = (f"后端「{spec}」不存在，现有可用：{have}" if spec
+                   else "没有可用后端")
+            return R.unavailable("ai.chat", why,
                                  device=self.name, via=self.via)
         on_line = args.get("_on_line")
         mt = int(args.get("max_tokens") or DEFAULT_MAX_TOKENS)
