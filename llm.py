@@ -23,6 +23,11 @@
   complete(prompt, model=None, system=None)                 -> (text, backend)
   stream(prompt, model=None, system=None, on_delta=None)    -> (text, backend)
 
+后端优先序（学 dsh-our-free-model 的免费多端思路）：
+  **免费多端(pollinations/ovh/llm7，failover+冷却+健康门控)** -> 云端增强 -> 本地 -> 占位
+  免费多端默认开（FLEET_USE_FREE=0 关，退回原 cloud/local/mock 链）；
+  开箱没配任何 cloud/local 时，大脑子也能经免费端点真说话，不再只会回声。
+
 「她」跑在哪台设备不重要——只要那台设备接了任一后端，她就在那里真说话。
 """
 import json
@@ -213,6 +218,27 @@ def _mock_complete(prompt, model, system, on_delta=None):
     return text
 
 
+def _free_complete(prompt, model, system, on_delta):
+    """免费多端后端：复用 ai_backends.chat_fallback（pollinations/ovh/llm7 降级链 +
+    冷却 + 健康门控）。返回 (text, 'free:<实际用的后端>')；任何失败抛异常让上层降级。
+
+    这是「先走云端免费」的落地：开箱（没配任何 cloud/local）时，大脑子也能通过
+    免费端点真说话，而不是只会回声；某条免费腿挂了自动切下一条，不坐实限流/封禁。
+    """
+    from fleet import ai_backends as AB
+    if not AB.backends():
+        raise RuntimeError("无可用免费后端（连 pollinations 都没起来）")
+    text, via = AB.chat_fallback(
+        prompt, system=system or "",
+        on_token=on_delta,
+        max_tokens=int(os.environ.get("FLEET_LLM_MAX_TOKENS", "1024")),
+        timeout=CLOUD_TIMEOUT,
+    )
+    if not text.strip():
+        raise RuntimeError("免费多端均返回空正文")
+    return text, "free:" + via
+
+
 def stream(prompt, model=None, system=None, on_delta=None):
     """流式推理：逐段回调 on_delta，最后返回 (完整文本, 后端名)。任何后端都不抛。
 
@@ -225,6 +251,16 @@ def stream(prompt, model=None, system=None, on_delta=None):
         emitted.append(x)
         if on_delta:
             on_delta(x)
+
+    # ---- 0) 免费多端（pollinations/ovh/llm7，failover+冷却，先走云端免费）----
+    # 直接复用 ai_backends.chat_fallback（失败分类 + 冷却 + 健康门控 + 降级链都已做好）。
+    # 默认开；FLEET_USE_FREE=0 关掉，退回原 cloud/local/mock 链。
+    if os.environ.get("FLEET_USE_FREE", "1") != "0":
+        try:
+            text, bk = _free_complete(prompt, model, system, on_delta)
+            return text, bk
+        except Exception as e:
+            print("[llm] 免费多端失败，降级到已配置后端：%s" % e)
 
     # ---- 1) 云端增强（可选，配了才走）----
     if os.environ.get("FLEET_CLOUD_URL"):
