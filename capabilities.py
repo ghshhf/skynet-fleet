@@ -77,6 +77,20 @@ SPECS = {
             {"name": "value", "type": "str", "required": True, "desc": "感知值（home/away 等）"},
         ],
     },
+    "image.gen": {
+        "title": "安卓出图（手机算力）",
+        "desc": "在本节点挂载的安卓手机上跑 SD 出图（SdBridge/QueueRunner），返回 PNG 路径；"
+                "PC 调度手机算力的实质落地（路线甲·N+2）",
+        "params": [
+            {"name": "prompt", "type": "str", "required": True, "desc": "正向提示词"},
+            {"name": "neg", "type": "str", "required": False, "desc": "负向提示词"},
+            {"name": "size", "type": "str", "required": False, "desc": "尺寸，如 512x512（按模型原生封顶）"},
+            {"name": "steps", "type": "int", "required": False, "desc": "步数（Turbo 4~8，SD1.5 20+）"},
+            {"name": "seed", "type": "int", "required": False, "desc": "随机种子，-1 随机"},
+            {"name": "cfg", "type": "float", "required": False, "desc": "CFG 系数"},
+            {"name": "model", "type": "str", "required": False, "desc": "模型文件（默认 Turbo）"},
+        ],
+    },
 }
 
 # 新名（domain.verb）→ 旧名（扁平）。新增能力在这里登记一行即可，
@@ -91,6 +105,7 @@ ALIASES = {
     "ai.chat": "ai",
     "persona.tick": "persona",
     "perceive.report": "perceive",
+    "image.gen.run": "image.gen",
 }
 
 # 旧基线的类型词汇 → 设备层的类型词汇
