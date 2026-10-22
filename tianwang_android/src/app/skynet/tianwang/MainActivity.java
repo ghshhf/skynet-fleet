@@ -42,6 +42,7 @@ public class MainActivity extends Activity {
     private TextView btnMic;
     private TextView btnSend;
     private TextView btnSettings;
+    private TextView btnPc;
     private EditText input;
 
     private final WavRecorder recorder = new WavRecorder();
@@ -49,6 +50,9 @@ public class MainActivity extends Activity {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     private MediaPlayer player;
+    // 系统语音（本地合成）。null = 还没起或起不来；起不来时 speakerWhy 里有原因。
+    private Speaker speaker;
+    private String speakerWhy = "";
     private boolean recording;
     private volatile boolean busy;                 // 一轮对话进行中，不接受新输入
     private int micDownX, micDownY;
@@ -59,12 +63,27 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         setContentView(R.layout.activity_main);
 
+        // 本地语音自检：只报状态，绝不拦启动。
+        // 模型没装好或者 ABI 不对时，App 仍要走「录音上传给电脑识别」那条老路，
+        // 不能因为一个附加能力把主流程拖死。
+        try {
+            String mp = Whisper.defaultModelPath(this);
+            File mf = new File(mp);
+            android.util.Log.i("fleet-whisper", "so 版本 " + Whisper.version()
+                    + "｜模型 " + (mf.isFile()
+                    ? mf.length() / 1048576 + "MB " + mp
+                    : "未安装（" + mp + "）"));
+        } catch (Throwable t) {
+            android.util.Log.w("fleet-whisper", "本地语音不可用：" + t);
+        }
+
         orb = findViewById(R.id.orb);
         status = findViewById(R.id.status);
         subtitle = findViewById(R.id.subtitle);
         btnMic = findViewById(R.id.btnMic);
         btnSend = findViewById(R.id.btnSend);
         btnSettings = findViewById(R.id.btnSettings);
+        btnPc = findViewById(R.id.btnPc);
         input = findViewById(R.id.input);
 
         recorder.setLevelListener(new WavRecorder.LevelListener() {
@@ -116,6 +135,13 @@ public class MainActivity extends Activity {
                     return true;
                 }
                 return false;
+            }
+        });
+
+        btnPc.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showPcPanel();
             }
         });
 
@@ -233,12 +259,13 @@ public class MainActivity extends Activity {
         setBusy(true);
         orb.setState(OrbView.THINK);
         final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        final String backend = Prefs.backend(this);
         final StringBuilder acc = new StringBuilder();
 
         worker.execute(new Runnable() {
             @Override
             public void run() {
-                Net.chat(base, token, prompt, new Net.SseCallback() {
+                Net.chat(base, token, prompt, backend, new Net.SseCallback() {
                     @Override
                     public void onLine(final String text) {
                         acc.append(text);
@@ -284,13 +311,62 @@ public class MainActivity extends Activity {
     }
 
     private void speak(final String text) {
-        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
         ui.post(new Runnable() {
             @Override
             public void run() {
                 orb.setState(OrbView.SPEAK);
             }
         });
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                // 先试系统语音：本机几毫秒起播、不走网络、断网也能念。
+                Speaker sp = systemSpeaker();
+                if (sp != null) {
+                    sp.say(text, new Runnable() {
+                        @Override
+                        public void run() {
+                            ui.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    setBusy(false);
+                                    orb.setState(OrbView.IDLE);
+                                }
+                            });
+                        }
+                    });
+                    return;
+                }
+                // 系统语音起不来：不静默降级，把原因写在字幕上再走电脑合成。
+                final String why = speakerWhy;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        say2("它说：" + text + "\n（系统语音不可用，改用电脑合成：" + why + "）");
+                    }
+                });
+                speakOnPc(text);
+            }
+        });
+    }
+
+    /** 懒起系统语音引擎（只试一次；失败就把原因记下来，不要每句都重试）。 */
+    private Speaker systemSpeaker() {
+        if (speaker != null) { return speaker; }
+        if (!speakerWhy.isEmpty()) { return null; }
+        Speaker sp = new Speaker();
+        Speaker.NotReady nr = sp.open(this, 4000);
+        if (nr != null) {
+            speakerWhy = nr.why;
+            sp.close();
+            return null;
+        }
+        speaker = sp;
+        return speaker;
+    }
+
+    private void speakOnPc(final String text) {
+        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
         worker.execute(new Runnable() {
             @Override
             public void run() {
@@ -362,6 +438,7 @@ public class MainActivity extends Activity {
     }
 
     private void stopPlayback() {
+        if (speaker != null) { speaker.stop(); }
         if (player != null) {
             try { player.stop(); } catch (Exception ignored) { }
             cleanupPlayer();
@@ -428,14 +505,24 @@ public class MainActivity extends Activity {
         box.addView(eBase);
 
         final EditText eToken = new EditText(this);
-        eToken.setHint("令牌（电脑上 FLEET_GUI_TOKEN 那枚）");
+        eToken.setHint("令牌（电脑上 --link 打印的那枚）");
         eToken.setText(Prefs.token(this));
         eToken.setTextSize(13);
         box.addView(eToken);
 
+        final EditText eBackend = new EditText(this);
+        eBackend.setHint("AI 后端（默认 pollinations；留空=全部）");
+        eBackend.setText(Prefs.backend(this));
+        eBackend.setTextSize(13);
+        box.addView(eBackend);
+
         TextView tip = new TextView(this);
-        tip.setText("电脑上执行：\nadb reverse tcp:8000 tcp:8000\n"
-                + "再设 FLEET_GUI_TOKEN=<任意串> 启动后端，这里填同一串。");
+        tip.setText("隧道模式（默认，推荐）\n"
+                + "  电脑：python fleet_gui.py --link\n"
+                + "  这里填 http://127.0.0.1:8000 + 电脑上打印的令牌\n\n"
+                + "局域网模式（不想插线时才用）\n"
+                + "  电脑：set FLEET_GUI_TOKEN=xxx 然后 python fleet_gui.py --lan\n"
+                + "  这里填 http://<电脑IP>:8000 + 上面那串令牌");
         tip.setTextSize(11);
         tip.setTextColor(Color.parseColor("#8B949E"));
         box.addView(tip);
@@ -447,7 +534,9 @@ public class MainActivity extends Activity {
                     @Override
                     public void onClick(android.content.DialogInterface d, int w) {
                         Prefs.save(MainActivity.this,
-                                eBase.getText().toString(), eToken.getText().toString());
+                                eBase.getText().toString(),
+                                eToken.getText().toString(),
+                                eBackend.getText().toString());
                         probeHealth();
                     }
                 })
@@ -472,9 +561,146 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
+    // ---------------- 控电脑 ----------------
+
+    /**
+     * 拉电脑的全能力清单 → 选一项 → 就地调用。
+     *
+     * 为什么要“参数”输入框：87 项里很多项要参数（装哪个包、点哪里、写什么字）。
+     * 不做 87 个专属表单，而是给一个 JSON 框——无参的填 {} 就行，要参的自己填。
+     * 这比“只能点无参的”诚实，也比现在就堆一堆表单现实。
+     */
+    private void showPcPanel() {
+        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        say2("正在从电脑拉能力清单…");
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                org.json.JSONArray rows = null;
+                String err = null;
+                try {
+                    org.json.JSONObject o = Net.caps(base, token);
+                    rows = o.optJSONArray("caps");
+                } catch (Exception e) {
+                    err = e.getMessage();
+                }
+                final org.json.JSONArray r = rows;
+                final String e2 = err;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (e2 != null) {
+                            say2("拉清单失败：" + e2);
+                            return;
+                        }
+                        if (r == null || r.length() == 0) {
+                            say2("电脑那头没有注册任何能力");
+                            return;
+                        }
+                        renderPcPanel(r);
+                    }
+                });
+            }
+        });
+    }
+
+    private void renderPcPanel(final org.json.JSONArray rows) {
+        final String[] names = new String[rows.length()];
+        final String[] labels = new String[rows.length()];
+        for (int i = 0; i < rows.length(); i++) {
+            org.json.JSONObject o = rows.optJSONObject(i);
+            names[i] = o == null ? "" : o.optString("name");
+            String title = o == null ? "" : o.optString("title");
+            String domain = o == null ? "" : o.optString("domain");
+            labels[i] = names[i] + (title.isEmpty() ? "" : "　" + title)
+                    + (domain.isEmpty() ? "" : "　[" + domain + "]");
+        }
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = (int) (getResources().getDisplayMetrics().density * 12);
+        box.setPadding(pad, pad, pad, 0);
+
+        TextView tip = new TextView(this);
+        tip.setText("参数（JSON，无参就留 {}）；要审批的会在电脑上弹窗等确认");
+        tip.setTextSize(10);
+        tip.setTextColor(Color.parseColor("#8B949E"));
+        box.addView(tip);
+
+        final EditText eArgs = new EditText(this);
+        eArgs.setText("{}");
+        eArgs.setTextSize(12);
+        eArgs.setSingleLine(true);
+        box.addView(eArgs);
+
+        android.widget.ListView list = new android.widget.ListView(this);
+        list.setAdapter(new android.widget.ArrayAdapter<String>(
+                this, android.R.layout.simple_list_item_1, labels));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+        box.addView(list, lp);
+
+        final AlertDialog dlg = new AlertDialog.Builder(this)
+                .setTitle("控电脑 · " + rows.length() + " 项能力")
+                .setView(box)
+                .setNegativeButton("关掉", null)
+                .create();
+
+        list.setOnItemClickListener(new android.widget.AdapterView.OnItemClickListener() {
+            @Override
+            public void onItemClick(android.widget.AdapterView<?> p, View v, int i, long id) {
+                org.json.JSONObject args;
+                try {
+                    String s = eArgs.getText().toString().trim();
+                    args = s.isEmpty() ? new org.json.JSONObject() : new org.json.JSONObject(s);
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this,
+                            "参数不是合法 JSON：" + e.getMessage(), Toast.LENGTH_LONG).show();
+                    return;
+                }
+                dlg.dismiss();
+                runOnPc(names[i], args);
+            }
+        });
+        dlg.show();
+    }
+
+    private void runOnPc(final String cap, final org.json.JSONObject args) {
+        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        setBusy(true);
+        say2("让电脑做：" + cap + "\n（要审批的话在电脑上点确认…）");
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                String text;
+                try {
+                    org.json.JSONObject r = Net.call(base, token, cap, args);
+                    boolean ok = r.optBoolean("ok");
+                    String out = ok ? r.optString("err", "") : r.optString("err", "");
+                    String data = r.isNull("data") ? "" : String.valueOf(r.opt("data"));
+                    text = (ok ? "✓ " : "✗ ") + cap
+                            + (out.isEmpty() ? "" : "\n" + out)
+                            + (data.isEmpty() || "null".equals(data) ? "" : "\n" + data);
+                    if (text.length() > 1200) { text = text.substring(0, 1200) + "…"; }
+                } catch (Exception e) {
+                    text = "✗ " + cap + "\n" + e.getMessage();
+                }
+                final String t = text;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        say2(t);
+                    }
+                });
+            }
+        });
+    }
+
     @Override
     protected void onDestroy() {
         stopPlayback();
+        if (speaker != null) { speaker.close(); speaker = null; }
         worker.shutdownNow();
         super.onDestroy();
     }
