@@ -604,16 +604,28 @@ def bridge_bulk(serial, cmd, timeout=25, max_bytes=1 << 20):
                 if size > max_bytes:
                     return {"ok": False,
                             "err": f"UI 树超过 {max_bytes} 字节仍未结束，桥侧截断可能失效"}
-            parts = head.split()
-            ms = -1
-            if len(parts) > 4 and parts[4].endswith("ms"):
-                try:
-                    ms = int(parts[4][:-2])
-                except ValueError:
-                    pass
-            pkg = parts[5][4:] if len(parts) > 5 and parts[5].startswith("pkg=") else ""
+            # header 形如：OK ui <keep> <bytes> <ms>ms pkg=<pkg> n=<遍历节点数> root=<取根ms>ms
+            # 按 key=value 取，不按下标取——以后桥再加字段不会把解析打歪。
+            def kv(key, cast=int, default=-1):
+                m = re.search(rf"(?:^|\s){key}=(\d+(?:ms)?)", head)
+                if not m:
+                    return default
+                v = m.group(1)
+                return cast(v[:-2]) if v.endswith("ms") else cast(v)
+
+            ms = kv("ms", int, -1)
+            if ms < 0:                                  # 兼容旧 header：第 5 个字段就是 3ms 这种
+                parts = head.split()
+                if len(parts) > 4 and parts[4].endswith("ms"):
+                    try:
+                        ms = int(parts[4][:-2])
+                    except ValueError:
+                        pass
+            m = re.search(r"(?:^|\s)pkg=(\S+)", head)
+            pkg = m.group(1) if m else ""
             return {"ok": True, "head": head, "lines": lines, "bytes": size,
-                    "ms": ms, "pkg": pkg, "err": ""}
+                    "ms": ms, "pkg": pkg,
+                    "nodes": kv("n", int, 0), "root_ms": kv("root", int, -1), "err": ""}
     except OSError as e:
         return {"ok": False, "err": f"桥通信失败：{e}"}
 
@@ -626,6 +638,137 @@ def bridge_ui(serial="", max_lines=150, timeout=20):
     要走 dump 的调用方自己去调 ui_xml()，那是显式选择。
     """
     return bridge_bulk(serial, f"UI {int(max_lines)}", timeout=timeout)
+
+
+# ---------------------------------------------------------------- 桥树解析
+#
+# 桥渲染的每一行长这样（两空格缩进表父子，▶可点 ◢不可点）：
+#   ▶[Button]T:"发送"ID:btn_send⮞[100,200][300,400]
+# 不编序号是刻意的：序号只在一次快照内有效，跨快照即失效，容易诱发
+# "拿旧序号点错位置"。寻址只认 id / 文字 / bounds 这三样真实存在的属性。
+
+_RE_UI_LINE = re.compile(
+    r'\[(?P<cls>[^\]]*)\]'
+    r'(?:T:"(?P<text>[^"]*)")?'
+    r'(?:D:"(?P<desc>[^"]*)")?'
+    r'(?:ID:(?P<id>\S+?))?'
+    r'⮞\[(?P<l>-?\d+),(?P<t>-?\d+)\]\[(?P<r>-?\d+),(?P<b>-?\d+)\]'
+)
+
+
+def parse_bridge_ui(lines):
+    """桥的渲染行 -> 结构化节点表（含 depth，供缩进还原层级）。
+
+    行里认不出来的（截断提示行、空行）直接跳过，不做静默猜测。
+    """
+    nodes = []
+    for raw in lines:
+        if not raw.strip():
+            continue
+        depth = (len(raw) - len(raw.lstrip(" "))) // 2
+        m = _RE_UI_LINE.search(raw)
+        if not m:
+            continue
+        b = (int(m["l"]), int(m["t"]), int(m["r"]), int(m["b"]))
+        nodes.append({
+            "depth": depth,
+            "clickable": raw.lstrip()[:1] == "▶",
+            "cls": m["cls"],
+            "text": m["text"] or "",
+            "desc": m["desc"] or "",
+            "id": m["id"] or "",
+            "bounds": b,
+            "center": ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2),
+        })
+    return nodes
+
+
+def bridge_screen(serial="", max_lines=200, timeout=20):
+    """一步拿到「前台包 + 结构化节点表」，比 ui_xml + parse_ui 快一个数量级。"""
+    got = bridge_ui(serial, max_lines=max_lines, timeout=timeout)
+    if not got["ok"]:
+        return {"ok": False, "err": got.get("err", ""), "nodes": [], "pkg": ""}
+    return {"ok": True, "err": "", "pkg": got.get("pkg", ""),
+            "nodes": parse_bridge_ui(got["lines"]),
+            "ms": got.get("ms", -1), "bytes": got.get("bytes", 0)}
+
+
+# ---------------------------------------------------------------- 元素级动作（P1）
+#
+# 和坐标动作（tap/swipe）的区别：调用方只说"哪个元素"，坐标由设备侧解析。
+# 界面一变，坐标动作得全部重算；元素动作不用。而且模型说得清"点发送"，
+# 说不清"点 1024,2388"。
+#
+# 选择器：id:xxx / text:xxx / desc:xxx / bounds:[l,t][r,b]，可加 #n 消歧。
+# 桥侧找不到会明确回 not-found + 界面候选，匹配多个回 ambiguous + 候选列表，
+# 一律不静默。
+
+def _sel(kind, value, index=0):
+    v = str(value)
+    if not v.strip():
+        raise ValueError("选择器不能为空")
+    # 值里的 # 只有在末尾跟数字时才当消歧序号，其余原样保留
+    return f"{kind}:{v}" + (f"#{int(index)}" if index else "")
+
+
+def bridge_tap_el(serial, kind, value, index=0):
+    """按元素点一下。失败时 err 是桥给的原话（找不到/歧义/越界/不可见）。"""
+    r = bridge_cmd(serial, "TAPEL " + _sel(kind, value, index))
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", ""), "sel": kind + ":" + str(value)}
+    head = "OK tapel "
+    rest = r["out"][len(head):] if r["out"].startswith(head) else ""
+    p = rest.split(" ", 2)
+    if len(p) < 2:
+        return {"ok": False, "via": "bridge", "err": f"桥的回报看不懂：{r['out'][:80]}"}
+    return {"ok": True, "via": "bridge", "x": int(p[0]), "y": int(p[1]),
+            "hit": p[2] if len(p) > 2 else "", "err": ""}
+
+
+def bridge_set_text(serial, kind, value, text, index=0):
+    """按元素设文本（ACTION_SET_TEXT）。
+
+    文本里若含 '|' 会和选择器分隔符打架，按桥的约定转义成 %7C；'%' 先转 %25，
+    否则一个原始 %7C 会被误还原。
+    """
+    safe = str(text).replace("%", "%25").replace("|", "%7C")
+    r = bridge_cmd(serial, "SETTEXT " + _sel(kind, value, index) + "|" + safe)
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", "")}
+    return {"ok": True, "via": "bridge", "hit": r["out"][len("OK settext "):], "err": ""}
+
+
+def bridge_set_seek(serial, kind, value, percent, index=0):
+    """把滑条设到控件自身区间的 percent%（0~100），走 ACTION_SET_PROGRESS。
+
+    注意语义：这是**控件区间的百分比**，不等于它控制的东西的百分比。
+    实测 MIUI 亮度条 seekbar 72% ≈ 系统亮度 30%（0~255 的 76），因为中间有伽马映射。
+    要"亮度 30%"就得设 seekbar 72%，别按 30% 传。
+    """
+    r = bridge_cmd(serial, "SETSEEK " + _sel(kind, value, index) + "|" + str(int(percent)))
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", "")}
+    out = r["out"][len("OK setseek "):]
+    # 形如：30%=4915 [SeekBar]D:"屏幕亮度"ID:...
+    pct_part, _, rest = out.partition(" ")
+    raw = pct_part.split("=")[1] if "=" in pct_part else ""
+    return {"ok": True, "via": "bridge", "raw": raw, "hit": rest, "err": ""}
+
+
+def bridge_scroll(serial, direction):
+    """滚动。direction: up/down/left/right。
+
+    走手势滑动而不是 ACTION_SCROLL_FORWARD —— 后者实测会返回 true 但界面不动
+    （详见桥里 SCROLL 那段注释）。
+    """
+    d = str(direction).strip().lower()
+    if d not in ("up", "down", "left", "right"):
+        return {"ok": False, "err": f"方向只能是 up/down/left/right，收到 {direction!r}"}
+    r = bridge_cmd(serial, "SCROLL " + d)
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", "")}
+    return {"ok": True, "via": "bridge", "hit": r["out"][len("OK scroll " + d + " "):], "err": ""}
+
 
 
 
@@ -775,6 +918,22 @@ def _selftest():
     alone = parse_ui("""<hierarchy><node text="x"
         bounds="[10,10][20,20]" clickable="false"/></hierarchy>""")
     assert clickable_of(alone, alone[0])["center"] == (15, 15)
+
+    # ⑧ 桥渲染行 -> 结构化节点：层级、可点、ID、bounds 一个都不能丢
+    ui = parse_bridge_ui([
+        "\u25b6[FrameLayout]\u2b9e[1,1][1280,2771]",
+        "  \u25b6[Button]T:\"\u53d1\u9001\"ID:btn_send\u2b9e[100,200][300,400]",
+        "  \u25c2[TextView]D:\"\u641c\u7d22\"\u2b9e[0,0][10,10]",
+        "\u2026 \u5df2\u622a\u65ad 3 \u884c",          # 非节点行，必须被跳过
+    ])
+    assert len(ui) == 3, ui
+    assert ui[0]["depth"] == 0 and ui[0]["clickable"] is True
+    assert ui[1]["depth"] == 1 and ui[1]["text"] == "\u53d1\u9001"
+    assert ui[1]["id"] == "btn_send" and ui[1]["center"] == (200, 300)
+    assert ui[2]["clickable"] is False and ui[2]["desc"] == "\u641c\u7d22"
+    # 只有 ID 没有文字的行也要解析出来（图标按钮常见）
+    only_id = parse_bridge_ui(["\u25b6[ImageView]ID:app:id/ic_menu\u2b9e[0,0][96,96]"])
+    assert only_id and only_id[0]["id"] == "app:id/ic_menu", only_id
 
     # ⑧ 桥没令牌时必须明确失败，不能假装点成了
     real = globals()["bridge_token"]

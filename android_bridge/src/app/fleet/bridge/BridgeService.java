@@ -146,6 +146,14 @@ public class BridgeService extends AccessibilityService {
                     return focusInfo();
                 case "UI":
                     return uiTree(rest);
+                case "TAPEL":
+                    return tapEl(rest);
+                case "SETTEXT":
+                    return setTextEl(rest);
+                case "SETSEEK":
+                    return setSeek(rest);
+                case "SCROLL":
+                    return scroll(rest);
                 case "IRINFO":
                     return irInfo();
                 case "IR":
@@ -280,14 +288,20 @@ public class BridgeService extends AccessibilityService {
     private static final int MAX_NODES = 3000;
 
     private String uiTree(String rest) {
+        // 取根本身可能很慢（目标 App 的 UI 线程忙时，accessibility 查询要排到它后面），
+        // 它和遍历是两笔开销，必须分开计时，否则优化会对错方向。
+        long tRoot = System.nanoTime();
         AccessibilityNodeInfo root = getRootInActiveWindow();
+        long rootMs = (System.nanoTime() - tRoot) / 1000000L;
         if (root == null) {
             return "ERR no-window 当前没有活动窗口（锁屏、下拉状态栏或系统弹窗遮住时会出现）";
         }
         int maxLines = 150;
+        uiWithId = !rest.contains("noid");        // UI 400 noid = 不带 id 的裸读，用来量化 id 的代价
         try {
             if (!rest.trim().isEmpty()) {
-                maxLines = Math.max(20, Math.min(1200, Integer.parseInt(rest.trim().split("\\s+")[0])));
+                maxLines = Math.max(20, Math.min(1200,
+                        Integer.parseInt(rest.trim().split("\\s+")[0])));
             }
         } catch (NumberFormatException ignored) {
         }
@@ -310,8 +324,10 @@ public class BridgeService extends AccessibilityService {
         CharSequence pkg = root.getPackageName();
         // 报字节不报字符：中文一个字 3 字节，按 length() 报会把体积低估成三分之一，
         // 而门禁判的就是字节数。
-        String head = "OK ui " + keep + " " + utf8Len(out) + " "
-                + ms + "ms pkg=" + (pkg == null ? "?" : pkg);
+        // n= 是遍历过的节点数（剪枝前），root= 是取根耗时。
+        // 这两个数决定了慢在哪：n 大说明树大要剪枝，root 大说明目标 App 的 UI 线程堵。
+        String head = "OK ui " + keep + " " + utf8Len(out) + " " + ms + "ms pkg="
+                + (pkg == null ? "?" : pkg) + " n=" + nodes[0] + " root=" + rootMs + "ms";
         return head + "\n" + out + "END";
     }
 
@@ -326,6 +342,16 @@ public class BridgeService extends AccessibilityService {
         }
         return n;
     }
+
+    /**
+     * 是否在树里带 resource-id。
+     *
+     * 这是实测出来的最大单项开销：第三方 App 的 id 字符串不在系统资源缓存里，
+     * 每个节点的 getViewIdResourceName() 都可能走一次跨进程查询。
+     * 抖音视频页 162 节点整体 2 秒，几乎全耗在这上面；系统设置同一指标是 1ms/节点。
+     * 留成开关是为了随时能量化「带 id」到底值不值得（选元素时值，纯看内容时不必）。
+     */
+    private boolean uiWithId = true;
 
     private void render(AccessibilityNodeInfo n, String indent, StringBuilder sb, int[] nodes) {
         if (nodes[0] >= MAX_NODES) return;
@@ -344,7 +370,7 @@ public class BridgeService extends AccessibilityService {
         String cls = simpleName(n.getClassName());
         String txt = clip(n.getText(), 30);
         String desc = clip(n.getContentDescription(), 40);
-        String vid = n.getViewIdResourceName();
+        String vid = uiWithId ? n.getViewIdResourceName() : null;
         boolean clickable = n.isClickable();
 
         // children.any { shouldKeepNode() } 的等价判断：kids 非空就说明子孙里有料
@@ -392,6 +418,422 @@ public class BridgeService extends AccessibilityService {
         int cut = max;
         if (Character.isHighSurrogate(s.charAt(cut - 1))) cut--;
         return s.substring(0, cut) + "…";
+    }
+
+    // ------------------------------------------------------------ 元素寻址（P1）
+    //
+    // 坐标点击（TAP）要求调用方先自己读屏、自己算中心点。界面一变就得全部重算，
+    // 而且模型根本算不准坐标 —— 它说得出「点发送」，说不出「点 1024,2388」。
+    // 所以把寻址下沉到设备侧：调用方只说元素，坐标在这儿解析。
+    //
+    // 选择器语法：kind:value[#n]
+    //   id:btn_send                / id:com.android.settings:id/btn_send（短名按 / 后缀匹配）
+    //   text:发送
+    //   desc:搜索
+    //   bounds:[100,200][300,400]  （±4px 容差）
+    //   #n  1-based，只在匹配到多个时消歧
+    //
+    // 纪律（主人的红线：不许静默）：找不到就报 not-found 并附界面上真实存在的候选，
+    // 匹配到多个就报 ambiguous 并把候选列出来，绝不"点个差不多的地方"。
+    // 也刻意不做「找不到就退化成点坐标」这类兜底 —— 那只会把错误藏起来。
+
+    private static final int BOUNDS_TOL = 4;
+
+    private static final class Sel {
+        String kind;     // id / text / desc / bounds
+        String value;
+        int index;       // 0 = 未指定
+    }
+
+    private static final class Hit {
+        final AccessibilityNodeInfo node;
+        final int x, y, area;
+
+        Hit(AccessibilityNodeInfo n, android.graphics.Rect r) {
+            node = n;
+            x = (r.left + r.right) / 2;
+            y = (r.top + r.bottom) / 2;
+            area = Math.max(1, r.width() * r.height());
+        }
+    }
+
+    private Sel parseSel(String s) {
+        if (s == null) return null;
+        String body = s.trim();
+        int bar = body.indexOf('|');
+        if (bar >= 0) body = body.substring(0, bar).trim();     // SETTEXT 的文本部分由调用方另取
+        int hash = body.lastIndexOf('#');
+        int index = 0;
+        if (hash > 0) {
+            String tail = body.substring(hash + 1);
+            if (tail.matches("\\d{1,3}")) {
+                index = Integer.parseInt(tail);
+                body = body.substring(0, hash).trim();
+            }
+        }
+        int colon = body.indexOf(':');
+        if (colon <= 0) return null;
+        Sel sel = new Sel();
+        sel.kind = body.substring(0, colon).trim().toLowerCase();
+        sel.value = body.substring(colon + 1).trim();
+        sel.index = index;
+        if (!"id".equals(sel.kind) && !"text".equals(sel.kind)
+                && !"desc".equals(sel.kind) && !"bounds".equals(sel.kind)) {
+            return null;
+        }
+        if (sel.value.isEmpty()) return null;
+        return sel;
+    }
+
+    /** 0 不匹配 / 1 模糊 / 2 精确。精确 = 整串相等，模糊 = 包含。 */
+    private static int matchScore(AccessibilityNodeInfo n, Sel sel) {
+        if ("id".equals(sel.kind)) {
+            String vid = n.getViewIdResourceName();
+            if (vid == null || vid.isEmpty()) return 0;
+            if (vid.equals(sel.value) || vid.endsWith("/" + sel.value)) return 2;
+            return 0;
+        }
+        if ("bounds".equals(sel.kind)) {
+            android.graphics.Rect want = rectOf(sel.value);
+            if (want == null) return 0;
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            boolean same = Math.abs(r.left - want.left) <= BOUNDS_TOL
+                    && Math.abs(r.top - want.top) <= BOUNDS_TOL
+                    && Math.abs(r.right - want.right) <= BOUNDS_TOL
+                    && Math.abs(r.bottom - want.bottom) <= BOUNDS_TOL;
+            return same ? 2 : 0;
+        }
+        CharSequence cs = "text".equals(sel.kind) ? n.getText() : n.getContentDescription();
+        if (cs == null) return 0;
+        String v = cs.toString().trim();
+        if (v.isEmpty()) return 0;
+        if (v.equals(sel.value)) return 2;
+        return v.contains(sel.value) ? 1 : 0;
+    }
+
+    private static android.graphics.Rect rectOf(String s) {
+        String[] nums = s.replaceAll("[^0-9,+-]", " ").trim().split("[\\s,]+");
+        if (nums.length < 4) return null;
+        try {
+            return new android.graphics.Rect(Integer.parseInt(nums[0]), Integer.parseInt(nums[1]),
+                    Integer.parseInt(nums[2]), Integer.parseInt(nums[3]));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private void collect(AccessibilityNodeInfo n, Sel sel, int minScore,
+                         Map<String, Hit> acc, int[] budget) {
+        if (n == null || budget[0] >= MAX_NODES) return;
+        budget[0]++;
+        if (matchScore(n, sel) >= minScore) {
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            if (!r.isEmpty()) {
+                String key = r.left + "," + r.top + "," + r.right + "," + r.bottom;
+                Hit old = acc.get(key);
+                // 内外层容器常共用同一块 bounds：留着外层会把点击落到容器上，
+                // 所以同一块区域优先保留可点的那个。
+                if (old == null || (!old.node.isClickable() && n.isClickable())) {
+                    acc.put(key, new Hit(n, r));
+                }
+            }
+        }
+        int cc = n.getChildCount();
+        for (int i = 0; i < cc; i++) collect(n.getChild(i), sel, minScore, acc, budget);
+    }
+
+    private List<Hit> locate(AccessibilityNodeInfo root, Sel sel) {
+        Map<String, Hit> acc = new LinkedHashMap<>();
+        collect(root, sel, 2, acc, new int[]{0});          // 先只收精确匹配
+        if (acc.isEmpty()) {
+            collect(root, sel, 1, acc, new int[]{0});      // 精确为空才退到模糊
+        }
+        List<Hit> hits = new ArrayList<>();
+        for (Hit h : acc.values()) {
+            if (h.node.isVisibleToUser()) hits.add(h);
+        }
+        final List<Hit> hidden = new ArrayList<>();
+        for (Hit h : acc.values()) {
+            if (!h.node.isVisibleToUser()) hidden.add(h);
+        }
+        // 按视觉顺序排（上→下、左→右）：歧义时 #n 必须和屏幕上看到的次序一致，
+        // 否则调用方数不清是第几个。同一位置再按面积小的优先（避开全屏容器）。
+        hits.sort((a, b) -> {
+            if (a.y != b.y) return Integer.compare(a.y, b.y);
+            if (a.x != b.x) return Integer.compare(a.x, b.x);
+            return Integer.compare(a.area, b.area);
+        });
+        hits.addAll(hidden);                               // 不可见的排在后面，只用于诊断
+        return hits;
+    }
+
+    /** 返回错误串；能继续往下点就返回 null。 */
+    private String checkHits(AccessibilityNodeInfo root, List<Hit> hits, Sel sel) {
+        int visible = 0;
+        for (Hit h : hits) if (h.node.isVisibleToUser()) visible++;
+        List<Hit> vis = hits.subList(0, visible);
+        if (vis.isEmpty()) {
+            if (!hits.isEmpty()) {
+                return "ERR not-visible " + hits.size() + " " + brief(hits.get(0).node)
+                        + " 找到了但不在可视区（先 SCROLL 滚到它）";
+            }
+            return "ERR not-found " + sel.kind + ":" + sel.value + " 界面上没有这个元素；候选 "
+                    + nearby(root);
+        }
+        if (sel.index > 0 && sel.index > visible) {
+            return "ERR bad-index #" + sel.index + " 只匹配到 " + visible + " 个";
+        }
+        if (sel.index == 0 && visible > 1) {
+            StringBuilder sb = new StringBuilder("ERR ambiguous " + visible + " 个匹配，请加 #序号：");
+            for (int i = 0; i < visible && i < 4; i++) {
+                if (i > 0) sb.append(" | ");
+                sb.append('#').append(i + 1).append(' ').append(brief(vis.get(i).node));
+            }
+            return sb.toString();
+        }
+        return null;
+    }
+
+    /** 界面上真实存在的可点/有字元素，找不到时贴给调用方，省得它瞎猜。 */
+    private String nearby(AccessibilityNodeInfo root) {
+        List<String> got = new ArrayList<>();
+        collectBrief(root, got, new int[]{0});
+        if (got.isEmpty()) return "（无）";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < got.size() && i < 6; i++) {
+            if (i > 0) sb.append(" | ");
+            sb.append(got.get(i));
+        }
+        return sb.toString();
+    }
+
+    private void collectBrief(AccessibilityNodeInfo n, List<String> out, int[] budget) {
+        if (n == null || budget[0] >= MAX_NODES || out.size() >= 6) return;
+        budget[0]++;
+        if (n.isVisibleToUser() && (n.isClickable()
+                || n.getText() != null || n.getContentDescription() != null)) {
+            String b = brief(n);
+            if (!b.equals("[]")) out.add(b);
+        }
+        int cc = n.getChildCount();
+        for (int i = 0; i < cc; i++) collectBrief(n.getChild(i), out, budget);
+    }
+
+    private static String brief(AccessibilityNodeInfo n) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('[').append(simpleName(n.getClassName())).append(']');
+        String t = clip(n.getText(), 16);
+        if (!t.isEmpty()) sb.append("T:\"").append(t).append('"');
+        String d = clip(n.getContentDescription(), 16);
+        if (!d.isEmpty()) sb.append("D:\"").append(d).append('"');
+        String vid = n.getViewIdResourceName();
+        if (vid != null && !vid.isEmpty()) sb.append("ID:").append(vid);
+        return sb.toString();
+    }
+
+    private int[] screenSize() {
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        return new int[]{dm.widthPixels, dm.heightPixels};
+    }
+
+    private String tapEl(String rest) {
+        Sel sel = parseSel(rest);
+        if (sel == null) {
+            return "ERR sel 用法：TAPEL id:xxx / text:xxx / desc:xxx / bounds:[l,t][r,b]";
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return "ERR no-window 当前没有活动窗口";
+        List<Hit> hits = locate(root, sel);
+        String bad = checkHits(root, hits, sel);
+        if (bad != null) return bad;
+        Hit h = hits.get(sel.index > 0 ? sel.index - 1 : 0);
+        int[] wh = screenSize();
+        if (h.x < 0 || h.y < 0 || h.x >= wh[0] || h.y >= wh[1]) {
+            return "ERR out-of-screen " + h.x + "," + h.y + " 屏幕 " + wh[0] + "x" + wh[1];
+        }
+        Path p = new Path();
+        p.moveTo(h.x, h.y);
+        if (!gesture(p, 55)) return "ERR gesture";
+        return "OK tapel " + h.x + " " + h.y + " " + brief(h.node);
+    }
+
+    private String setTextEl(String rest) {
+        int bar = rest.indexOf('|');
+        if (bar < 0) return "ERR 用法：SETTEXT <sel>|<文本>";
+        Sel sel = parseSel(rest.substring(0, bar));
+        if (sel == null) return "ERR sel 无法解析：" + rest.substring(0, bar).trim();
+        String text = unesc(rest.substring(bar + 1));
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return "ERR no-window 当前没有活动窗口";
+        List<Hit> hits = locate(root, sel);
+        String bad = checkHits(root, hits, sel);
+        if (bad != null) return bad;
+        AccessibilityNodeInfo target = editable(hits.get(sel.index > 0 ? sel.index - 1 : 0).node, 0);
+        if (target == null) return "ERR not-editable " + brief(hits.get(0).node);
+        Bundle args = new Bundle();
+        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+        boolean ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+        return ok ? "OK settext " + brief(target) : "ERR text-rejected " + brief(target);
+    }
+
+    /** 命中的可能是输入框的容器，往下找真正可编辑的那个。 */
+    private AccessibilityNodeInfo editable(AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 8) return null;
+        if (n.isEditable()) return n;
+        int cc = n.getChildCount();
+        for (int i = 0; i < cc; i++) {
+            AccessibilityNodeInfo got = editable(n.getChild(i), depth + 1);
+            if (got != null) return got;
+        }
+        return null;
+    }
+
+    /** 往下找带 RangeInfo 的那个（SeekBar 本体），容器自己通常没有区间信息。 */
+    private AccessibilityNodeInfo rangeable(AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 8) return null;
+        if (n.getRangeInfo() != null) return n;
+        int cc = n.getChildCount();
+        for (int i = 0; i < cc; i++) {
+            AccessibilityNodeInfo got = rangeable(n.getChild(i), depth + 1);
+            if (got != null) return got;
+        }
+        return null;
+    }
+
+    /**
+     * SETSEEK &lt;选择器&gt;|&lt;百分比 0-100&gt;
+     *
+     * 为什么不拖：滑条的实际可拖区间受左右 padding、滑块半径影响，各 ROM 不同，
+     * 按屏幕像素算「30%」必然偏；而 ACTION_SET_PROGRESS 交的是语义值，由控件自己换算。
+     * 另外 SeekBar 的 clickable 常为 false（MIUI 亮度条就是），TAPEL 根本点不动。
+     * 区间不假定 0~100，以控件自报的 RangeInfo 为准（有的滑条是 0~255 或 1~2047）。
+     */
+    private String setSeek(String rest) {
+        int bar = rest.indexOf('|');
+        if (bar < 0) return "ERR 用法：SETSEEK <sel>|<0-100>";
+        Sel sel = parseSel(rest.substring(0, bar));
+        if (sel == null) return "ERR sel 无法解析：" + rest.substring(0, bar).trim();
+        int pct;
+        try {
+            pct = Math.max(0, Math.min(100, Integer.parseInt(rest.substring(bar + 1).trim())));
+        } catch (NumberFormatException e) {
+            return "ERR 百分比不是整数：" + rest.substring(bar + 1).trim();
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return "ERR no-window 当前没有活动窗口";
+        List<Hit> hits = locate(root, sel);
+        String bad = checkHits(root, hits, sel);
+        if (bad != null) return bad;
+        AccessibilityNodeInfo n = hits.get(sel.index > 0 ? sel.index - 1 : 0).node;
+        AccessibilityNodeInfo target = rangeable(n, 0);
+        if (target == null) return "ERR not-seekbar " + brief(n) + " 该元素没有区间信息";
+
+        AccessibilityNodeInfo.RangeInfo ri = target.getRangeInfo();
+        float lo = ri == null ? 0f : ri.getMin();
+        float hi = ri == null ? 100f : ri.getMax();
+        float val = lo + (hi - lo) * pct / 100f;
+        Bundle args = new Bundle();
+        args.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE, val);
+        // 编译用的 android-35 jar 里没有 ACTION_SET_PROGRESS 这个常量
+        //（javac 报"找不到符号"），但它就是 R.id.accessibilityActionSetProgress = 0x0102003d。
+        // 用数值而不是反射：动作 id 是平台固定值，不会随版本变。
+        boolean ok = target.performAction(0x0102003d, args);
+        if (!ok) {
+            return "ERR seek-rejected " + brief(target)
+                    + " 该控件不接受 setProgress（区间 " + lo + "~" + hi + "）";
+        }
+        return "OK setseek " + pct + "%=" + Math.round(val) + " " + brief(target);
+    }
+
+    // 为什么滚动不用 ACTION_SCROLL_FORWARD：
+    //   实测（K80 / MIUI 设置首页）连续发 3 次 FORWARD，第 1 次 performAction 返回 true
+    //   但界面纹丝不动，第 2、3 次才滚；BACKWARD 同样首发生效、次发空转。
+    //   也就是说这个动作的返回值不能代表"真的滚了"，而"回读验证再重试"正是主人禁止的兜底。
+    //   改走手势滑动：和 TAPEL 同一条 dispatchGesture 路径，行为对任何 App 一致。
+    //   用较长的 duration 抑制 fling，避免"滑一下飞出去三屏"。
+    private static final int SCROLL_MS = 550;
+    private static final float SCROLL_SPAN = 0.35f;   // 相对容器高度/宽度的滑动比例
+
+    private String scroll(String rest) {
+        String dir = rest.trim().toLowerCase();
+        boolean vertical, forward;
+        if ("down".equals(dir)) { vertical = true; forward = true; }
+        else if ("up".equals(dir)) { vertical = true; forward = false; }
+        else if ("right".equals(dir)) { vertical = false; forward = true; }
+        else if ("left".equals(dir)) { vertical = false; forward = false; }
+        else return "ERR 用法：SCROLL up|down|left|right";
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return "ERR no-window 当前没有活动窗口";
+
+        // 页面上可能同时有横向 tab 和竖向列表，按面积挑最大的那个当主体容器
+        final List<AccessibilityNodeInfo> cand = new ArrayList<>();
+        final List<Integer> areas = new ArrayList<>();
+        findScrollable(root, cand, areas, new int[]{0});
+        if (cand.isEmpty()) return "ERR no-scrollable 当前界面没有可滚动容器";
+        int best = 0;
+        for (int i = 1; i < cand.size(); i++) if (areas.get(i) > areas.get(best)) best = i;
+        AccessibilityNodeInfo n = cand.get(best);
+
+        android.graphics.Rect r = new android.graphics.Rect();
+        n.getBoundsInScreen(r);
+        if (r.isEmpty()) return "ERR no-bounds " + brief(n);
+
+        float sx, sy, ex, ey;
+        if (vertical) {
+            float h = r.height();
+            float cx = (r.left + r.right) / 2f;
+            if (forward) {                       // 内容往上走：手指从下往上划
+                sy = r.top + h * 0.72f;
+                ey = sy - h * SCROLL_SPAN;
+            } else {
+                sy = r.top + h * 0.28f;
+                ey = sy + h * SCROLL_SPAN;
+            }
+            sx = cx;
+            ex = cx;
+        } else {
+            float w = r.width();
+            float cy = (r.top + r.bottom) / 2f;
+            if (forward) {                       // 内容往左走：手指从右往左划
+                sx = r.left + w * 0.75f;
+                ex = sx - w * SCROLL_SPAN;
+            } else {
+                sx = r.left + w * 0.25f;
+                ex = sx + w * SCROLL_SPAN;
+            }
+            sy = cy;
+            ey = cy;
+        }
+
+        Path p = new Path();
+        p.moveTo(sx, sy);
+        p.lineTo(ex, ey);
+        if (!gesture(p, SCROLL_MS)) return "ERR gesture";
+        return "OK scroll " + dir + " " + brief(n);
+    }
+
+    private void findScrollable(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> out,
+                                List<Integer> areas, int[] budget) {
+        if (n == null || budget[0] >= MAX_NODES) return;
+        budget[0]++;
+        if (n.isScrollable() && n.isVisibleToUser() && n.getChildCount() > 0) {
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            if (!r.isEmpty()) {
+                out.add(n);
+                areas.add(r.width() * r.height());
+            }
+        }
+        int cc = n.getChildCount();
+        for (int i = 0; i < cc; i++) findScrollable(n.getChild(i), out, areas, budget);
+    }
+
+    /** SETTEXT 用 | 分隔选择器与文本，文本里的 | 与 % 由控制端转义。 */
+    private static String unesc(String s) {
+        return s.replace("%7C", "|").replace("%7c", "|").replace("%25", "%");
     }
 
     // ------------------------------------------------------------ 红外
