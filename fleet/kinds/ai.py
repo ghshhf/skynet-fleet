@@ -44,7 +44,7 @@ class AI(BaseDevice):
         return True, ""
 
     def caps(self):
-        return ("ai.list", "ai.status", "ai.complete", "ai.chat")
+        return ("ai.list", "ai.status", "ai.complete", "ai.chat", "image.gen")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -56,7 +56,44 @@ class AI(BaseDevice):
             return self._complete(args)
         if cap == "ai.chat":
             return self._chat(args)
+        if cap == "image.gen":
+            return self._image_gen(args)
         return super().invoke(cap, args)
+
+    # ---------------- 出图（经手机 SdBridge）----------------
+
+    def _image_gen(self, args):
+        """生成一张图：参数规整后交给 image_gen_runner（后端可注入、未配置明确报错）。
+
+        」，失败带原因（runner 不静默交空）。出图是写文件副作用 ⇒ side_effect=True。
+        """
+        try:
+            import image_gen_runner as IG
+        except Exception as e:
+            return R.error("image.gen", f"出图 runner 加载失败: {e}",
+                           device=self.name, via=self.via)
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return R.error("image.gen", "prompt 不能为空",
+                           device=self.name, via=self.via)
+        try:
+            seed = int(args["seed"]) if args.get("seed") is not None else -1
+        except (TypeError, ValueError):
+            seed = -1
+        res = IG.run(
+            prompt,
+            neg=(args.get("neg") or ""),
+            size=(args.get("size") or "512x512"),
+            steps=int(args.get("steps") or 20),
+            seed=seed,
+            cfg=float(args.get("cfg") or 7.0),
+            model=args.get("model") or None,
+        )
+        if not res.get("ok"):
+            return R.unavailable("image.gen", res.get("err") or "出图失败",
+                                 device=self.name, via=self.via)
+        return R.success("image.gen", self.name, side_effect=True, via=self.via,
+                         data={"path": res.get("path"), "backend": "android_bridge"})
 
     # ---------------- 只读 ----------------
 
