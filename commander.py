@@ -897,6 +897,55 @@ def _cmd_pull(name, remotepath, outpath):
     print(f"  已拉取 -> {outpath} ({len(r['data'])}B base64)")
 
 
+def _cmd_relay_fetch(name, url):
+    """经指定节点的 SkyNet relay 取页（该节点需上报 skynet.relay 能力）。
+
+    走节点本机出口：relay 用 skynet.net.fetch_text(url) 取页面，
+    返回 base64 正文 + 文本。适合让「出口好的」节点代取。
+    """
+    node = REGISTRY.with_lock(lambda d: d.get(name))
+    if not node:
+        print(f"  节点 {name} 不在线")
+        return
+    info = node.get("info") or {}
+    rp = info.get("relay_port")
+    caps = node.get("capabilities") or []
+    if "skynet.relay" not in caps or not rp:
+        print(f"  节点 {name} 未上报 skynet.relay 能力（caps={caps}, relay_port={rp}）")
+        print("  提示：在该节点上 node_agent.py --relay-port <端口> 启动 relay 后再试")
+        return
+    import socket as _sock, json as _json
+    try:
+        s = _sock.create_connection(("127.0.0.1", int(rp)), timeout=20)
+    except OSError as e:
+        print(f"  连不上 {name} 的 relay 端口 {rp}：{e}")
+        print("  说明：relay 默认只绑 127.0.0.1；跨机需经 adb reverse / SSH 隧道转发")
+        return
+    rid = _next_id("rf")
+    s.sendall(_json.dumps({"type": "task", "id": rid, "kind": "fetch",
+                           "url": url}).encode("utf-8") + b"\n")
+    data = b""
+    try:
+        while b"\n" not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    if not data:
+        print(f"  relay 无回执（{name} 可能已掉线）")
+        return
+    msg = _json.loads(data.split(b"\n", 1)[0].decode("utf-8", "ignore"))
+    if not msg.get("ok"):
+        print(f"  取页失败：{msg.get('error', '未知原因')}")
+        return
+    text = msg.get("text", "") or ""
+    status = msg.get("status", 0)
+    print(f"  ← {name} relay 取页 OK（HTTP {status}, {len(text)} 字）")
+    print(text[:2000] + (" …[截断]" if len(text) > 2000 else ""))
+
+
 def _cmd_broadcast(cmd):
     if not _gate("broadcast"):
         return
@@ -1757,6 +1806,7 @@ def repl():
     print("cmd> nodes | exec <节点> <命令> | broadcast <命令> | push <节点> <文件> | pull <节点> <远程> [输出]")
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
+    print("      | relay_fetch <节点> <URL>   # 经节点 SkyNet relay 代取网页（节点需先 --relay-port 启动 relay）")
     print("      | enroll <节点> [有效期秒] | enroll_list | enroll_revoke <节点>   # 扫码入网（离线验签）")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
     print("      | policy | policy_eval <事件JSON> | her | her_memory | her_followups | her_say <文本> | intent <一句话> | quit")
@@ -1807,6 +1857,10 @@ def repl():
             sp = rest.split(" ", 2)
             if len(sp) >= 2:
                 _cmd_pull(sp[0], sp[1], sp[2] if len(sp) >= 3 else sp[1].split("/")[-1])
+        elif op == "relay_fetch":
+            sp = rest.split(" ", 1)
+            if len(sp) == 2:
+                _cmd_relay_fetch(sp[0], sp[1])
         elif op == "ctx_put":
             sp = rest.split(" ", 2)
             if len(sp) == 3:

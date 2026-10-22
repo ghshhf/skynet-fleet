@@ -21,6 +21,7 @@ import time
 import capabilities
 import common
 import image_gen_runner
+from fleet.skynet_relay import get_relay
 
 _DEBUG = bool(os.environ.get("FLEET_DEBUG"))
 
@@ -74,10 +75,24 @@ def _send_wait(s, msg, timeout=20):
 
 def run_node(host, port, name, password, platform="windows",
              caps=None, sandbox="sandbox_node", bg=False, cap_req=None, session=False,
-             models=None, gpu=False, ram_gb=0):
+             models=None, gpu=False, ram_gb=0, relay_port=None):
     caps = caps or ["exec", "push", "pull"]
     if isinstance(caps, str):
         caps = caps.split(",")
+    # 本机若指定 --relay-port，先启动 SkyNet relay，并把 skynet.relay 能力上报给 commander
+    relay = None
+    if relay_port:
+        try:
+            relay = get_relay()
+            relay.host = "127.0.0.1"
+            relay.port = int(relay_port)
+            actual = relay.start()
+            if "skynet.relay" not in caps:
+                caps.append("skynet.relay")
+            print(f"[{name}] SkyNet relay 已启动 127.0.0.1:{actual}（skynet.relay 能力已上报）", flush=True)
+        except Exception as e:
+            print(f"[{name}] SkyNet relay 启动失败（不影响上线）：{type(e).__name__}: {e}", flush=True)
+            relay = None
     if models and "compute" not in caps:
         caps = caps + ["compute"]
     if isinstance(models, str):
@@ -157,6 +172,7 @@ def _session(host, port, name, password, platform, caps, sandbox, cap_req,
                         # 不只报能力名，还报「说明书」（参数 schema）→ 编排才知道怎么调
                         "capability_specs": capabilities.describe(caps),
                         "info": {"sandbox": os.path.abspath(sandbox), "session": session,
+                                 "relay_port": (relay.port if relay and relay.running else None),
                                  "compute": {"cpu": os.cpu_count() or 0, "gpu": gpu,
                                              "ram_gb": ram_gb, "models": models or []}}})
     print(f"[{name}] 已注册（token={resp['token'][:8]}…）caps={caps}", flush=True)
@@ -524,6 +540,8 @@ def main():
     ap.add_argument("--models", default=None, help="本节点可跑的本地模型，逗号分隔，如 polaris-0.4b,qwen3-4b")
     ap.add_argument("--gpu", action="store_true", help="本节点有 GPU（路由优先）")
     ap.add_argument("--ram", type=int, default=0, help="本节点内存 GB（路由参考）")
+    ap.add_argument("--relay-port", type=int, default=None,
+                    help="启动 SkyNet relay 并监听此端口（供他机经端口转发取页）")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
@@ -532,7 +550,7 @@ def main():
         raise SystemExit("--name 必填（或使用 --selftest）")
     run_node(args.host, args.port, args.name, args.password, args.platform,
              args.caps, args.sandbox, bg=False, cap_req=args.cap_req, session=args.session,
-             models=args.models, gpu=args.gpu, ram_gb=args.ram)
+             models=args.models, gpu=args.gpu, ram_gb=args.ram, relay_port=args.relay_port)
 
 
 if __name__ == "__main__":

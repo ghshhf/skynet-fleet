@@ -47,6 +47,11 @@ class SkyNetRelay:
         self._thread.start()
         return self.port
 
+    @property
+    def running(self):
+        """relay 是否已 start() 并在监听。"""
+        return self._srv is not None
+
     def stop(self):
         self._stop.set()
         try:
