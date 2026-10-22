@@ -569,12 +569,29 @@ try:
     check("/app.js" in html and "/app.css" in html, "index.html 引用本地 app.js / app.css")
     check("<script" in html and "src=\"/app.js\"" in html, "index.html 用本地脚本")
 
-    # id 契约：app.js 里 $("xxx") 拿到的 id 必须在 index.html 里存在。
+    # id 契约：app.js 里 $("xxx") 拿到的 id 必须**有着落**。
     # 少一个 id 就是「界面某个角落永远不动」，是最难肉眼发现的那种坏。
+    #
+    # 🔴 「有着落」有两处，不是一处（N+1 立项时实测踩过）：
+    #    ① index.html 里静态写着的；
+    #    ② app.js 自己运行时创建的（`el("div", ...)` 之后 `.id = "xxx"`）。
+    #    只认 ① 会把一切动态界面误报——自写技能表单那 5 个 id 全是运行时建的，
+    #    但它们真实存在、点点就有反应，报「缺 id」是假的。
+    #    认了 ② 之后契约仍然完整：每个引用要么静态存在、要么被代码创建，
+    #    拼错的那个照样抓得到（拼错的 id 两边都不会出现）。
     html_ids = set(re.findall(r"""\bid\s*=\s*["']([^"']+)["']""", html))
     used_ids = set(re.findall(r"""\$\(\s*["']([^"']+)["']\s*\)""", js))
-    missing = sorted(used_ids - html_ids)
-    check(not missing, f"app.js 用到的 id 在 index.html 里都有（缺 {missing or '无'}）")
+    dyn_ids = set(re.findall(r"""\.id\s*=\s*["']([^"']+)["']""", js))
+    missing = sorted(used_ids - html_ids - dyn_ids)
+    check(not missing,
+          f"app.js 用到的 id 都有着落（静态或运行时创建；缺 {missing or '无'}）")
+    # 反向也钉一下：声称动态创建的 id 必须真被创建（防止有人靠加一行
+    # `.id = "xxx"` 把检查糊弄过去——那样 $("xxx") 还是会拿到 null）。
+    # 用正则而不是字符串 count：`.id = "x"` 和 `.id="x"` 都算，别在空格上误报。
+    fake_dyn = sorted(
+        i for i in (used_ids & dyn_ids)
+        if not re.search(r"""\.id\s*=\s*["']%s["']""" % re.escape(i), js))
+    check(not fake_dyn, f"动态 id 的赋值写在代码里（不是注释掉的）：{fake_dyn or '无'}")
 
     # JS 语法：node 在就查一遍（在不在都无所谓，查了更严）。
     import shutil
