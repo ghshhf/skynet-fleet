@@ -156,6 +156,11 @@ CASES = [
     # N+1 桌面端技能机制：列出/选用/记分/提交/回滚 + 按钮到端点活线。
     # 超时给宽一点：里面要起一次真 FleetServer + 一次 Playwright。
     ("eval_t18_skill_desktop", ["evals/t18_skill_desktop.py"], HERE, 300),
+    # N+1b 第 1 步 配对信箱内核：广播字段最小化（AST 静态扫）/验证码
+    # 一次性+过期+试爆锁/fail-closed/会话令牌 revoke 即死/审计闭环且
+    # 令牌不进 journal/fleetpair:// 链接往返/组播 TTL=1 LAN-only/tap 滤坏包。
+    # 全离线：socket 全假、journal 用临时 sqlite。
+    ("eval_t19_pair_mailbox", ["evals/t19_pair_mailbox.py"], HERE, 180),
 ]
 
 
