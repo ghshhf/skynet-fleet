@@ -161,6 +161,10 @@ CASES = [
     # 令牌不进 journal/fleetpair:// 链接往返/组播 TTL=1 LAN-only/tap 滤坏包。
     # 全离线：socket 全假、journal 用临时 sqlite。
     ("eval_t19_pair_mailbox", ["evals/t19_pair_mailbox.py"], HERE, 180),
+    # N+1c 手机出图：manifest/java 契约静态扫（RUN_COMMAND 常量/权限/不写死模型）
+    # + worker 行为（假 sd+假 sysfs：prompt/steps/size/插电/温度/并发锁/Vulkan
+    # 诚实边界/二进制缺失）。全离线、可测。
+    ("eval_t20_phone_image", ["evals/t20_phone_image.py"], HERE, 120),
 ]
 
 

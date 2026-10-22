@@ -3,6 +3,7 @@ package app.skynet.tianwang;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.media.MediaPlayer;
@@ -43,6 +44,7 @@ public class MainActivity extends Activity {
     private TextView btnSend;
     private TextView btnSettings;
     private TextView btnPc;
+    private TextView btnImg;
     private EditText input;
 
     private final WavRecorder recorder = new WavRecorder();
@@ -84,6 +86,7 @@ public class MainActivity extends Activity {
         btnSend = findViewById(R.id.btnSend);
         btnSettings = findViewById(R.id.btnSettings);
         btnPc = findViewById(R.id.btnPc);
+        btnImg = findViewById(R.id.btnImg);
         input = findViewById(R.id.input);
 
         recorder.setLevelListener(new WavRecorder.LevelListener() {
@@ -142,6 +145,13 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 showPcPanel();
+            }
+        });
+
+        btnImg.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(MainActivity.this, ImageActivity.class));
             }
         });
 
