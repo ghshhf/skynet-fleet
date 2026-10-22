@@ -153,6 +153,9 @@ CASES = [
     # 仓库 skills/ 下每个 vendored 技能必须带 _audit.json 且结论 clean，
     # 且 MANIFEST.json 登记与实际目录一一对应。未审查进仓 = 红。
     ("eval_p4_skills_integrity", ["evals/p4_skills_integrity.py"], HERE, 120),
+    # N+1 桌面端技能机制：列出/选用/记分/提交/回滚 + 按钮到端点活线。
+    # 超时给宽一点：里面要起一次真 FleetServer + 一次 Playwright。
+    ("eval_t18_skill_desktop", ["evals/t18_skill_desktop.py"], HERE, 300),
 ]
 
 
