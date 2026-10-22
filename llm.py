@@ -36,6 +36,9 @@ import shlex
 import subprocess
 import urllib.request
 
+from fleet import ai_backends as AB
+from fleet import memory_store as MS
+
 TIMEOUT = float(os.environ.get("FLEET_LLM_TIMEOUT", "120"))
 CLOUD_TIMEOUT = float(os.environ.get("FLEET_CLOUD_TIMEOUT", "45"))
 # 云端连续失败几次后本会话内不再重试（避免每次对话都等它超时）
@@ -242,15 +245,42 @@ def _free_complete(prompt, model, system, on_delta):
 def stream(prompt, model=None, system=None, on_delta=None):
     """流式推理：逐段回调 on_delta，最后返回 (完整文本, 后端名)。任何后端都不抛。
 
-    后端链：云端增强 -> 本地 -> 占位。
+    后端链：免费多端 -> 云端增强 -> 本地 -> 占位。
+    持久记忆：本轮 user 先写入；用 prompt 检索相关记忆拼进 system，让「她」
+    跨会话有上下文；每轮 assistant 回复在返回前写入（_ret 收口，不漏任何返回点）。
+    FLEET_MEMORY=0 可关闭，退回纯无记忆链路。
     """
     b = backend()
     emitted = []
+    _store = MS.get_store()
+
+    # 用户本轮输入先入库（记忆写失败不影响对话）
+    try:
+        _store.remember("user", prompt, tags=("llm",))
+    except Exception:
+        pass
+
+    # 检索相关记忆，拼进 system（所有后端分支自动带上，无需逐处改）
+    sys_mem = []
+    try:
+        sys_mem = _store.recall(prompt, top_k=3, min_sim=0.05)
+    except Exception:
+        sys_mem = []
+    if sys_mem:
+        system = (system or "") + "\n「你记得：" + "；".join(sys_mem) + "」"
 
     def _d(x):
         emitted.append(x)
         if on_delta:
             on_delta(x)
+
+    def _ret(text, backend_name):
+        """写入本轮 assistant 回复，再返回（统一收口，不漏任何返回点）。"""
+        try:
+            _store.remember("assistant", text, tags=("llm", backend_name))
+        except Exception:
+            pass
+        return text, backend_name
 
     # ---- 0) 免费多端（pollinations/ovh/llm7，failover+冷却，先走云端免费）----
     # 直接复用 ai_backends.chat_fallback（失败分类 + 冷却 + 健康门控 + 降级链都已做好）。
@@ -258,7 +288,7 @@ def stream(prompt, model=None, system=None, on_delta=None):
     if os.environ.get("FLEET_USE_FREE", "1") != "0":
         try:
             text, bk = _free_complete(prompt, model, system, on_delta)
-            return text, bk
+            return _ret(text, bk)
         except Exception as e:
             print("[llm] 免费多端失败，降级到已配置后端：%s" % e)
 
@@ -267,7 +297,7 @@ def stream(prompt, model=None, system=None, on_delta=None):
         try:
             text = _cloud_complete(prompt, model, system)
             _d(text)
-            return text, "cloud"
+            return _ret(text, "cloud")
         except Exception as e:
             _CLOUD_FAIL["n"] += 1
             if not emitted:
@@ -292,12 +322,12 @@ def stream(prompt, model=None, system=None, on_delta=None):
                 text = _stream_placeholder(prompt, _d)
             else:
                 text = _mock_complete(prompt, model, system, _d)
-                return text, "mock"
+                return _ret(text, "mock")
     except Exception as e:
         print("[llm] 本地后端失败：%s" % e)
         text = _mock_complete(prompt, model, system, _d)
-        return text, "mock"
-    return text, b
+        return _ret(text, "mock")
+    return _ret(text, b)
 
 
 def complete(prompt, model=None, system=None):
