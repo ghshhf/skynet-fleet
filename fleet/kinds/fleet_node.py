@@ -9,6 +9,7 @@ invoke 一律如实回答 `unavailable` 并说清缺什么——假装修好了�
 """
 import json
 import os
+import socket
 import time
 
 from ..core import BaseDevice, DeviceResult as R
@@ -69,8 +70,80 @@ class FleetNode(BaseDevice):
         return tuple(caps)
 
     def invoke(self, cap, args=None):
-        return R.unavailable(
-            cap, "控制面没有对外代发口（D0 只登记；D1 接 MCP 时补），暂不能远程执行",
+        # skynet.relay：返回本机 relay 运行状态（只读，不限网）
+        if cap == "skynet.relay":
+            try:
+                relay = get_relay()
+                if relay.running:
+                    return R.success(
+                        cap, self.name,
+                        data={"ok": True, "host": relay.host, "port": relay.port,
+                              "url": f"http://{relay.host}:{relay.port}"},
+                        via=self.via)
+                return R.success(
+                    cap, self.name,
+                    data={"ok": False, "host": relay.host, "port": relay.port,
+                          "err": "relay 未启动（节点未以 --relay-port 启动）"},
+                    via=self.via)
+            except Exception as e:
+                return R.error(cap, f"读取 relay 状态失败：{type(e).__name__}: {e}",
+                               device=self.name, via=self.via)
+
+        # skynet.relay.fetch：经该节点的 SkyNet relay 代取 URL（只对本机/可达节点有效）
+        if cap == "skynet.relay.fetch":
+            args = dict(args or {})
+            url = args.get("url", "")
+            if not url:
+                return R.error(cap, "缺少 url 参数", device=self.name, via=self.via)
+            info = self.rec.get("info") or {}
+            rp = info.get("relay_port")
+            caps = self.rec.get("capabilities") or []
+            if "skynet.relay" not in caps or not rp:
+                return R.error(
+                    cap, f"节点 {self.name} 未上报 skynet.relay 能力或未配 relay_port"
+                    f"（caps={caps}, relay_port={rp}）",
+                    device=self.name, via=self.via)
+            try:
+                s = socket.create_connection(("127.0.0.1", int(rp)), timeout=20)
+            except OSError as e:
+                return R.error(
+                    cap, f"连不上 {self.name} 的 relay 端口 {rp}：{e}"
+                    f"（relay 默认只绑 127.0.0.1，跨机需经 adb reverse / SSH 隧道）",
+                    device=self.name, via=self.via)
+            rid = f"rf-{self.name}-{int(time.time() * 1000)}"
+            try:
+                import json as _json
+                s.sendall(_json.dumps({"type": "task", "id": rid, "kind": "fetch",
+                                       "url": url}).encode("utf-8") + b"\n")
+                data = b""
+                while b"\n" not in data:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                s.close()
+            if not data:
+                return R.error(cap, f"relay 无回执（{self.name} 可能已掉线）",
+                               device=self.name, via=self.via)
+            try:
+                msg = _json.loads(data.split(b"\n", 1)[0].decode("utf-8", "ignore"))
+            except Exception as e:
+                return R.error(cap, f"relay 回执解析失败：{type(e).__name__}: {e}",
+                               device=self.name, via=self.via)
+            if not msg.get("ok"):
+                return R.error(cap, f"取页失败：{msg.get('error', '未知原因')}",
+                               device=self.name, via=self.via)
+            text = msg.get("text", "") or ""
+            status = msg.get("status", 0)
+            return R.success(
+                cap, self.name,
+                data={"ok": True, "status": status, "text": text,
+                      "chars": len(text), "via": f"relay:{self.name}:{rp}"},
+                via=self.via)
+
+        return R.unsupported(
+            cap, f"{self.name}（{self.kind}）没有这项能力",
             device=self.name, via=self.via)
 
     def snapshot(self):

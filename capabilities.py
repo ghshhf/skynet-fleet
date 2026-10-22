@@ -91,6 +91,20 @@ SPECS = {
             {"name": "model", "type": "str", "required": False, "desc": "模型文件（默认 Turbo）"},
         ],
     },
+    "skynet.relay": {
+        "title": "SkyNet relay 状态",
+        "desc": "返回本节点是否跑着 SkyNet relay 及其监听端口，供他机经端口转发取页",
+        "params": [],
+    },
+    "skynet.relay.fetch": {
+        "title": "经 SkyNet relay 代取网页",
+        "desc": "经指定节点的 SkyNet relay 代取 URL，返回页面正文与状态码；"
+                "relay 默认只绑 127.0.0.1，跨机需经端口转发",
+        "params": [
+            {"name": "node", "type": "str", "required": True, "desc": "目标节点名"},
+            {"name": "url", "type": "str", "required": True, "desc": "要取的 URL"},
+        ],
+    },
 }
 
 # 新名（domain.verb）→ 旧名（扁平）。新增能力在这里登记一行即可，

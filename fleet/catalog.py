@@ -169,6 +169,14 @@ CAPABILITIES = [
                params=(Param("url", "str", True), Param("dest", "str", True)),
                side_effect=True, check=_skynet_reason,
                note="写本地文件 ⇒ 要过审批闸门。断点续传、落盘按内容去重"),
+    # ---- SkyNet relay：本机出口经端口转发借给别的节点 ----
+    Capability("skynet.relay", "本机 SkyNet relay 状态（运行/端口/主机）",
+               note="只读：返回本节点是否跑着 SkyNet relay 及其监听端口，供他机经端口转发取页"),
+    Capability("skynet.relay.fetch", "经指定节点的 SkyNet relay 代取网页",
+               params=(Param("node", "str", True, "目标节点名"),
+                       Param("url", "str", True, "要取的 URL")),
+               side_effect=True, check=_skynet_reason,
+               note="走该节点本机出口；relay 默认只绑 127.0.0.1，跨机需经 adb reverse / SSH 隧道"),
     # ---- 免费 AI（pollinations 免 key 当一等公民；本地模型需 FLEET_LLM_URL）----
     Capability("ai.list", "可用的免费 AI 后端清单（只读）",
                note="免 key 端点（pollinations）零配置开箱即用；本地模型需 FLEET_LLM_URL"),
