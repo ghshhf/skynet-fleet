@@ -488,8 +488,13 @@ def _selftest():
         assert api_key(), "settings.json 存在时应能读到 forwardKey"
 
     # ⑦ 偏好表里的模型必须都是探到过的名字，别写成瞎编的
+    #    形状按探测返回的**真格式**：`vendor/model`（斜杠分隔，可再带 `:free`
+    #    后缀）。原断言写成 `含 ":" 或以 -free 结尾` 是拍脑袋格式——
+    #    实测缓存里的真名是 `stealth/glyph-cluster`、`kilo-auto/free` 这种，
+    #    既没冒号也不是 -free 结尾，把真名字全毙了（2026-10-22 误报）。
+    #    "真的能出字"由 probe() 现场逐个调验证，不在这条形状检查里假装能验。
     for m in PREFER:
-        assert ":" in m or m.endswith("-free"), m
+        assert "/" in m and not m.startswith("/") and not m.endswith("/"), m
 
     # ⑧ 白名单之外的动作一律拒绝——模型碰不到 shell / 文件 / 网络。
     #    用假 serial：这些分支在校验阶段就返回，根本不会去碰设备。
