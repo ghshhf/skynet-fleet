@@ -262,3 +262,170 @@ def _chat_stream(b, prompt, system, on_token, max_tokens, timeout):
             f"正文被截断（finish_reason=length）。加大 max_tokens 再试"
             f"（本项目建议 ≥1024）。")
     return text
+
+
+# =================== 失败分类 + 冷却 + 健康门控 + 降级链 ===================
+# 学 dsh-our-free-model（src/route/classify.js + src/combos.js）：
+# 免费端点会死/限流/地区拦截/偶发抽风。不能「单押一条」——一条挂了要透明切到下一条，
+# 且挂掉的端点要被「踢出轮转」一段时间（冷却），别反复硬砸把限流/封禁坐实。
+# 本地模型（FLEET_LLM_URL）只在 fallback 链垫底：先走云端免费、本地不做主力。
+
+# 冷却缓存：backend id -> {"until": 绝对秒, "level": 退避级数}
+_COOLDOWN = {}
+# round-robin 游标（等效模型分摊负载，学 dsh combos round-robin）
+_RR = {"cursor": 0}
+
+FAIL_TRANSIENT = "transient"   # 临时抖动：超时/断网/5xx → 可重试 + 短冷却
+FAIL_RATE = "rate_limit"       # 限流 429/quota → 可重试 + 指数退避
+FAIL_AUTH = "auth"             # 401/403/404 → 记死，踢出轮转
+FAIL_REQUEST = "request"       # 未匹配 4xx → 请求本身的问题，不冷却（但跨端点仍可试）
+FAIL_ABORTED = "aborted"       # 用户取消 → 不重试
+
+_COOLDOWN_SHORT = 30    # 秒：transient 默认
+_COOLDOWN_LONG = 2 * 60  # 秒：auth 类记死时长
+_BACKOFF_BASE = 2        # 秒：rate_limit 指数退避基数
+_BACKOFF_MAX = 5 * 60    # 秒：退避上限
+
+
+def classify_failure(exc):
+    """把一个异常归一成 {kind, retryable, cooldown, bench, advance}。
+
+    - bench=True  → 该端点踢出轮转 cooldown 秒（auth 记死，transient 短冷却）
+    - advance=True → 降级链可以切到下一条候选（跨端点重试同一条请求有意义）
+    未匹配 4xx 不冷却（是请求的问题，别误伤端点），但仍 advance（换端点可能就通了）。
+    """
+    msg = ""
+    status = None
+    if isinstance(exc, urllib.error.HTTPError):
+        status = getattr(exc, "code", None)
+        try:
+            body = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        msg = f"{getattr(exc, 'reason', '')} {body}"
+    else:
+        msg = str(exc)
+    low = msg.lower()
+
+    # 1) 限流/配额/容量（文字优先于状态码，学 dsh：wording beats status）
+    if any(k in low for k in ("rate limit", "too many requests", "quota",
+                              "capacity", "overloaded")):
+        return {"kind": FAIL_RATE, "retryable": True, "cooldown": _BACKOFF_BASE,
+                "bench": True, "advance": True}
+    # 2) 状态码
+    if status == 429:
+        return {"kind": FAIL_RATE, "retryable": True, "cooldown": _BACKOFF_BASE,
+                "bench": True, "advance": True}
+    if status in (401, 403, 404):
+        return {"kind": FAIL_AUTH, "retryable": False, "cooldown": _COOLDOWN_LONG,
+                "bench": True, "advance": True}
+    if status in (408, 425):
+        return {"kind": FAIL_TRANSIENT, "retryable": True, "cooldown": _COOLDOWN_SHORT,
+                "bench": True, "advance": True}
+    if status and 500 <= status <= 599:
+        return {"kind": FAIL_TRANSIENT, "retryable": True, "cooldown": _COOLDOWN_SHORT,
+                "bench": True, "advance": True}
+    # 3) 未匹配 4xx：请求本身的问题，不冷却，但跨端点仍可试下一条
+    if status and 400 <= status < 500:
+        return {"kind": FAIL_REQUEST, "retryable": False, "cooldown": 0,
+                "bench": False, "advance": True}
+    # 4) 超时/断网/其他 → 临时抖动
+    return {"kind": FAIL_TRANSIENT, "retryable": True, "cooldown": _COOLDOWN_SHORT,
+            "bench": True, "advance": True}
+
+
+def mark_failure(bid, verdict):
+    """按 verdict 给端点记冷却（rate_limit 用指数退避，级数累加）。"""
+    if not verdict.get("bench"):
+        return
+    cd = verdict.get("cooldown", 0)
+    if cd <= 0:
+        return
+    st = _COOLDOWN.get(bid, {"until": 0, "level": 0})
+    if verdict.get("kind") == FAIL_RATE:
+        level = min(st.get("level", 0) + 1, 15)
+        cd = min(_BACKOFF_BASE * (2 ** (level - 1)), _BACKOFF_MAX)
+    else:
+        level = 0
+    _COOLDOWN[bid] = {"until": time.time() + cd, "level": level}
+
+
+def mark_success(bid):
+    """成功一次就清冷却（端点活了）。"""
+    _COOLDOWN.pop(bid, None)
+
+
+def cooldown_remaining(bid):
+    st = _COOLDOWN.get(bid)
+    if not st:
+        return 0
+    return max(0, int(st["until"] - time.time()))
+
+
+def is_healthy(b):
+    """端点是否可进轮转（冷却期内视为不健康）。"""
+    return cooldown_remaining(b["id"]) <= 0
+
+
+def _fallback_order():
+    """降级链优先级：免 key 在前、token 其次、本地模型（仅测试）垫底。
+    对应「先走云端免费、本地不做主力」的定调。"""
+    rank = {"pollinations": 0, "ovh": 1, "llm7": 2}
+    bs = backends()
+
+    def key(b):
+        if b["id"] == "local":
+            return 99
+        if b["id"] in rank:
+            return rank[b["id"]]
+        if str(b.get("id", "")).startswith("custom"):
+            return 3
+        return 5
+    return sorted(bs, key=key)
+
+
+def healthy_backends():
+    """backends() 里健康（未在冷却）的子集，按 fallback 优先级排。"""
+    return [b for b in _fallback_order() if is_healthy(b)]
+
+
+def chat_fallback(prompt, system="", on_token=None, max_tokens=2048, timeout=120,
+                  candidates=None, strategy="fallback"):
+    """降级链（学 dsh combos fallback）：依次试候选端点，第一个产出非空白正文的胜出，
+    切换对调用方不可见（只在 via 字段暴露实际用了谁）。全部失败则抛出带每条原因的 RuntimeError。
+
+    candidates: 候选端点列表（backend dict）。None = 用 healthy_backends()（云端免费优先）。
+    strategy:
+      "fallback"     — 固定从优先级最高的健康端点开始（质量阶梯：免费 key 优先）
+      "round-robin" — 从轮转游标处开始，等效模型分摊负载（解决「全挤一个端点抢额度」）
+    """
+    if candidates is None:
+        candidates = healthy_backends()
+    if not candidates:
+        raise RuntimeError("没有可用后端（全部冷却中或不存在）")
+
+    if strategy == "round-robin" and len(candidates) > 1:
+        idx = _RR["cursor"] % len(candidates)
+        candidates = candidates[idx:] + candidates[:idx]
+        _RR["cursor"] = (idx + 1) % len(candidates)
+
+    last_err = None
+    for b in candidates:
+        try:
+            text = _chat_stream(b, prompt, system, on_token, max_tokens, timeout)
+            if text and text.strip():
+                mark_success(b["id"])
+                return text, b["id"]
+            # 空回：算这次失败（上游抽风/推理烧光），冷却 + 试下一条
+            mark_failure(b["id"], {"kind": FAIL_TRANSIENT, "bench": True,
+                                   "cooldown": _COOLDOWN_SHORT})
+            last_err = f"{b['id']} 空回（上游无正文）"
+        except Exception as e:
+            v = classify_failure(e)
+            mark_failure(b["id"], v)
+            last_err = f"{b['id']} [{v['kind']}] {e}"
+            if not v["advance"]:
+                raise RuntimeError(last_err)
+    raise RuntimeError("全部后端失败：" + " → ".join(b["id"] for b in candidates)
+                       + f" ；末因：{last_err}")
+
