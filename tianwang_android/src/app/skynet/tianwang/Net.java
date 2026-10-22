@@ -52,12 +52,18 @@ public final class Net {
         }
     }
 
-    /** {prompt} 进 → SSE 流出，边收边回调 */
-    public static void chat(String base, String token, String prompt, SseCallback cb) {
+    /** {prompt, backends} 进 → SSE 流出，边收边回调
+     *
+     * backends：逗号分隔，空串 = 后端自己的默认（全部）。手机语音一次只念一句，
+     * 传一个具体的 id 才不会几个后端同屏串台。
+     */
+    public static void chat(String base, String token, String prompt, String backends,
+                            SseCallback cb) {
         HttpURLConnection c = null;
         try {
             JSONObject req = new JSONObject();
             req.put("prompt", prompt);
+            req.put("backends", backends == null ? "" : backends);
             c = open(base + "/api/chat", "POST", token, "application/json");
             c.setReadTimeout(300000);          // 后端自己 300s 超时，这边给同样的耐心
             writeBody(c, req.toString().getBytes(UTF8));
@@ -189,6 +195,53 @@ public final class Net {
             if ((d[0] & 0xFF) == 0xFF && (d[1] & 0xE0) == 0xE0) { return "mp3"; }
         }
         return "wav";
+    }
+
+    // ---------------- 控电脑：看清单 / 让它做事 ----------------
+
+    /** GET /api/caps → 电脑那头能做的全部事。原样 JSON 交给界面自己排。 */
+    public static JSONObject caps(String base, String token) throws IOException {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(base + "/api/caps").openConnection();
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(CONNECT_MS);
+            c.setReadTimeout(20000);
+            c.setRequestProperty("X-Fleet-Token", token == null ? "" : token);
+            int code = c.getResponseCode();
+            String body = readText(c);
+            if (code != 200) { throw new IOException(friendly(code, body)); }
+            return parse(body);
+        } finally {
+            if (c != null) { c.disconnect(); }
+        }
+    }
+
+    /**
+     * POST /api/call → 让电脑做一件事。
+     *
+     * ⚠️ 要审批的能力会**一直挂着**，直到电脑上的弹窗被点确认（或服务端超时）。
+     * 所以调用方要给足读超时，界面也要先说一句「等电脑上确认」——不然人以为卡死了。
+     */
+    public static JSONObject call(String base, String token, String cap, JSONObject args)
+            throws IOException {
+        HttpURLConnection c = null;
+        try {
+            JSONObject req = new JSONObject();
+            req.put("cap", cap);
+            req.put("args", args == null ? new JSONObject() : args);
+            c = open(base + "/api/call", "POST", token, "application/json");
+            c.setReadTimeout(180000);
+            writeBody(c, req.toString().getBytes(UTF8));
+            int code = c.getResponseCode();
+            String body = readText(c);
+            if (code != 200) { throw new IOException(friendly(code, body)); }
+            return parse(body);
+        } catch (org.json.JSONException e) {
+            throw new IOException("请求体拼不出来：" + e.getMessage());
+        } finally {
+            if (c != null) { c.disconnect(); }
+        }
     }
 
     /** 探活：/api/health 不带鉴权，用来判断"电脑那头起了没"。 */

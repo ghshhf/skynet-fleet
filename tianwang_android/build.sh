@@ -119,6 +119,29 @@ echo "[3/5] d8 完成"
 ( cd build/dex && "$AAPT" add -f ../base.apk classes.dex >/dev/null )
 echo "[4/5] classes.dex 已合入"
 
+# ---------------- ⑥b 本地语音的 .so ----------------
+# 不在这一步现场编（NDK 全套编一遍一分半，且大多数改动跟语音无关），
+# 用 jni/build/libfleet_whisper.so 这个已经 strip 过的产物（约 1.6MB）。
+# 要重编：bash jni/build.sh
+SO="$HERE/jni/build/libfleet_whisper.so"
+if [ -f "$SO" ]; then
+  PY="${PY:-/d/tools/python/python.exe}"
+  "$PY" - "$HERE/build/base.apk" "$SO" <<'PYEOF'
+import sys, zipfile, os
+apk, so = sys.argv[1], sys.argv[2]
+# 用 STORED 存（不压缩）：Android 6+ 可以直接 mmap APK 里的库，
+# 压缩存的话系统还得先解压到 /data 再加载，既多一份磁盘又慢一拍。
+# 以 'a' 模式打开会保留原有条目，只追加这一个。
+with zipfile.ZipFile(apk, "a", zipfile.ZIP_STORED) as z:
+    z.write(so, "lib/arm64-v8a/" + os.path.basename(so))
+print("      lib/arm64-v8a/%s  %.1f MB" % (os.path.basename(so),
+                                          os.path.getsize(so) / 1048576))
+PYEOF
+  echo "[4/5b] libfleet_whisper.so 已合入"
+else
+  echo "[4/5b] 跳过本地语音（没有 jni/build/libfleet_whisper.so）"
+fi
+
 # ---------------- ⑦ 签名 ----------------
 KS="$HERE/keystore.jks"
 PASS="tianwang"

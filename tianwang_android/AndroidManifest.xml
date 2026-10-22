@@ -38,5 +38,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 本地语音自检：用来单独确认「.so / 模型 / 音频格式」哪一环出问题。
+             设为导出是为了让 adb shell am start 能拉起（不导出的话 shell 起不来，
+             自检就失去意义）。它只读本地文件、做一次识别，不写外部状态，
+             也不返回任何数据给调用方，被别的应用拉起的风险可以接受。 -->
+        <activity
+            android:name=".SelfTestActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay" />
     </application>
 </manifest>
