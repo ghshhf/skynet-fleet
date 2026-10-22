@@ -11,6 +11,11 @@
   --accent:#2f6bd8; --accent-soft:#f1f5fd;
   /* 实心 accent 底（承载白字）：必须与 #fff 达 WCAG AA 4.5:1，故与 --accent 分离 */
   --accent-solid:#2f6bd8;
+  /* accent 当**文字色**用时的变量：#2f6bd8 落在 --panel-2(#f2f3f5) 上只有
+     4.487，差 0.013 不达标（axe 在技能页实测抓到，激活 tab 就是这一例）。
+     压深一档到 #2d66cf = 4.834，其余底色也全过（白底 5.367 / accent-soft 4.912）。
+     边框仍用 --accent（边框无对比度要求，不动品牌色）。 */
+  --accent-text:#2d66cf;
   --user:#eef0f3; --danger:#c0332a; --ok:#147a41; --warn:#8a5d00;
   /* 实心色底（承载白字）：上面的 --danger/--ok/--warn 同时当文字色用，
      而「白字压在中间明度底色上」所需的亮度与「浅底上的文字」相反，
@@ -27,6 +32,8 @@ html[data-theme="dark"]{
   --accent:#5b8def; --accent-soft:#182338;
   /* 深色主题下 #5b8def + 白字只有 3.23，实心底压到 #3b6fd4 = 4.76 */
   --accent-solid:#3b6fd4;
+  /* 深色主题 --accent 作文字色四种底色全过（4.711~5.560，实测），故直接沿用 */
+  --accent-text:#5b8def;
   --user:#242930; --warn:#e0b44c;
   /* 深色底上的文字用亮色；实心底（+白字）仍用浅底那套深色，两边才都达 4.5 */
   --danger:#f0756c; --ok:#4ec97f;
@@ -96,7 +103,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .sb-item{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:8px;
   font-size:13px;color:var(--fg-2);cursor:pointer;margin-bottom:1px}
 .sb-item:hover{background:var(--panel);color:var(--fg)}
-.sb-item.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.sb-item.on{background:var(--accent-soft);color:var(--accent-text);font-weight:600}
 .sb-item .ic{width:16px;height:16px;flex:0 0 16px;opacity:.9}
 .sb-item .tag{font-size:9.5px;padding:1px 5px;border-radius:5px;
   background:var(--panel-2);color:var(--fg-3);font-weight:500}
@@ -126,7 +133,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .hbtn{width:28px;height:28px;border-radius:7px;display:grid;place-items:center;
   color:var(--fg-3);cursor:pointer}
 .hbtn:hover{background:var(--panel-2);color:var(--fg)}
-.hbtn.on{background:var(--accent-soft);color:var(--accent)}
+.hbtn.on{background:var(--accent-soft);color:var(--accent-text)}
 
 /* 消息流 */
 .stream{flex:1;overflow-y:auto;padding:22px 0 8px}
@@ -149,7 +156,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .msg.bot .txt{font-size:13.5px;line-height:1.72}
 .msg.bot .txt p{margin:0 0 9px}
 .msg.bot .txt p:last-child{margin-bottom:0}
-.msg.bot .txt .hl{background:var(--accent-soft);color:var(--accent);padding:0 4px;
+.msg.bot .txt .hl{background:var(--accent-soft);color:var(--accent-text);padding:0 4px;
   border-radius:4px;font-family:var(--mono);font-size:12.5px}
 .msg.bot .txt ul{margin:0 0 9px;padding-left:18px}
 .msg.bot .txt li{margin:2px 0}
@@ -284,7 +291,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .apprfoot .grow{flex:1}
 .caprow .hbtn.go{font-size:10.5px;padding:2px 9px;border-radius:6px;
   border:1px solid var(--line);color:var(--fg-2);margin-top:6px}
-.caprow .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
+.caprow .hbtn.go:hover{border-color:var(--accent);color:var(--accent-text)}
 
 /* ==========================================================================
    右栏：设备页（W3·主机可视化）
@@ -335,7 +342,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .prow .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prow .ppid{font-family:var(--mono);font-size:10px;color:var(--fg-3);width:44px;text-align:right}
 .prow .pcpu{font-family:var(--mono);font-size:10.5px;color:var(--fg-2);width:42px;text-align:right}
-.prow .sortarrow{font-size:9px;color:var(--accent);width:9px}
+.prow .sortarrow{font-size:9px;color:var(--accent-text);width:9px}
 
 /* 失败原因：说清楚为什么空着 */
 .dp-notes{padding:8px 12px 14px;display:flex;flex-direction:column;gap:6px}
@@ -353,10 +360,13 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 /* ---------- 三 Tab 条 ---------- */
 .tabbar{flex:0 0 auto;display:flex;align-items:center;gap:2px;
   padding:10px 20px 0;border-bottom:1px solid var(--line-soft)}
+/* tab 的专用容器：role="tablist" 只允许 role="tab" 的子元素，
+   刷新按钮因此挪到容器外（见 index.html 里的说明）。 */
+.tabbar .tablist{display:flex;align-items:center;gap:2px;min-width:0}
 .tab{padding:7px 14px;font-size:13px;color:var(--fg-2);border-bottom:2px solid transparent;
   border-radius:6px 6px 0 0}
 .tab:hover{color:var(--fg);background:var(--panel-2)}
-.tab.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:500}
+.tab.on{color:var(--accent-text);border-bottom-color:var(--accent);font-weight:500}
 .tab:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 
 /* ---------- Tab 内容区 ---------- */
@@ -386,7 +396,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .card .cmeta .hbtn.go{width:auto;height:auto;font-size:10.5px;padding:2px 9px;
   border-radius:6px;border:1px solid var(--line);background:var(--panel);
   color:var(--fg-2);font-family:inherit;white-space:nowrap}
-.card .cmeta .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
+.card .cmeta .hbtn.go:hover{border-color:var(--accent);color:var(--accent-text)}
 .card .cmeta .hbtn.go:disabled{opacity:.55;cursor:default}
 .card .cmeta .seedin{width:104px;font-size:11px;padding:2px 7px;border-radius:6px;
   background:var(--panel-2);border:1px solid var(--line);color:var(--fg);
@@ -401,7 +411,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 
 /* 来源徽标：内建 / 外接 */
 .badge-src{font-size:10px;padding:1px 6px;border-radius:9px;
-  background:var(--accent-soft);color:var(--accent);font-family:var(--mono)}
+  background:var(--accent-soft);color:var(--accent-text);font-family:var(--mono)}
 .badge-src.ext{background:var(--panel);color:var(--fg-2);border:1px solid var(--line)}
 .badge-role{font-size:10px;padding:1px 6px;border-radius:9px;
   background:var(--panel);color:var(--fg-2);border:1px solid var(--line)}
@@ -409,6 +419,64 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 /* 卡片里的原因（不可用时） */
 .card .creason{font-size:11px;color:var(--warn);line-height:1.5;word-break:break-word}
 .card .creason.err{color:var(--danger)}
+
+/* ==================================================================
+   自写技能区（专家 Tab 的「自写」段，skills_evolved/）
+   —— 与前两区的唯一区别：这边有**动作**（选用/记分/提交/回滚）。
+   配色一律取既有变量，不引入新色值（N 环刚把实心底拆成 *-solid，
+   这里不新增「白字压中间明度底」的组合）。
+   ================================================================== */
+.card.eskill{gap:7px}
+.card .cops{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  margin-top:3px;padding-top:7px;border-top:1px solid var(--line-soft)}
+.card .cops .hbtn{width:auto;height:auto;font-size:10.5px;padding:3px 10px;
+  border-radius:6px;border:1px solid var(--line);background:var(--panel);
+  color:var(--fg-2);white-space:nowrap;cursor:pointer;font-family:inherit}
+.card .cops .hbtn:hover{border-color:var(--accent);color:var(--accent-text)}
+.card .cops .hbtn:disabled{opacity:.55;cursor:default}
+/* 回滚是破坏性动作：红字 + 红边，但不铺红底——铺了就跟「选用 ✓」抢注意力 */
+.card .cops .hbtn.danger{color:var(--danger);border-color:var(--danger)}
+.card .cops .hbtn.danger:hover{background:var(--danger-solid);color:#fff;
+  border-color:var(--danger-solid)}
+.badge-role.err{color:var(--danger);border-color:var(--danger)}
+
+/* 记分盒：默认收起（点了「记分」才拉） */
+.sstat{display:none;flex-direction:column;gap:4px;font-size:11px;
+  color:var(--fg-2);font-family:var(--mono);background:var(--panel);
+  border:1px solid var(--line-soft);border-radius:8px;padding:7px 9px;
+  margin-top:2px;line-height:1.6;word-break:break-word}
+.sstat:not(:empty){display:flex}
+.sstat .srow{display:flex;align-items:baseline;justify-content:space-between;
+  gap:8px;font-size:11px;color:var(--fg-2);border-bottom:none;padding:0}
+.sstat .srate{color:var(--ok);font-weight:500}
+.sstat .sverdict{color:var(--fg-3);font-size:10.5px;margin-top:2px;
+  padding-top:4px;border-top:1px dashed var(--line)}
+.sstat .err{color:var(--danger);font-family:inherit}
+
+/* 长新技能的表单：两步（预览四闸 → 确认落盘），
+   四闸全过前「确认落盘」保持 disabled——后端也会再拦一遍，前端只是别让人白点。 */
+.esform{display:flex;flex-direction:column;gap:7px;background:var(--panel-2);
+  border:1px solid var(--line);border-radius:10px;padding:11px 12px;margin-bottom:12px}
+.esform .esform-t{font-size:11px;color:var(--fg-3);letter-spacing:.04em;
+  text-transform:uppercase}
+.esform .esrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.esform .esrow input{flex:1;min-width:170px;font-size:12px;padding:5px 9px;
+  border-radius:7px;background:var(--panel);border:1px solid var(--line);
+  color:var(--fg);font-family:var(--mono)}
+.esform .esrow input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.esform .esrow .hbtn{width:auto;height:auto;font-size:11px;padding:4px 11px;
+  border-radius:7px;border:1px solid var(--line);background:var(--panel);
+  color:var(--fg-2);white-space:nowrap;cursor:pointer;font-family:inherit}
+.esform .esrow .hbtn:hover{border-color:var(--accent);color:var(--accent-text)}
+.esform .esrow .hbtn:disabled{opacity:.55;cursor:default}
+.esform .esgates{display:none;flex-direction:column;gap:3px;font-size:11px;
+  font-family:var(--mono);line-height:1.6}
+.esform .esgates:not(:empty){display:flex}
+.esform .gate{padding:3px 8px;border-radius:6px;word-break:break-word}
+.esform .gate.ok{color:var(--ok);background:var(--panel)}
+.esform .gate.no{color:var(--danger);background:var(--panel)}
+.esform .esnote{color:var(--fg-3);font-size:10.5px;padding:2px 8px;
+  word-break:break-word}
 
 /* ==================================================================
    角色卡商店（专家 Tab 下半段）
@@ -424,7 +492,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .storebar .hbtn.go{width:auto;height:auto;font-size:11.5px;padding:5px 12px;
   border-radius:7px;border:1px solid var(--line);background:var(--panel-2);
   color:var(--fg-2);white-space:nowrap}
-.storebar .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
+.storebar .hbtn.go:hover{border-color:var(--accent);color:var(--accent-text)}
 .storebar .hbtn.go:disabled{opacity:.55;cursor:default}
 
 .storeinbox{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
@@ -434,7 +502,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .storeinbox .hbtn{width:auto;height:auto;font-size:11px;padding:3px 10px;
   border-radius:7px;border:1px solid var(--line);background:var(--panel);
   color:var(--fg-2);font-family:inherit}
-.storeinbox .hbtn:hover{border-color:var(--accent);color:var(--accent)}
+.storeinbox .hbtn:hover{border-color:var(--accent);color:var(--accent-text)}
 
 .storeres{min-height:40px}
 .storeres .wall{margin-top:8px}
@@ -534,7 +602,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 }
 .vv-send{background:var(--accent-solid);border-color:var(--accent-solid);color:#fff}
 .vv-send:disabled{opacity:.5;cursor:not-allowed}
-.vv-hands.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.vv-hands.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-text)}
 
 @media (max-width:900px){
   .vv-orb{width:200px;height:200px}
