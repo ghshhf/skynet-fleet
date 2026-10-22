@@ -17,8 +17,19 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- 录音：运行时申请 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 出图：读 Termux 写进 Pictures/fleet 的结果图 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- 出图：调用 Termux 跑本地 sd.cpp（F-Droid 版） -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- 让本 App 能"看到"并拉起 Termux（Android 11+ 包可见性） -->
+    <queries>
+        <package android:name="com.termux" />
+    </queries>
 
     <application
         android:allowBackup="false"
@@ -47,5 +58,12 @@
             android:name=".SelfTestActivity"
             android:exported="true"
             android:theme="@android:style/Theme.NoDisplay" />
+
+        <!-- 出图：本地 Termux 算力，不经过电脑。从主界面"出图"入口拉起。 -->
+        <activity
+            android:name=".ImageActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
     </application>
 </manifest>
