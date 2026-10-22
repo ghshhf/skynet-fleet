@@ -30,6 +30,7 @@ import socket
 import sys
 import tempfile
 import time
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -300,7 +301,133 @@ def t_beacon():
           "tap 滤掉坏包只留合法公告（收 %d 封）" % len(got))
 
 
-# ---------------------------------------------------------------- main
+# ---------------------------------------------------------------- ⑨ HTTP 活线
+
+def t_http():
+    print("\n[⑨] HTTP 活线：配对握手/受控端点/TLS 钉扎（需 openssl）")
+    import http.client
+    import ssl as SSL
+    from fleet.gui import server as GS
+    from fleet import pairtls as PT
+
+    if not PT.find_openssl():
+        print("  -  跳过 TLS 活线：本机没有 openssl（证书生成不了）——"
+              "不是通过，是缺环境", flush=True)
+        return
+
+    f = GS.FleetServer()
+    try:
+        f.start()
+        info = f.enable_pairing(pair_host="127.0.0.1", pair_port=0)
+        port = info["pair_port"]
+        fp = info["fp"]
+        check(info["tls"] and len(fp) == 64, "配对监听器带 TLS 且指纹 64 位")
+
+        def req(method, path, body=None, token=None, tls=True):
+            if tls:
+                ctx = SSL.SSLContext(SSL.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = SSL.CERT_NONE
+                c = http.client.HTTPSConnection("127.0.0.1", port,
+                                                context=ctx, timeout=10)
+            else:
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            hdrs = {}
+            if token:
+                hdrs[GS.SESSION_HEADER] = token
+            c.request(method, path, body=json.dumps(body or {}), headers=hdrs)
+            r = c.getresponse()
+            raw = r.read()
+            c.close()
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                obj = {"_raw": raw[:40]}
+            return r.status, obj
+
+        # 明文连 TLS 口必须失败（不许静默降级）
+        try:
+            st, _ = req("GET", "/api/pair/state", tls=False)
+            check(False, "明文连 TLS 端口被拒（实际 %s）" % st)
+        except (SSL.SSLError, ConnectionError, OSError):
+            check(True, "明文连 TLS 端口被拒（TLS 握手失败）")
+
+        st, obj = req("GET", "/api/pair/state")
+        check(st == 200 and obj.get("enabled") is True,
+              "/api/pair/state 无需令牌可见（enabled=true）")
+
+        st, obj = req("POST", "/api/pair", {"code": "000000",
+                                            "controller": "evil"})
+        check(st == 401 and obj.get("err"), "错码 401 且带原因（%s）"
+              % str(obj.get("err"))[:16])
+
+        st, obj = req("POST", "/api/pair", {"code": info["code"],
+                                            "controller": "PC-B",
+                                            "fp": fp[:8]})
+        check(st == 200 and obj.get("token") and obj.get("fp") == fp,
+              "正确码换到会话令牌，且指纹与监听器一致")
+        tok = obj.get("token") or ""
+
+        # 一次性：同一码再配被拒
+        st, obj = req("POST", "/api/pair", {"code": info["code"],
+                                            "controller": "PC-B2"})
+        check(st == 401, "验证码一次性：第二次同码 401")
+
+        st, obj = req("POST", "/api/remote/sysinfo", {}, token=None)
+        check(st == 401, "受控端点无会话令牌 → 401")
+        st, obj = req("POST", "/api/remote/sysinfo", {}, token="garbage-xxx")
+        check(st == 403, "假会话令牌 → 403")
+        st, obj = req("POST", "/api/remote/sysinfo", {}, token=tok)
+        check(st == 200 and obj.get("ok"), "持令牌调只读能力成功（sysinfo）")
+
+        st, obj = req("POST", "/api/remote/ai.chat", {}, token=tok)
+        check(st == 404, "白名单外能力 404（ai.chat 摸不到）")
+        st, obj = req("POST", "/api/remote/skill/promote", {}, token=tok)
+        check(st == 404, "白名单外能力 404（skill.promote 摸不到）")
+
+        # ask 档 fail-closed：无闸门 → denied，且原因说清是闸门
+        st, obj = req("POST", "/api/remote/mouse", {"x": 0, "y": 0}, token=tok)
+        check(st == 200 and not obj.get("ok")
+              and "闸门" in str(obj.get("err", "")),
+              "ask 档无闸门 → denied 带原因（键鼠绝不被远程驱动）")
+
+        # GUI 端点不泄漏：配对口上没有 X-Fleet-Token 就 401
+        st, obj = req("GET", "/api/health")
+        check(st == 401, "配对监听器不服务 GUI 端点（/api/health 401）")
+
+        # 截图登记回取（真截只读一张，无害）
+        st, obj = req("POST", "/api/remote/screenshot", {}, token=tok)
+        sid = obj.get("shot_id") or ""
+        if st == 200 and obj.get("ok") and sid:
+            ctx = SSL.SSLContext(SSL.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = SSL.CERT_NONE
+            u = "https://127.0.0.1:%d/api/remote/shot?id=%s" % (port, sid)
+            rq = urllib.request.Request(u, headers={GS.SESSION_HEADER: tok})
+            r = urllib.request.urlopen(rq, context=ctx, timeout=15)
+            head = r.read(8)
+            check(head.startswith(b"\x89PNG"), "凭 shot_id 回取到真 PNG")
+        else:
+            check(False, "远程截图成功并登记（%s）" % str(obj.get("err"))[:30])
+
+        # revoke：旧令牌当场死
+        st, obj = req("POST", "/api/remote/revoke", {}, token=tok)
+        check(st == 200, "远程自我掐断成功")
+        st, obj = req("POST", "/api/remote/sysinfo", {}, token=tok)
+        check(st == 403, "revoke 后旧令牌 403")
+
+        # 指纹两条路径一致：Python sha256(DER) == openssl x509 -fingerprint
+        import subprocess as SP
+        r = SP.run([PT.find_openssl(), "x509", "-in", f.pair_tls["cert"],
+                    "-fingerprint", "-sha256", "-noout"],
+                   capture_output=True)
+        out = r.stdout.decode("utf-8", "replace").strip()
+        ossl_fp = out.split("=", 1)[-1].replace(":", "").lower() if "=" in out \
+            else ""
+        check(ossl_fp == fp, "指纹双路径一致（python sha256(DER) == openssl）")
+    finally:
+        f.disable_pairing()
+        f.stop()
 
 def main():
     print("t19 配对信箱内核：", flush=True)
@@ -311,6 +438,7 @@ def main():
     t_audit()
     t_link()
     t_beacon()
+    t_http()
     print("\n[t19] 失败 %d 项" % len(FAIL), flush=True)
     if FAIL:
         for m in FAIL:
