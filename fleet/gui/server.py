@@ -115,7 +115,8 @@ class FleetServer:
     """本机 GUI 后端。构造即生成 token；start() 之后端口才定下来。"""
 
     def __init__(self, registry=None, gate=None, persona=None, host="127.0.0.1",
-                 port=0, chat_gate_fn=chat_gate, approval=None):
+                 port=0, chat_gate_fn=chat_gate, approval=None,
+                 evidence_journal=None):
         self.registry = registry if registry is not None else build()
         # 闸门在服务端：/api/call 走它。默认 None —— 于是注册表按 fail-closed
         # 拒绝一切有副作用的能力，答复里带明确原因（这是 W1 的真实状态，
@@ -137,6 +138,13 @@ class FleetServer:
         self._thread = None
         self.started_at = 0.0
         self.calls = []                              # 调用流水（给 /api/health 看）
+        # 执行证据（2026-10-22 新增）：能力调用前后写 journal，生成 exec: 级证据。
+        # 之前每一层都只管调用、不管留痕 ⇒ journal 里 done = 0 条，
+        # 技能进化没有原料、followups 全是挂着的账。接上以后就有了。
+        # 不传 evidence_journal 就只调用不记录（测试与一次性脚本不受影响）。
+        from fleet import execute as _X
+        self.executor = _X.Executor(self.registry, journal=evidence_journal,
+                                    actor="gui")
         self._shots = {}                            # 截图登记：id -> 路径（W3）
         self._shot_seq = 0
         self._shot_lk = threading.Lock()
@@ -227,7 +235,7 @@ class FleetServer:
         gate = self.gate
         if self.approval is not None:
             gate = self.approval.gate_for(tag=tag, session=session)
-        r = self.registry.call(cap, device=device, args=args or {}, gate=gate)
+        r = self.executor.call(cap, device=device, args=args or {}, gate=gate)
         self.calls.append({"cap": cap, "code": r.code, "ms": round(r.ms, 1),
                            "at": time.time()})
         return r.as_dict()
@@ -249,7 +257,7 @@ class FleetServer:
 
         def _work():
             try:
-                r = self.registry.call(
+                r = self.executor.call(
                     "ai.chat",
                     args={"prompt": prompt, "system": system,
                           "backends": backends, "_on_line": _on_line},
