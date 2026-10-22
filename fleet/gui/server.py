@@ -379,6 +379,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(self._audio_presets())
         if path == "/api/skills":
             return self._json(self._skills())
+        if path == "/api/skills/evolved":
+            return self._json(self._skills_evolved())
+        if path == "/api/skill/stats":
+            return self._json(self._skill_stats())
         if path == "/api/connectors":
             return self._json(self._connectors())
         if path == "/api/memory":
@@ -423,6 +427,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_approval_respond(body)
         if path == "/api/memory/delete":
             return self._post_memory_delete(body)
+        if path == "/api/skill/use":
+            return self._post_skill_use(body)
+        if path == "/api/skill/propose":
+            return self._post_skill_propose(body)
+        if path == "/api/skill/promote":
+            return self._post_skill_promote(body)
+        if path == "/api/skill/rollback":
+            return self._post_skill_rollback(body)
         self._err(404, f"没有这个接口: {path}")
 
     # ---------------- 各接口的实现 ----------------
@@ -619,6 +631,155 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return {"ok": False, "count": 0, "skills": [],
                     "error": f"{type(e).__name__}: {e}"}
+
+    # ---------------- 自写技能（skills_evolved/）----------------
+    #
+    # 与 /api/skills 分开：那边是 vendored 第三方 + 用户级，只读清单；
+    # 这边是「从跑通过的执行里长出来的」，带选用/记分/提交/回滚四个动作。
+    # 分开两个端点，两套账，跟目录分开是同一个理由（P3 定的）。
+
+    def _skills_evolved(self):
+        """自写技能清单（只读）。正文不外发，同 skills.summary() 的纪律。"""
+        from ..skills_evolve import evolved_summary
+        try:
+            return evolved_summary()
+        except Exception as e:
+            return {"ok": False, "count": 0, "skills": [],
+                    "error": f"{type(e).__name__}: {e}"}
+
+    def _skill_stats(self):
+        """一张自写技能的记分。
+
+        🔴 verdict 原样带回：「证据不足，分数不可信」不许前端自己解读成
+        一个百分数——没有证据时明确说没有，是 P4 定的纪律。
+        """
+        from urllib.parse import parse_qs
+        from ..skills_evolve import skill_stats, SkillError
+        p = parse_qs(urlparse(self.path).query)
+        name = (p.get("name") or [""])[0].strip()
+        if not name:
+            return {"ok": False, "err": "缺少 name（要查哪张技能的记分）"}
+        try:
+            st = skill_stats(name)
+        except SkillError as e:
+            return {"ok": False, "err": str(e)}
+        except Exception as e:
+            return {"ok": False, "err": f"{type(e).__name__}: {e}"}
+        return {"ok": True, **st}
+
+    def _post_skill_use(self, body):
+        """记一次「这张技能被用了」（选用留痕）。
+
+        这是**打点**不是审批：技能被读进提示词那一刻打一条，
+        成功 done、失败 open。它只说明「有人调用了这张卡」，
+        不说明「被照着执行了」——后者本仓观测不到，别假装能。
+        """
+        from ..skills_evolve import note_use, _safe_name, SkillError
+        name = (body.get("name") or "").strip()
+        if not name:
+            return self._err(400, "缺少 name（要记哪张技能被用了）")
+        try:
+            _safe_name(name)
+            i = note_use(name, ok=bool(body.get("ok", True)),
+                         detail=str(body.get("detail") or "")[:120])
+        except SkillError as e:
+            return self._err(400, str(e))
+        except Exception as e:
+            return self._err(500, f"记不上：{type(e).__name__}: {e}")
+        return self._json({"ok": True, "event_id": i, "name": name,
+                           "used_ok": bool(body.get("ok", True))})
+
+    def _post_skill_propose(self, body):
+        """第一步：从一条执行长出候选，**不落盘**。
+
+        为什么分两步：计划书§七「自动改技能并直接生效」明确不做——
+        候选必须先给人看四闸结果，人点了确认才落盘。
+        """
+        from ..skills_evolve import propose, verify, SkillError
+        trace = (body.get("trace") or "").strip()
+        name = (body.get("name") or "").strip()
+        desc = str(body.get("desc") or "")[:200]
+        if not trace or not name:
+            return self._err(400, "缺少 trace 或 name（从哪条执行链、长成什么名）")
+        try:
+            cand = propose(trace, name, desc)
+        except SkillError as e:
+            return self._json({"ok": False, "err": str(e), "stage": "propose"})
+        except Exception as e:
+            return self._err(500, f"提议失败：{type(e).__name__}: {e}")
+        ok, gates = verify(cand)
+        return self._json({"ok": ok, "stage": "verify", "name": name,
+                           "trace": trace, "gates": gates,
+                           "caps": cand.get("caps", []),
+                           "evolved_from": cand.get("evolved_from", []),
+                           "text": cand.get("text", "")})
+
+    def _post_skill_promote(self, body):
+        """第二步：落盘。服务端**重新 propose + 重新过闸**，不信任前端传来的文本。
+
+        🔴 为什么不接受前端传候选文本：前端传什么就落什么 = 绕过四闸。
+           两步都在服务端重算，前端带来的只有 (trace, name, desc) 三个参数。
+        🔴 没有 force 开关：计划书§七「自动改技能并直接生效」不做。
+           四闸不过就原样返回 gates，让前端显示哪闸红。
+           `overwrite` 只放开「同名不覆盖」这一道守卫，四闸照样先跑——
+           桌面端要能发布第二个版本，否则回滚永远碰不到（t18 立项时发现）。
+        落盘后紧跟一次 scoped commit——**版本=git**，没有提交就没有快照，
+        之后的回滚会没有目标。commit 不在 git 仓库里时不阻断落盘，
+        但明确告诉前端「回滚不可用」。
+        """
+        from ..skills_evolve import (propose, promote, commit_evolved,
+                                     SkillError)
+        trace = (body.get("trace") or "").strip()
+        name = (body.get("name") or "").strip()
+        desc = str(body.get("desc") or "")[:200]
+        if not trace or not name:
+            return self._err(400, "缺少 trace 或 name（从哪条执行链、长成什么名）")
+        try:
+            cand = propose(trace, name, desc)
+        except SkillError as e:
+            return self._json({"ok": False, "err": str(e), "stage": "propose"})
+        except Exception as e:
+            return self._err(500, f"提议失败：{type(e).__name__}: {e}")
+        ok, rep = promote(cand, allow_overwrite=bool(body.get("overwrite")))
+        if not ok:
+            r = dict(rep)
+            # err / error 都认：promote 历史上用过 error，改成 err 之后
+            # 这里两侧兼容，避免哪一边漏改就让失败原因整条消失。
+            why = r.get("err") or r.get("error") or "落盘被拒"
+            # 同名已存在时把「可以显式覆盖」说清楚，前端才知道下一步能干什么
+            can_ow = bool(r.get("can_overwrite")) or "同名技能已存在" in str(why)
+            return self._json({"ok": False, "stage": "promote", "err": why,
+                               "gates": r.get("gates", []),
+                               "can_overwrite": can_ow})
+        sha = None
+        commit_note = ""
+        try:
+            sha = commit_evolved(name)
+        except SkillError as e:
+            commit_note = str(e)
+        if sha is None and not commit_note:
+            commit_note = "没有可提交的改动（可能什么都没变）"
+        return self._json({"ok": True, "stage": "promote", **rep,
+                           "git": sha, "commit_note": commit_note,
+                           "rollback_ready": bool(sha)})
+
+    def _post_skill_rollback(self, body):
+        """回滚一张自写技能到上一个已提交版本。
+
+        自验三样（加载/审计/四闸）在 skills_evolve.rollback 里做，
+        任一不过工作区会被改回原样——回滚不许把仓滚坏。
+        """
+        from ..skills_evolve import rollback, SkillError
+        name = (body.get("name") or "").strip()
+        if not name:
+            return self._err(400, "缺少 name（要回滚哪张技能）")
+        try:
+            ok, rep = rollback(name, to_sha=(body.get("to") or "").strip() or None)
+        except SkillError as e:
+            return self._json({"ok": False, "err": str(e), "stage": "rollback"})
+        except Exception as e:
+            return self._err(500, f"回滚失败：{type(e).__name__}: {e}")
+        return self._json({"ok": ok, "stage": "rollback", **rep})
 
     def _connectors(self):
         """连接器清单：**内建设备 + 外部 MCP server，统一成一张表**。

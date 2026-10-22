@@ -36,6 +36,7 @@ import shutil
 import journal as J
 from . import skills as SK
 from . import skills_audit as SA
+from .skills import SkillError
 
 # 自写技能目录（与 skills/ 分开：那边是 vendored 第三方，有自己的契约与门禁）
 Evolved_DIR = os.path.join(SK.REPO_SKILLS_DIR, "..", "skills_evolved")
@@ -58,6 +59,19 @@ USE_PREFIX = "skill:use:"
 # 技能使用事件的 trace 前缀（第三种级别：既不是 exec 也不是 mem）
 USE_TRACE_PREFIX = "use:"
 
+# 技能名形状：名字会变成目录名（skills_evolved/<name>/），
+# 所以只许字母数字点下划线连字符，且不许以点开头（藏目录/穿越）。
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _safe_name(name):
+    """校验技能名。不合法直接抛——**不许静默改**（把 ../ 洗成空更危险）。"""
+    n = (name or "").strip()
+    if not _NAME_RE.match(n):
+        raise SkillError(
+            "技能名不合法：%r（只许字母数字 . _ -，首字符不许是点，最长 64）" % name)
+    return n
+
 
 # ------------------------------------------------------------------ 证据
 
@@ -67,8 +81,31 @@ def _evidence_journal(db=None):
     return J.Journal(path, cap=200000)
 
 
+def _coerce_ids(ids):
+    """把证据 id 统一成 int。
+
+    🔴 为什么必须有这一步（t18 实测抓出来的真 bug）：
+       frontmatter 的 `evolved_from: [2, 4, 6]` 经 _parse_inline_list
+       解析出来是**字符串** ["2","4","6"]（它同时要解析 caps 这种字符串列表，
+       没法在里面分类型）。而 SQLite 的 id 列是整数。
+       于是 _done_events 用 "2" 去查 int 键 ⇒ 全部「证据不存在」
+       ⇒ 回滚后重过四闸时闸1 必红 ⇒ rollback 的自验③永远失败
+       ⇒ **回滚在线上实际是坏的**（只是从没被跑过所以没暴露）。
+       在取数的唯一入口归一化，比在每个调用点记得转要可靠。
+    """
+    out = []
+    for i in ids or []:
+        s = str(i).strip()
+        if s.isdigit():
+            out.append(int(s))
+        else:
+            out.append(s)
+    return out
+
+
 def _done_events(j, ids):
     """按 ids 取证据，且只认 status='done' 的。返回 (存在的, 缺失的)。"""
+    ids = _coerce_ids(ids)
     if not ids:
         return [], []
     q = ",".join("?" * len(ids))
@@ -224,9 +261,11 @@ def verify(candidate, db=None, reg=None, roots=None):
         else:
             detail = "取到 %d 条 done 证据" % len(ok_rows)
             if bad:
+                # 🔴 用 %s 不用 %d：证据 id 可能来自 frontmatter（字符串），
+                # 报错路径自己崩掉比报不出错更糟——t18 实测在这里崩过。
                 add("闸1 溯源真", False,
                     "有 %d 条证据不成立：%s" % (
-                        len(bad), "；".join("#%d %s" % (i, why2) for i, why2 in bad[:5])))
+                        len(bad), "；".join("#%s %s" % (i, why2) for i, why2 in bad[:5])))
             else:
                 add("闸1 溯源真", True, detail)
         # 强证据：至少一条 exec: 级
@@ -413,21 +452,34 @@ def _ledger_append(rec):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def promote(candidate, db=None, reg=None, force=False):
+def promote(candidate, db=None, reg=None, allow_overwrite=False):
     """把过了四闸的候选落盘到 skills_evolved/，并写回执。
 
-    落盘后不覆盖既有同名技能（要覆盖必须走噪声守卫 + 显式 --force）。
+    🔴 `allow_overwrite` 只放开「同名不覆盖」这一道守卫，**绝不放开四闸**。
+       四闸永远先跑，红就拒绝。原先这里叫 `force`，一个开关同时绕两道，
+       等于留了个「连闸门一起绕」的后门——桌面端要点一下就能把没过闸的
+       内容写进 skills_evolved/，那是计划书§七明令不做的事。
+       （t18 立项时发现：因为 GUI 只会传「不覆盖」，桌面端根本产不出
+       第二个版本，回滚也就永远碰不到——所以这个开关必须存在且必须安全。）
+
+    落盘后默认不覆盖既有同名技能；要发布新版本得显式 allow_overwrite=True。
     """
     ok, gates = verify(candidate, db=db, reg=reg)
-    if not ok and not force:
+    if not ok:
         bad = "；".join("%s：%s" % (g["gate"], g["detail"])
                         for g in gates if not g["ok"])
-        return False, {"error": "没过四闸，拒绝落盘：%s" % bad, "gates": gates}
+        # 🔴 键名必须叫 err（不是 error）：GUI 的 _post_skill_promote 读的是
+        #    rep["err"]，两边不一致时**失败的真实原因会整条丢掉**——
+        #    前端只显示「四闸不过」，看不到底哪闸红、是不是同名。
+        #    （t18 立项时实测：promote 用 error、端点读 err，err 恒为 None。）
+        return False, {"err": "没过四闸，拒绝落盘：%s" % bad, "gates": gates}
 
-    name = candidate.get("name") or ""
+    name = _safe_name(candidate.get("name") or "")
     dest = os.path.join(Evolved_DIR, name)
-    if os.path.exists(dest) and not force:
-        return False, {"error": "同名技能已存在（不静默覆盖）：%s" % dest}
+    if os.path.exists(dest) and not allow_overwrite:
+        return False, {"err": "同名技能已存在（不静默覆盖）：%s。"
+                                "要发布新版本，请显式 allow_overwrite=True"
+                                % dest, "gates": gates}
 
     if os.path.exists(dest):
         shutil.rmtree(dest, ignore_errors=True)
@@ -454,6 +506,203 @@ def promote(candidate, db=None, reg=None, force=False):
            "gate": "pass", "gates": len(gates)}
     _ledger_append(rec)
     return True, {"name": name, "dest": dest, "ledger": rec, "gates": gates}
+
+
+# ------------------------------------------------------------------ git 快照
+#
+# P3 定的机制：**不自己造快照**。每张技能一个文件，
+# `git log -- skills_evolved/<name>/SKILL.md` 就是它的完整版本史，
+# 回滚 = `git checkout <sha> -- 该文件`，回执 = commit。
+# 所以 promote 之后必须 commit，否则「回滚」没有可滚的目标——
+# 这不是缺陷声明，是这套机制的边界：没提交的落盘只是工作区草稿。
+
+def _repo_root():
+    """技能目录所在的 git 仓库根（找不到返回 None）。"""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             cwd=Evolved_DIR, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode("utf-8", "replace").strip() or None
+
+
+def _git(args, cwd):
+    """跑一条 git。失败抛 SkillError（带 stderr，不许静默）。"""
+    import subprocess
+    try:
+        out = subprocess.run(["git"] + list(args), cwd=cwd,
+                             capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SkillError("git 跑不起来：%s: %s" % (type(e).__name__, e))
+    if out.returncode != 0:
+        raise SkillError("git %s 失败：%s" % (
+            " ".join(args), out.stderr.decode("utf-8", "replace").strip()[:200]))
+    return out.stdout.decode("utf-8", "replace")
+
+
+def commit_evolved(name, message=""):
+    """把一张自写技能的落盘提交进 git（scoped add，不碰别的改动）。
+
+    只 add 两样：`skills_evolved/<name>/` 与 `skills_evolved/EVOLVED.jsonl`。
+    绝不 `git add -A`——工作区里可能有别人的未完成改动，不替用户决定。
+    不是 git 仓库就返回 None（调用方照常落盘，但要告诉用户回滚不可用）。
+    """
+    name = _safe_name(name)
+    repo = _repo_root()
+    if repo is None:
+        return None
+    rel_dir = os.path.relpath(os.path.join(Evolved_DIR, name), repo).replace("\\", "/")
+    rel_ledger = os.path.relpath(LEDGER, repo).replace("\\", "/")
+    _git(["add", "--", rel_dir, rel_ledger], repo)
+    # 没有暂存内容就不提交（比如什么都没变）——空 commit 只是噪音
+    staged = _git(["diff", "--cached", "--name-only"], repo).strip()
+    if not staged:
+        return None
+    msg = message or ("skills(evolved): promote %s（四闸过）" % name)
+    _git(["commit", "-m", msg], repo)
+    sha = _git(["rev-parse", "HEAD"], repo).strip()
+    return sha
+
+
+def _candidate_from_disk(path):
+    """从落盘的 SKILL.md 重建一个候选（供 rollback 后重过四闸用）。
+
+    steps 不在 frontmatter 里，按正文的编号行数重建——
+    _render_body 的格式是「N. 调 `cap`——title（证据 journal#id）」，
+    数编号行就等于数步骤（闸3 只看步数，不看内容）。
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    meta, body = SK.parse_frontmatter(text, where=path)
+    n_steps = len(re.findall(r"(?m)^\s*\d+\.\s+调\s+`", body))
+    return {"name": meta.get("name") or os.path.basename(os.path.dirname(path)),
+            "description": meta.get("description") or "",
+            "evolved_from": _coerce_ids(meta.get("evolved_from") or []),
+            "caps": list(meta.get("caps") or []),
+            "guard": meta.get("guard") or "",
+            "steps": [None] * n_steps,
+            "body": body, "text": text}
+
+
+def rollback(name, to_sha=None, db=None, reg=None):
+    """回滚一张自写技能到上一个**已提交**版本。
+
+    流程（任一步不过就把工作区改回原样再抛——回滚不许把仓滚坏）：
+      1. 取这个文件的 git 提交史（新→旧）；
+      2. 定目标：给了 to_sha 就验它在史里；没给就滚到上一个版本
+         （工作区有未提交改动 ⇒ 回到最近一次提交；干净 ⇒ 回到上上一版）；
+      3. `git checkout <sha> -- 文件`；
+      4. 自验三样：旧文本能加载、重新过目录审计（规则可能变过）、
+         四闸仍过（用回滚后的 frontmatter 重建候选）；
+      5. 写回执 op=rollback（append-only，不删不改历史）。
+
+    诚实边界：git 只认**提交过**的版本。promote 后没 commit 的落盘是
+    工作区草稿，没有快照可回——这不是 bug，是「版本=git」的机制边界，
+    所以 commit_evolved 要在 promote 之后紧跟一步。
+    """
+    name = _safe_name(name)
+    dest = os.path.join(Evolved_DIR, name)
+    skmd = os.path.join(dest, "SKILL.md")
+    if not os.path.isfile(skmd):
+        raise SkillError("没有这张自写技能：%s（%s 下找不到 SKILL.md）" % (name, dest))
+
+    repo = _repo_root()
+    if repo is None:
+        raise SkillError(
+            "当前不在 git 仓库里——没有已提交的快照可回滚（版本=git，P3 定的机制）")
+    rel = os.path.relpath(skmd, repo).replace("\\", "/")
+
+    shas = [s for s in _git(["log", "--format=%H", "--", rel], repo).split() if s]
+    if not shas:
+        raise SkillError(
+            "这张技能还没有任何已提交的版本：先 promote 再 commit，"
+            "之后的新版本才能回滚到当前这一版")
+
+    if to_sha:
+        if to_sha not in shas:
+            raise SkillError("要回滚到的 %s 不在这张技能的提交史里（史：%s）"
+                             % (to_sha[:8], " ".join(s[:8] for s in shas[:5])))
+        target = to_sha
+    else:
+        dirty = bool(_git(["status", "--porcelain", "--", rel], repo).strip())
+        if dirty:
+            target = shas[0]      # 工作区改了没提交 ⇒ 回到最近一次提交
+        elif len(shas) >= 2:
+            target = shas[1]      # 工作区干净 ⇒ 回到上一个版本
+        else:
+            raise SkillError(
+                "这张技能只有一个已提交版本（%s），没有更旧的可以回滚"
+                % shas[0][:8])
+
+    # 救出当前工作区版本：自验失败时要原样写回
+    with open(skmd, "rb") as f:
+        cur_bytes = f.read()
+    cur_audit = None
+    audit_path = os.path.join(dest, "_audit.json")
+    if os.path.isfile(audit_path):
+        with open(audit_path, "rb") as f:
+            cur_audit = f.read()
+
+    try:
+        _git(["checkout", target, "--", rel], repo)
+        # 自验① 能加载（frontmatter 坏了这里就抛）
+        cand = _candidate_from_disk(skmd)
+        # 自验② 重新过目录审计——当年 clean 不代表现在还 clean，规则会变
+        rep = SA.audit_skill(dest)
+        if rep.get("verdict") != "clean":
+            raise SkillError("回滚目标版本过不了现行审查：%s（%s）"
+                             % (rep.get("verdict"),
+                                "；".join(rep.get("findings", [])[:3])))
+        # 自验③ 四闸仍过（溯源/能力/步骤/文本，用回滚后的内容重建候选）
+        ok, gates = verify(cand, db=db, reg=reg)
+        if not ok:
+            bad = "；".join("%s：%s" % (g["gate"], g["detail"])
+                            for g in gates if not g["ok"])
+            raise SkillError("回滚目标版本过不了四闸：%s" % bad)
+    except Exception:
+        # 恢复原状：文件 + 审计结论，一样不许少
+        with open(skmd, "wb") as f:
+            f.write(cur_bytes)
+        if cur_audit is not None:
+            with open(audit_path, "wb") as f:
+                f.write(cur_audit)
+        raise
+
+    rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+           "op": "rollback", "name": name, "to": target,
+           "from_versions": len(shas), "gate": "pass"}
+    _ledger_append(rec)
+    return True, {"name": name, "rolled_to": target,
+                  "history": [s[:8] for s in shas[:5]], "ledger": rec}
+
+
+def evolved_summary():
+    """自写技能清单（给 /api/skills/evolved）。
+
+    与 skills.summary() 同一条纪律：**正文不外发**。多给三样 GUI 要用的：
+    每张卡的 caps / evolved_from 条数 / ledger 里最近一条回执 / 审计结论。
+    """
+    ledger = {}
+    for rec in _ledger_read():
+        ledger.setdefault(rec.get("name"), rec)   # 只留最后一条
+    out = []
+    for rec in list_evolved():
+        r = dict(rec)
+        r.pop("body", None)
+        name = r.get("name")
+        last = ledger.get(name)
+        r["ledger_last"] = last
+        ap = os.path.join(Evolved_DIR, name, "_audit.json")
+        try:
+            with open(ap, "r", encoding="utf-8") as f:
+                r["audit"] = json.load(f).get("verdict", "?")
+        except (OSError, ValueError):
+            r["audit"] = "?"
+        out.append(r)
+    return {"ok": True, "count": len(out), "skills": out, "dir": Evolved_DIR}
 
 
 def list_evolved():
@@ -614,11 +863,18 @@ def _cli(argv):
     pm.add_argument("--name", required=True)
     pm.add_argument("--trace", default="")
     pm.add_argument("--desc", default="")
-    pm.add_argument("--force", action="store_true")
+    # 🔴 这个开关只放开「同名不覆盖」，**不放开四闸**（见 promote 的 docstring）。
+    #    以前的 --force 连闸门一起绕，等于一个后门。
+    pm.add_argument("--overwrite", action="store_true",
+                    help="允许覆盖同名技能（发布新版本）；四闸仍要全过")
     pu = sub.add_parser("note-use", help="记一次技能使用")
     pu.add_argument("name")
     pu.add_argument("--fail", action="store_true")
     pu.add_argument("--detail", default="")
+    pr = sub.add_parser("rollback", help="回滚到上一个已提交版本（git 快照）")
+    pr.add_argument("name")
+    pr.add_argument("--to", default="", help="回滚到指定 sha（默认上一个版本）")
+    sub.add_parser("evolved", help="自写技能清单（含最近回执与审计结论）")
     a = p.parse_args(argv)
     cmd = a.cmd or "list"
 
@@ -658,13 +914,29 @@ def _cli(argv):
             cand = {"name": a.name, "description": a.desc, "trace": "",
                     "evolved_from": [], "caps": [], "guard": "", "steps": [],
                     "body": "", "text": ""}
-        ok, rep = promote(cand, force=a.force)
+        ok, rep = promote(cand, allow_overwrite=a.overwrite)
         print(json.dumps(rep, ensure_ascii=False, indent=2))
         return 0 if ok else 1
 
     if cmd == "note-use":
         i = note_use(a.name, ok=not a.fail, detail=a.detail)
         print("已记使用事件 #%d（%s）" % (i, "成功" if not a.fail else "失败"))
+        return 0
+
+    if cmd == "rollback":
+        ok, rep = rollback(a.name, to_sha=a.to or None)
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
+    if cmd == "evolved":
+        d = evolved_summary()
+        print("自写技能 %d 张（%s）" % (d["count"], d["dir"]))
+        for s in d["skills"]:
+            last = s.get("ledger_last") or {}
+            print("  %-24s caps=%-2d 证据=%-2d 审计=%-12s 最近=%s@%s" % (
+                s.get("name"), len(s.get("caps") or []),
+                len(s.get("evolved_from") or []), s.get("audit", "?"),
+                last.get("op", "-"), (last.get("ts") or "-")[:19]))
         return 0
 
     p.print_help()
