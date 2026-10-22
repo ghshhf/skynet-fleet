@@ -299,7 +299,7 @@ public class BridgeService extends AccessibilityService {
         long ms = (System.nanoTime() - t0) / 1000000L;
 
         String[] lines = body.toString().split("\n");
-        int keep = Math.min(lines.length, maxLines);
+        int keep = body.length() == 0 ? 0 : Math.min(lines.length, maxLines);
         StringBuilder out = new StringBuilder(body.length() + 128);
         for (int i = 0; i < keep; i++) out.append(lines[i]).append('\n');
         if (keep < lines.length) {
@@ -308,9 +308,23 @@ public class BridgeService extends AccessibilityService {
         }
 
         CharSequence pkg = root.getPackageName();
-        String head = "OK ui " + keep + " " + out.length() + " "
+        // 报字节不报字符：中文一个字 3 字节，按 length() 报会把体积低估成三分之一，
+        // 而门禁判的就是字节数。
+        String head = "OK ui " + keep + " " + utf8Len(out) + " "
                 + ms + "ms pkg=" + (pkg == null ? "?" : pkg);
         return head + "\n" + out + "END";
+    }
+
+    private static int utf8Len(CharSequence s) {
+        int n = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x80) n += 1;
+            else if (c < 0x800) n += 2;
+            else if (Character.isHighSurrogate(c)) { n += 4; i++; }
+            else n += 3;
+        }
+        return n;
     }
 
     private void render(AccessibilityNodeInfo n, String indent, StringBuilder sb, int[] nodes) {
