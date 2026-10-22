@@ -23,6 +23,8 @@ import urllib.request
 import configparser
 from pathlib import Path
 
+from . import metrics as M   # 零依赖可观测性（请求/失败/冷却/降级/延迟/健康）
+
 _CUSTOM = []   # 来自仓库根 local.env [ai_custom] 的自定义后端（gitignored，只本机）
 
 
@@ -348,6 +350,8 @@ def mark_failure(bid, verdict):
     else:
         level = 0
     _COOLDOWN[bid] = {"until": time.time() + cd, "level": level}
+    # 可观测性：每次进入冷却都记一笔（按后端与触发类型），看限流/封禁坐实频率
+    M.ai_cooldown_total.inc({"backend": bid, "kind": verdict.get("kind", "")})
 
 
 def mark_success(bid):
@@ -385,8 +389,15 @@ def _fallback_order():
 
 
 def healthy_backends():
-    """backends() 里健康（未在冷却）的子集，按 fallback 优先级排。"""
-    return [b for b in _fallback_order() if is_healthy(b)]
+    """backends() 里健康（未在冷却）的子集，按 fallback 优先级排。
+
+    顺便刷新可观测性瞬时量：健康数 / 冷却中数——每调一次就对齐一次。
+    """
+    all_b = _fallback_order()
+    bs = [b for b in all_b if is_healthy(b)]
+    M.ai_healthy_backends.set(len(bs))
+    M.ai_cooldown_active.set(len(all_b) - len(bs))
+    return bs
 
 
 def chat_fallback(prompt, system="", on_token=None, max_tokens=2048, timeout=120,
@@ -410,19 +421,31 @@ def chat_fallback(prompt, system="", on_token=None, max_tokens=2048, timeout=120
         _RR["cursor"] = (idx + 1) % len(candidates)
 
     last_err = None
-    for b in candidates:
+    for i, b in enumerate(candidates):
+        t0 = time.time()
         try:
             text = _chat_stream(b, prompt, system, on_token, max_tokens, timeout)
+            dt = time.time() - t0
             if text and text.strip():
                 mark_success(b["id"])
+                M.ai_request_total.inc({"backend": b["id"], "result": "ok"})
+                M.ai_latency.observe(dt, {"backend": b["id"]})
+                if i > 0:
+                    M.ai_fallback_total.inc()     # 切到第 i 条才成功 ⇒ 记一次降级
                 return text, b["id"]
             # 空回：算这次失败（上游抽风/推理烧光），冷却 + 试下一条
             mark_failure(b["id"], {"kind": FAIL_TRANSIENT, "bench": True,
                                    "cooldown": _COOLDOWN_SHORT})
+            M.ai_request_total.inc({"backend": b["id"], "result": "empty"})
+            M.ai_failure_total.inc({"backend": b["id"], "kind": "empty"})
+            M.ai_latency.observe(dt, {"backend": b["id"]})
             last_err = f"{b['id']} 空回（上游无正文）"
         except Exception as e:
             v = classify_failure(e)
             mark_failure(b["id"], v)
+            M.ai_request_total.inc({"backend": b["id"], "result": "err"})
+            M.ai_failure_total.inc({"backend": b["id"], "kind": v["kind"]})
+            M.ai_latency.observe(time.time() - t0, {"backend": b["id"]})
             last_err = f"{b['id']} [{v['kind']}] {e}"
             if not v["advance"]:
                 raise RuntimeError(last_err)
