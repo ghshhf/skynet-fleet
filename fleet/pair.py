@@ -41,6 +41,9 @@ import time
 
 #: 配对广播端口（UDP）。避开 AudioSync 的 24548 族。
 PAIR_UDP_PORT = 24560
+#: 配对会话端口（TCP，TLS）。被控端点 /api/pair 与 /api/remote/* 只在这个
+#: 独立监听器上服务；GUI 主循环仍只绑 127.0.0.1，两边攻击面不互通。
+PAIR_TCP_PORT = 24561
 #: 组播组：239.255.0.0/16 是管理域内组播，配合 TTL=1 路由器不转发
 MCAST_GRP = ("239.77.7.77", PAIR_UDP_PORT)
 #: 公告间隔（秒，估）：1s 足够主控端秒级发现，又不至于刷屏
@@ -183,6 +186,32 @@ def tap_beacons(sock, timeout=1.5, limit=32):
     return out
 
 
+# ---------------------------------------------------------------- 地址
+
+def local_ips():
+    """本机各网卡地址（去重排序）。给自签证书写 SAN 用。
+
+    两条路互补：getaddrinfo(主机名) 拿得到系统登记的全部地址；UDP connect
+    外网地址再取 sockname，拿「默认路由走哪张网卡」那个地址（主机名解析
+    不全的机器上这条更准）。connect 不真发包（UDP 无连接），只是选路。
+    """
+    ips = set()
+    try:
+        for fam in (socket.AF_INET, socket.AF_INET6):
+            for info in socket.getaddrinfo(socket.gethostname(), None, fam):
+                ips.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    return sorted(ips)
+
+
 # ---------------------------------------------------------------- 链接
 
 def make_link(host, port, code, fp=""):
@@ -283,6 +312,19 @@ class PairingMailbox:
                 "locked_for": max(0.0, round(self._locked_until - now, 1)),
                 "fails": self._fails,
             }
+
+    def current_code(self):
+        """当前验证码原文——**只给被控端自己的 GUI 显示用**。
+
+        不过网络：HTTP 层没有任何端点吐它（pair_info 经本方法读，那是
+        本机回环里的 GUI）。过期返回空串（GUI 据此显示「已过期，请刷新」）。
+        """
+        with self._lk:
+            if not self._code:
+                return ""
+            if time.time() - self._code_at > self.ttl:
+                return ""
+            return self._code
 
     def _code_ok(self, code, now):
         """锁内校验。返回 (ok, err)。"""

@@ -28,12 +28,17 @@ import json
 import os
 import queue
 import secrets
+import socket
+import ssl
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+from .. import pair as PAIR
+from .. import pairtls as PTLS
 from ..catalog import build
 from .approval import ApprovalBroker
 
@@ -41,6 +46,7 @@ from .approval import ApprovalBroker
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 UI_DIR = os.path.join(ROOT, "ui")
 TOKEN_HEADER = "X-Fleet-Token"
+SESSION_HEADER = "X-Fleet-Session"
 PERSONA_PATH = os.environ.get(
     "FLEET_PERSONA", os.path.join(ROOT, "persona_state.json"))
 
@@ -148,6 +154,17 @@ class FleetServer:
         self._shots = {}                            # 截图登记：id -> 路径（W3）
         self._shot_seq = 0
         self._shot_lk = threading.Lock()
+        # ---- 配对信箱（N+1b）：被控侧状态机 + 独立 TLS 监听器 ----
+        # 信箱默认关闭；enable_pairing() 才开（fail-closed，同 --lan 的显式纪律）。
+        # 监听器是**第二个** HTTP 服务（0.0.0.0 + TLS），只服务 /api/pair 与
+        # /api/remote/*——GUI 主循环仍只绑 127.0.0.1，两边的攻击面不互通。
+        self.mailbox = PAIR.PairingMailbox(name=socket.gethostname(),
+                                           journal=evidence_journal)
+        self.pair_httpd = None
+        self.pair_tls = None          # {cert, key, fp, dir}
+        self.pair_beacon = None
+        self.pair_port = 0
+        self.pair_host = ""
 
     # ---------------- 截图登记（W3 的屏幕预览）----------------
 
@@ -195,6 +212,98 @@ class FleetServer:
             self._httpd.shutdown()
             self._httpd.server_close()
             self._httpd = None
+        self.disable_pairing()
+
+    # ---------------- 配对信箱（N+1b 被控侧） ----------------
+
+    def enable_pairing(self, pair_host="0.0.0.0", pair_port=None,
+                       require_tls=True):
+        """开「可被配对」：起广播 + 独立 TLS 监听器 + 备好验证码。
+
+        显式动作（GUI 开关），不是默认态——同 `--lan` 的纪律：
+        局域网里能被连进来驱动桌面，必须是主人亲手点的。
+        require_tls=False 只允许 pair_host 是回环（测试用）；LAN 上
+        禁明文——不给自己留「忘了开加密」的口子。
+        """
+        if self.mailbox.enabled:
+            raise RuntimeError("配对已经开着了（先 disable_pairing）")
+        pair_port = int(pair_port or PAIR.PAIR_TCP_PORT)
+        if require_tls:
+            san = [pair_host] if pair_host not in ("0.0.0.0", "::", "") \
+                else ["127.0.0.1"]
+            try:
+                local_ips = PAIR.local_ips()
+            except Exception:
+                local_ips = []
+            san += [ip for ip in local_ips if ip not in san]
+            self.pair_tls = PTLS.gen_selfsigned(
+                tempfile.mkdtemp(prefix="fleet_pair_tls_"), san_ips=san)
+        elif pair_host not in ("127.0.0.1", "::1"):
+            raise RuntimeError(
+                "禁明文配对：只有回环地址允许 require_tls=False（测试用）")
+        self.pair_host = pair_host
+        self.pair_port = pair_port
+        self.mailbox.enabled = True
+        code = self.mailbox.refresh_code()
+        httpd = ThreadingHTTPServer((pair_host, pair_port), _Handler)
+        httpd.daemon_threads = True
+        httpd.fleet = self
+        if self.pair_tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(self.pair_tls["cert"], self.pair_tls["key"])
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        self.pair_httpd = httpd
+        self.pair_port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever,
+                         kwargs={"poll_interval": 0.2}, daemon=True).start()
+        self.pair_beacon = PAIR.Beacon(name=self.mailbox.name,
+                                       pair_port=self.pair_port)
+        self.pair_beacon.start()
+        return self.pair_info()
+
+    def pair_info(self):
+        """GUI 被控侧面板要的一切：码、链接、指纹、监听地址。"""
+        code = self.mailbox.code_state()
+        cur = self.mailbox.current_code() if self.mailbox.enabled else ""
+        host = self.pair_host if self.pair_host not in ("0.0.0.0", "::", "") \
+            else "127.0.0.1"
+        return {
+            "enabled": self.mailbox.enabled,
+            "name": self.mailbox.name,
+            "code": cur,
+            "code_state": code,
+            "link": PAIR.make_link(host, self.pair_port, cur,
+                                   (self.pair_tls or {}).get("fp", "")[:8])
+            if cur else "",
+            "fp": (self.pair_tls or {}).get("fp", ""),
+            "pair_host": self.pair_host,
+            "pair_port": self.pair_port,
+            "tls": bool(self.pair_tls),
+        }
+
+    def disable_pairing(self):
+        """关配对：停广播、停监听、**所有会话当场作废**（熔断）。"""
+        if self.pair_beacon is not None:
+            self.pair_beacon.stop()
+            self.pair_beacon = None
+        if self.pair_httpd is not None:
+            self.pair_httpd.shutdown()
+            self.pair_httpd.server_close()
+            self.pair_httpd = None
+        n = self.mailbox.revoke_all()
+        self.mailbox.enabled = False
+        if self.pair_tls:
+            for k in ("cert", "key"):
+                try:
+                    os.unlink(self.pair_tls[k])
+                except OSError:
+                    pass
+            try:
+                os.rmdir(self.pair_tls.get("dir") or "")
+            except OSError:
+                pass
+            self.pair_tls = None
+        return n
 
     @property
     def dial_host(self):
@@ -353,6 +462,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._err(404, f"没有这个路径: {path}")
 
     def _api_get(self, path):
+        # 配对/受控端点走自己的鉴权（会话令牌，不是 GUI 令牌）——
+        # 必须在 _authorized 之前分流，否则主控端永远卡在 401。
+        if path.startswith("/api/pair") or path.startswith("/api/remote"):
+            return self._pair_api(path)
         ok, code, why = self._authorized()
         if not ok:
             return self._err(code, why)
@@ -398,6 +511,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._err(404, f"没有这个接口: {path}")
 
     def _api_post(self, path):
+        # 同上：配对/受控端点用自己的鉴权，先分流。
+        if path.startswith("/api/pair") or path.startswith("/api/remote"):
+            return self._pair_api(path)
         ok, code, why = self._authorized()
         if not ok:
             return self._err(code, why)
@@ -436,6 +552,127 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/skill/rollback":
             return self._post_skill_rollback(body)
         self._err(404, f"没有这个接口: {path}")
+
+    # ---------------- 配对 / 受控端点（N+1b） ----------------
+    #
+    # 这一组只活在配对监听器上（0.0.0.0 + TLS），鉴权用**会话令牌**
+    # （X-Fleet-Session），不是 GUI 的 X-Fleet-Token。两类端点：
+    #   /api/pair/*       配对握手（持码换令牌）
+    #   /api/remote/*     受控能力（持令牌代理 pcctl.*）
+    #
+    # 🔴 受控能力走**白名单映射**，不是「传什么能力名就调什么」：
+    # 远端能摸到的只有 pcctl.* 这一族；ai.chat / card.* / skill.* 这些
+    # 想都别想（不在表里就是 404）。闸门仍在被控端本地：ask 档没批就是
+    # denied，一次系统调用都不发生。
+
+    REMOTE_CAPS = {
+        # 只读一档（approval=auto）：看不是改，不弹窗
+        "screenshot": "pcctl.screenshot",
+        "windows": "pcctl.windows",
+        "sysinfo": "pcctl.sysinfo",
+        "clipboard": "pcctl.clipboard.read",
+        "procs": "pcctl.proc.list",
+        # 动手一档（approval=ask）：被控端审批弹窗不放行就 denied
+        "mouse": "pcctl.mouse.move",
+        "click": "pcctl.mouse.click",
+        "key": "pcctl.key",
+        "text": "pcctl.text",
+        "clipboard_set": "pcctl.clipboard.write",
+        "launch": "pcctl.app.launch",
+        "kill": "pcctl.proc.kill",
+    }
+
+    def _session_authorized(self):
+        """校验 X-Fleet-Session（配对握手发的那枚一次性令牌）。
+
+        401 = 没带；403 = 带了但对不上（过期/已 revoke/根本不是本站发的）。
+        比对走 mailbox.session_for：revoke 是即时的，不存在「缓存里
+        还能用一会儿」。
+        """
+        got = self.headers.get(SESSION_HEADER) or ""
+        if not got:
+            return None, 401, f"缺少 {SESSION_HEADER} 头：先过 /api/pair 握手"
+        s = self.fleet.mailbox.session_for(got)
+        if s is None:
+            return None, 403, "会话令牌无效（未配对、已过期或已被掐断）"
+        return s, 200, ""
+
+    def _pair_api(self, path):
+        f = self.fleet
+        if path == "/api/pair/state":
+            return self._json({"ok": True, "enabled": f.mailbox.enabled,
+                               "name": f.mailbox.name})
+        if path == "/api/pair":
+            return self._post_pair()
+        if path == "/api/remote/revoke":
+            return self._post_remote_revoke()
+        if path.startswith("/api/remote/shot"):
+            return self._get_remote_shot()
+        if path.startswith("/api/remote/"):
+            return self._post_remote(path[len("/api/remote/"):])
+        self._err(404, f"没有这个接口: {path}")
+
+    def _post_pair(self):
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._err(400, str(e))
+        r = self.fleet.mailbox.try_pair(
+            body.get("code") or "", controller_name=body.get("controller") or "",
+            cert_fp=body.get("fp") or "")
+        if not r.get("ok"):
+            return self._err(401, r.get("err") or "配对失败")
+        return self._json({"ok": True, "token": r["token"],
+                           "fp": (self.fleet.pair_tls or {}).get("fp", ""),
+                           "session": r.get("session")})
+
+    def _post_remote_revoke(self):
+        s, code, why = self._session_authorized()
+        if s is None:
+            return self._err(code, why)
+        self.fleet.mailbox.revoke(self.headers.get(SESSION_HEADER) or "")
+        return self._json({"ok": True, "revoked": True})
+
+    def _get_remote_shot(self):
+        """回取刚截的图（登记制，同 W3：远端不许指定任意文件路径）。"""
+        s, code, why = self._session_authorized()
+        if s is None:
+            return self._err(code, why)
+        q = parse_qs(urlparse(self.path).query)
+        sid = (q.get("id") or [""])[0]
+        p = self.fleet.shot_path(sid)
+        if not p or not os.path.isfile(p):
+            return self._err(404, f"没有这张截图（id={sid}）：先调 /api/remote/screenshot")
+        try:
+            data = open(p, "rb").read()
+        except OSError as e:
+            return self._err(500, f"截图文件读不出来：{e}")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _post_remote(self, name):
+        s, code, why = self._session_authorized()
+        if s is None:
+            return self._err(code, why)
+        cap = self.REMOTE_CAPS.get(name)
+        if not cap:
+            return self._err(404, f"受控端没有这个动作: {name}"
+                                   "（可用：%s）" % "/".join(sorted(self.REMOTE_CAPS)))
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._err(400, str(e))
+        args = body.get("args") if isinstance(body.get("args"), dict) else body
+        r = self.fleet.call(cap, args=args, tag="remote:%s" % s["controller"])
+        out = r if isinstance(r, dict) else {"ok": False, "err": "内部错误"}
+        if name == "screenshot" and out.get("ok"):
+            # 截图落的是被控端磁盘；登记后远端凭 id 回取，不给路径直读
+            sid = self.fleet.register_shot((out.get("data") or {}).get("path") or "")
+            out["shot_id"] = sid
+        return self._json(out)
 
     # ---------------- 各接口的实现 ----------------
 
