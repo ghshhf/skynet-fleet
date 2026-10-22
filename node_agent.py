@@ -20,6 +20,7 @@ import time
 
 import capabilities
 import common
+import image_gen_runner
 
 _DEBUG = bool(os.environ.get("FLEET_DEBUG"))
 
@@ -234,6 +235,8 @@ def _dispatch(s, m, name, sandbox):
             _do_exec(s, {"id": c["id"], "cmd": c["cmd"]})
     elif t == common.COMPUTE:
         _do_compute(s, m)
+    elif t == common.IMAGE_GEN:
+        _do_image_gen(s, m)
     elif t == common.UI_SKIP:
         _do_ui_skip(s, m)
     elif t == common.CAP_GRANT:
@@ -315,6 +318,26 @@ def _do_compute(s, m):
     except Exception as e:
         common.send_msg(s, {"t": common.COMPUTE_RESULT, "id": mid, "ok": False,
                             "out": "", "err": str(e)})
+
+
+def _do_image_gen(s, m, backend=None):
+    """安卓出图：在本节点挂载的手机上跑 SD，把 PNG 路径回传 PC。
+
+    后端可注入（测试用）；默认走 image_gen_runner 的 android_bridge 后端。
+    任何失败都回一张带原因的 err 回执，不许静默交空（与 exec/compute 同纪律）。
+    """
+    mid = m.get("id")
+    try:
+        res = image_gen_runner.run(
+            m.get("prompt", ""), neg=m.get("neg", ""), size=m.get("size", "512x512"),
+            steps=int(m.get("steps", 20)), seed=int(m.get("seed", -1)),
+            cfg=float(m.get("cfg", 7.0)), model=m.get("model"), backend=backend)
+        common.send_msg(s, {"t": common.IMAGE_GEN_RESULT, "id": mid,
+                            "ok": res["ok"], "path": res.get("path", ""),
+                            "err": res.get("err", "")})
+    except Exception as e:
+        common.send_msg(s, {"t": common.IMAGE_GEN_RESULT, "id": mid, "ok": False,
+                            "path": "", "err": str(e)})
 
 
 _DEFAULT_UI_RULES = [{
@@ -427,6 +450,40 @@ def _selftest():
     print("[selftest] 默认规则可被 ui_automation.match 消费 OK")
     print("[selftest] exec 白名单：链式/管道/重定向/反引号/变量/换行全拒 OK")
     print("[selftest] exec 解释器默认拒，FLEET_ALLOW_INTERPRETER=1 才放行 OK")
+
+    # ---- image.gen 能力接线（路线甲·N+2）：参数解析 + 回执路径 + 空 prompt 拒 ----
+    def _fake_ok(prompt, neg, size, steps, seed, cfg, model):
+        return f"/sdcard/Pictures/fleet/{seed or 0}.png"
+
+    s4 = _FakeSock()
+    _do_image_gen(s4, {"id": "g1", "prompt": "一只猫", "size": "512x512", "steps": 4, "seed": 7},
+                  backend=_fake_ok)
+    m4 = _read_msgs(s4)[0]
+    assert m4["t"] == common.IMAGE_GEN_RESULT and m4["ok"] is True, m4
+    assert m4["id"] == "g1", m4
+    assert m4["path"] == "/sdcard/Pictures/fleet/7.png", m4
+
+    def _fake_fail(prompt, neg, size, steps, seed, cfg, model):
+        raise RuntimeError("手机没电了")
+
+    s5 = _FakeSock()
+    _do_image_gen(s5, {"id": "g5", "prompt": "一只狗"}, backend=_fake_fail)
+    m5 = _read_msgs(s5)[0]
+    assert m5["ok"] is False and "手机没电" in m5["err"], m5
+
+    s6 = _FakeSock()
+    _do_image_gen(s6, {"id": "g6", "prompt": "  "})
+    m6 = _read_msgs(s6)[0]
+    assert m6["ok"] is False and "prompt" in m6["err"], m6
+
+    # 默认后端未配置时必须明确报错（不许静默交空），且走回执通道
+    se = _FakeSock()
+    _do_image_gen(se, {"id": "ge", "prompt": "猫"})
+    me = _read_msgs(se)[0]
+    assert me["ok"] is False and ("未配置" in me["err"] or "未实现" in me["err"]), me
+
+    print("[selftest] image.gen 正常/异常/空prompt/未配置后端 全过")
+
     print("[selftest] PASS")
 
 
