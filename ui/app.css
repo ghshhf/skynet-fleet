@@ -9,7 +9,13 @@
   --line:#e3e5e8; --line-soft:#edeef0;
   --fg:#1b1d21; --fg-2:#5c626d; --fg-3:#666e78;
   --accent:#2f6bd8; --accent-soft:#f1f5fd;
-  --user:#eef0f3; --danger:#d8453c; --ok:#1f9d55; --warn:#c98a00;
+  /* 实心 accent 底（承载白字）：必须与 #fff 达 WCAG AA 4.5:1，故与 --accent 分离 */
+  --accent-solid:#2f6bd8;
+  --user:#eef0f3; --danger:#c0332a; --ok:#147a41; --warn:#8a5d00;
+  /* 实心色底（承载白字）：上面的 --danger/--ok/--warn 同时当文字色用，
+     而「白字压在中间明度底色上」所需的亮度与「浅底上的文字」相反，
+     故分开：*-solid 专用于背景 + #fff。均实测 ≥ 4.5:1。 */
+  --warn-solid:#8a5d00; --danger-solid:#c0332a; --ok-solid:#147a41;
   --radius:10px; --radius-lg:14px;
   --shadow:0 1px 2px rgba(16,20,28,.06),0 8px 24px rgba(16,20,28,.06);
   --mono:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;
@@ -19,7 +25,12 @@ html[data-theme="dark"]{
   --line:#2b3036; --line-soft:#24282d;
   --fg:#e6e8eb; --fg-2:#a2a9b3; --fg-3:#8f97a5;
   --accent:#5b8def; --accent-soft:#182338;
-  --user:#242930; --warn:#d0a63c;
+  /* 深色主题下 #5b8def + 白字只有 3.23，实心底压到 #3b6fd4 = 4.76 */
+  --accent-solid:#3b6fd4;
+  --user:#242930; --warn:#e0b44c;
+  /* 深色底上的文字用亮色；实心底（+白字）仍用浅底那套深色，两边才都达 4.5 */
+  --danger:#f0756c; --ok:#4ec97f;
+  --warn-solid:#8a5d00; --danger-solid:#c0332a; --ok-solid:#147a41;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -55,7 +66,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .tb-win i{width:30px;height:26px;display:grid;place-items:center;border-radius:6px;
   color:var(--fg-3);font-style:normal;font-size:11px}
 .tb-win i:hover{background:var(--panel-2);color:var(--fg)}
-.tb-win i.close:hover{background:var(--danger);color:#fff}
+.tb-win i.close:hover{background:var(--danger-solid);color:#fff}
 .tb-theme{width:28px;height:26px;border-radius:6px;display:grid;place-items:center;
   color:var(--fg-3);font-size:12px}
 .tb-theme:hover{background:var(--panel-2);color:var(--fg)}
@@ -102,7 +113,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .sb-conv .txt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sb-foot{padding:9px 12px;border-top:1px solid var(--line);display:flex;
   align-items:center;gap:9px;font-size:12.5px;color:var(--fg-2)}
-.sb-foot .ava{width:24px;height:24px;border-radius:50%;background:var(--accent);
+.sb-foot .ava{width:24px;height:24px;border-radius:50%;background:var(--accent-solid);
   color:#fff;display:grid;place-items:center;font-size:11px}
 
 /* 中栏 */
@@ -158,7 +169,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   border:1px solid var(--line);border-radius:var(--radius);background:var(--panel-2);
   padding:9px 13px;display:flex;align-items:center;gap:11px;font-size:12.5px}
 .voicebar[hidden]{display:none}
-.voicebar .mic{width:26px;height:26px;border-radius:50%;background:var(--danger);
+.voicebar .mic{width:26px;height:26px;border-radius:50%;background:var(--danger-solid);
   color:#fff;display:grid;place-items:center;flex:0 0 26px;animation:pulse 1.4s infinite}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(216,69,60,.5)}50%{box-shadow:0 0 0 7px rgba(216,69,60,0)}}
 .voicebar .wv{display:flex;align-items:center;gap:2.5px;height:18px}
@@ -181,8 +192,8 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   font-size:12px;color:var(--fg-2);cursor:pointer}
 .cbtn:hover{background:var(--panel-2);color:var(--fg)}
 .cbtn.mic{margin-left:auto;width:27px;padding:0;justify-content:center}
-.cbtn.mic.on{background:var(--danger);color:#fff}
-.cbtn.send{background:var(--accent);color:#fff}
+.cbtn.mic.on{background:var(--danger-solid);color:#fff}
+.cbtn.send{background:var(--accent-solid);color:#fff}
 .cbtn.send:hover{filter:brightness(1.08)}
 .cbtn:disabled{opacity:.45;cursor:default}
 .cbtn .kbd{font-size:10px;color:var(--fg-3);font-family:var(--mono)}
@@ -215,10 +226,10 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .caprow .tags{margin-top:4px;display:flex;gap:4px;flex-wrap:wrap}
 .badge{font-size:9.5px;padding:1px 5px;border-radius:5px;font-family:var(--mono);
   background:var(--panel-2);color:var(--fg-3)}
-.badge.se{background:var(--warn);color:#fff}
-.badge.ask{background:var(--accent);color:#fff}
-.badge.deny{background:var(--danger);color:#fff}
-.badge.ok{background:var(--ok);color:#fff}
+.badge.se{background:var(--warn-solid);color:#fff}
+.badge.ask{background:var(--accent-solid);color:#fff}
+.badge.deny{background:var(--danger-solid);color:#fff}
+.badge.ok{background:var(--ok-solid);color:#fff}
 
 /* 结果条（能力调用的真实 DeviceResult） */
 .resbar{margin:0 28px 8px;max-width:760px;margin-inline:auto;font-size:11.5px;
@@ -266,7 +277,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .apprrow .acts{display:flex;gap:6px;justify-content:flex-end;margin-top:8px}
 .apprrow .hbtn{font-size:11.5px;padding:3px 10px;border-radius:7px;
   border:1px solid var(--line);background:var(--panel)}
-.apprrow .hbtn.yes{background:var(--accent);color:#fff;border-color:transparent}
+.apprrow .hbtn.yes{background:var(--accent-solid);color:#fff;border-color:transparent}
 .apprrow .hbtn.no{color:var(--danger)}
 .apprfoot{display:flex;align-items:center;gap:8px;margin-top:10px;
   padding-top:8px;border-top:1px solid var(--line-soft);font-size:11px;color:var(--fg-3)}
@@ -511,7 +522,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 }
 .vv-mic:hover{background:var(--accent-soft);border-color:var(--accent)}
 .vv-mic:active{transform:scale(.96)}
-.vv-mic.rec{background:var(--danger);border-color:var(--danger);color:#fff}
+.vv-mic.rec{background:var(--danger-solid);border-color:var(--danger-solid);color:#fff}
 .vv-input{
   flex:1;min-width:0;height:46px;padding:0 14px;font:inherit;color:var(--fg);
   background:var(--bg);border:1px solid var(--line);border-radius:23px;outline:none;
@@ -521,7 +532,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   height:46px;padding:0 18px;border-radius:23px;border:1px solid var(--line);
   background:var(--panel-2);color:var(--fg);font-size:13.5px;white-space:nowrap;
 }
-.vv-send{background:var(--accent);border-color:var(--accent);color:#fff}
+.vv-send{background:var(--accent-solid);border-color:var(--accent-solid);color:#fff}
 .vv-send:disabled{opacity:.5;cursor:not-allowed}
 .vv-hands.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
 
