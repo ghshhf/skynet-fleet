@@ -10,7 +10,7 @@ t20 · 手机出图功能（N+1c）门禁
       - Java 侧**不**写死模型路径（模型只在 worker 侧，符合「APK 不装模型」）
       - MainActivity 把 btnImg 接到 ImageActivity
   [②] worker 行为（bash + 假 sd 桩 + 假 sysfs）
-      - 空 prompt / 坏 steps / 坏 size / 未插电 / 超温 / 并发锁 → 拒（ok:false）
+      - 空 prompt / 坏 steps / 坏 size / 超温 / 并发锁 → 拒（ok:false）
       - 正常 → ok:true 且日志含 vulkan（诚实边界：没 Vulkan 就报失败）
       - stdout 只有一行 JSON（Termux 100KB 截断纪律）
 
@@ -150,7 +150,6 @@ def base_env(work):
     # 因为 Git Bash / 真机 Termux 都只认 /data/... 这种正斜杠路径。
     wp = posix(work)
     e = dict(os.environ)
-    e["FLEET_IMG_ALLOW_BATTERY"] = "0"          # 默认不开电池放行，才能测闸门
     e["FLEET_IMG_WORKDIR"] = wp + "/work"
     e["FLEET_IMG_OUT_DIR"] = wp + "/out"
     e["FLEET_IMG_LOG_DIR"] = wp + "/log"
@@ -209,17 +208,12 @@ def t_worker():
         rc, out, err = run_worker(e, ["--prompt", "x", "--steps", "10", "--size", "999"])
         check("size" in out and json.loads(out)["ok"] is False, "size=999 拒（白名单外）")
 
-        # 2.5 未插电
-        make_sysfs(work, "Discharging", 30000)
-        rc, out, err = run_worker(e, ["--prompt", "x", "--steps", "10", "--size", "512"])
-        check("插电" in out and json.loads(out)["ok"] is False, "未插电拒")
-
-        # 2.6 超温（50°C）
+        # 2.5 超温（50°C）
         make_sysfs(work, "Charging", 50000)
         rc, out, err = run_worker(e, ["--prompt", "x", "--steps", "10", "--size", "512"])
         check("温度" in out and json.loads(out)["ok"] is False, "50°C 超温拒")
 
-        # 2.7 并发锁：第一张跑太久，第二张插不进
+        # 2.6 并发锁：第一张跑太久，第二张插不进
         # 用一个"睡 1s"的假 sd 模拟长任务，先后台起一张，再同步起第二张
         slow = os.path.join(work, "fake_sd_slow.sh")
         with open(slow, "w", encoding="utf-8") as f:
@@ -241,7 +235,7 @@ def t_worker():
         p1.wait(timeout=10)
         check("画完" in out and json.loads(out)["ok"] is False, "并发第二张被锁拒（ok:false）")
 
-        # 2.8 诚实边界：日志没 vulkan → 拒（用不打印 vulkan 的假 sd）
+        # 2.7 诚实边界：日志没 vulkan → 拒（用不打印 vulkan 的假 sd）
         nosd = os.path.join(work, "fake_sd_cpu.sh")
         with open(nosd, "w", encoding="utf-8") as f:
             f.write("#!/usr/bin/env bash\nout=\"\"\n")
@@ -257,7 +251,7 @@ def t_worker():
         rc, out, err = run_worker(e3, ["--prompt", "x", "--steps", "10", "--size", "512"])
         check("Vulkan" in out and json.loads(out)["ok"] is False, "日志无 Vulkan → 报失败（不假装成功）")
 
-        # 2.9 sd 二进制不存在 → 拒
+        # 2.8 sd 二进制不存在 → 拒
         e4 = base_env(work)
         e4["FLEET_IMG_SD_BIN"] = posix(os.path.join(work, "nope.sh"))
         e4["FLEET_IMG_BATTERY_DIR"] = posix(work)

@@ -7,7 +7,7 @@
 #   - stdout 只许**一行 JSON**（Termux RUN_COMMAND 回传上限 100KB，sd 日志全走日志文件）
 #   - 测试注入点（环境变量覆盖，门禁用假 sysfs 测闸门）：
 #       FLEET_IMG_SD_BIN / FLEET_IMG_MODEL / FLEET_IMG_BATTERY_DIR /
-#       FLEET_IMG_THERMAL_GLOB / FLEET_IMG_MAX_TEMP / FLEET_IMG_ALLOW_BATTERY /
+#       FLEET_IMG_THERMAL_GLOB / FLEET_IMG_MAX_TEMP /
 #       FLEET_IMG_OUT_DIR / FLEET_IMG_WORKDIR / FLEET_IMG_LOG_DIR / FLEET_IMG_BACKEND
 set -u
 
@@ -74,23 +74,7 @@ if [ -n "$SEED" ]; then
   esac
 fi
 
-# ---- 闸门 6：插电（可放开）----
-plugged() {
-  local st f
-  for f in "$BATTERY_DIR"/*/status; do
-    [ -r "$f" ] || continue
-    st="$(cat "$f" 2>/dev/null)"
-    case "$st" in
-      Charging|Full|NotCharging) return 0;;
-    esac
-  done
-  return 1
-}
-if [ "${FLEET_IMG_ALLOW_BATTERY:-0}" != "1" ]; then
-  plugged || fail "未插电/未在充电（FLEET_IMG_ALLOW_BATTERY=1 可放开）"
-fi
-
-# ---- 闸门 7：温度上限 ----
+# ---- 闸门 6：温度上限 ----
 max_temp() {
   local m=0 t f
   for f in $THERMAL_GLOB; do
@@ -108,7 +92,7 @@ if [ "$TEMP" -gt "$MAX_TEMP" ] 2>/dev/null; then
   fail "机身温度 ${TEMP}°C > 上限 ${MAX_TEMP}°C"
 fi
 
-# ---- 闸门 8：并发锁（第二张未完 → 拒）----
+# ---- 闸门 7：并发锁（第二张未完 → 拒）----
 # 用 mkdir 原子锁（POSIX 跨平台，不依赖 flock：Termux / CI / Git Bash 都可用）。
 # 陈旧锁（>30 分钟）视为上次崩溃残留，自动清掉再抢一次。
 mkdir -p "$WORKDIR" || fail "无法创建工作目录 $WORKDIR"
