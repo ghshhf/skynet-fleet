@@ -20,8 +20,10 @@ RESERVED = {
     ("her", "pending_thought"),
     ("her", "last_recall"),
 }
-# 技术缓存不是生活记忆
-SKIP_NS = {"compute_cache"}
+# 技术缓存不是生活记忆。
+# pending 是「有说法、没证据」的待核区（见 memguard.py）：它不是事实，
+# 所以不许被当成往事说出来——这正是「引用必须是真的」那条验收的地基。
+SKIP_NS = {"compute_cache", "pending"}
 
 DEFAULT_WINDOW = (12 * 3600, 72 * 3600)   # 12h–72h：隔日的、还记得住的事
 DEFAULT_PREFER_AGE = 26 * 3600            # 偏好「昨天这个时候」
