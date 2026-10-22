@@ -10,6 +10,7 @@ on:
       - "tianwang_android/**"
       - "android_bridge/**"
       - "docs/**"
+      - "scripts/**"
       - "**.md"
   workflow_dispatch:
 
