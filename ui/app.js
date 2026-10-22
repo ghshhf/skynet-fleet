@@ -248,7 +248,11 @@
   function setAssetTab(tab) {
     ASSET_TAB = tab;
     Array.prototype.forEach.call(document.querySelectorAll("#tabBar .tab"), function (b) {
-      b.classList.toggle("on", b.getAttribute("data-tab") === tab);
+      var on = b.getAttribute("data-tab") === tab;
+      b.classList.toggle("on", on);
+      // aria-selected 必须跟 .on 同步：只有 class 变了而 ARIA 没变，
+      // 屏幕阅读器会一直念「第一个 tab 选中着」——视觉换了、语义没换。
+      b.setAttribute("aria-selected", on ? "true" : "false");
     });
     loadAssetTab(tab);
   }
@@ -266,9 +270,17 @@
       return;
     }
     if (tab === "skills") {
-      api("/api/skills").then(function (d) {
-        ASSET_CACHE.skills = d;
-        renderSkillsTab(d);
+      // 两个端点并行：/api/skills 是 vendored+用户级（只读清单），
+      // /api/skills/evolved 是自写技能（带动作）。后者失败不拖垮前者——
+      // 自写区单独显示原因，上面两区照常出（空状态不许装作有，但也不许
+      // 一个区读不到就整页白屏）。
+      var pEvolved = api("/api/skills/evolved").catch(function (e) {
+        return { ok: false, error: e.message, skills: [] };
+      });
+      Promise.all([api("/api/skills"), pEvolved]).then(function (rs) {
+        ASSET_CACHE.skills = rs[0];
+        ASSET_CACHE.evolved = rs[1];
+        renderSkillsTab(rs[0], rs[1]);
       }).catch(function (e) { renderTabErr(body, "读不到技能清单：" + e.message); });
       return;
     }
@@ -537,25 +549,307 @@
 
   /* ---------------- 技能（SKILL.md） ---------------- */
 
-  function renderSkillsTab(d) {
+  function renderSkillsTab(d, ev) {
     var body = $("tabBody");
     body.textContent = "";
     if (d.error) { body.appendChild(el("div", "why", d.error)); }
     var skills = d.skills || [];
+    ev = ev || { skills: [] };
+    var evolved = ev.skills || [];
 
-    // 按来源分组：仓内技能在前，用户级在后。
+    // 按来源分组：仓内技能在前，用户级在后，自写最后（那边带动作）。
     var repo = skills.filter(function (s) { return s.source === "repo"; });
     var user = skills.filter(function (s) { return s.source !== "repo"; });
 
-    body.appendChild(el("div", "sec", "技能 · " + skills.length + " 个（SKILL.md）"));
-    if (!skills.length) {
+    body.appendChild(el("div", "sec",
+      "技能 · " + skills.length + " 个（SKILL.md） + 自写 " + evolved.length + " 个"));
+    if (!skills.length && !evolved.length && !ev.error) {
       body.appendChild(el("div", "empty",
         "还没读到任何技能。技能是带 frontmatter 的 <b>SKILL.md</b> 文件，"
-        + "放在仓内 <b>skills/</b> 或用户级 <b>~/.workbuddy/skills/</b> 目录下。"));
+        + "放在仓内 <b>skills/</b>、用户级 <b>~/.workbuddy/skills/</b> 目录下；"
+        + "自写技能长在 <b>skills_evolved/</b>（见本页下方）。"));
       return;
     }
     if (repo.length) { body.appendChild(el("div", "sec", "本仓")); body.appendChild(skillWall(repo)); }
     if (user.length) { body.appendChild(el("div", "sec", "用户级")); body.appendChild(skillWall(user)); }
+    renderEvolvedSkills(body, ev);
+  }
+
+  /* ---------------- 自写技能（skills_evolved/） ----------------
+     与上面两区的区别：这边能**动作**。
+       选用 —— 打点（note_use）：只证明「有人调用了这张卡」，
+               不证明「被照着执行了」，后者本仓观测不到。
+       记分 —— skill_stats：使用次数 / 逐能力影子成功率 / 证据充分性。
+               「证据不足，分数不可信」是后端原话，照显，不粉饰。
+       提交 —— 两步：先预览四闸（不落盘），人看了再确认落盘；
+               服务端落盘前**重新过一遍闸**，前端只带 (trace,name,desc)。
+       回滚 —— git 快照回到上一个**已提交**版本；自验三样
+               （能加载/审计 clean/四闸过）在服务端做，不过就改回原样。
+     四个动作全走 requireToken + 服务端裁决，前端不判定任何事。
+  */
+  function renderEvolvedSkills(body, ev) {
+    var list = (ev && ev.skills) || [];
+    body.appendChild(el("div", "sec",
+      "自写 · " + list.length + " 个（从跑通过的执行里长出来，可提交/回滚）"));
+    if (ev && ev.error) {
+      body.appendChild(el("div", "why", "自写技能清单读不到：" + ev.error
+        + "（上面两区不受影响；自写区在 skills_evolved/，"
+        + "读不到通常是目录不存在或里有坏 SKILL.md）"));
+    }
+    if (!list.length && !(ev && ev.error)) {
+      body.appendChild(el("div", "empty",
+        "还没有自写技能。用下面这个面板从一条**跑通过的执行链**里长："
+        + "填 trace 和名字 → 预览四闸 → 确认才落盘。"));
+    }
+    body.appendChild(evolvedForm());
+    list.forEach(function (s) { body.appendChild(evolvedCard(s)); });
+  }
+
+  function evolvedForm() {
+    var wrap = el("div", "esform");
+    wrap.appendChild(el("div", "esform-t", "从执行链长出新技能（两步：预览四闸 → 确认落盘）"));
+
+    var row1 = el("div", "esrow");
+    var fTrace = el("input"); fTrace.id = "esTrace"; fTrace.type = "text";
+    fTrace.placeholder = "trace，如 exec:巡检";
+    fTrace.setAttribute("aria-label", "执行链 trace");
+    var fName = el("input"); fName.id = "esName"; fName.type = "text";
+    fName.placeholder = "技能名，如 wifi-reconnect";
+    fName.setAttribute("aria-label", "新技能名");
+    row1.appendChild(fTrace); row1.appendChild(fName);
+
+    var row2 = el("div", "esrow");
+    var fDesc = el("input"); fDesc.id = "esDesc"; fDesc.type = "text";
+    fDesc.placeholder = "一句话说明（可空，留空按 trace 自动生成）";
+    fDesc.setAttribute("aria-label", "技能说明");
+    row2.appendChild(fDesc);
+
+    var row3 = el("div", "esrow");
+    var bPrev = el("button", "hbtn go", "预览四闸");
+    bPrev.id = "esPreview";
+    var bProm = el("button", "hbtn go", "确认落盘");
+    bProm.id = "esPromote";
+    bProm.disabled = true;
+    bProm.title = "先预览，四闸全过才可点";
+    row3.appendChild(bPrev); row3.appendChild(bProm);
+
+    wrap.appendChild(row1); wrap.appendChild(row2); wrap.appendChild(row3);
+
+    var gates = el("div", "esgates");
+    gates.id = "esGates";
+    wrap.appendChild(gates);
+
+    bPrev.addEventListener("click", function () { doProposeSkill(bPrev); });
+    bProm.addEventListener("click", function () { doPromoteSkill(bProm); });
+    return wrap;
+  }
+
+  function showGates(d) {
+    var box = $("esGates");
+    var bProm = $("esPromote");
+    box.textContent = "";
+    if (d.err) {
+      box.appendChild(el("div", "gate no", "✕ " + d.err));
+      bProm.disabled = true;
+      return;
+    }
+    (d.gates || []).forEach(function (g) {
+      var row = el("div", "gate " + (g.ok ? "ok" : "no"),
+        (g.ok ? "✓ " : "✕ ") + g.gate + " :: " + g.detail);
+      box.appendChild(row);
+    });
+    var caps = el("div", "esnote",
+      " caps " + (d.caps || []).length + " 个："
+      + (d.caps || []).join("、") + "｜证据 " + (d.evolved_from || []).length + " 条");
+    box.appendChild(caps);
+    bProm.disabled = !d.ok;
+    bProm.textContent = d.ok ? "确认落盘" : "四闸未过，不能落盘";
+  }
+
+  function doProposeSkill(btn) {
+    if (!requireToken()) { return; }
+    var trace = $("esTrace").value.trim();
+    var name = $("esName").value.trim();
+    var desc = $("esDesc").value.trim();
+    if (!trace || !name) { toast("trace 和技能名都要填", true); return; }
+    btn.disabled = true;
+    btn.textContent = "过闸中…";
+    api("/api/skill/propose", {
+      method: "POST", body: { trace: trace, name: name, desc: desc }
+    }).then(function (d) {
+      showGates(d);
+      if (d.err) { toast("预览没成：" + d.err, true); }
+    }).catch(function (e) {
+      toast("预览失败：" + e.message, true);
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = "预览四闸";
+    });
+  }
+
+  function doPromoteSkill(btn, overwrite) {
+    if (!requireToken()) { return; }
+    var trace = $("esTrace").value.trim();
+    var name = $("esName").value.trim();
+    var desc = $("esDesc").value.trim();
+    if (!trace || !name) { toast("trace 和技能名都要填", true); return; }
+    btn.disabled = true;
+    btn.textContent = overwrite ? "发布新版本中…" : "落盘中…";
+    api("/api/skill/promote", {
+      method: "POST",
+      body: { trace: trace, name: name, desc: desc, overwrite: !!overwrite }
+    }).then(function (d) {
+      if (d.ok) {
+        // git 提交是「版本=git」的一半：没提交就明说回滚不可用，不装作有快照。
+        toast(d.git
+          ? ("已落盘并提交 " + String(d.git).slice(0, 8) + "（可回滚）")
+          : ("已落盘，但未提交：" + (d.commit_note || "?") + "——暂不能回滚"), !d.git);
+        loadAssetTab("skills");
+      } else if (d.can_overwrite && !overwrite) {
+        // 同名已存在。**不自动覆盖**：覆盖是发布新版本，得人明确点头。
+        // （allow_overwrite 只放开同名守卫，四闸服务端照样先跑。）
+        btn.disabled = false;
+        btn.textContent = "确认落盘";
+        if (confirm("「" + name + "」已经存在。\n"
+          + "把它发布为**新版本**（覆盖）？\n"
+          + "四闸仍会在服务端重跑，不过就拒绝。")) {
+          doPromoteSkill(btn, true);
+        }
+      } else {
+        toast("落盘被拒：" + (d.err || "四闸不过"), true);
+        showGates(d);
+      }
+    }).catch(function (e) {
+      toast("落盘失败：" + e.message, true);
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = "确认落盘";
+    });
+  }
+
+  function evolvedCard(s) {
+    var card = el("div", "card eskill");
+    var top = el("div", "ctop");
+    top.appendChild(el("span", s.error ? "dot-bad" : "dot-ok"));
+    top.appendChild(el("div", "cname", s.name));
+    if (s.audit && s.audit !== "?") {
+      top.appendChild(el("span", "badge-role " + (s.audit === "clean" ? "" : "err"),
+        "审计 " + s.audit));
+    }
+    card.appendChild(top);
+    if (s.error) {
+      card.appendChild(el("div", "creason err", s.error));
+      return card;
+    }
+    card.appendChild(el("div", "cdesc", s.description || s.heading || ""));
+
+    var meta = el("div", "cmeta");
+    meta.appendChild(el("span", "", "caps " + (s.caps || []).length));
+    meta.appendChild(el("span", "", "证据 " + (s.evolved_from || []).length + " 条"));
+    var last = s.ledger_last || {};
+    meta.appendChild(el("span", "badge-role",
+      (last.op || "?") + (last.ts ? " · " + String(last.ts).slice(5, 16) : "")));
+    card.appendChild(meta);
+
+    // 记分区（点了才拉：每张卡一次 stats，懒得每次都全量拉）
+    var stat = el("div", "sstat");
+    stat.id = "stat-" + s.name;
+    card.appendChild(stat);
+
+    var ops = el("div", "cops");
+    var bOk = el("button", "hbtn go", "选用 ✓");
+    var bNo = el("button", "hbtn go", "选用 ✗");
+    var bSt = el("button", "hbtn go", "记分");
+    var bRb = el("button", "hbtn go danger", "回滚");
+    bOk.title = "记一条「这张技能被用了且跑成了」（打点，不是审批）";
+    bNo.title = "记一条「用了但没成」——失败也是数据";
+    bSt.title = "使用次数 / 逐能力影子成功率 / 证据充分性";
+    bRb.title = "回到上一个已提交版本（git 快照）；服务端会重过四闸，不过就改回原样";
+    bOk.addEventListener("click", function () { doUseSkill(s.name, true, bOk); });
+    bNo.addEventListener("click", function () { doUseSkill(s.name, false, bNo); });
+    bSt.addEventListener("click", function () { doSkillStats(s.name, stat, bSt); });
+    bRb.addEventListener("click", function () { doRollbackSkill(s.name, bRb); });
+    ops.appendChild(bOk); ops.appendChild(bNo); ops.appendChild(bSt); ops.appendChild(bRb);
+    card.appendChild(ops);
+    return card;
+  }
+
+  function doUseSkill(name, ok, btn) {
+    if (!requireToken()) { return; }
+    btn.disabled = true;
+    api("/api/skill/use", {
+      method: "POST", body: { name: name, ok: ok }
+    }).then(function (d) {
+      if (d.ok) {
+        toast("已记：#" + d.event_id + " " + name + (ok ? " 用成" : " 没用成"));
+      } else {
+        toast("记不上：" + (d.err || "?"), true);
+      }
+    }).catch(function (e) {
+      toast("记不上：" + e.message, true);
+    }).then(function () { btn.disabled = false; });
+  }
+
+  function doSkillStats(name, box, btn) {
+    if (!requireToken()) { return; }
+    if (box._loaded) { box._loaded = false; box.textContent = ""; btn.textContent = "记分"; return; }
+    btn.disabled = true;
+    btn.textContent = "算…";
+    api("/api/skill/stats?name=" + encodeURIComponent(name)).then(function (d) {
+      box.textContent = "";
+      if (!d.ok) {
+        box.appendChild(el("div", "err", d.err || "算不出"));
+        return;
+      }
+      // 🔴 found=false 必须和「0 次使用」分开说：后端对查无此技能返回
+      //    ok=true + found=false（查询成功了，只是没找到）。直接显示
+      //    「使用 0 次」会冒充一张存在的技能——那是界面骗人。
+      if (d.found === false) {
+        box._loaded = true;
+        btn.textContent = "收起记分";
+        box.appendChild(el("div", "err", "没有这张自写技能：" + name));
+        return;
+      }
+      box._loaded = true;
+      btn.textContent = "收起记分";
+      box.appendChild(el("div", "",
+        "使用 " + d.used + " 次（其中成功 " + d.used_done + "）"));
+      (d.shadow || []).forEach(function (r) {
+        var rate = r.rate === null || r.rate === undefined
+          ? "证据不足" : Math.round(r.rate * 100) + "%";
+        box.appendChild(el("div", "srow",
+          "  " + r.cap + "（done " + r.done + " / open " + r.open + "）"));
+        var v = el("span", r.rate === null || r.rate === undefined ? "" : "srate", rate);
+        box.lastChild.appendChild(v);
+      });
+      // 「证据不足，分数不可信」是后端原话——照显，不许包装成百分比。
+      box.appendChild(el("div", "sverdict", d.verdict || ""));
+    }).catch(function (e) {
+      box.appendChild(el("div", "err", "算不出：" + e.message));
+    }).then(function () { btn.disabled = false; });
+  }
+
+  function doRollbackSkill(name, btn) {
+    if (!requireToken()) { return; }
+    // 回滚会改工作区文件，先问一句（界面侧的确认；服务端还有三道自验）。
+    if (!confirm("回滚 " + name + " 到上一个已提交版本？\n"
+      + "服务端会重过四闸，任何一项不过都会把工作区改回原样。")) {
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "回滚中…";
+    api("/api/skill/rollback", {
+      method: "POST", body: { name: name }
+    }).then(function (d) {
+      if (d.ok) {
+        toast("已回滚到 " + String(d.rolled_to || "").slice(0, 8));
+        loadAssetTab("skills");
+      } else {
+        toast("回滚被拒：" + (d.err || "?"), true);
+      }
+    }).catch(function (e) {
+      toast("回滚失败：" + e.message, true);
+    }).then(function () { btn.disabled = false; btn.textContent = "回滚"; });
   }
 
   function skillWall(list) {

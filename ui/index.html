@@ -155,15 +155,28 @@
                #resBar 在这个视图里 display:none，看不见 ⇒ 点了合成/入库却没反应，
                正是本仓最忌讳的「界面摆着不响应」。两条都更新，哪个可见显哪个。 -->
           <div class="resbar" id="resBarAssets" hidden></div>
-          <div class="tabbar" id="tabBar" role="tablist">
-            <button class="tab on" data-tab="cards" role="tab">专家</button>
-            <button class="tab" data-tab="skills" role="tab">技能</button>
-            <button class="tab" data-tab="conns" role="tab">连接器</button>
-            <button class="tab" data-tab="audio" role="tab">声音</button>
+          <!-- 🔴 tablist 里只能放 role="tab" 的子元素。刷新按钮曾经直接
+               挂在 #tabBar 上，axe 报 aria-required-children [critical]
+               （"Element has children which are not allowed: button"）。
+               这个违规 N 环没抓到，只因那时 axe 只扫默认聊天视图、
+               资产视图没渲染 ⇒ 「没渲染就等于没验」。现在把 tab 收进
+               专用容器，刷新按钮留在容器外。 -->
+          <div class="tabbar" id="tabBar">
+            <div class="tablist" role="tablist" aria-label="资产视图切换">
+              <button class="tab on" data-tab="cards" role="tab"
+                      aria-selected="true" aria-controls="tabBody">专家</button>
+              <button class="tab" data-tab="skills" role="tab"
+                      aria-selected="false" aria-controls="tabBody">技能</button>
+              <button class="tab" data-tab="conns" role="tab"
+                      aria-selected="false" aria-controls="tabBody">连接器</button>
+              <button class="tab" data-tab="audio" role="tab"
+                      aria-selected="false" aria-controls="tabBody">声音</button>
+            </div>
             <span class="grow"></span>
             <button class="hbtn" id="assetsRefresh" title="刷新">↻</button>
           </div>
-          <div class="tabbody" id="tabBody"></div>
+          <div class="tabbody" id="tabBody" role="tabpanel"
+               aria-label="资产视图内容"></div>
         </div>
 
         <!-- 助理：无限智能体名册（真读 cards/ 下的角色卡）-->
