@@ -13,6 +13,7 @@ import time
 
 from ..core import BaseDevice, DeviceResult as R
 from ..transports import get as get_transport
+from ..skynet_relay import get_relay
 
 NODES_PATH = os.environ.get("FLEET_NODES", os.path.join(
     os.path.expanduser("~"), ".fleet", "nodes.json"))
@@ -54,10 +55,18 @@ class FleetNode(BaseDevice):
         return True, ""
 
     def caps(self):
-        caps = self.rec.get("capabilities")
-        if caps:
-            return tuple(caps)
-        return ("shell.exec", "file.push", "file.pull")
+        caps = list(self.rec.get("capabilities") or [])
+        # 本机若跑着 SkyNet relay，主动申报 skynet.relay 能力，
+        # 供 commander 路由 relay_fetch 到本节点。
+        try:
+            relay = get_relay()
+            if relay.running and "skynet.relay" not in caps:
+                caps.append("skynet.relay")
+        except Exception:
+            pass
+        if not caps:
+            return ("shell.exec", "file.push", "file.pull")
+        return tuple(caps)
 
     def invoke(self, cap, args=None):
         return R.unavailable(
@@ -68,4 +77,11 @@ class FleetNode(BaseDevice):
         d = super().snapshot()
         d["meta"].setdefault("platform", self.rec.get("platform") or "")
         d["last_seen"] = self.rec.get("last_seen")
+        try:
+            relay = get_relay()
+            if relay.running:
+                d["relay_port"] = relay.port
+                d["relay_host"] = relay.host
+        except Exception:
+            pass
         return d
