@@ -36,8 +36,35 @@ FLOOD = 10
 def flood(app, n):
     """假的长任务：在 worker 线程里高频吐行，跟真作业的路径一模一样。"""
     for i in range(n):
-        app._on_job_line(f"[arxiv] 假收获 {i}")
+        try:
+            app._on_job_line(f"[arxiv] 假收获 {i}")
+        except Exception:
+            # app 正在拆窗（go() 返回后 run_test 上下文退出）时，喂行会炸。
+            # 这不是缺陷：界面都没了，线程安静退出即可——刷一屏 traceback
+            # 只会把看门禁的人吓一跳，不增加任何信息。
+            return
         time.sleep(0.02)
+
+
+async def wait_until(fn, timeout=10.0, step=0.05):
+    """轮询等到条件成立或超时，替掉固定 pause。
+
+    为什么改（2026-10-22 实测）：原来是 flood 完固定 `pause(0.8)`。
+    单跑 3/3 过，但全量回归里前序用例把机器拖起负载，0.8s 等不满
+    一轮 flood（10 行 × 0.02s + 调度延迟）⇒ 误判「直播开着，论文页
+    没收流」。这不是缺陷是假红——负载不该改变结论。
+    轮询等到**条件真的成立**为止，断言本身一字不动，只是把
+    「等一个猜的时间」换成「等到事实发生」。
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        try:
+            if fn():
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(step)
+    return False
 
 
 async def go():
@@ -57,18 +84,23 @@ async def go():
         await pilot.pause(0.4)
         app._job_cap = "web.papers"
 
+        jl0 = app._job_lines
+
         # 2) 开着：论文页一行行长出来
         threading.Thread(target=flood, args=(app, FLOOD), daemon=True).start()
-        await pilot.pause(0.8)
+        await wait_until(lambda: len(app.query_one("#paperlog").lines) > 0)
         on_rows = len(app.query_one("#paperlog").lines)
         if on_rows <= 0:
             fails.append("直播开着，论文页没收流")
 
         # 3) 关掉：中途不长，但行数累计
+        #    先等第一次 flood 真跑完再抓 before：不等的话，第一轮的尾巴
+        #    会在 live=False 之后继续滴，把「关了不长」误判成「关了还在长」。
+        await wait_until(lambda: app._job_lines >= jl0 + FLOOD)
         app._live = False
         before = len(app.query_one("#paperlog").lines)
         threading.Thread(target=flood, args=(app, FLOOD), daemon=True).start()
-        await pilot.pause(0.8)
+        await wait_until(lambda: app._job_lines >= jl0 + 2 * FLOOD)
         after_off = len(app.query_one("#paperlog").lines)
         if after_off != before:
             fails.append("直播关了还往论文页长行")
@@ -78,7 +110,7 @@ async def go():
         # 4) 重新开：又能继续长（开关可逆）
         app._live = True
         threading.Thread(target=flood, args=(app, 5), daemon=True).start()
-        await pilot.pause(0.8)
+        await wait_until(lambda: len(app.query_one("#paperlog").lines) > after_off)
         after_on = len(app.query_one("#paperlog").lines)
         if after_on <= after_off:
             fails.append("重新开直播后没有继续长")
