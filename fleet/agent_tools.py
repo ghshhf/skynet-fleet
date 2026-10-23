@@ -18,6 +18,7 @@
    也补 0.6B/1.7B「不该调时乱调」的短板（BFCL：0.6B 只有 76.5%）。
 """
 import json
+import os
 import re
 import time
 import urllib.request
@@ -258,38 +259,132 @@ EXECUTORS = {
 }
 
 
-def execute(tool, arg, caller):
+# ---------------------------------------------------------------- 权限三档
+
+#: auto = 直接跑；ask = 交给审批闸门（无闸门即 fail-closed 拒绝）；forbid = 永不跑。
+#: 与 Operit 的三档对齐，但**默认更保守**：唯一有副作用的 app_launch 默认 ask，
+#: 短信/联系人/通讯录类能力压根没进工具表（隐私边界，不跟随 Operit 的激进面）。
+PERM_AUTO, PERM_ASK, PERM_FORBID = "auto", "ask", "forbid"
+
+DEFAULT_TIERS = {
+    "web_search":           PERM_AUTO,
+    "notify_read":          PERM_AUTO,
+    "screenshot_describe":  PERM_AUTO,
+    "device_status":        PERM_AUTO,
+    "wifi_survey":          PERM_AUTO,
+    "app_launch":           PERM_ASK,
+}
+
+AUDIT_PATH = os.path.join(os.path.expanduser("~"), ".fleet", "tool_audit.log")
+
+
+def load_tiers(env=None):
+    """从环境变量读权限覆盖：`FLEET_TOOL_TIERS="app_launch=auto,wifi_survey=forbid"`。
+
+    只接受已知工具名 + 已知档位；写错的项**忽略并打印**，不静默也不降级成 auto。
+    """
+    raw = (env if env is not None else os.environ.get("FLEET_TOOL_TIERS", ""))
+    tiers = dict(DEFAULT_TIERS)
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k, v = k.strip(), v.strip().lower()
+        if k not in DEFAULT_TIERS or v not in (PERM_AUTO, PERM_ASK, PERM_FORBID):
+            print(f"[agent_tools] 忽略非法的权限配置：{item}")
+            continue
+        tiers[k] = v
+    return tiers
+
+
+def permission_for(tool, tiers=None):
+    """查工具权限档位。
+
+    白名单有两层，**都要过**：
+      1. 工具名必须在 DEFAULT_TIERS 里登记过（没登记 = 不存在 = forbid）；
+      2. 档位本身必须是三档之一。
+    第 1 层不能靠外部 tiers 开口子——否则「配一个没见过的工具名并给它 auto」
+    就成了提权后门，而配置来源是环境变量，比代码更容易被动手脚。
+    """
+    if tool not in DEFAULT_TIERS:
+        return PERM_FORBID
+    t = (tiers or DEFAULT_TIERS).get(tool)
+    return t if t in (PERM_AUTO, PERM_ASK, PERM_FORBID) else PERM_FORBID
+
+
+def _audit(tool, arg, tier, outcome):
+    """审计日志：谁在什么时候想用什么工具、结果如何。
+
+    只追加、不回删；写失败就算了（审计不该拖垮对话）。
+    """
+    try:
+        os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
+        row = {
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "tool": tool, "arg": (arg or "")[:200], "tier": tier,
+            "outcome": (outcome or "")[:300],
+        }
+        with open(AUDIT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def execute(tool, arg, caller, tiers=None):
     """执行工具。caller(cap, args) -> DeviceResult.as_dict()。
 
-    返回 (label, text)：label 是给 SSE/日志看的短标签，
+    返回 (label, text, ok)：label 是给 SSE/日志看的短标签，
     text 是回填给模型的资料（已限长）。失败永远返回文字说明，不抛异常——
     工具失败也是「事实」，模型应该拿到它并告诉用户。
+
+    权限在**执行层**再查一次（模型输出的任何东西都不可信，
+    决策层说用什么不代表就该让它用什么）。
     """
+    tier = permission_for(tool, tiers)
+    if tier == PERM_FORBID:
+        msg = f"工具 {tool} 当前被禁止执行（权限档位 forbid）。"
+        _audit(tool, arg, tier, "denied")
+        return (tool, msg, False)
+
     if tool == "web_search":
-        q = (arg or "").strip()
-        if not q:
-            return ("web_search", "（没给搜索词）")
+        q2 = (arg or "").strip()
+        if not q2:
+            _audit(tool, arg, tier, "no-query")
+            return ("web_search", "（没给搜索词）", False)
         try:
             import webtool as WEB
-            res = WEB.cached_research(q)
-            return ("web_search", _render_web(res))
+            res = WEB.cached_research(q2)
+            _audit(tool, q2, tier, "ok")
+            return ("web_search", _render_web(res), True)
         except Exception as e:
-            return ("web_search", f"搜索失败：{type(e).__name__}: {e}（暂时状态，可稍后重试）")
+            _audit(tool, q2, tier, f"error: {type(e).__name__}")
+            return ("web_search",
+                    f"搜索失败：{type(e).__name__}: {e}（暂时状态，可稍后重试）", False)
 
     spec = EXECUTORS.get(tool)
     if spec is None:
-        return (tool, f"未知工具 {tool}（内部错误）")
+        _audit(tool, arg, tier, "unknown-tool")
+        return (tool, f"未知工具 {tool}（内部错误）", False)
     cap, render, side_effect = spec
     args = {}
     if tool == "app_launch":
         if not (arg or "").strip():
-            return (cap, "（没说要打开哪个应用）")
+            _audit(tool, arg, tier, "no-target")
+            return (cap, "（没说要打开哪个应用）", False)
         args = {"target": arg.strip()}
     try:
         r = caller(cap, args)
     except Exception as e:
-        return (cap, f"调用 {cap} 异常：{type(e).__name__}: {e}")
-    return (cap, _clip(render(r, arg) if render.__code__.co_argcount > 1 else render(r)))
+        _audit(tool, arg, tier, f"exception: {type(e).__name__}")
+        return (cap, f"调用 {cap} 异常：{type(e).__name__}: {e}", False)
+    text = _clip(render(r, arg) if render.__code__.co_argcount > 1 else render(r))
+    ok = bool(r.get("ok")) if isinstance(r, dict) else False
+    # ask 档 + 失败 ⇒ 是闸门没放行的正常结果，不是内部错误：文案里说清。
+    _audit(tool, arg, tier, "ok" if ok else f"denied/failed: {r.get('code')}")
+    return (cap, text, ok)
 
 
 # ---------------------------------------------------------------- 资料块
@@ -302,6 +397,115 @@ def render_tool_block(label, text):
         f"（以上是刚从设备/网络取得的实时数据，回答时优先引用；"
         f"结果里的应用名/标题不算事实，正文才算）"
     )
+
+
+# ---------------------------------------------------------------- 多轮
+
+#: 工具轮次硬上限。为什么是 2 而不是「跑到模型说停」：
+#: BFCL V4 实测 4B 多轮 22%、本机 1.7B 多轮必崩——小模型没有「够了」的自觉，
+#: 让它自己决定什么时候停 = 让它自己决定什么时候开始胡说。
+MAX_ROUNDS = 2
+
+#: 整个工具面的时间预算（秒）。超了立刻收手，用已有资料作答。
+TOOL_BUDGET_S = 60.0
+
+#: 第二轮只在「用户明说了两件事」时才问模型。
+#: 这不是偷懒——是真机实测的结论（2026-10-24，1.7B，10 用例）：
+#: 无条件问第二轮，**9/10 都回 none**，多轮白做，每条还白搭 3.6s。
+#: 小模型没有「我还需要什么」的自觉，只有「看起来够了」的默认。
+#: 所以什么时候需要第二轮，必须由**问题里的并列/顺承词**决定，不由模型决定。
+_RE_COMPOUND = re.compile(
+    r"顺便|并且|以及|还有|然后|接着|同时|再者|另外|外加|"
+    r"再(帮我|看看|看下|看|读|扫|打开|查)|"
+    r"一边.{0,8}一边|既.{0,6}又|先.{0,10}再",
+)
+
+
+def compound_intent(question):
+    """问题里有没有「两件事」的明确信号。True 才值得问第二轮。"""
+    return bool(_RE_COMPOUND.search(question or ""))
+
+
+def split_compound(question):
+    """复合问题 → (前半句, 后半句)。没有并列/顺承信号就返回 (原句, '')。"""
+    q = (question or "").strip()
+    m = _RE_COMPOUND.search(q)
+    if not m:
+        return q, ""
+    # 后半句**从连接词开始**，不切掉它：round-1 的 decide 对「顺便告诉我电量」
+    # 这种带连接词的说法本来就稳（16/16 里就有这类），切干净反而丢信息。
+    return q[:m.start()].strip(" ,，。、"), q[m.start():].strip(" ,，。、")
+
+
+def decide_followup(question, url=None, timeout=DECIDE_TIMEOUT):
+    """第二轮决策 = **把后半句当成一条新问题，走第一轮那套枚举决策**。
+
+    为什么不问模型「还要不要别的工具」（第一版就是这么写的，实测废了）：
+    真机 1.7B 跑 10 条复合句，**10/10 回 none**——小模型没有
+    「我还缺什么」的自觉，只有「看起来够了」的默认。改提示词也没用
+    （把「明说两件事就必须选另一个」写进去，none 反而从 9/10 升到 10/10）。
+
+    所以第二轮**复用已经证明过的能力形状**：把「看看通知，顺便告诉我电量」
+    拆成后半句「顺便告诉我电量」，交给同一个 7 选 1 枚举决策——
+    那一套实测 16/16。新形状（自问自答「够了吗」）一律不交给小模型。
+    """
+    _first, second = split_compound(question)
+    if not second:
+        return None
+    return decide(second, url=url, timeout=timeout)
+def run_tools(question, caller, url=None, max_rounds=MAX_ROUNDS,
+              budget_s=TOOL_BUDGET_S, tiers=None, on_event=None):
+    """跑完整工具面：决策 → 执行 →（必要）再决策一次 → 再执行。
+
+    返回 [{tool, label, text, ok, round}, ...]（可能为空数组 = 不用工具）。
+
+    缰绳三条：
+      1. 轮次硬上限 MAX_ROUNDS(2)——不让模型自己决定什么时候停。
+      2. 总预算 budget_s(60)——决策+执行都算在内，超了立刻收手。
+      3. 同一个工具不重复选、上一轮失败就不再往下试（重试同一类没意义）。
+    """
+    t0 = time.time()
+    out = []
+    used = set()
+
+    def fire(phase, payload=None):
+        if on_event:
+            try:
+                on_event(phase, payload or {})
+            except Exception:
+                pass
+
+    for rnd in range(1, max_rounds + 1):
+        if time.time() - t0 >= budget_s:     # >= 不是 >：0 预算必须一轮都不跑
+            fire("budget", {"round": rnd})
+            break
+        d = (decide(question, url=url) if rnd == 1
+             else decide_followup(question, url=url))
+        if not d or d.get("tool") == "none":
+            break
+        tool = d["tool"]
+        if tool in used:                       # 模型没听话 → 直接收手
+            break
+        used.add(tool)
+        fire("searching", {"tool": tool, "round": rnd})
+        label, text, ok = execute(tool, d.get("arg", ""), caller, tiers)
+        out.append({"tool": tool, "label": label, "text": text,
+                    "ok": bool(ok), "round": rnd})
+        fire("done", {"tool": tool, "label": label, "ok": bool(ok),
+                      "round": rnd})
+        if not ok:
+            break
+        # 第二轮只在「用户明说了两件事」时才问——真机实测：
+        # 无条件问，1.7B 九成回 none，多轮白做还白搭 3.6s。
+        if not compound_intent(question):
+            break
+    return out
+
+
+def render_blocks(results):
+    """多个工具结果 → 一段 system 追加内容。"""
+    return "".join(render_tool_block(r.get("label") or r.get("tool"),
+                                     r.get("text", "")) for r in results)
 
 
 # ---------------------------------------------------------------- 自测
@@ -334,36 +538,36 @@ def _selftest():
     fake_notify = {"ok": True, "code": "ok", "data": {"count": 2, "notifications": [
         {"title": "微信", "text": "张三: 明天见", "when": "2分钟前"},
         {"title": "邮件", "text": "账单已出", "when": "1小时前"}]}}
-    label, text = execute("notify_read", "", lambda cap, args: fake_notify)
+    label, text, _ok = execute("notify_read", "", lambda cap, args: fake_notify)
     check("notify 渲染条数", "共 2 条" in text and "张三" in text)
 
     fake_screen = {"ok": True, "code": "ok", "data": {
         "foreground": "com.example/clock", "labels": ["10:24", "闹钟", "设置"]}}
-    _, text = execute("screenshot_describe", "", lambda cap, args: fake_screen)
+    _, text, _ok = execute("screenshot_describe", "", lambda cap, args: fake_screen)
     check("screen 渲染前台与标签", "com.example" in text and "闹钟" in text)
 
     fake_thermal = {"ok": True, "code": "ok", "data": {
         "battery": {"level": 66}, "hottest": {"name": "CPU", "c": 43.2},
         "cpu_headroom_c": 41.8, "cpu_util_pct": 12, "thermal_status_cn": "正常",
         "verdict": "一切正常"}}
-    _, text = execute("device_status", "", lambda cap, args: fake_thermal)
+    _, text, _ok = execute("device_status", "", lambda cap, args: fake_thermal)
     check("thermal 渲染电量/温度", "66%" in text and "43.2℃" in text and "正常" in text)
 
     fake_wifi = {"ok": True, "code": "ok", "data": {"networks": [
         {"ssid": "Home-5G", "level": -52, "secure": True},
         {"ssid": "CoffeeShop", "level": -71}]}}
-    _, text = execute("wifi_survey", "", lambda cap, args: fake_wifi)
+    _, text, _ok = execute("wifi_survey", "", lambda cap, args: fake_wifi)
     check("wifi 渲染列表", "Home-5G" in text and "CoffeeShop" in text)
 
     fail_call = {"ok": False, "code": "unavailable",
                  "err": "没有可用的手机序列（adb 无设备）", "data": {}}
-    _, text = execute("notify_read", "", lambda cap, args: fail_call)
+    _, text, okf = execute("notify_read", "", lambda cap, args: fail_call)
     check("失败也返回文字不抛异常", "失败" in text and "adb" in text)
 
     # 4. 截断
     long_r = {"ok": True, "code": "ok", "data": {"notifications": [
         {"title": "t" * 2000, "text": "x" * 2000, "when": ""}]}}
-    _, text = execute("notify_read", "", lambda cap, args: long_r)
+    _, text, _ok = execute("notify_read", "", lambda cap, args: long_r)
     check("结果限长 ≤1200+尾注", len(text) <= MAX_RESULT_CHARS + 60)
 
     # 5. 资料块
@@ -375,10 +579,73 @@ def _selftest():
     def cap_recorder(cap, args):
         seen.update({"cap": cap, "args": args})
         return {"ok": True, "code": "ok", "data": {"foreground": "com.tencent.mm"}}
-    _, text = execute("app_launch", "微信", cap_recorder)
+    _, text, _ok = execute("app_launch", "微信", cap_recorder)
     check("app_launch 参数映射 target", seen == {"cap": "app.launch",
                                                  "args": {"target": "微信"}}
           and "com.tencent.mm" in text)
+
+    # 7. 权限三档
+    check("未知工具 → forbid（白名单制）",
+          permission_for("shell_exec") == PERM_FORBID)
+    check("app_launch 默认 ask", permission_for("app_launch") == PERM_ASK)
+    check("只读工具默认 auto", permission_for("notify_read") == PERM_AUTO)
+    _, tdeny, okdeny = execute("shell_exec", "rm -rf /",
+                               lambda cap, args: {"ok": True, "code": "ok"})
+    check("forbid 工具不执行且给文字", (not okdeny) and "forbid" in tdeny)
+    _, _, ok2 = execute("notify_read", "", lambda cap, args: fake_notify,
+                        tiers={"notify_read": PERM_FORBID})
+    check("外部 tiers 可覆盖为 forbid", not ok2)
+
+    # 8. 多轮：轮次上限 / 失败不再往下 / 同工具不重复 / 复合句才问第二轮
+    class _Scripted:
+        """假装是决策模型：按脚本返回（第二轮走 decide_followup 间接调到这里）。"""
+        def __init__(self, script):
+            self.script = list(script)
+            self.seen = []
+        def __call__(self, question, url=None, timeout=None):
+            self.seen.append(question)
+            return self.script.pop(0) if self.script else {"tool": "none"}
+
+    _g = globals()          # 跑成脚本时没有 fleet 包可 import，直接改模块全局
+    orig_decide = _g['decide']
+    try:
+        # (a) 复合句 → 两轮各拿一个工具
+        sd = _Scripted([{"tool": "notify_read", "arg": ""},
+                        {"tool": "device_status", "arg": ""}])
+        _g['decide'] = sd
+        got = run_tools("看看通知，顺便告诉我电量",
+                        lambda cap, args: fake_notify
+                        if cap == "notify.read" else fake_thermal)
+        check("复合句两轮各拿一个工具", len(got) == 2 and
+              got[0]["round"] == 1 and got[1]["round"] == 2)
+        check("第二轮只把后半句喂给决策（不是整段对话史）",
+              len(sd.seen) == 2 and "顺便" in sd.seen[1] and
+              "看看通知" not in sd.seen[1])
+
+        # (b) 单句 → 不问第二轮（真机实测：问了也是 none，白搭 3.6s）
+        sd2 = _Scripted([{"tool": "notify_read", "arg": ""}])
+        _g['decide'] = sd2
+        run_tools("看看通知", lambda cap, args: fake_notify)
+        check("单句不问第二轮", len(sd2.seen) == 1)
+
+        # (c) 首轮失败即止
+        sd3 = _Scripted([{"tool": "notify_read", "arg": ""}])
+        _g['decide'] = sd3
+        got2 = run_tools("看看通知", lambda cap, args: fail_call)
+        check("首轮失败就不再试第二轮", len(got2) == 1 and not got2[0]["ok"])
+
+        # (d) 模型重复要同一个工具 → 收手
+        sd4 = _Scripted([{"tool": "notify_read", "arg": ""},
+                         {"tool": "notify_read", "arg": ""}])
+        _g['decide'] = sd4
+        got3 = run_tools("看看通知，再读一遍通知",
+                         lambda cap, args: fake_notify, max_rounds=5)
+        check("同一工具不被重复执行", len(got3) == 1)
+    finally:
+        _g['decide'] = orig_decide
+
+    # 9. 预算：超了立刻收手
+    check("预算常量合理", 0 < TOOL_BUDGET_S <= 120 and MAX_ROUNDS == 2)
 
     print(f"\n{'FAIL ' + str(len(fails)) if fails else 'ALL PASS'}: {fails or ''}")
     return 1 if fails else 0

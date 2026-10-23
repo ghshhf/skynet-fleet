@@ -120,6 +120,13 @@ class MCPServer:
         通知（没有 id）不回复——这是 JSON-RPC 的规矩，
         回一句反而会让客户端的 id 对不上。
         """
+        # 批请求（数组）：逐条处理，全是通知就整体不回（JSON-RPC 的规矩）。
+        # 放在这里而不是 HTTP 层——stdio 也可能收到数组，规则必须只有一份。
+        if isinstance(req, list):
+            out = [self.handle(x) for x in req]
+            out = [r for r in out if r is not None]
+            return out or None
+
         if not isinstance(req, dict):
             return _err(None, INVALID_REQUEST, "请求不是 JSON 对象")
 
@@ -224,6 +231,22 @@ class MCPServer:
                 continue
             sout.write(json.dumps(resp, ensure_ascii=False) + "\n")
             sout.flush()
+
+
+# ---------------------------------------------------------------- HTTP 复用
+
+def handle_json(req, registry=None, include_unsafe=False, gate=None):
+    """一个（或一批）JSON-RPC 请求 → 响应对象。给 HTTP 传输复用。
+
+    为什么单独抽出来：stdio 是「一行一个 JSON」，HTTP 是「一个 body 一个 JSON」，
+    但**协议处理完全是同一套**——抽出来是为了让两条传输共享同一份派发逻辑，
+    免得以后改了 stdio 忘了改 HTTP（那是必然会发生的事）。
+
+    批请求（数组）按 JSON-RPC 的规矩：逐条处理，**全是不需要回的通知时回 None**
+    （等价于什么都不回）。
+    """
+    srv = MCPServer(registry=registry, include_unsafe=include_unsafe, gate=gate)
+    return srv.handle(req)
 
 
 # ---------------------------------------------------------------- CLI
