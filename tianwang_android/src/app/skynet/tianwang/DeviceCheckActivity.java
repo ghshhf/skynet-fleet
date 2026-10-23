@@ -112,9 +112,9 @@ public class DeviceCheckActivity extends Activity {
 
     private void runBench(final int steps, final int size, final boolean autoFinish) {
         if (running) { toast("正在检测中"); return; }
-        final List<ModelManager.Spec> av = ModelManager.available(this);
+        final List<ModelManager.Spec> av = ModelManager.availableSd(this);
         if (av.isEmpty()) {
-            Log.e(TAG, "BENCH_SKIP 没有可用模型，无法跑基准");
+            Log.e(TAG, "BENCH_SKIP 没有可用出图模型，无法跑基准");
             txtResult.setText("没有可用模型，先推模型进来再跑基准。");
             if (autoFinish) finish();
             return;
@@ -182,9 +182,9 @@ public class DeviceCheckActivity extends Activity {
                         p.secPerStep, p.vaeSec, p.benchSize, p.benchSteps, p.benchModel)
                 : "还没跑").append('\n');
 
-        List<ModelManager.Spec> av = ModelManager.available(this);
+        List<ModelManager.Spec> av = ModelManager.availableSd(this);
         if (av.isEmpty()) {
-            sb.append("\n模型：一个都没有（先推模型进来）");
+            sb.append("\n模型：一个都没有（先推出图模型进来）");
         } else {
             ModelManager.Spec cur = ModelManager.current(this);
             sb.append("\n模型：").append(cur.label).append('\n');
