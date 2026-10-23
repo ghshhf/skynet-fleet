@@ -163,8 +163,12 @@
                专用容器，刷新按钮留在容器外。 -->
           <div class="tabbar" id="tabBar">
             <div class="tablist" role="tablist" aria-label="资产视图切换">
-              <button class="tab on" data-tab="cards" role="tab"
-                      aria-selected="true" aria-controls="tabBody">专家</button>
+              <!-- 编队总览排第一：这是「现在整个编队什么状态」的入口，
+                   别的 tab 都是往里看某一类东西，只有它是先给你全貌。 -->
+              <button class="tab on" data-tab="fleet" role="tab"
+                      aria-selected="true" aria-controls="tabBody">编队</button>
+              <button class="tab" data-tab="cards" role="tab"
+                      aria-selected="false" aria-controls="tabBody">专家</button>
               <button class="tab" data-tab="skills" role="tab"
                       aria-selected="false" aria-controls="tabBody">技能</button>
               <button class="tab" data-tab="conns" role="tab"

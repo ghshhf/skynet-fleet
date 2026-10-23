@@ -609,3 +609,23 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   .vv-bar{padding:8px 12px 14px;gap:8px}
   .vv-send,.vv-hands{padding:0 12px;font-size:12.5px}
 }
+
+/* ==========================================================================
+   编队总览（X2）
+   四格指标 + 分区列表。颜色按「有没有问题」走，不用固定色——
+   全部正常时不该满屏警示色，那会让人对告警脱敏。
+   ========================================================================== */
+.fl-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+  gap:8px;padding:12px;border-bottom:1px solid var(--line-soft)}
+.fl-kpi{padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+  background:var(--panel);display:flex;flex-direction:column;gap:3px;min-width:0}
+.fl-k{font-size:11px;color:var(--fg-3);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.fl-v{font-size:21px;font-weight:650;line-height:1.15;font-variant-numeric:tabular-nums}
+.fl-s{font-size:11px;color:var(--fg-3);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.fl-kpi.good .fl-v{color:var(--ok)}
+.fl-kpi.warn{border-color:var(--warn)}
+.fl-kpi.warn .fl-v{color:var(--warn)}
+.fl-kpi.bad{border-color:var(--danger)}
+.fl-kpi.bad .fl-v{color:var(--danger)}

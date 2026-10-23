@@ -242,8 +242,8 @@
      🔴 空状态不许装作有：拉不到就显示原因。
      ================================================================== */
 
-  var ASSET_TAB = "cards";
-  var ASSET_CACHE = { cards: null, skills: null, conns: null, caps: null, audio: null };
+  var ASSET_TAB = "fleet";
+  var ASSET_CACHE = { fleet: null, cards: null, skills: null, conns: null, caps: null, audio: null };
 
   function setAssetTab(tab) {
     ASSET_TAB = tab;
@@ -262,6 +262,13 @@
     body.textContent = "";
     body.appendChild(el("div", "empty", "读取中…"));
 
+    if (tab === "fleet") {
+      api("/api/fleet").then(function (d) {
+        ASSET_CACHE.fleet = d;
+        renderFleetTab(d);
+      }).catch(function (e) { renderTabErr(body, "读不到编队总览：" + e.message); });
+      return;
+    }
     if (tab === "cards") {
       api("/api/cardstore").then(function (d) {
         ASSET_CACHE.cards = d;
@@ -297,8 +304,163 @@
     }).catch(function (e) { renderTabErr(body, "读不到连接器清单：" + e.message); });
   }
 
-  function renderTabErr(body, why) {
+  /* ==================================================================
+     X2 · 编队总览
+
+     一句话：把「谁在线 / 有没有活 / 活干成没干成」摊在一屏上，
+     不用挨个接口点进去拼。
+
+     口径跟后端保持一致，前端**不重算**：
+       · 「成功率」分母是 done + failed，**取消不算失败**——主人主动取消
+         不是系统出错，算进去只会天天假红。
+       · 一个作业都没跑过时显示「未知」而不是 0%：0% 读起来像「全挂了」，
+         真相是「还没数据」，这两件事不能糊在一起。
+       · 网关那几条显示的是**上次探测的缓存**，不是此刻的实时结果；
+         额度会自己刷新，所以写「等刷新」而不是「不可用」。
+     ================================================================== */
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n >= 1073741824) { return (n / 1073741824).toFixed(1) + " GB"; }
+    if (n >= 1048576) { return (n / 1048576).toFixed(1) + " MB"; }
+    if (n >= 1024) { return (n / 1024).toFixed(0) + " KB"; }
+    return n + " B";
+  }
+
+  function fmtAgo(ts) {
+    if (!ts) { return ""; }
+    var s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    if (s < 60) { return s + " 秒前"; }
+    if (s < 3600) { return Math.round(s / 60) + " 分钟前"; }
+    if (s < 86400) { return Math.round(s / 3600) + " 小时前"; }
+    return Math.round(s / 86400) + " 天前";
+  }
+
+  function renderFleetTab(d) {
+    var body = $("tabBody");
     body.textContent = "";
+    if (!d || !d.ok) { renderTabErr(body, (d && d.err) || "后端没给编队数据"); return; }
+
+    var dev = d.devices || { total: 0, online: 0, offline: 0, rows: [] };
+    var jobs = d.jobs || {};
+    var art = d.artifacts || {};
+    var phone = d.phone || {};
+
+    /* ---- 四格指标 ---- */
+    var grid = el("div", "fl-grid");
+    function kpi(label, value, sub, tone) {
+      var c = el("div", "fl-kpi" + (tone ? " " + tone : ""));
+      c.appendChild(el("div", "fl-k", label));
+      c.appendChild(el("div", "fl-v", String(value)));
+      c.appendChild(el("div", "fl-s", sub || ""));
+      grid.appendChild(c);
+    }
+    kpi("设备在线", dev.online + " / " + dev.total,
+        dev.offline ? dev.offline + " 台不可用" : "全部可用",
+        dev.offline ? "warn" : "good");
+    var pending = (jobs.running || 0) + (jobs.queued || 0);
+    kpi("在跑 / 排队", (jobs.running || 0) + " / " + (jobs.queued || 0),
+        pending ? "共 " + pending + " 个活没结" : "手上没活",
+        jobs.stale ? "warn" : "");
+    kpi("作业成功率",
+        jobs.success_rate === null || jobs.success_rate === undefined
+          ? "未知" : Math.round(jobs.success_rate * 100) + "%",
+        (jobs.success_rate === null || jobs.success_rate === undefined)
+          ? "还没跑过作业" : "成 " + jobs.done + " · 败 " + jobs.failed,
+        (jobs.success_rate !== null && jobs.success_rate !== undefined
+         && jobs.success_rate < 0.5) ? "bad" : "");
+    kpi("产物", art.count || 0,
+        fmtBytes(art.bytes) + (art.kinds && Object.keys(art.kinds).length
+          ? " · " + Object.keys(art.kinds).join("/") : ""), "");
+    body.appendChild(grid);
+
+    /* ---- 手机 ---- */
+    var ph = el("div", "dp-sec");
+    ph.appendChild(el("div", "dp-sech", "手机"));
+    var phRow = el("div", "drow");
+    phRow.appendChild(el("span", phone.available ? "dot-ok" : "dot-off"));
+    phRow.appendChild(el("span", "grow",
+      phone.available
+        ? (phone.device || "") + " · " + (phone.brief || "")
+        : (phone.note || "没有手机类设备")));
+    ph.appendChild(phRow);
+    (phone.anomalies || []).forEach(function (a) {
+      ph.appendChild(el("div", "dpnote", "⚠ " + a));
+    });
+    body.appendChild(ph);
+
+    /* ---- 网关：一律显示「上次探测」，并说清额度会自己刷新 ---- */
+    if (d.gateways) {
+      var gw = el("div", "dp-sec");
+      gw.appendChild(el("div", "dp-sech", "本机免费网关（缓存 · 额度会自己刷新）"));
+      Object.keys(d.gateways).forEach(function (name) {
+        var g = d.gateways[name] || {};
+        var row = el("div", "drow");
+        row.appendChild(el("span", g.live ? "dot-ok" : "dot-bad"));
+        var txt = name + " · 活 " + (g.live || 0) + "/" + (g.total || 0);
+        if (g.quota_waiting) {
+          txt += " · " + g.quota_waiting + " 条等额度刷新";
+          if (g.next_reprobe_in !== null && g.next_reprobe_in !== undefined) {
+            txt += "（最快 " + g.next_reprobe_in + "s 后自动重探）";
+          }
+        }
+        if (g.probed_at) { txt += " · 上次探测 " + fmtAgo(g.probed_at); }
+        row.appendChild(el("span", "grow", txt));
+        gw.appendChild(row);
+      });
+      body.appendChild(gw);
+    }
+
+    /* ---- 提示：出问题的地方必须能一眼看到 ---- */
+    (d.notes || []).forEach(function (n) {
+      body.appendChild(el("div", "dpnote", "⚠ " + n));
+    });
+
+    /* ---- 设备表：离线的排前面（有问题的先看见） ---- */
+    var dv = el("div", "dp-sec");
+    dv.appendChild(el("div", "dp-sech", "设备 · " + dev.total + " 台"));
+    (dev.rows || []).forEach(function (r) {
+      var row = el("div", "drow");
+      row.appendChild(el("span", r.ok ? "dot-ok" : "dot-off"));
+      row.appendChild(el("span", "grow", r.name));
+      var tags = el("span", "tags");
+      tags.appendChild(el("span", "badge", r.caps + " 项"));
+      if (!r.ok && r.reason) {
+        var b = el("span", "badge deny", r.reason.slice(0, 28));
+        tags.appendChild(b);
+      }
+      row.appendChild(tags);
+      dv.appendChild(row);
+    });
+    if (!(dev.rows || []).length) { dv.appendChild(el("div", "empty", "注册表里一台设备都没有")); }
+    body.appendChild(dv);
+
+    /* ---- 最近作业 ---- */
+    var jb = el("div", "dp-sec");
+    jb.appendChild(el("div", "dp-sech", "最近作业"));
+    var recent = jobs.recent || [];
+    if (!recent.length) {
+      jb.appendChild(el("div", "empty", "还没提交过作业"));
+    } else {
+      recent.forEach(function (j) {
+        var row = el("div", "drow");
+        row.appendChild(el("span", j.state === "done" ? "dot-ok"
+          : (j.state === "failed" ? "dot-bad" : "dot-off")));
+        row.appendChild(el("span", "grow",
+          j.cap + " · " + j.id + (j.node ? " @" + j.node : "")));
+        var t = el("span", "tags");
+        t.appendChild(el("span", "badge", j.state));
+        if (j.attempts > 1) { t.appendChild(el("span", "badge", "试 " + j.attempts + "/" + j.max_attempts)); }
+        if (j.artifacts) { t.appendChild(el("span", "badge", j.artifacts + " 产物")); }
+        if (j.stale) { t.appendChild(el("span", "badge deny", "租约过期")); }
+        row.appendChild(t);
+        jb.appendChild(row);
+        if (j.err) { jb.appendChild(el("div", "dpnote", j.id + "：" + j.err)); }
+      });
+    }
+    body.appendChild(jb);
+  }
+
+  function renderTabErr(body, why) {    body.textContent = "";
     body.appendChild(el("div", "why", why));
   }
 

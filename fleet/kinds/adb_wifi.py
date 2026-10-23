@@ -954,7 +954,18 @@ class AdbWifi(BaseDevice):
     # ---------------- 动手：screenshot / launch ----------------
 
     def _screenshot(self, args):
-        """截设备屏幕存 PNG，并回盲文预览（终端里也能「看」到）。"""
+        """截设备屏幕存 PNG，并回盲文预览（终端里也能「看」到）。
+
+        可选 `thumb=true`：额外生成一张缩到 720 宽的缩略图，回在 `thumb` 字段。
+
+        为什么缩略图要显式要、不默认做
+        ------------------------------
+        手机截一张是 1280×2772 / 4MB。这么大的图丢给看图接口会被拒
+        （"Image too large"）——于是「能截图」变成「截了也看不见」，能力在、效果零。
+        但缩略要自己解 PNG（环境里没 PIL），一张要几秒；设成默认会让每次截图
+        都无端慢几秒，而常规场景（存证、归档）根本不需要。
+        所以默认一个字节不变，谁要谁点。
+        """
         target, err = self._need_target("adb.wifi.screenshot", args)
         if not target:
             return R.error("adb.wifi.screenshot", err, device=self.name, via=self.via)
@@ -978,9 +989,23 @@ class AdbWifi(BaseDevice):
         except Exception as e:
             # 盲文是「锦上添花」，缺 PIL 不该让整个截图失败——但要说清为什么没有
             note += f"；盲文预览不可用（{e}）"
+        data = {"target": target, "path": path, "bytes": len(blob),
+                "preview": prev, "note": note}
+        if str(args.get("thumb") or "").strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                from .. import imgscale
+                tp = (path[:-4] if path.lower().endswith(".png") else path) + "_small.png"
+                tw, th, tsize = imgscale.downscale(path, tp, max_w=720, max_h=1400)
+                data["thumb"] = tp
+                data["thumb_size"] = "%dx%d" % (tw, th)
+                data["thumb_bytes"] = tsize
+                data["note"] = note + "；缩略图 %dx%d / %dKB，看图接口收得下" % (
+                    tw, th, tsize // 1024)
+            except Exception as e:
+                # 缩略失败不该把「已经截到的图」一起废掉，但要说清为什么没有
+                data["thumb_note"] = "缩略图没做成：%s（原图仍在 %s）" % (str(e)[:80], path)
         return R.success("adb.wifi.screenshot", self.name, side_effect=True, via=self.via,
-                         data={"target": target, "path": path, "bytes": len(blob),
-                               "preview": prev, "note": note})
+                         data=data)
 
     def _launch(self, args):
         """启动应用。包名或 activity 都行。"""
