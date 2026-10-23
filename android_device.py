@@ -100,16 +100,81 @@ def devices():
     return out
 
 
-def pick_serial(prefer_wireless=True):
-    """挑一台设备。优先无线调试的（手机），其次第一台。没有就返回空。"""
+_PROFILES = {}
+
+
+def profile(serial, timeout=10):
+    """一台设备的「身份指纹」：{model, board, mem_mb, phone}。
+
+    为什么需要它：adb 列表里有手机也有电视盒子/广告机（RK3568 那种 2GB 板子，
+    开机吃掉 1.7GB）。两者 `adb shell` 都能通、截图点按都不报错，光看「连上了」
+    分不出谁真能干算力活。`android.hardware.telephony` 是手机与盒子最稳的分界。
+
+    一次 shell 走完四项（无线调试下每次往返 200–400ms，分四次问就慢了）。
+    """
+    if serial in _PROFILES:
+        return _PROFILES[serial]
+    cmd = ("getprop ro.product.model; getprop ro.board.platform; "
+           "grep MemTotal /proc/meminfo; "
+           # grep -c 计数为 0 时退出码是 1，会被当成整条命令失败 ⇒ 用 || echo 0 兜住
+           "pm list features 2>/dev/null | grep -c android.hardware.telephony || echo 0")
+    rc, txt = shell(serial, cmd, timeout=timeout)
+    p = {"model": "", "board": "", "mem_mb": 0, "phone": False, "ok": rc == 0}
+    if rc == 0:
+        lines = [x.strip() for x in txt.replace("\r", "").splitlines() if x.strip()]
+        if lines:
+            p["model"] = lines[0]
+        if len(lines) > 1:
+            p["board"] = lines[1]
+        for x in lines:
+            if x.startswith("MemTotal"):
+                digits = "".join(ch for ch in x if ch.isdigit())
+                if digits:
+                    p["mem_mb"] = int(digits) // 1024
+        if lines and lines[-1].isdigit():
+            p["phone"] = int(lines[-1]) > 0
+    _PROFILES[serial] = p
+    return p
+
+
+def pick_serial(prefer_wireless=True, prefer=None):
+    """挑一台给编队用的设备。没有就返回空。
+
+    为什么不「取第一台」：同时接着手机和一块安卓板子时，adb 列表顺序取决于谁先
+    连上。按顺序取会把编队绑到最没用的那台上——而且它能截图能点按，不会报错，
+    活照派、慢十倍、还查不出原因。这种错最贵。
+
+    优先级（高 → 低）：
+      ① 显式指定：prefer 参数 或 环境变量 FLEET_ANDROID_SERIAL（可给完整序列/子串/型号名）
+      ② 有电话功能的真手机（盒子/一体机/广告机没有 telephony）
+      ③ 无线调试的（手机常态是无线）
+      ④ 还是平手就维持 adb 原顺序（绝不因为分不清就报错）
+    """
     ds = [d for d in devices() if d["state"] == "device"]
     if not ds:
         return ""
-    if prefer_wireless:
-        for d in ds:
-            if d["wireless"]:
+
+    want = (prefer or os.environ.get("FLEET_ANDROID_SERIAL") or "").strip()
+    if want:
+        def keys(d):
+            return (d["serial"], d["model"], d["device"], d["product"])
+        for d in ds:                                  # 先整字命中（避免子串歧义）
+            if want in keys(d):
                 return d["serial"]
-    return ds[0]["serial"]
+        for d in ds:                                  # 再放宽到子串（rk3568 / 25060 这种半截名）
+            if any(want in str(k) for k in keys(d)):
+                return d["serial"]
+
+    if len(ds) == 1:
+        return ds[0]["serial"]
+
+    def rank(i_d):
+        i, d = i_d
+        p = profile(d["serial"])
+        return (0 if p["phone"] else 1,          # 真手机优先
+                0 if (d["wireless"] or not prefer_wireless) else 1,
+                i)                                # 最后才看原顺序，保证确定性
+    return sorted(enumerate(ds), key=rank)[0][1]["serial"]
 
 
 # ---------------------------------------------------------------- 自动接入
@@ -944,7 +1009,62 @@ def _selftest():
     finally:
         globals()["bridge_token"] = real
 
-    print("android_device \u81ea\u6d4b\uff1a8 \u9879\u5168\u8fc7")
+    # ⑨ 选设备：手机优先于盒子——这是「2GB 板子排前面就把活全派给砖头」的防线
+    _real_devices, _real_shell = globals()["devices"], globals()["shell"]
+    _real_env = os.environ.pop("FLEET_ANDROID_SERIAL", None)
+
+    def _fake_devices(_rows):
+        return lambda: _rows
+
+    def _fake_shell(_prof):
+        def f(serial, cmd, timeout=60):
+            p = _prof.get(serial, {})
+            if not p:
+                return 1, ""
+            txt = "%s\n%s\nMemTotal:       %d kB\n%d\n" % (
+                p.get("model", ""), p.get("board", ""),
+                p.get("mem_mb", 0) * 1024, 1 if p.get("phone") else 0)
+            return 0, txt
+        return f
+
+    BOARD = {"serial": "192.168.0.105:5555", "state": "device", "model": "SYKJ_18C",
+             "product": "rk3568_d", "device": "rk3568_d", "wireless": True}
+    PHONE = {"serial": "192.168.137.40:5555", "state": "device", "model": "25060RK16C",
+             "product": "dali", "device": "dali", "wireless": True}
+    prof = {BOARD["serial"]: {"model": "SYKJ_18C", "board": "rk356x", "mem_mb": 1957, "phone": False},
+            PHONE["serial"]: {"model": "25060RK16C", "board": "kalama", "mem_mb": 11285, "phone": True}}
+    try:
+        _PROFILES.clear()
+        # 板子排在前面（这正是 adb 的真实顺序），仍然要选手机
+        globals()["devices"], globals()["shell"] = _fake_devices([BOARD, PHONE]), _fake_shell(prof)
+        assert pick_serial() == PHONE["serial"], "只连一台手机一台盒子时必须选手机"
+        # 显式指定能翻盘（就要那块板子也得听得懂）
+        assert pick_serial(prefer="SYKJ") == BOARD["serial"]
+        assert pick_serial(prefer=BOARD["serial"]) == BOARD["serial"]
+        assert pick_serial(prefer="25060") == PHONE["serial"]
+        # 环境变量同权，且优先于自动排序
+        os.environ["FLEET_ANDROID_SERIAL"] = "rk3568"
+        assert pick_serial() == BOARD["serial"], "FLEET_ANDROID_SERIAL 没生效"
+        os.environ.pop("FLEET_ANDROID_SERIAL")
+        # 只有一台：不去 profile 也直接给（少一次往返）
+        globals()["shell"] = _fake_shell({})           # 任何 shell 都失败
+        globals()["devices"] = _fake_devices([BOARD])
+        assert pick_serial() == BOARD["serial"]
+        # 一台都没有：空串，不抛
+        globals()["devices"] = _fake_devices([])
+        assert pick_serial() == ""
+        # 两台都是盒子：维持原顺序（分不清就按列表来，不瞎猜）
+        _PROFILES.clear()
+        globals()["devices"], globals()["shell"] = _fake_devices([BOARD, PHONE]), _fake_shell(
+            {BOARD["serial"]: {"phone": False}, PHONE["serial"]: {"phone": False}})
+        assert pick_serial() == BOARD["serial"]
+    finally:
+        globals()["devices"], globals()["shell"] = _real_devices, _real_shell
+        _PROFILES.clear()
+        if _real_env is not None:
+            os.environ["FLEET_ANDROID_SERIAL"] = _real_env
+
+    print("android_device \u81ea\u6d4b\uff1a9 \u9879\u5168\u8fc7")
 
 
 # ---------------------------------------------------------------- CLI
