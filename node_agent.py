@@ -21,6 +21,7 @@ import time
 import capabilities
 import common
 import image_gen_runner
+import video_gen_runner
 from fleet.skynet_relay import get_relay
 
 _DEBUG = bool(os.environ.get("FLEET_DEBUG"))
@@ -257,6 +258,8 @@ def _dispatch(s, m, name, sandbox):
         _do_compute(s, m)
     elif t == common.IMAGE_GEN:
         _do_image_gen(s, m)
+    elif t == common.VIDEO_GEN:
+        _do_video_gen(s, m)
     elif t == common.UI_SKIP:
         _do_ui_skip(s, m)
     elif t == common.CAP_GRANT:
@@ -357,6 +360,26 @@ def _do_image_gen(s, m, backend=None):
                             "err": res.get("err", "")})
     except Exception as e:
         common.send_msg(s, {"t": common.IMAGE_GEN_RESULT, "id": mid, "ok": False,
+                            "path": "", "err": str(e)})
+
+
+def _do_video_gen(s, m, backend=None):
+    """视频生成（P3 壳 + 远端路由）：在本节点/挂载的视频后端上出一段视频。
+
+    与 _do_image_gen 同构：参数规整 + 回执路径 + 任何失败都带原因回执，
+    不许静默交空。默认后端（无 FLEET_VIDEO_BACKEND）如实说「未配置」。
+    """
+    mid = m.get("id")
+    try:
+        res = video_gen_runner.run(
+            m.get("prompt", ""), duration=m.get("duration", 3), fps=m.get("fps", 24),
+            size=m.get("size", "512x512"), seed=int(m.get("seed", -1)),
+            model=m.get("model"), backend=backend)
+        common.send_msg(s, {"t": common.VIDEO_GEN_RESULT, "id": mid,
+                            "ok": res["ok"], "path": res.get("path", ""),
+                            "err": res.get("err", "")})
+    except Exception as e:
+        common.send_msg(s, {"t": common.VIDEO_GEN_RESULT, "id": mid, "ok": False,
                             "path": "", "err": str(e)})
 
 
@@ -503,6 +526,38 @@ def _selftest():
     assert me["ok"] is False and ("未配置" in me["err"] or "未实现" in me["err"]), me
 
     print("[selftest] image.gen 正常/异常/空prompt/未配置后端 全过")
+
+    # ---- video.gen 能力接线（P3 壳 + 远端路由）：与 image.gen 同构的回执路径 ----
+    def _v_ok(prompt, duration, fps, size, seed, model):
+        return f"/sdcard/Movies/fleet/{seed or 0}.mp4"
+
+    s7 = _FakeSock()
+    _do_video_gen(s7, {"id": "v1", "prompt": "海浪", "duration": 3, "fps": 24, "seed": 9},
+                  backend=_v_ok)
+    m7 = _read_msgs(s7)[0]
+    assert m7["t"] == common.VIDEO_GEN_RESULT and m7["ok"] is True, m7
+    assert m7["path"] == "/sdcard/Movies/fleet/9.mp4", m7
+
+    def _v_fail(prompt, duration, fps, size, seed, model):
+        raise RuntimeError("视频后端没电了")
+
+    s8 = _FakeSock()
+    _do_video_gen(s8, {"id": "v8", "prompt": "日落"}, backend=_v_fail)
+    m8 = _read_msgs(s8)[0]
+    assert m8["ok"] is False and "视频后端没电" in m8["err"], m8
+
+    s9 = _FakeSock()
+    _do_video_gen(s9, {"id": "v9", "prompt": "  "})
+    m9 = _read_msgs(s9)[0]
+    assert m9["ok"] is False and "prompt" in m9["err"], m9
+
+    # 默认后端未配置时必须明确报错（不许静默交空）
+    se2 = _FakeSock()
+    _do_video_gen(se2, {"id": "ve", "prompt": "云"})
+    me2 = _read_msgs(se2)[0]
+    assert me2["ok"] is False and "未配置" in me2["err"], me2
+
+    print("[selftest] video.gen 正常/异常/空prompt/未配置后端 全过")
 
     print("[selftest] PASS")
 
