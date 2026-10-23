@@ -52,6 +52,12 @@ DEFAULT_NETFORCE_DIRS = [
     os.path.join(os.path.expanduser("~"), "code", "netforce"),
 ]
 
+#: 返回给调用方的标题硬上限。上游（skynet）已经修了刷屏仓库，这里是**边界防御**：
+#: 标题最终会被拼进模型上下文，谁也不能保证上游永远干净。
+#: 实测事故：一条 GitHub 刷屏仓库的 description 有 5.9 万字，5 条凑出 31 万字，
+#: 直接撑爆手机模型 4096 上下文（llama-server 400）。截断比报错重要，但必须标出来。
+TITLE_MAX = 300
+
 
 def netforce_home():
     """找 netforce 仓库。找不到返回 ""。
@@ -136,15 +142,21 @@ def search(query, wiki_tag=None, only=None, min_rel=None, limit=20,
         hits = hits[:limit]
     out = []
     for h in hits:
-        out.append({
+        raw_title = (h.title or "").strip()
+        title = raw_title[:TITLE_MAX]
+        rec = {
             "url": h.url,
             "host": h.host,
-            "title": h.title,
+            "title": title,
             "engines": list(h.engines),
             "cross": len(h.engines),
             "rel": round(float(h.rel), 4),
             "score": round(float(h.score), 4),
-        })
+        }
+        if len(raw_title) > TITLE_MAX:
+            # 不静默：调用方有权知道这条是被砍过的，砍过就说明上游出了问题
+            rec["title_truncated"] = len(raw_title)
+        out.append(rec)
     return out
 
 
