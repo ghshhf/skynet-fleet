@@ -67,6 +67,29 @@ def models():
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+def _strip_leading_think(s):
+    """剥掉开头漏进正文的思考标签（自包含，手机上也能跑）。
+
+    背景（2026-10-24 实测）：serve.sh 用 --reasoning-budget 0 关思考时，
+    llama-server 会把裸 `</think>` 放进 content 开头（解析器没见过开标签，
+    剥不掉；budget 1 / reasoning-format none 也各有别的漏法）。
+    在这里剥，服务端保持最快配置。
+    """
+    t = (s or "").lstrip()
+    while True:
+        if t.startswith("</think>"):
+            t = t[len("</think>"):].lstrip()
+            continue
+        if t.startswith("<think>"):
+            e = t.find("</think>")
+            if e < 0:
+                break                      # 没闭合：不动，交给上层预算逻辑
+            t = t[e + len("</think>"):].lstrip()
+            continue
+        break
+    return t
+
+
 def chat(messages, n=192, temp=0.7, stream=False):
     """一次对话。返回 {text, elapsed_s, tokens, tps, ttft_s}。"""
     payload = {"messages": messages, "max_tokens": n, "temperature": temp,
@@ -74,7 +97,7 @@ def chat(messages, n=192, temp=0.7, stream=False):
     if not stream:
         data, dt = _post("/v1/chat/completions", payload)
         choice = (data.get("choices") or [{}])[0]
-        text = (choice.get("message") or {}).get("content") or ""
+        text = _strip_leading_think((choice.get("message") or {}).get("content") or "")
         usage = data.get("usage") or {}
         ct = usage.get("completion_tokens") or 0
         return {"text": text.strip(), "elapsed_s": round(dt, 2),
@@ -107,7 +130,7 @@ def chat(messages, n=192, temp=0.7, stream=False):
                     ttft = time.time() - t0
                 parts.append(piece)
     dt = time.time() - t0
-    text = "".join(parts).strip()
+    text = _strip_leading_think("".join(parts)).strip()
     return {"text": text, "elapsed_s": round(dt, 2),
             "tokens": None, "tps": None,
             "ttft_s": round(ttft, 3) if ttft else None, "model": ""}

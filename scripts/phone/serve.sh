@@ -34,9 +34,20 @@
 #   不加它，llama-server 不走 GGUF 内嵌的 chat template，而是退回**启发式解析器**，
 #   那个解析器不认识模型自己的工具调用分隔符，于是 `tools` 字段被整个忽略、
 #   工具调用被当成普通文本吐出来。表现就是「模型明明会调工具，但 tool_calls 永远为 null」。
-#   加了之后 4B（Qwen3VL）稳定产出合法 tool_calls；0.6B（北极星-V7）仍然不出 ——
-#   它是微调/蒸馏版，本身没保留 function calling 能力，这不是配置能救的。
 #   结论：--jinja 是标配，对支持的模型必需、对不支持的模型无害。
+#   （更正 2026-10-24：当年「0.6B 仍不出 tool_calls」的结论错了——那台跑的是
+#   北极星-V7 微调版，function calling 被调没了；**官方 Qwen3-0.6B 原版是出的**。）
+#
+# 为什么 --reasoning-budget 0（实测 2026-10-24）：
+#   Qwen3 系列默认开思考，`<think>` 会把 max_tokens 预算吃光——
+#   response_format 的 JSON 直接为空、闲聊答一句话要 20+ 秒。
+#   budget 0 = 服务端层面关思考。深问题要思考时用 EXTRA 传 --reasoning-budget -1。
+#   客户端单次调用也可靠 chat_template_kwargs:{"enable_thinking":false} 关。
+#
+# 默认模型 = Qwen3-1.7B-Q8_0（2026-10-24 实测定论，四项同口径对照）：
+#   读资料 3/3 零编造带引用 1.6s｜schema 决策 6/6（官方 0.6B 只有 3/6）｜
+#   原生 tool_calls 合法｜1.9GB 内存。官方 0.6B 读资料 0.9s 也全对，
+#   内存紧张时的轻量备选；北极星-V7（已淘汰）是它的微调版，工具能力丢了。
 #
 # 用法：sh serve.sh [模型相对路径] [端口] [vision]
 #   vision = 挂视觉投影（能看图，但实测 prefill 慢 4 倍：4B 长 prompt 90.6s → 23.0s）
@@ -48,8 +59,8 @@
 #   FA=on        FlashAttention：on / off / auto
 #   CTX=4096     上下文长度
 #   KVQ=0        设 1 则 KV cache 用 q8_0（省一半 KV 内存，长上下文更稳）
-#   EXTRA=""     追加任意 llama-server 参数（原样透传）
-MODEL="${1:-models/北极星-V7-Q8_0.gguf}"
+#   EXTRA=""     追加任意 llama-server 参数（原样透传，如 --reasoning-budget -1 开思考）
+MODEL="${1:-models/Qwen3-1.7B-Q8_0.gguf}"
 PORT="${2:-8080}"
 VISION="${3:-}"
 
@@ -82,7 +93,7 @@ echo "cfg model=$(basename "$M") port=$PORT t=$THREADS tb=$TB fa=$FA ctx=$CTX kv
   > "$HOME/skynet/llama-server.cfg"
 nohup llama-server -m "$M" $MMPROJ --host 0.0.0.0 --port "$PORT" \
   -t "$THREADS" -tb "$TB" -fa "$FA" -c "$CTX" $KVARGS $EXTRA \
-  --jinja --no-warmup > "$HOME/skynet/llama-server.log" 2>&1 &
+  --reasoning-budget 0 --jinja --no-warmup > "$HOME/skynet/llama-server.log" 2>&1 &
 echo "pid=$!"
 for i in 1 2 3 4 5 6 7 8; do
   sleep 1
