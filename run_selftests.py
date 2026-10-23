@@ -60,6 +60,12 @@ CASES = [
     ("fleet_result", ["-m", "fleet.core.result"], HERE, 30),
     ("fleet_registry", ["-m", "fleet.core.registry"], HERE, 30),
     ("fleet_list", ["-m", "fleet", "list"], HERE, 120),
+    # ---- Android 静态门禁：XML 标签 vs Java 强转类型 ----
+    # 一次真事故一条：activity_device.xml 里 btnDevBack 是 <TextView>，
+    # Java 却声明成 Button → 点「基准测试」必崩 ClassCastException。
+    # 这种错编译期查不出来（findViewById 按声明类型推导，不校验布局），
+    # 只能在真机上点一下才知道，所以必须静态拦。纯离线、秒级。
+    ("android_viewcast", ["tools/check_viewcast.py"], HERE, 30),
     # ---- evals：一次真事故一个脚本 ----
     ("eval_d0_bridge_offline", ["evals/d0_bridge_offline.py"], HERE, 90),
     ("eval_t0_input", ["evals/t0_input_not_clobbered.py"], HERE, 90),

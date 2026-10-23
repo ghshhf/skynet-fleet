@@ -378,6 +378,56 @@ public final class Net {
         }
     }
 
+    /**
+     * 当前在等主人点头的动作（有副作用的能力：打开应用、点屏幕、打字）。
+     *
+     * 这一路是**手机能不能动手**的开关：电脑那边遇到 ask 档会挂起等人确认，
+     * 手机不来看一眼，30 秒后就当拒绝了——于是手机永远只能读、不能动。
+     */
+    public static JSONObject approvals(String base, Auth auth) throws IOException {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(base + "/api/approvals").openConnection();
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(CONNECT_MS);
+            c.setReadTimeout(8000);
+            applyAuth(c, auth);
+            int code = c.getResponseCode();
+            String body = readText(c);
+            if (code != 200) { throw new IOException(friendly(code, body)); }
+            return parse(body);
+        } finally {
+            if (c != null) { c.disconnect(); }
+        }
+    }
+
+    /**
+     * 对一条待审批表态（同意 / 拒绝）。
+     *
+     * approve 必须是**布尔**——服务端不是布尔直接 400，所以这里别传字符串。
+     */
+    public static JSONObject respond(String base, Auth auth, String requestId,
+                                     boolean approve) throws IOException {
+        HttpURLConnection c = null;
+        try {
+            JSONObject body = new JSONObject();
+            body.put("request_id", requestId);
+            body.put("approve", approve);
+            c = open(base + "/api/approval/respond", "POST", auth,
+                     "application/json");
+            c.setReadTimeout(8000);
+            c.getOutputStream().write(body.toString().getBytes(UTF8));
+            int code = c.getResponseCode();
+            String txt = readText(c);
+            if (code != 200) { throw new IOException(friendly(code, txt)); }
+            return parse(txt);
+        } catch (org.json.JSONException e) {
+            throw new IOException("回应审批拼不出来：" + e.getMessage());
+        } finally {
+            if (c != null) { c.disconnect(); }
+        }
+    }
+
     // ---------------- 底层 ----------------
 
     private static void applyAuth(HttpURLConnection c, Auth auth) {

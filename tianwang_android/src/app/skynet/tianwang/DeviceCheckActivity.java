@@ -40,7 +40,11 @@ public class DeviceCheckActivity extends Activity {
     private static final String TAG = "fleet-dev";
 
     private TextView txtInfo, txtResult;
-    private Button btnRun, btnBench, btnClear, btnBack;
+    // btnBack 在布局里是 TextView（只是个可点的文字，不是按钮）——
+    // 声明成 Button 会在 findViewById 时 ClassCastException 直接崩 Activity。
+    // 所以它单独声明为 View：只需要 setOnClickListener，不需要 Button 的任何能力。
+    private Button btnRun, btnBench, btnClear;
+    private View btnBack;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
