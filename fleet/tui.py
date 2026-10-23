@@ -46,8 +46,9 @@ from textual.widgets import (DataTable, Footer, Header, Input,
                              ProgressBar, RichLog, Static, TabbedContent, TabPane)
 
 from .shell import BUILTINS, FleetShell, _status_bits
+from . import VERSION as FLEET_VERSION
 
-TITLE_LINE = "设备编队 · 天网"
+TITLE_LINE = f"设备编队 · 天网  v{FLEET_VERSION}"
 
 # 长任务进度契约：认不出格式就退化成"只知道还活着"，不硬猜
 RE_PROG = re.compile(r"\((\d+)\s*/\s*(\d+)\)")

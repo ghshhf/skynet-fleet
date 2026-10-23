@@ -42,6 +42,9 @@ jobs:
         # --smoke 只起服务探 /api/health，不开窗、不依赖 webview，无显示器也能跑。
         run: python fleet_gui.py --smoke
 
+      - name: 自测（门禁 67 项）
+        run: python run_selftests.py
+
       - name: 打包 fleet-gui.exe
         run: python tools/build_gui.py
 
