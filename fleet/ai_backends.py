@@ -187,6 +187,60 @@ def _chat_once(b, prompt, max_tokens=1, timeout=8):
     return _chat_stream(b, prompt, "", None, max_tokens, timeout)
 
 
+class _ThinkStripper:
+    """剥掉答案开头的思考标签（流式安全）。
+
+    背景（2026-10-24 实测）：llama-server 加 --reasoning-budget 0（关思考的
+    服务端开关）时，Qwen3 的输出以裸 `</think>` 开头——预算 0 让模板立即
+    闭合思考，但解析器没见过开标签，就把闭标签当正文放出来了。
+    `--reasoning-budget 1` 一样漏，`--reasoning-format none` 漏得更凶
+    （整对 <think></think> 进正文）。所以在消费端剥，与后端无关。
+
+    流式难点：标签可能被切成 `</th` + `ink>` 两个 delta 到达，
+    所以开头先攒 buffer；确认无前缀后一律直通，零额外开销。
+    """
+
+    #: 开头出现这些结构才剥；其他一律视为正文
+    _OPEN, _CLOSE = "<think>", "</think>"
+    _MAX_PENDING = 65536                   # 防失控：思考没闭合也最多攒 64KB
+
+    def __init__(self):
+        self._buf = ""
+        self._done = False
+
+    def feed(self, chunk):
+        if self._done:
+            return chunk
+        self._buf += chunk
+        s = self._buf.lstrip(" \t\r\n")
+        if not s:
+            return ""                      # 全是空白，继续攒
+        if s.startswith(self._OPEN):
+            end = s.find(self._CLOSE)
+            if end < 0:
+                # 思考进行中（或没闭合）。预算被思考烧光时正文本来就该空，
+                # 这里最多攒 _MAX_PENDING，超了就当作正文放行，不再吞字。
+                if len(s) < self._MAX_PENDING:
+                    return ""
+                self._done = True
+                self._buf = ""
+                return s
+            self._done = True
+            self._buf = ""
+            return s[end + len(self._CLOSE):].lstrip()
+        if s.startswith(self._CLOSE):
+            self._done = True
+            self._buf = ""
+            return s[len(self._CLOSE):].lstrip()
+        # 可能是「半截标签」——是候选的前缀就继续攒
+        if any(c.startswith(s) for c in (self._OPEN, self._CLOSE)):
+            return ""
+        # 确认开头不是标签：全部放行
+        self._done = True
+        rest, self._buf = self._buf, ""
+        return rest
+
+
 def _chat_stream(b, prompt, system, on_token, max_tokens, timeout):
     msgs = []
     if system:
@@ -205,6 +259,7 @@ def _chat_stream(b, prompt, system, on_token, max_tokens, timeout):
         raise RuntimeError(f"HTTP {e.code}: {body}")
     full = []
     finish = None
+    stripper = _ThinkStripper()
     # 🔴 流中途超时/断开：**已经收到的内容不许丢**。上游偶发卡死（实测本地网关
     # 8 次里撞到 1 次 timeout），原实现让异常直接冲出函数，full 里的半截回答
     # 全部作废，用户只看到一句「出错」——其实答案已经写了一半。
@@ -231,9 +286,11 @@ def _chat_stream(b, prompt, system, on_token, max_tokens, timeout):
             # 只取正文 content；reasoning 是模型内部思考，不进答案流
             delta = (choices[0].get("delta") or {}).get("content")
             if delta:
-                full.append(delta)
-                if on_token:
-                    on_token(delta)
+                out = stripper.feed(delta)
+                if out:
+                    full.append(out)
+                    if on_token:
+                        on_token(out)
     except (socket.timeout, TimeoutError) as e:
         stalled = f"读取超时（{timeout}s 内上游没再发数据）: {e}"
     except urllib.error.URLError as e:
