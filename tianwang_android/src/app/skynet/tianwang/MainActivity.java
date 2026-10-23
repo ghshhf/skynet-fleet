@@ -98,6 +98,14 @@ public class MainActivity extends Activity {
     private final WavRecorder recorder = new WavRecorder();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    // 紧急通道：审批用。
+    // 为什么不能跟 worker 混用—— worker 是**单线程**，而审批轮询是个
+    // `while(...) { sleep(1500) ... }` 的长驻循环，一旦起跑就把那唯一一根
+    // 线程永久占死。结果：弹窗弹得出来（轮询自己在跑），但点「允许」后
+    // sendApproval 排在这个无限循环后面，**永远轮不到**，界面上就是
+    // 「点了没反应」，最后 30 秒一到弹一句「这条审批已经结束了」。
+    // 审批是 30 秒时效的请求，绝不能和出图/聊天这类长任务排同一条队。
+    private final ExecutorService urgent = Executors.newFixedThreadPool(2);
 
     private MediaPlayer player;
     // 系统语音（本地合成）。null = 还没起或起不来；起不来时 speakerWhy 里有原因。
@@ -1745,12 +1753,204 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        startApprovalWatch();
+    }
+
+    @Override
     protected void onPause() {
         if (recording) { stopRecordAndAsk(true); }
         stopPlayback();
         setBusy(false);
         orb.setState(OrbView.IDLE);
+        stopApprovalWatch();
         super.onPause();
+    }
+
+    // ---------------- 审批：手机能不能「动手」全靠这一块 ----------------
+
+    /**
+     * 电脑那边遇到 ask 档（打开应用、点屏幕、打字）会挂起等人点头，
+     * 等 30 秒没人理就当拒绝。**手机不来看一眼，它就永远只能读、不能动。**
+     *
+     * 所以这里轮询待审批清单，有就弹一个打断式对话框：说清要做什么、
+     * 在哪台设备上、参数是什么，然后让主人选允许/拒绝。
+     */
+    private volatile boolean approvalWatch;
+    /** 轮询心跳计数：只为日志降噪用，不影响逻辑。 */
+    private int _dbgN;
+    /** 连续连不上电脑的次数（成功一次就清零），用来决定要不要出声提醒。 */
+    private int approvalFailN;
+    private android.app.AlertDialog approvalDlg;
+    /** 已经弹过的 id，防止同一个请求反复弹。 */
+    private final java.util.Set<String> approvalSeen =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
+    private void startApprovalWatch() {
+        if (approvalWatch) { return; }
+        approvalWatch = true;
+        urgent.execute(() -> {
+            while (approvalWatch) {
+                try { Thread.sleep(1500); } catch (InterruptedException e) { return; }
+                if (!approvalWatch) { return; }
+                try {
+                    JSONObject r = Net.approvals(Prefs.baseUrl(MainActivity.this),
+                                                 Net.auth(MainActivity.this));
+                    approvalFailN = 0;   // 通了就别再念叨断线
+                    if (r.optInt("count", 0) <= 0) {
+                        if (approvalWatch && _dbgN++ % 8 == 0) {
+                            // 每 12 秒留一条心跳。审批弹不出来时，先能回答
+                            // 「轮询到底活着吗、它看到几条」——否则只能靠猜。
+                            Log.d(TAG, "审批轮询在跑：count=0 base="
+                                    + Prefs.baseUrl(MainActivity.this));
+                        }
+                        continue;
+                    }
+                    org.json.JSONArray arr = r.optJSONArray("pending");
+                    if (arr == null || arr.length() == 0) { continue; }
+                    JSONObject p = arr.optJSONObject(0);
+                    if (p == null) { continue; }
+                    String rid = p.optString("request_id", "");
+                    if (rid.isEmpty() || !approvalSeen.add(rid)) { continue; }
+                    if (approvalSeen.size() > 64) { approvalSeen.clear(); }
+                    String cap = p.optString("cap", "");
+                    String title = p.optString("title", cap);
+                    String dev = p.optString("device", "");
+                    String prev = p.optString("args_preview", "");
+                    ui.post(() -> askApproval(rid, title, cap, dev, prev));
+                } catch (Exception e) {
+                    // 不能静默吞掉：审批弹不出来时，这是唯一的线索。
+                    // 踩过两次：
+                    //   ① 轮询一直 403，界面上什么都没有；
+                    //   ② adb reverse 掉了，连不上 127.0.0.1:8000（**这才是
+                    //      「点了没反应」的真凶**——弹窗根本没机会出现）。
+                    // 两种都是「主人只看到点了没反应，日志里一个字都没有」。
+                    Log.w(TAG, "审批轮询失败：" + e);
+                    // 连续失败要说一次人话。静默重试 = 主人永远不知道
+                    // 手机其实已经和电脑断开了，「已配对」那行旧字还在骗人。
+                    // 只在「刚断」和「刚恢复」时报一次，不刷屏。
+                    int n = ++approvalFailN;
+                    if (n == 3 || n % 20 == 0) {
+                        final String why = e.getMessage() == null ? String.valueOf(e) : e.getMessage();
+                        ui.post(() -> say2("连不上电脑（" + Prefs.baseUrl(MainActivity.this)
+                                + "），审批先不管了：" + why
+                                + "\n电脑端开着、且 adb reverse tcp:8000 tcp:8000 还在，才会恢复。"));
+                    }
+                }
+            }
+        });
+    }
+
+    private void stopApprovalWatch() {
+        approvalWatch = false;
+        if (approvalDlg != null) {
+            try { approvalDlg.dismiss(); } catch (Exception ignored) { }
+            approvalDlg = null;
+        }
+    }
+
+    private void askApproval(String rid, String title, String cap,
+                             String device, String preview) {
+        if (isFinishing()) { return; }
+        StringBuilder sb = new StringBuilder();
+        sb.append("要做的动作：").append(title.isEmpty() ? cap : title);
+        if (!cap.isEmpty() && !cap.equals(title)) { sb.append("\n能力：").append(cap); }
+        if (!device.isEmpty()) { sb.append("\n设备：").append(device); }
+        if (!preview.isEmpty() && !preview.equals("{}")) {
+            sb.append("\n参数：").append(preview);
+        }
+        sb.append("\n\n不同意就什么都不做。这条 30 秒没人理会自动取消。");
+        android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
+                .setTitle("要允许这个动作吗？")
+                .setMessage(sb.toString())
+                .setPositiveButton("允许", null)
+                .setNegativeButton("拒绝", null)
+                // 允许按返回键/点外面关掉：不点允许本来就等于不执行，
+                // 而把人锁在框里只会让人以为 App 卡死了。
+                .setCancelable(true)
+                .create();
+        // 先设成 null 再在 show 后换掉监听：默认监听一点就 dismiss，
+        // 而回应失败（比如已经超时）时我希望弹窗留着，主人看见原因再关。
+        d.setOnShowListener(dlg -> {
+            d.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+             .setOnClickListener(v -> sendApproval(rid, true, d));
+            d.getButton(android.app.AlertDialog.BUTTON_NEGATIVE)
+             .setOnClickListener(v -> sendApproval(rid, false, d));
+        });
+        approvalDlg = d;
+        d.show();
+        // 这条可能已经在别处被处理，或者 30 秒到了自动取消。
+        // **不盯着它，旧弹窗会一直挂在屏幕上**（实测踩过：回一条超时，弹窗
+        // 不走，下一条审批被它挡在后面，点「允许」点到的其实是早已作废的那条）。
+        watchApprovalGone(rid, d);
+    }
+
+    /** 这条审批还在等吗？不在了就把弹窗自己收掉。 */
+    private void watchApprovalGone(String rid, android.app.AlertDialog d) {
+        ui.postDelayed(() -> {
+            if (!d.isShowing()) { return; }
+            urgent.execute(() -> {
+                boolean still = true;
+                try {
+                    JSONObject r = Net.approvals(Prefs.baseUrl(MainActivity.this),
+                                                 Net.auth(MainActivity.this));
+                    org.json.JSONArray arr = r.optJSONArray("pending");
+                    if (arr != null) {
+                        still = false;
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject p = arr.optJSONObject(i);
+                            if (p != null
+                                    && rid.equals(p.optString("request_id", ""))) {
+                                still = true;
+                                break;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "查审批是否还在失败：" + e);
+                    // 探不到就当它还在——误关弹窗比让它多留一会儿糟
+                }
+                if (!still) {
+                    ui.post(() -> {
+                        if (d.isShowing()) {
+                            d.dismiss();
+                            if (approvalDlg == d) { approvalDlg = null; }
+                            say2("这条审批已经结束了");
+                        }
+                    });
+                } else {
+                    watchApprovalGone(rid, d);
+                }
+            });
+        }, 1500);
+    }
+
+    private void sendApproval(String rid, boolean allow, android.app.AlertDialog d) {
+        final String base = Prefs.baseUrl(this);
+        final Net.Auth auth = Net.auth(this);
+        urgent.execute(() -> {
+            String err = "";
+            try {
+                Net.respond(base, auth, rid, allow);
+            } catch (Exception e) {
+                err = e.getMessage() == null ? "回应没送到" : e.getMessage();
+            }
+            final String msg = err;
+            ui.post(() -> {
+                if (msg.isEmpty()) {
+                    say2(allow ? "已允许" : "已拒绝");
+                    d.dismiss();
+                    if (approvalDlg == d) { approvalDlg = null; }
+                } else {
+                    // 多半是「这条已经超时结束了」——说清，别让主人以为没生效。
+                    // 仍然要关掉弹窗：留着一条已经点不动的框在屏幕上没意义。
+                    say2("回应没生效：" + msg);
+                    d.dismiss();
+                    if (approvalDlg == d) { approvalDlg = null; }
+                }
+            });
+        });
     }
 
     // ---------------- 控电脑 ----------------
