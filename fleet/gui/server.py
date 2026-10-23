@@ -37,6 +37,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+from .. import device_auth as DEVAUTH
 from .. import pair as PAIR
 from .. import pairtls as PTLS
 from ..catalog import build
@@ -47,6 +48,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 UI_DIR = os.path.join(ROOT, "ui")
 TOKEN_HEADER = "X-Fleet-Token"
 SESSION_HEADER = "X-Fleet-Session"
+#: 长期设备凭据（配对换来的）。与上面两个不是一回事：
+#:   X-Fleet-Token   —— 本窗口现生成，重启即失效（联调/本机网页用）
+#:   X-Fleet-Session —— 被控侧信箱发的会话令牌（另一条 TLS 通道用）
+#:   X-Fleet-Device  —— 配对一次长期有效（手机用这个，重启不用重新抄令牌）
+DEVICE_HEADER = "X-Fleet-Device"
 PERSONA_PATH = os.environ.get(
     "FLEET_PERSONA", os.path.join(ROOT, "persona_state.json"))
 
@@ -117,6 +123,62 @@ def chat_gate(cap, dev, args, level):
 
 # ------------------------------------------------------------------ 服务
 
+def _hdrsafe(v):
+    """把任意文本变成合法的 HTTP 头值。
+
+    🔴 血泪：头只能装 latin-1。角色卡 id 是中文时，`send_header` 会抛
+    `UnicodeEncodeError: 'latin-1' codec can't encode ...` —— 而那一刻
+    响应头已经写了一部分，客户端看到的是「unexpected end of stream」。
+    现象是「语音有时候不出声」，日志里也只是一串断在 send_header 的栈，
+    完全看不出根因是中文。这里按 RFC 3986 百分号编码，ASCII 原样保留。
+    """
+    s = str(v or "")
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if 32 <= o < 127:
+            out.append(ch)
+        else:
+            out.extend("%%%02X" % b for b in ch.encode("utf-8"))
+    return "".join(out)
+
+
+def _fold_history(history, prompt, max_turns=6, max_chars=4000):
+    """把多轮历史折成一段可读的前缀。
+
+    取**最近** max_turns 轮（越近越相关，早期的最没价值），再按总字数截断——
+    否则聊上二十轮，prompt 会膨胀到后端拒收。截断从最老的开始丢，
+    丢完还要保证最后一条是「本轮问题」，不能让历史把问题挤掉。
+    """
+    if not isinstance(history, list) or not history:
+        return prompt
+    rows = []
+    for h in history[-max_turns * 2:]:
+        if not isinstance(h, dict):
+            continue
+        role = str(h.get("role") or "").strip()
+        text = str(h.get("content") or h.get("text") or "").strip()
+        if not text:
+            continue
+        if role == "assistant":
+            rows.append(("它", text))
+        elif role in ("user", "me"):
+            rows.append(("我", text))
+    if not rows:
+        return prompt
+    # 从老到新累加，超预算就把最老的丢掉
+    while rows and sum(len(t) for _, t in rows) > max_chars:
+        rows.pop(0)
+    if not rows:
+        return prompt
+    lines = ["[之前的对话，按时间顺序]"]
+    for who, t in rows:
+        lines.append("%s：%s" % (who, t.replace("\n", " ")[:600]))
+    lines.append("[本轮]")
+    lines.append(prompt)
+    return "\n".join(lines)
+
+
 class FleetServer:
     """本机 GUI 后端。构造即生成 token；start() 之后端口才定下来。"""
 
@@ -160,6 +222,12 @@ class FleetServer:
         # /api/remote/*——GUI 主循环仍只绑 127.0.0.1，两边的攻击面不互通。
         self.mailbox = PAIR.PairingMailbox(name=socket.gethostname(),
                                            journal=evidence_journal)
+        # ---- 设备凭据库：配对一次、长期免令牌 ----
+        # 与上面的信箱分工不同，别混：
+        #   信箱（mailbox）  = 「谁在控我」的会话，进程内，重启即清空；
+        #   凭据库（devices）= 「这台设备被允许进门」的事实，落盘，重启仍在。
+        # 手机走的是后者——主人要的是「配对完就不用再配」，不是「每次开机重配」。
+        self.devices = DEVAUTH.DeviceVault(name=socket.gethostname())
         self.pair_httpd = None
         self.pair_tls = None          # {cert, key, fp, dir}
         self.pair_beacon = None
@@ -349,15 +417,21 @@ class FleetServer:
                            "at": time.time()})
         return r.as_dict()
 
-    def chat(self, prompt, backends=""):
+    def chat(self, prompt, backends="", history=None):
         """对话：走 registry.call('ai.chat')，带 _on_line 回调。
 
         backends：逗号分隔的后端白名单（空 = 全部后端，跟以前一样）。
         手机语音一次只念一句，多后端一起回会串台，所以手机端固定传一个。
 
+        history：之前的来回 [{role, content}, ...]。**为什么折进 prompt 而不是
+        传 messages 数组**：ai.chat 下面挂着十几个后端，绝大多数只吃单条 prompt，
+        在这一层改成 messages 会让所有适配器一起崩。折成带标记的转写，
+        语义等价、零回归，代价是历史也算进 prompt 的 token。
+
         reg.call 是阻塞的（生成完才返回），所以这里在**工作线程**里跑它，
         把 _on_line 收到的行推进队列；调用方（HTTP 线程）从队列取，边收边写 SSE。
         """
+        prompt = _fold_history(history, prompt)
         system = self.persona.system_prompt(prompt)
         q = queue.Queue()
 
@@ -425,21 +499,45 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError("请求体必须是 JSON 对象")
         return obj
 
-    def _authorized(self):
-        """校验 X-Fleet-Token。
+    def _authorized(self, gui_only=False):
+        """校验请求凭据。两种都认，但有先后：
 
-        401 = 压根没带凭据；403 = 带了但不是本次启动发的那枚。
-        分开是为了让「调用方忘了加头」和「有人拿着旧令牌来敲」在日志里
-        长得不一样——这两种事的处置不一样（前者是 bug，后者是可疑行为）。
-        比对一律走 secrets.compare_digest（常数时间，防时序侧信道）。
+          1. `X-Fleet-Token`  —— 本窗口注入的一次性令牌（本机网页、联调脚本）
+          2. `X-Fleet-Device` —— 配对换来的长期设备凭据（手机走这条）
+
+        为什么必须加第 2 条：令牌每次启动都重新随机，只活内存。电脑一重启
+        手机就 403 —— 这不是主人用错了，是设计缺陷。配对一次就该一直能用，
+        撤销由主人单方面决定，不该由「电脑重启了」决定。
+
+        401 = 压根没带凭据；403 = 带了但对不上（旧令牌/已撤销设备/伪造）。
+        分开是为了在日志里区分「调用方忘了加头」（bug）和「有人拿旧凭据来敲」
+        （可疑行为）。比对一律 secrets.compare_digest，防时序侧信道。
         """
+        self._device = None
         got = self.headers.get(TOKEN_HEADER) or ""
-        if not got:
-            return False, 401, (f"缺少 {TOKEN_HEADER} 头："
-                                "这个服务只认本窗口启动时注入的令牌")
-        if not secrets.compare_digest(got, self.fleet.token):
+        if got:
+            if secrets.compare_digest(got, self.fleet.token):
+                return True, 200, ""
             return False, 403, "令牌不对：不是本次启动注入的那枚"
-        return True, 200, ""
+
+        raw = self.headers.get(DEVICE_HEADER) or ""
+        if raw:
+            if gui_only:
+                # 管理类接口（读配对码/撤销设备）只认本机令牌：
+                # 否则任意一台已配对设备就能替主人发新码、踢别人。
+                return False, 403, f"{DEVICE_HEADER} 不行：这个接口只认本机令牌"
+            pair = DEVAUTH.parse_header(raw)
+            if not pair:
+                return False, 403, (f"{DEVICE_HEADER} 格式不对"
+                                    "（应为 dev-xxx:fw_yyy）")
+            dev = self.fleet.devices.verify(*pair)
+            if dev is None:
+                return False, 403, "设备凭据无效（没配对、已被撤销，或是伪造的）"
+            self._device = dev
+            return True, 200, ""
+
+        return False, 401, (f"没带凭据：这台设备还没配对。电脑上点「生成配对码」，"
+                            f"手机里输入那 6 位即可（之后长期有效，不用再配）")
 
     # ---------------- 路由 ----------------
 
@@ -601,6 +699,19 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _pair_api(self, path):
         f = self.fleet
+        # ---- 长期设备凭据（手机端配对走这组）----
+        # 码本身**没有任何接口吐出来**：只能从电脑屏幕上肉眼抄。
+        # 码一旦能通过网络读，配对就退化成「谁先连上谁赢」。
+        if path == "/api/pair/claim":
+            return self._post_pair_claim()
+        if path == "/api/pair/me":
+            return self._get_pair_me()
+        if path == "/api/pair/devices":
+            return self._get_pair_devices()
+        if path == "/api/pair/code":
+            return self._post_pair_new_code()
+        if path == "/api/pair/devices/revoke":
+            return self._post_pair_revoke_device()
         if path == "/api/pair/state":
             return self._json({"ok": True, "enabled": f.mailbox.enabled,
                                "name": f.mailbox.name})
@@ -613,6 +724,74 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/remote/"):
             return self._post_remote(path[len("/api/remote/"):])
         self._err(404, f"没有这个接口: {path}")
+
+    # ---------------- 长期设备凭据 ----------------
+
+    def _post_pair_claim(self):
+        """设备持 6 位码换长期凭据。成功一次后这台设备不用再配。"""
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._err(400, str(e))
+        r = self.fleet.devices.claim(
+            body.get("code") or "",
+            name=body.get("name") or body.get("device") or "",
+            platform=body.get("platform") or "")
+        if not r.get("ok"):
+            # 401 而不是 400：语义是「凭据不足」，客户端据此提示重新配对
+            return self._err(401, r.get("err") or "配对失败")
+        return self._json({"ok": True, "device_id": r["device_id"],
+                           "secret": r["secret"], "device": r.get("device"),
+                           "host": socket.gethostname()})
+
+    def _get_pair_me(self):
+        """带设备凭据来问「我配对的那台电脑现在怎么样」。"""
+        d = getattr(self, "_device", None)
+        if not d:
+            ok, code, why = self._authorized()
+            if not ok:
+                return self._err(code, why)
+            d = self._device
+        f = self.fleet
+        return self._json({"ok": True, "device": d, "host": socket.gethostname(),
+                           "caps": len(f.registry.capabilities()),
+                           "devices": len(f.registry.devices())})
+
+    def _get_pair_devices(self):
+        """【本机】配对码状态 + 已配对设备清单。GUI 设置页读这个。"""
+        ok, code, why = self._authorized(gui_only=True)
+        if not ok:
+            return self._err(code, why)
+        f = self.fleet
+        return self._json({"ok": True, "host": socket.gethostname(),
+                           "code": f.devices.current_code(),
+                           "code_state": f.devices.code_state(),
+                           "devices": f.devices.list()})
+
+    def _post_pair_new_code(self):
+        ok, code, why = self._authorized(gui_only=True)
+        if not ok:
+            return self._err(code, why)
+        c = self.fleet.devices.new_code()
+        return self._json({"ok": True, "code": c,
+                           "code_state": self.fleet.devices.code_state()})
+
+    def _post_pair_revoke_device(self):
+        ok, code, why = self._authorized(gui_only=True)
+        if not ok:
+            return self._err(code, why)
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._err(400, str(e))
+        if body.get("all"):
+            n = self.fleet.devices.revoke_all()
+            return self._json({"ok": True, "revoked": n})
+        did = body.get("device_id") or ""
+        if not did:
+            return self._err(400, "要指明 device_id（或传 all=true 全掐）")
+        self.fleet.devices.revoke(did)
+        return self._json({"ok": True, "revoked": 1})
 
     def _post_pair(self):
         try:
@@ -1619,9 +1798,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Voice-Backend", backend or "")
-        self.send_header("X-Voice-Format", ctype.split("/")[-1])
-        self.send_header("X-Voice-Card", card_id or "")
+        self.send_header("X-Voice-Backend", _hdrsafe(backend))
+        self.send_header("X-Voice-Format", _hdrsafe(ctype.split("/")[-1]))
+        self.send_header("X-Voice-Card", _hdrsafe(card_id))
         self.end_headers()
         self.wfile.write(data)
 
@@ -1631,7 +1810,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._err(400, "缺少 prompt（或 prompt 是空的）")
         # backends 不传 = 空 = 全部后端（零回归）；传了就只走那几个。
         backends = (body.get("backends") or "").strip()
-        q = self.fleet.chat(prompt, backends)
+        # 多轮：手机/网页可以带上前几轮，这里只做透传，折叠在 Fleet.chat 里做
+        # （放那儿是因为「怎么折」是对话层的事，不是 HTTP 层的事）。
+        hist = body.get("history")
+        q = self.fleet.chat(prompt, backends, history=hist)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

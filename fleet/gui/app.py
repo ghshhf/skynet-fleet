@@ -123,6 +123,18 @@ def main(argv=None):
     print(f"[fleet-gui] 本地服务已起：{srv.base_url}", flush=True)
     print(f"[fleet-gui] 页面地址（片段里是一次性令牌）：{url}", flush=True)
 
+    # 配对码：屏幕上抄给手机用的那 6 位。**只有这一处**能拿到它——
+    # HTTP 里没有任何接口会吐（能通过网络读的码等于没有码）。
+    # 一次配对之后手机拿的是长期设备凭据，电脑重启也不用重配。
+    try:
+        code = srv.devices.new_code()
+        print(f"[fleet-gui] 配对码 {code}（5 分钟内有效）——手机：天网 → 设置 → 配对",
+              flush=True)
+        print("[fleet-gui] 配过对的设备不用再配；要踢掉某台，在网页「编队」页撤销。",
+              flush=True)
+    except Exception as e:                       # 发不出码也要能开窗口
+        print("[fleet-gui] 配对码生成失败：%s: %s" % (type(e).__name__, e), flush=True)
+
     # 文案按模式各说各的：--lan 下还打「只对本机开放」就是在骗人。
     if args.lan:
         print(f"[fleet-gui] --lan：已绑 0.0.0.0:{port}，局域网内可访问。"

@@ -25,6 +25,16 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
+    <!-- 包可见性（Android 11+）：targetSdk 30 起，queryIntentServices 默认
+         什么都查不到——于是"逐个点名试 TTS 引擎"那段永远拿到空列表，
+         表现出来的就是"明明装了小米语音引擎，却一直报没引擎"。
+         这条 queries 就是让它能看见语音引擎。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"

@@ -16,6 +16,7 @@ import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.util.Log;
@@ -24,6 +25,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import org.json.JSONObject;
 
 /**
  * 天网 · 手机原生端主界面。
@@ -49,7 +52,17 @@ public class MainActivity extends Activity {
     private TextView btnImg;
     private TextView btnDev;
     private TextView btnModels;
+    private TextView btnPair;
+    private TextView btnClear;
     private EditText input;
+    private ScrollView chatScroll;
+    private LinearLayout chatList;
+    /** 多轮上下文：只留最近的来回。放在内存里，不落盘——
+     *  这段是「这次会话在聊什么」，不是「主人是谁」。后者属于人格记忆包。 */
+    private final java.util.ArrayList<JSONObject> history = new java.util.ArrayList<>();
+    private static final int HISTORY_MAX = 12;
+    /** 正在流式更新的那个气泡；null = 当前没有在生成的回复。 */
+    private TextView streaming;
 
     private final WavRecorder recorder = new WavRecorder();
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -93,7 +106,13 @@ public class MainActivity extends Activity {
         btnImg = findViewById(R.id.btnImg);
         btnDev = findViewById(R.id.btnDev);
         btnModels = findViewById(R.id.btnModels);
+        btnPair = findViewById(R.id.btnPair);
+        btnClear = findViewById(R.id.btnClear);
         input = findViewById(R.id.input);
+        chatScroll = findViewById(R.id.chatScroll);
+        chatList = findViewById(R.id.chatList);
+        addHint("这上面是对话：在下面的框里打字，或按住大圆说话。\n"
+                + "说的话会留在这儿，往上翻能看到前几轮。");
 
         // 版本号来自 APK 本身（aapt2 link --version-name/--version-code），
         // 不写死在代码里——写死就会出现「代码改了但包没换」还说不清的状况。
@@ -192,6 +211,23 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 startActivity(new Intent(MainActivity.this, ModelActivity.class));
+            }
+        });
+
+        btnPair.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showPairDialog();
+            }
+        });
+
+        btnClear.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                chatList.removeAllViews();
+                history.clear();
+                addHint("清屏了，上下文也一起清了。");
+                say2("清屏了，上下文也一起清了");
             }
         });
 
@@ -330,13 +366,14 @@ public class MainActivity extends Activity {
         }
         say2("识别中…");
         orb.setState(OrbView.THINK);
-        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        final String base = Prefs.baseUrl(this);
+        final Net.Auth auth = Net.auth(this);
         setBusy(true);
         worker.execute(new Runnable() {
             @Override
             public void run() {
                 try {
-                    final String text = Net.recognize(base, token, wav);
+                    final String text = Net.recognize(base, auth, wav);
                     ui.post(new Runnable() {
                         @Override
                         public void run() {
@@ -346,7 +383,6 @@ public class MainActivity extends Activity {
                                 say2("没听清，再说一次？");
                                 return;
                             }
-                            say2("你说：" + text);
                             ask(text);
                         }
                     });
@@ -375,7 +411,6 @@ public class MainActivity extends Activity {
             return;
         }
         input.setText("");
-        say2("你说：" + t);
         ask(t);
     }
 
@@ -385,21 +420,32 @@ public class MainActivity extends Activity {
         stopPlayback();
         setBusy(true);
         orb.setState(OrbView.THINK);
-        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        final String base = Prefs.baseUrl(this);
+        final Net.Auth auth = Net.auth(this);
         final String backend = Prefs.backend(this);
         final StringBuilder acc = new StringBuilder();
+
+        // 先把「我说的」钉到屏幕上，再看它怎么答。
+        // 顺序反了会出现「它答完才看见我问了啥」，很像它答错人。
+        appendMsg(true, prompt);
+        say2("在想…");
+        final TextView bubble = appendMsg(false, "…");
+        streaming = bubble;
 
         worker.execute(new Runnable() {
             @Override
             public void run() {
-                Net.chat(base, token, prompt, backend, new Net.SseCallback() {
+                Net.chat(base, auth, prompt, backend, snapshotHistory(), new Net.SseCallback() {
                     @Override
                     public void onLine(final String text) {
                         acc.append(text);
                         ui.post(new Runnable() {
                             @Override
                             public void run() {
-                                say2("它说：" + acc);
+                                // 直接改气泡文字，不走 say2：字幕只放过程，
+                                // 正文进气泡——两者混用会让一屏信息全废。
+                                bubble.setText(cleanTags(acc.toString()));
+                                scrollToBottom();
                             }
                         });
                     }
@@ -410,7 +456,11 @@ public class MainActivity extends Activity {
                             @Override
                             public void run() {
                                 setBusy(false);
+                                streaming = null;
                                 orb.setState(OrbView.IDLE);
+                                if ("…".contentEquals(bubble.getText())) {
+                                    bubble.setText("（没答上来）");
+                                }
                                 say2("对话失败：" + message);
                             }
                         });
@@ -418,18 +468,30 @@ public class MainActivity extends Activity {
 
                     @Override
                     public void onDone() {
-                        String reply = acc.toString().trim();
+                        String reply = cleanTags(acc.toString().trim());
                         if (reply.isEmpty()) {
                             ui.post(new Runnable() {
                                 @Override
                                 public void run() {
                                     setBusy(false);
+                                    streaming = null;
                                     orb.setState(OrbView.IDLE);
+                                    bubble.setText("（空回复）");
                                     say2("它没说话（空回复）");
                                 }
                             });
                             return;
                         }
+                        // 只有真的答出来了才进上下文：空回复/报错不该污染下一轮
+                        pushHistory(prompt, reply);
+                        streaming = null;
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                bubble.setText(reply);
+                                scrollToBottom();
+                            }
+                        });
                         speak(reply);
                     }
                 });
@@ -442,6 +504,7 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 orb.setState(OrbView.SPEAK);
+                say2("在说…");
             }
         });
         worker.execute(new Runnable() {
@@ -458,6 +521,8 @@ public class MainActivity extends Activity {
                                 public void run() {
                                     setBusy(false);
                                     orb.setState(OrbView.IDLE);
+                                    // 念完把字幕清回空闲：留在"在想…"会让人以为还在跑
+                                    say2(getString(R.string.idle_sub));
                                 }
                             });
                         }
@@ -469,7 +534,7 @@ public class MainActivity extends Activity {
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
-                        say2("它说：" + text + "\n（系统语音不可用，改用电脑合成：" + why + "）");
+                        say2("系统语音不可用，改用电脑合成（" + why + "）");
                     }
                 });
                 speakOnPc(text);
@@ -493,7 +558,8 @@ public class MainActivity extends Activity {
     }
 
     private void speakOnPc(final String text) {
-        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        final String base = Prefs.baseUrl(this);
+        final Net.Auth auth = Net.auth(this);
         worker.execute(new Runnable() {
             @Override
             public void run() {
@@ -501,7 +567,7 @@ public class MainActivity extends Activity {
                 String ext = "wav";
                 String err = null;
                 try {
-                    Net.SayResult r = Net.say(base, token, text);
+                    Net.SayResult r = Net.say(base, auth, text);
                     wav = r.data;
                     ext = r.ext;
                 } catch (Exception e) {
@@ -516,7 +582,7 @@ public class MainActivity extends Activity {
                         if (data == null) {
                             setBusy(false);
                             orb.setState(OrbView.IDLE);
-                            say2("它说：" + text + "\n（合成失败，没出声：" + why + "）");
+                            say2("合成失败，没出声（" + why + "）");
                             return;
                         }
                         play(data, fmt, text);
@@ -595,24 +661,259 @@ public class MainActivity extends Activity {
         Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
     }
 
-    private void probeHealth() {
+    // ---------------- 对话流 ----------------
+
+    /**
+     * 往对话流里加一条。返回那个 TextView，调用方可以继续改文字（流式）。
+     *
+     * 为什么不用 RecyclerView：一屏最多十几条、每次会话清空。
+     * 为这点数据引一个 Adapter + ViewHolder，代价远大于收益。
+     */
+    private TextView appendMsg(boolean mine, String text) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextIsSelectable(true);       // 能选中复制，比"长按整条复制"更顺手
+        t.setTextSize(14f);
+        t.setTextColor(getResources().getColor(R.color.text, getTheme()));
+        t.setLineSpacing(dp(3), 1f);
+        t.setPadding(dp(13), dp(9), dp(13), dp(9));
+        t.setBackgroundResource(mine ? R.drawable.bg_bubble_me
+                                     : R.drawable.bg_bubble_ai);
+        // 限宽用 maxWidth 而不是 LayoutParams.width：
+        // 指定 width 会把气泡拉成一条满宽的色块，左右分边就看不出来了。
+        t.setMaxWidth(dp(300));
+
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        tp.gravity = mine ? android.view.Gravity.END : android.view.Gravity.START;
+        tp.topMargin = dp(6);
+        row.addView(t, tp);
+        chatList.addView(row);
+        scrollToBottom();
+        return t;
+    }
+
+    /**
+     * 去掉流里的后端标签 `[pollinations]`。
+     *
+     * 只在手机端做：电脑上多后端同屏对照需要这个标签，手机上只念一路，
+     * 留着就变成"每句前面挂个方括号"，读起来像乱码。
+     */
+    private static String cleanTags(String s) {
+        if (s == null) { return ""; }
+        return s.replaceAll("\\[[a-z0-9][a-z0-9_.\\-]{0,24}\\]\\s*", "");
+    }
+
+    private int dp(int v) {
+        return (int) (getResources().getDisplayMetrics().density * v);
+    }
+
+    /** 空对话时的一句提示。用暗色居中，不伪装成气泡——
+     *  「没话说」和「它回了这句」必须一眼能分清。 */
+    private void addHint(String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(12f);
+        t.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        t.setGravity(android.view.Gravity.CENTER);
+        t.setPadding(dp(18), dp(20), dp(18), 0);
+        t.setLineSpacing(dp(3), 1f);
+        chatList.addView(t);
+    }
+
+    private void scrollToBottom() {
+        chatScroll.post(new Runnable() {
+            @Override
+            public void run() {
+                chatScroll.fullScroll(View.FOCUS_DOWN);
+            }
+        });
+    }
+
+    /** 记一轮。超过上限从头部丢——上下文是给模型看的，不是档案。 */
+    private void pushHistory(String q, String a) {
+        try {
+            JSONObject u = new JSONObject();
+            u.put("role", "user");
+            u.put("content", q);
+            JSONObject m = new JSONObject();
+            m.put("role", "assistant");
+            m.put("content", a);
+            synchronized (history) {
+                history.add(u);
+                history.add(m);
+                while (history.size() > HISTORY_MAX) {
+                    history.remove(0);
+                }
+            }
+        } catch (org.json.JSONException ignored) { }
+    }
+
+    private org.json.JSONArray snapshotHistory() {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        synchronized (history) {
+            for (JSONObject o : history) { arr.put(o); }
+        }
+        return arr;
+    }
+
+    // ---------------- 配对 ----------------
+
+    /**
+     * 配对：输电脑屏幕上的 6 位码 → 换长期凭据 → 存本地。
+     *
+     * 这是「配一次、之后不再配」的入口。以前这里没有它，只能手抄令牌，
+     * 而令牌每次电脑重启都变——于是天天在救火。
+     */
+    private void showPairDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+
+        final TextView where = new TextView(this);
+        where.setText("电脑：" + Prefs.baseUrl(this)
+                + "\n在电脑网页「编队」页点「生成」，把 6 位码填在下面。");
+        where.setTextSize(12f);
+        where.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        box.addView(where);
+
+        final EditText code = new EditText(this);
+        code.setHint("6 位配对码");
+        code.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        code.setTextSize(20f);
+        code.setLetterSpacing(0.3f);
+        box.addView(code);
+
+        final TextView tip = new TextView(this);
+        tip.setText("配对一次长期有效：电脑重启、换网都不用再配。\n"
+                + "被撤销时才需要重配（电脑网页上能撤销）。");
+        tip.setTextSize(11f);
+        tip.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        box.addView(tip);
+
+        new AlertDialog.Builder(this)
+                .setTitle("配对这台手机")
+                .setView(box)
+                .setPositiveButton("配对", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        doPair(code.getText().toString().trim());
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void doPair(final String code) {
+        if (code.length() != 6) {
+            toast("配对码是 6 位数字");
+            return;
+        }
         final String base = Prefs.baseUrl(this);
-        status.setText("连接 " + base + " …");
-        status.setTextColor(Color.parseColor("#8B949E"));
+        final String name = Prefs.deviceName(this);
+        say2("正在配对…");
         worker.execute(new Runnable() {
             @Override
             public void run() {
-                final String r = Net.health(base);
+                try {
+                    final JSONObject r = Net.claim(base, code, name, "android");
+                    Prefs.saveDevice(MainActivity.this, r.optString("device_id"),
+                            r.optString("secret"), name);
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            say2("配对成功，以后不用再配了");
+                            toast("配对成功：" + name);
+                            // 配完不留旧令牌：留着反而以后分不清是哪把钥匙在生效
+                            Prefs.save(MainActivity.this, Prefs.baseUrl(MainActivity.this),
+                                    "", Prefs.backend(MainActivity.this));
+                            probeHealth();
+                        }
+                    });
+                } catch (final Exception e) {
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            say2("配对失败：" + e.getMessage());
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    private void showDeviceToken() {
+        if (!Prefs.paired(this)) {
+            toast("还没配对，没有本机令牌");
+            return;
+        }
+        final String token = Prefs.deviceId(this) + ":" + Prefs.deviceSecret(this);
+        new AlertDialog.Builder(this)
+                .setTitle("本机设备令牌")
+                .setMessage(Prefs.deviceName(this) + "\n" + Prefs.deviceId(this)
+                        + "\n\n这是这台手机在电脑上的身份证。别的端要连这台手机时用它；"
+                        + "丢掉不要紧，重新配对一次就换新的。")
+                .setPositiveButton("复制", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        android.content.ClipboardManager cm =
+                                (android.content.ClipboardManager)
+                                        getSystemService(CLIPBOARD_SERVICE);
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText(
+                                "fleet-device", token));
+                        toast("已复制（dev-id:secret）");
+                    }
+                })
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    private void probeHealth() {
+        final String base = Prefs.baseUrl(this);
+        final boolean paired = Prefs.paired(this);
+        status.setText((paired ? "核对 " : "连接 ") + base + " …");
+        status.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                String line;
+                int color;
+                if (!paired) {
+                    // 没配对时只探活（/api/health 不要鉴权），
+                    // 能不能干活还得配对——所以这里不许写「已连上」了事。
+                    String r = Net.health(base);
+                    if (r == null) {
+                        line = "连不上 " + base;
+                        color = R.color.alert;
+                    } else {
+                        line = "电脑在，但这台没配对";
+                        color = R.color.think;
+                    }
+                } else {
+                    try {
+                        JSONObject m = Net.me(base, Net.auth(MainActivity.this));
+                        String host = m.optString("host", "");
+                        line = "已配对 " + (host.isEmpty() ? "" : "· " + host);
+                        color = R.color.listen;
+                    } catch (Exception e) {
+                        line = "凭据失效：" + e.getMessage();
+                        color = R.color.alert;
+                    }
+                }
+                final String fLine = line;
+                final int fColor = color;
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
-                        if (r == null) {
-                            status.setText("连不上 " + base);
-                            status.setTextColor(Color.parseColor("#DA3633"));
-                        } else {
-                            status.setText("已连上 " + base);
-                            status.setTextColor(Color.parseColor("#3FB950"));
-                        }
+                        status.setText(fLine);
+                        status.setTextColor(getResources().getColor(fColor, getTheme()));
                     }
                 });
             }
@@ -625,33 +926,76 @@ public class MainActivity extends Activity {
         int pad = (int) (getResources().getDisplayMetrics().density * 20);
         box.setPadding(pad, pad / 2, pad, 0);
 
+        // ---- ① 连哪台电脑 ----
         final EditText eBase = new EditText(this);
         eBase.setHint("后端地址，例如 http://127.0.0.1:8000");
         eBase.setText(Prefs.baseUrl(this));
         eBase.setTextSize(13);
         box.addView(eBase);
 
-        final EditText eToken = new EditText(this);
-        eToken.setHint("令牌（电脑上 --link 打印的那枚）");
-        eToken.setText(Prefs.token(this));
-        eToken.setTextSize(13);
-        box.addView(eToken);
+        // ---- ② 配对状态 ----
+        final TextView st = new TextView(this);
+        st.setTextSize(13);
+        st.setPadding(0, dp(10), 0, dp(4));
+        st.setText(Prefs.paired(this)
+                ? "配对：✔ " + Prefs.deviceName(this) + "（" + Prefs.deviceId(this) + "）"
+                : "配对：✘ 还没配对，现在发不了请求");
+        st.setTextColor(getResources().getColor(
+                Prefs.paired(this) ? R.color.listen : R.color.think, getTheme()));
+        box.addView(st);
 
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        TextView bPair = chip("配对 / 重配", R.color.accent);
+        bPair.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showPairDialog(); }
+        });
+        row.addView(bPair);
+        TextView bTok = chip("本机令牌", R.color.text_dim);
+        bTok.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showDeviceToken(); }
+        });
+        row.addView(bTok);
+        TextView bForget = chip("解除配对", R.color.alert);
+        bForget.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                Prefs.clearDevice(MainActivity.this);
+                st.setText("配对：✘ 已解除（电脑那边还留着记录，网页上可撤销）");
+                st.setTextColor(getResources().getColor(R.color.think, getTheme()));
+                probeHealth();
+            }
+        });
+        row.addView(bForget);
+        box.addView(row);
+
+        // ---- ③ 后端 ----
         final EditText eBackend = new EditText(this);
         eBackend.setHint("AI 后端（默认 pollinations；留空=全部）");
         eBackend.setText(Prefs.backend(this));
         eBackend.setTextSize(13);
         box.addView(eBackend);
 
+        // ---- ④ 老令牌：只当兜底 ----
+        final EditText eToken = new EditText(this);
+        eToken.setHint("老令牌（一般留空，配对后不需要）");
+        eToken.setText(Prefs.token(this));
+        eToken.setTextSize(13);
+        box.addView(eToken);
+
         TextView tip = new TextView(this);
         tip.setText("隧道模式（默认，推荐）\n"
                 + "  电脑：python fleet_gui.py --link\n"
-                + "  这里填 http://127.0.0.1:8000 + 电脑上打印的令牌\n\n"
-                + "局域网模式（不想插线时才用）\n"
-                + "  电脑：set FLEET_GUI_TOKEN=xxx 然后 python fleet_gui.py --lan\n"
-                + "  这里填 http://<电脑IP>:8000 + 上面那串令牌");
+                + "  这里填 http://127.0.0.1:8000，然后点「配对」输 6 位码\n\n"
+                + "局域网模式\n"
+                + "  电脑：python fleet_gui.py --lan（要先设 FLEET_GUI_TOKEN）\n"
+                + "  这里填 http://<电脑IP>:8000，同样用 6 位码配对\n\n"
+                + "令牌那一栏只在配不上对、或是很老的电脑端时才用。");
         tip.setTextSize(11);
-        tip.setTextColor(Color.parseColor("#8B949E"));
+        tip.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        tip.setPadding(0, dp(8), 0, 0);
         box.addView(tip);
 
         new AlertDialog.Builder(this)
@@ -668,7 +1012,32 @@ public class MainActivity extends Activity {
                     }
                 })
                 .setNegativeButton("取消", null)
+                .setNeutralButton("配对", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        Prefs.save(MainActivity.this, eBase.getText().toString(),
+                                eToken.getText().toString(),
+                                eBackend.getText().toString());
+                        showPairDialog();
+                    }
+                })
                 .show();
+    }
+
+    /** 设置弹窗里的小按钮。AlertDialog 里塞真 Button 会把布局撑开，用 TextView 更像胶囊。 */
+    private TextView chip(String text, int colorRes) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(12f);
+        t.setPadding(dp(12), dp(7), dp(12), dp(7));
+        t.setBackgroundResource(R.drawable.bg_chip);
+        t.setTextColor(getResources().getColor(colorRes, getTheme()));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.rightMargin = dp(8);
+        t.setLayoutParams(lp);
+        return t;
     }
 
     @Override
@@ -698,7 +1067,8 @@ public class MainActivity extends Activity {
      * 这比“只能点无参的”诚实，也比现在就堆一堆表单现实。
      */
     private void showPcPanel() {
-        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        final String base = Prefs.baseUrl(this);
+        final Net.Auth auth = Net.auth(this);
         say2("正在从电脑拉能力清单…");
         worker.execute(new Runnable() {
             @Override
@@ -706,7 +1076,7 @@ public class MainActivity extends Activity {
                 org.json.JSONArray rows = null;
                 String err = null;
                 try {
-                    org.json.JSONObject o = Net.caps(base, token);
+                    org.json.JSONObject o = Net.caps(base, auth);
                     rows = o.optJSONArray("caps");
                 } catch (Exception e) {
                     err = e.getMessage();
@@ -793,7 +1163,8 @@ public class MainActivity extends Activity {
     }
 
     private void runOnPc(final String cap, final org.json.JSONObject args) {
-        final String base = Prefs.baseUrl(this), token = Prefs.token(this);
+        final String base = Prefs.baseUrl(this);
+        final Net.Auth auth = Net.auth(this);
         setBusy(true);
         say2("让电脑做：" + cap + "\n（要审批的话在电脑上点确认…）");
         worker.execute(new Runnable() {
@@ -801,7 +1172,7 @@ public class MainActivity extends Activity {
             public void run() {
                 String text;
                 try {
-                    org.json.JSONObject r = Net.call(base, token, cap, args);
+                    org.json.JSONObject r = Net.call(base, auth, cap, args);
                     boolean ok = r.optBoolean("ok");
                     String out = ok ? r.optString("err", "") : r.optString("err", "");
                     String data = r.isNull("data") ? "" : String.valueOf(r.opt("data"));
