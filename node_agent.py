@@ -75,7 +75,8 @@ def _send_wait(s, msg, timeout=20):
 
 def run_node(host, port, name, password, platform="windows",
              caps=None, sandbox="sandbox_node", bg=False, cap_req=None, session=False,
-             models=None, gpu=False, ram_gb=0, relay_port=None):
+             models=None, gpu=False, ram_gb=0, relay_port=None, relay_lan=False,
+             relay_token=""):
     caps = caps or ["exec", "push", "pull"]
     if isinstance(caps, str):
         caps = caps.split(",")
@@ -83,13 +84,16 @@ def run_node(host, port, name, password, platform="windows",
     relay = None
     if relay_port:
         try:
-            relay = get_relay()
-            relay.host = "127.0.0.1"
+            bind_host = "0.0.0.0" if relay_lan else "127.0.0.1"
+            relay = get_relay(host=bind_host, token=relay_token)
             relay.port = int(relay_port)
-            actual = relay.start()
+            actual = relay.start(host=bind_host, token=relay_token)
             if "skynet.relay" not in caps:
                 caps.append("skynet.relay")
-            print(f"[{name}] SkyNet relay 已启动 127.0.0.1:{actual}（skynet.relay 能力已上报）", flush=True)
+            if relay_lan:
+                print(f"[{name}] SkyNet relay 已启动 {bind_host}:{actual}（--lan，需 token；skynet.relay 能力已上报）", flush=True)
+            else:
+                print(f"[{name}] SkyNet relay 已启动 127.0.0.1:{actual}（skynet.relay 能力已上报）", flush=True)
         except Exception as e:
             print(f"[{name}] SkyNet relay 启动失败（不影响上线）：{type(e).__name__}: {e}", flush=True)
             relay = None
@@ -542,6 +546,10 @@ def main():
     ap.add_argument("--ram", type=int, default=0, help="本节点内存 GB（路由参考）")
     ap.add_argument("--relay-port", type=int, default=None,
                     help="启动 SkyNet relay 并监听此端口（供他机经端口转发取页）")
+    ap.add_argument("--lan", action="store_true",
+                    help="relay 绑 0.0.0.0（局域网其他节点可借本机出口）；必须配 --relay-token")
+    ap.add_argument("--relay-token", default=os.environ.get("FLEET_RELAY_TOKEN", ""),
+                    help="--lan 模式下的共享 token，拦住局域网误连/扫描")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
@@ -550,7 +558,8 @@ def main():
         raise SystemExit("--name 必填（或使用 --selftest）")
     run_node(args.host, args.port, args.name, args.password, args.platform,
              args.caps, args.sandbox, bg=False, cap_req=args.cap_req, session=args.session,
-             models=args.models, gpu=args.gpu, ram_gb=args.ram, relay_port=args.relay_port)
+             models=args.models, gpu=args.gpu, ram_gb=args.ram, relay_port=args.relay_port,
+             relay_lan=args.lan, relay_token=args.relay_token)
 
 
 if __name__ == "__main__":
