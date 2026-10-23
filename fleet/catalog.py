@@ -90,6 +90,9 @@ CAPABILITIES = [
     Capability("radio.wifi.link", "当前 WiFi 链路实况（频段/信道/速率/RSSI）"),
     Capability("radio.cell", "蜂窝驻留频段与信号（双卡各一条）",
                note="频段由 ARFCN 换算频率后按 3GPP 区间反推，不是直读"),
+    Capability("thermal.read", "热状态体检（温度/节流线/各簇频率/电池/内存）",
+               note="手机被动散热，SOC 到 85℃ 就压频，同一套参数 tg 会从 50 掉到 30；"
+                    "「怎么突然慢了」不查它一定答错。降频是启发式推断，非直读标志位"),
     # ---- 手机：动 ----
     Capability("app.launch", "启动手机应用（带前台核验）",
                params=(Param("target", "str", True, "包名/activity/action/URI"),

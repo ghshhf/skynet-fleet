@@ -13,6 +13,7 @@ import infrared
 import phone_ops as O
 import phone_state as PS
 import radio as RADIO
+import thermal as THERMAL
 from ..core import BaseDevice, DeviceResult as R
 
 KEYMAP = {"back": 4, "home": 3, "enter": 66, "menu": 82, "power": 26,
@@ -54,7 +55,10 @@ class AndroidPhone(BaseDevice):
                 # 射频层：这台手机是编队里唯一有「天线」的设备。
                 # 电脑的无线网卡被自己开的移动热点占满、也不再扫周边 AP，
                 # 蜂窝频段电脑连基带都没有——这两件事只能下放给手机干。
-                "radio.wifi.survey", "radio.wifi.link", "radio.cell")
+                "radio.wifi.survey", "radio.wifi.link", "radio.cell",
+                # 热状态：算力节点最该被看见的东西。手机被动散热，SOC 到 85℃ 就压频，
+                # 同一套参数 tg 能从 50 掉到 30。「怎么突然慢了」不查它一定答错。
+                "thermal.read")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -204,6 +208,14 @@ class AndroidPhone(BaseDevice):
                 "subs": r["subs"], "count": r["count"],
                 "note": "频段由 ARFCN 换算频率后按 3GPP 区间反推，"
                         "不是直读——这台 ROM 的 dumpsys 不给 mBands"})
+
+        if cap == "thermal.read":
+            r = THERMAL.read(s)
+            if not r.get("ok"):
+                return R.unavailable(cap, r.get("err") or "读不到热状态",
+                                     device=self.name, via=self.via)
+            return R.success(cap, self.name, via=self.via,
+                             data={k: v for k, v in r.items() if k != "ok"})
 
         if cap == "ir.send":
             proto = (args.get("protocol") or "nec").lower()

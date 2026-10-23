@@ -53,6 +53,7 @@ public class MainActivity extends Activity {
     private TextView btnDev;
     private TextView btnModels;
     private TextView btnRadio;
+    private TextView btnThermal;
     private TextView btnPair;
     private TextView btnClear;
     private EditText input;
@@ -108,6 +109,7 @@ public class MainActivity extends Activity {
         btnDev = findViewById(R.id.btnDev);
         btnModels = findViewById(R.id.btnModels);
         btnRadio = findViewById(R.id.btnRadio);
+        btnThermal = findViewById(R.id.btnThermal);
         btnPair = findViewById(R.id.btnPair);
         btnClear = findViewById(R.id.btnClear);
         input = findViewById(R.id.input);
@@ -220,6 +222,13 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 scanRadio();
+            }
+        });
+
+        btnThermal.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                checkThermal();
             }
         });
 
@@ -804,6 +813,95 @@ public class MainActivity extends Activity {
         }
         if (aps.length() > n) {
             sb.append("\n…还有 ").append(aps.length() - n).append(" 个");
+        }
+        return sb.toString();
+    }
+
+    /** 体温：查热状态。手机被动散热，SOC 到 85℃ 就压频——
+     *  「刚才还快，现在怎么慢了」八成就是它，不查就会去乱猜量化/线程数。 */
+    private void checkThermal() {
+        final String base = Prefs.baseUrl(this);
+        if (!Prefs.paired(this)) {
+            addHint("还没配对。先点「配对」换一张长期凭据，再查。");
+            return;
+        }
+        final Net.Auth auth = Net.auth(this);
+        final TextView bubble = appendMsg(false, "正在读热状态…");
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                String text;
+                try {
+                    JSONObject r = Net.call(base, auth, "thermal.read", new JSONObject());
+                    text = renderThermal(r.optJSONObject("data"));
+                } catch (Exception e) {
+                    text = "读热状态失败：" + e.getMessage();
+                }
+                final String out = text;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        bubble.setText(out);
+                        scrollToBottom();
+                    }
+                });
+            }
+        });
+    }
+
+    /** 把 thermal.read 的 data 排成几行。手机是比例字体，不用等宽表。 */
+    private static String renderThermal(JSONObject d) {
+        if (d == null) {
+            return "热状态没有返回数据。";
+        }
+        StringBuilder sb = new StringBuilder();
+        String st = d.optString("thermal_status_name", "?");
+        sb.append("热状态 ").append(st)
+          .append("（").append(d.optString("thermal_status_cn", "")).append("）");
+        JSONObject temps = d.optJSONObject("temps");
+        if (temps != null) {
+            String cpu = temps.optString("CPU", "");
+            String soc = temps.optString("SOC", "");
+            if (cpu.length() > 0) { sb.append("   CPU ").append(cpu).append("℃"); }
+            if (soc.length() > 0) { sb.append("  SOC ").append(soc).append("℃"); }
+        }
+        double head = d.optDouble("cpu_headroom_c", 999);
+        if (head < 900) {
+            sb.append("\n距首档节流线还有 ").append(Math.round(head * 10) / 10.0).append("℃");
+        }
+        JSONObject cpu = d.optJSONObject("cpu");
+        if (cpu != null) {
+            org.json.JSONArray cl = cpu.optJSONArray("clusters");
+            if (cl != null && cl.length() > 0) {
+                sb.append("\n频率 ");
+                for (int i = 0; i < cl.length(); i++) {
+                    JSONObject c = cl.optJSONObject(i);
+                    if (c == null) { continue; }
+                    if (i > 0) { sb.append("  "); }
+                    sb.append("cpu").append(c.optInt("cpu")).append(" ")
+                      .append(c.optInt("cur_mhz")).append("/")
+                      .append(c.optInt("max_mhz")).append("MHz");
+                }
+            }
+        }
+        JSONObject b = d.optJSONObject("battery");
+        if (b != null) {
+            sb.append("\n电池 ").append(b.optInt("level")).append("%  ")
+              .append(b.optDouble("temp_c", 0)).append("℃  ")
+              .append(b.optBoolean("charging") ? "充电中" : "放电中");
+        }
+        JSONObject mem = d.optJSONObject("mem");
+        if (mem != null) {
+            sb.append("\n内存 可用 ").append(mem.optInt("avail_mb")).append("MB / ")
+              .append(mem.optInt("total_mb")).append("MB");
+        }
+        int util = d.optInt("cpu_util_pct", -1);
+        if (util >= 0) {
+            sb.append("   CPU 利用率 ").append(util).append("%");
+        }
+        String verdict = d.optString("verdict", "");
+        if (verdict.length() > 0) {
+            sb.append("\n\n").append(verdict);
         }
         return sb.toString();
     }

@@ -41,7 +41,15 @@ DEVICE_PREFIX = "dev-"
 SECRET_PREFIX = "fw_"
 
 #: 默认库位置。跟着用户走而不是跟着仓库走——换目录跑 GUI 不该丢配对。
-DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".fleet", "devices.json")
+#:
+#: ⚠️ 文件名**必须**和 fleet/catalog.py 的 DEVICES_PATH 区分开。
+#: 曾经两边都指向 ~/.fleet/devices.json：一个是「见过的设备」（kind/via/caps/
+#: first_seen…），一个是「配对凭据」（hash/secret_head/platform），schema 不同、
+#: 各自整文件覆盖。结果对方一落盘就把凭据表抹平，表现是手机端「凭据被拒」，
+#: 而且 _load 只收带 hash 的记录 → 读回来是空库，人会以为配对从来没成功过。
+#: 这类「两个模块抢一个状态文件」的 bug 不会报错，只会安静丢数据，所以在这里
+#: 写死分开，并在 _selftest 里断言两者不相等。
+DEFAULT_PATH = os.path.join(os.path.expanduser("~"), ".fleet", "device_auth.json")
 
 
 # ---------------------------------------------------------------- 工具
@@ -363,6 +371,16 @@ def _selftest():
     chk(parse_header("abc:def") is None, "缺前缀当非法")
     chk(parse_header("dev-x") is None, "缺密钥当非法")
     chk(parse_header(None) is None, "None 当非法")
+
+    # ★ 回归守卫：凭据库和「见过的设备」表必须是两个文件。
+    # 撞在一起时谁后写谁覆盖，凭据会被静默抹掉（真踩过，表现是手机端「凭据被拒」）。
+    try:
+        from .catalog import DEVICES_PATH as _SEEN_PATH
+    except Exception:
+        _SEEN_PATH = ""
+    chk(bool(_SEEN_PATH) and os.path.abspath(DEFAULT_PATH) != os.path.abspath(_SEEN_PATH),
+        "凭据库与设备表不能是同一个文件（DEFAULT_PATH=%s, DEVICES_PATH=%s）"
+        % (DEFAULT_PATH, _SEEN_PATH))
 
     print("\n设备凭据库自测：%d 通过，%d 失败" % (ok, fail))
     return 0 if fail == 0 else 1
