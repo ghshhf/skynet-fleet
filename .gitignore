@@ -71,3 +71,6 @@ tianwang_android/keystore.jks
 tianwang_android/jni/build-sd/
 android_bridge/build/
 android_bridge/keystore.jks
+
+# 测试产物（不进库）
+out/

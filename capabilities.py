@@ -186,6 +186,50 @@ SPECS = {
             {"name": "url", "type": "str", "required": True, "desc": "要取的 URL"},
         ],
     },
+    "phone.node.status": {
+        "title": "手机算力节点现状",
+        "desc": "返回手机上的推理服务是否在跑、装了哪些模型、剩多少内存、有哪些人格包",
+        "params": [],
+    },
+    "memory.pack.list": {
+        "title": "人格记忆包列表",
+        "desc": "列出可用的人格包：每个包的指纹、片数与分层（身份/原则/技能/关系/经历）统计",
+        "params": [],
+    },
+    "memory.pack.render": {
+        "title": "渲染人格为 system prompt",
+        "desc": "把人格包按预算渲染成一段 system prompt；identity 与 value 两层永不被裁掉，"
+                "其余按时间衰减与查询相关度竞争预算",
+        "params": [
+            {"name": "pack", "type": "str", "required": True, "desc": "人格包名"},
+            {"name": "budget", "type": "int", "required": False, "desc": "token 预算，默认 800"},
+            {"name": "query", "type": "str", "required": False, "desc": "相关度查询"},
+        ],
+    },
+    "memory.pack.diff": {
+        "title": "人格包同步差异",
+        "desc": "比对本地人格包与手机上已同步的内容，返回缺几片、多几片、是否已同步",
+        "params": [{"name": "pack", "type": "str", "required": True, "desc": "人格包名"}],
+    },
+    "memory.pack.sync": {
+        "title": "增量下发人格包到手机",
+        "desc": "只把手机缺的分片推过去，推完两端重算 digest 校验；"
+                "写手机磁盘，会改变「手机认为它是谁」",
+        "params": [{"name": "pack", "type": "str", "required": True, "desc": "人格包名"}],
+    },
+    "phone.llm.ask": {
+        "title": "用手机上的人格回答",
+        "desc": "用指定人格包 + 手机上的权重回答一句话。同一份权重换包就换人，"
+                "服务不用重启（实测首字延迟 ~130ms）",
+        "params": [
+            {"name": "ask", "type": "str", "required": True, "desc": "问什么"},
+            {"name": "pack", "type": "str", "required": False, "desc": "人格包名，留空不带人格"},
+            {"name": "n", "type": "int", "required": False, "desc": "最多生成多少 token，默认 160"},
+            {"name": "budget", "type": "int", "required": False, "desc": "记忆渲染预算，默认 800"},
+            {"name": "query", "type": "str", "required": False, "desc": "相关度查询"},
+            {"name": "temp", "type": "float", "required": False, "desc": "温度，默认 0.7"},
+        ],
+    },
 }
 
 # 新名（domain.verb）→ 旧名（扁平）。新增能力在这里登记一行即可，
@@ -207,6 +251,12 @@ ALIASES = {
     "art.put": "artifact.put",
     "art.get": "artifact.get",
     "art.list": "artifact.list",
+    "mem.list": "memory.pack.list",
+    "mem.render": "memory.pack.render",
+    "mem.diff": "memory.pack.diff",
+    "mem.sync": "memory.pack.sync",
+    "phone.status": "phone.node.status",
+    "phone.ask": "phone.llm.ask",
 }
 
 # 旧基线的类型词汇 → 设备层的类型词汇

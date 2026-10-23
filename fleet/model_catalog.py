@@ -59,21 +59,21 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "label": "北极星-V7 Q8_0（中文 LLM，已在你手机上）", "kind": LLM,
         "url": "https://huggingface.co/coqui/artifacts/"
                "resolve/main/beijixing-v7-q8_0.gguf",
-        "size_bytes": 639_000_000, "sampler": None, "cfg": None,
+        "size_bytes": 639_446_720, "sampler": None, "cfg": None,
         "native_size": None, "steps": None,
     },
     "qwen3-vl-4b-instruct-q4_k_m.gguf": {
         "label": "Qwen3-VL-4B-Instruct（4B 多模态 VL）", "kind": VL,
         "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF/"
                "resolve/main/qwen3-vl-4b-instruct-q4_k_m.gguf",
-        "size_bytes": 0, "sampler": None, "cfg": None,
+        "size_bytes": 2_497_281_664, "sampler": None, "cfg": None,
         "native_size": None, "steps": None,
     },
     "mmproj-qwen3vl-4b-instruct-q8_0.gguf": {
         "label": "mmproj-Qwen3VL-4B（视觉投影）", "kind": VL,
         "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF/"
                "resolve/main/mmproj-qwen3vl-4b-instruct-q8_0.gguf",
-        "size_bytes": 0, "sampler": None, "cfg": None,
+        "size_bytes": 453_974_304, "sampler": None, "cfg": None,
         "native_size": None, "steps": None,
     },
 }

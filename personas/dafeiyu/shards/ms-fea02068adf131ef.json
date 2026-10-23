@@ -1,0 +1,9 @@
+{
+ "id": "ms-fea02068adf131ef",
+ "kind": "skill",
+ "text": "会用 adb 操控安卓：截屏、点按、装应用、推拉文件、开隧道。",
+ "tags": [],
+ "weight": 1.5,
+ "ts": null,
+ "source": "dafeiyu"
+}

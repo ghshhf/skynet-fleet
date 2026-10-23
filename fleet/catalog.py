@@ -22,6 +22,7 @@ from .kinds.host import Host
 from .kinds.fleet_node import FleetNode, load_nodes
 from .kinds.internet import Internet
 from .kinds.job_board import JobBoard
+from .kinds.phone_node import PhoneNode
 from .kinds.lan_scanner import LanScanner
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -508,6 +509,33 @@ CAPABILITIES = [
                side_effect=True,
                note="Chub/JanitorAI 等不可程序化拉的源走这条路："
                     "主人自己下好的卡扔进 cards_inbox/，本仓负责体检与入库"),
+    # ---- 手机算力节点（kind=phone_node）：人格在记忆包里，不在权重里 ----
+    Capability("phone.node.status", "看手机算力节点的现状",
+               note="只读：服务是否在跑、装了哪些模型、剩多少内存、有哪些人格包"),
+    Capability("memory.pack.list", "列出可用的人格记忆包",
+               note="只读：每个包的指纹、片数与分层统计"),
+    Capability("memory.pack.render", "把人格包渲染成 system prompt",
+               params=(Param("pack", "str", True, "人格包名，见 memory.pack.list"),
+                       Param("budget", "int", doc="token 预算，默认 800"),
+                       Param("query", "str", doc="相关度查询：命中的经历会被拉进预算")),
+               note="只读：纯本地计算，不碰设备。identity/value 两层永不被预算裁掉"),
+    Capability("memory.pack.diff", "比对本地人格包与手机上已同步的差",
+               params=(Param("pack", "str", True, "人格包名")),
+               note="只读：给增量同步用，只算 id 差集，不传内容"),
+    Capability("memory.pack.sync", "把人格包增量下发到手机",
+               params=(Param("pack", "str", True, "人格包名")),
+               side_effect=True,
+               note="写手机磁盘 = 改「手机认为它是谁」⇒ 要过审批闸门。"
+                    "只传缺的分片（内容寻址），传完两端重算 digest 校验"),
+    Capability("phone.llm.ask", "用指定人格包 + 手机上的权重回答一句话",
+               params=(Param("ask", "str", True, "问什么"),
+                       Param("pack", "str", doc="人格包名，留空 = 不带人格"),
+                       Param("n", "int", doc="最多生成多少 token，默认 160"),
+                       Param("budget", "int", doc="记忆渲染预算，默认 800"),
+                       Param("query", "str", doc="相关度查询，留空用 ask"),
+                       Param("temp", "float", doc="温度，默认 0.7")),
+               side_effect=True,
+               note="占用手机算力。同一份权重要换人格，只换 pack，不用重启服务"),
 ]
 
 
@@ -533,6 +561,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(CardStore())
     reg.add(AudioSynth())
     reg.add(JobBoard())
+    reg.add(PhoneNode())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:
