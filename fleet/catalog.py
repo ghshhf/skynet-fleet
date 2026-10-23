@@ -21,6 +21,7 @@ from .kinds.card_store import CardStore
 from .kinds.host import Host
 from .kinds.fleet_node import FleetNode, load_nodes
 from .kinds.internet import Internet
+from .kinds.job_board import JobBoard
 from .kinds.lan_scanner import LanScanner
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -169,6 +170,42 @@ CAPABILITIES = [
                params=(Param("url", "str", True), Param("dest", "str", True)),
                side_effect=True, check=_skynet_reason,
                note="写本地文件 ⇒ 要过审批闸门。断点续传、落盘按内容去重"),
+    # ---- 作业层：长任务（可排队/可查询/可取消/掉线可迁）----
+    Capability("job.submit", "提交长任务（作业）",
+               params=(Param("cap", "str", True, "要执行的能力名，如 image.gen"),
+                       Param("args", "json", doc="该能力的参数"),
+                       Param("node", "str", doc="指定节点，留空=自动挑"),
+                       Param("max_attempts", "int", doc="最多尝试次数，默认 3"),
+                       Param("note", "str", doc="备注（给自己看）")),
+               side_effect=True,
+               note="写作业账本；手机算力的长任务（出图/视频/LLM 长文）走这里而不是同步调用"),
+    Capability("job.list", "列出作业（按提交时间倒序）",
+               params=(Param("state", "str", doc="按状态过滤：queued/running/done/failed/cancelled"),
+                       Param("limit", "int", doc="最多几条，默认 50"))),
+    Capability("job.get", "查一个作业的详情与状态历史",
+               params=(Param("id", "str", True, "作业 id"),)),
+    Capability("job.cancel", "取消作业（排队中/运行中都可）",
+               params=(Param("id", "str", True, "作业 id"),
+                       Param("reason", "str", doc="取消原因")),
+               side_effect=True,
+               note="终态作业不假装取消成功，会如实说不必取消"),
+    # ---- 产物中心：内容寻址（id 换机器也能引用）----
+    Capability("artifact.put", "收一个产物（文件路径或 base64）",
+               params=(Param("path", "str", doc="本机已有文件路径"),
+                       Param("b64", "str", doc="base64 内容（与 path 二选一）"),
+                       Param("kind", "str", doc="image/video/text/blob…"),
+                       Param("name", "str", doc="显示名，默认取文件名"),
+                       Param("job", "str", doc="关联作业 id"),
+                       Param("source", "str", doc="来源节点名"),
+                       Param("ttl_days", "float", doc="保留天数，0=永久")),
+               side_effect=True,
+               note="内容寻址（sha256 前16位）；同内容不重复存盘"),
+    Capability("artifact.get", "取产物内容（返回 base64）",
+               params=(Param("id", "str", True, "产物 id，形如 art-xxxxxxxxxxxxxxxx"),)),
+    Capability("artifact.list", "列出产物（可按 kind/job 过滤）",
+               params=(Param("kind", "str", doc="按类型过滤"),
+                       Param("job", "str", doc="按作业过滤"),
+                       Param("limit", "int", doc="最多几条，默认 50"))),
     # ---- 跨设备记忆同步（P5c）----
     Capability("fleet.memory.sync", "跨设备记忆同步（导出/导入本节点记忆）",
                params=(Param("op", "str", doc="export(默认) 或 import"),
@@ -492,6 +529,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(Render())
     reg.add(CardStore())
     reg.add(AudioSynth())
+    reg.add(JobBoard())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:
