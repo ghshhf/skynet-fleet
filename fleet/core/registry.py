@@ -381,6 +381,31 @@ class Registry:
         if cap is None:
             return R.DeviceResult.unsupported(cap_name, f"注册表里没有这项能力: {cap_name}")
 
+        # ---- 判定次序（2026-10-23 定，两条门禁同时钉住这个顺序）----
+        # ① 结构：能力在不在 / 有没有设备声明 / 指定设备在不在且支不支持。
+        #    属**调用契约错误**——说错会让上层选错处置（该换设备却去重试）。
+        # ② 策略：审批档 deny / 没注入闸门 ⇒ 拒绝。**安全判定不许被环境状态遮掩**
+        #    —— t14 踩过：「引擎没装」把「没闸门 ⇒ 拒绝」盖成了一句普通失败。
+        # ③ 环境：probe / check_fn。设备在但暂时不可用，才是可重试那一类。
+        # ①②不可能同时命中，故 ① 先走；check() 内部仍会再判一次结构，幂等。
+        if not self.owners(cap_name):
+            return self._failure(cap_name, f"没有任何设备声明能做 {cap_name}", device)
+        if device:
+            _d0 = self.device(device)
+            if _d0 is None:
+                return self._failure(cap_name, f"没有这台设备: {device}", device)
+            if not _d0.supports(cap_name):
+                return self._failure(cap_name, f"{_d0.name} 不支持 {cap_name}", device)
+
+        if cap.approval == "deny":
+            return R.DeviceResult.denied(
+                cap_name, "该能力被审批档设为 deny（fail-closed，数据文件无法覆盖）",
+                device=device or "")
+        if (cap.side_effect or cap.approval == "ask") \
+                and VOICE_SOURCE_KEY not in args and (gate or self.gate) is None:
+            return R.DeviceResult.denied(
+                cap_name, "需要审批闸门（没注入 gate 一律拒绝）", device=device or "")
+
         ok, reason, dev = self.check(cap_name, device)
         if not ok:
             return self._failure(cap_name, reason, device)
