@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  系统开深色时自动生效。名字必须和 values/colors.xml 一一对应，
+  否则漏掉的那个会退回浅色值，在深底上直接看不见。
+-->
+<resources>
+    <color name="bg">#0B0F14</color>
+    <color name="surface">#161B22</color>
+    <color name="surface2">#1F2630</color>
+    <color name="drawer">#10151B</color>
+    <color name="line">#30363D</color>
+    <color name="text">#E6EDF3</color>
+    <color name="text_dim">#8B949E</color>
+    <color name="text_faint">#6E7681</color>
+
+    <color name="accent">#3FD6AC</color>
+    <color name="accent_soft">#12332B</color>
+    <color name="on_accent">#06231C</color>
+
+    <color name="mine_bg">#12314F</color>
+    <color name="mine_line">#1F4E7A</color>
+    <color name="mine_text">#E6EDF3</color>
+
+    <color name="icon">#C9D1D9</color>
+    <color name="orb_idle">#30363D</color>
+    <color name="listen">#3FB950</color>
+    <color name="think">#D29922</color>
+    <color name="alert">#DA3633</color>
+    <color name="scrim">#99000000</color>
+</resources>

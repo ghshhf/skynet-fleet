@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 输入坞：一整块圆角灰面，输入框和按钮都住在里面（参考页就是这么套的）。
+     比逐个按钮描边干净，也让"这里能说话"这件事一眼看得出。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="@color/surface" />
+    <corners android:radius="24dp" />
+</shape>
