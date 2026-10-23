@@ -82,6 +82,14 @@ CAPABILITIES = [
     Capability("state.read", "手机全身状态（电/网/声音/屏/传感器/存储）"),
     Capability("bt.scan", "手机蓝牙扫描",
                params=(Param("secs", "int", doc="扫几秒，默认 8"),)),
+    # ---- 手机：射频（只有手机有的感官） ----
+    Capability("radio.wifi.survey", "扫周边 WiFi 频段（手机当天线）",
+               params=(Param("rounds", "int", doc="扫几轮并集，默认 1"),
+                       Param("settle", "int", doc="扫描后等几秒收结果，默认 7")),
+               note="电脑的射频被自己开的热点占满、不再扫周边 AP，这件事只能手机干"),
+    Capability("radio.wifi.link", "当前 WiFi 链路实况（频段/信道/速率/RSSI）"),
+    Capability("radio.cell", "蜂窝驻留频段与信号（双卡各一条）",
+               note="频段由 ARFCN 换算频率后按 3GPP 区间反推，不是直读"),
     # ---- 手机：动 ----
     Capability("app.launch", "启动手机应用（带前台核验）",
                params=(Param("target", "str", True, "包名/activity/action/URI"),
