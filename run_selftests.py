@@ -42,6 +42,9 @@ CASES = [
     ("infrared", ["infrared.py", "--selftest"], HERE, 30),
     ("radio", ["radio.py", "--selftest"], HERE, 30),
     ("thermal", ["thermal.py", "--selftest"], HERE, 30),
+    # 联网组件：31 项纯离线断言（要不要联网的判定、垃圾结果过滤、HTML 清洗、
+    # 资料拼接）。真联网的活不进门禁 —— 门禁不许依赖外网。
+    ("webtool", ["webtool.py", "--selftest"], HERE, 30),
     ("agent_phone", ["agent_phone.py", "--selftest"], HERE, 60),
     ("survey", ["survey.py", "--selftest"], HERE, 30),
     ("ble", ["ble.py", "--selftest"], HERE, 30),

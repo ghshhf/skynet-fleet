@@ -1333,6 +1333,17 @@
       try { ev = JSON.parse(payload); } catch (e) { return; }
       if (ev.type === "line") {
         if (curBot) { curBot.lines.push(ev.text); renderLines(curBot.txt, curBot.lines); }
+      } else if (ev.type === "web") {
+        // 联网进度。搜索十几秒，不提示的话界面上就是一句话卡着不动。
+        var wd = ev.data || {};
+        if (wd.phase === "searching") {
+          toast("正在联网查…");
+        } else if (wd.used) {
+          var n = (wd.sources && wd.sources.length) || 0;
+          toast("已联网 · 引用了 " + n + " 个来源");
+        } else if (wd.reason) {
+          toast(wd.reason);
+        }
       } else if (ev.type === "error") {
         toast(ev.err || "后端报了错但没给原因", true);
       } else if (ev.type === "done") {

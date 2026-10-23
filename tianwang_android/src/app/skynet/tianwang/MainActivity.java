@@ -13,9 +13,12 @@ import android.os.Looper;
 import android.text.TextUtils;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.animation.DecelerateInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -43,22 +46,48 @@ public class MainActivity extends Activity {
     private static final int REQ_MIC = 41;
 
     private OrbView orb;
-    private TextView status;
+    /** 顶栏副标题：模型名 · 连接状态。原来那行「已配对」合并进来了——
+     *  参考页的副标题就是「当前在跟谁说话」，两行小字没有必要占两条。 */
+    private TextView headerSub;
     private TextView subtitle;
-    private TextView btnMic;
-    private TextView btnSend;
-    private TextView btnSettings;
-    private TextView btnPc;
-    private TextView btnImg;
-    private TextView btnDev;
-    private TextView btnModels;
-    private TextView btnRadio;
-    private TextView btnThermal;
-    private TextView btnPair;
-    private TextView btnClear;
+    private ImageView btnMic;
+    private ImageView btnSend;
+    private ImageView btnAttach;
+    private ImageView btnSpeak;
+    private ImageView btnMenu;
+    private ImageView btnNewChat;
+    private ImageView btnMore;
+    /** 思考开关：关掉能省掉整段内心戏，短问答快很多。 */
+    private TextView chipThink;
+    /** 联网开关（三态循环）。 */
+    private TextView chipWeb;
+    private View scrim;
+    private View drawer;
+    private TextView drawerHistory;
     private EditText input;
     private ScrollView chatScroll;
     private LinearLayout chatList;
+
+    /** 顶栏两段文字。分开放是因为它们刷新时机完全不同：
+     *  模型名只在换模型时变，连接状态每次探活都变。 */
+    private String modelLabel = "";
+    private String connLabel = "未连接";
+    private int connColor = R.color.text_dim;
+    /** 抽屉是否已滑出。用来做返回键与重复点击的判断。 */
+    private boolean drawerOpen;
+    /** 思考模式开关。默认关：这台是 0.6B，开着思考会把 token 全花在推理上。 */
+    private boolean thinking;
+    /** 联网模式：auto（按问题判断）/ on（强制搜）/ off（不联网）。
+     *  默认 auto —— 用户要的是「能联网」，而不是「每条都联网」：
+     *  每句闲聊都等十几秒搜一遍是灾难。 */
+    private String webMode = "auto";
+    /** 这一轮实际引用了哪些网页。搜完就存下来，等回答出来附在气泡末尾。
+     *  为什么不只放状态行：状态行是过程提示，播报一开始就被「在说…」盖掉，
+     *  等播报完又变回空闲提示——人回头想看「它参考了谁」已经没了。
+     *  来源是判断可信度的唯一线索，必须留在一个不会被覆盖的地方。 */
+    private volatile org.json.JSONArray webSrc = null;
+    /** 语音播报开关。默认开，但只有出结果时才会用到。 */
+    private boolean speakOn = true;
     /** 多轮上下文：只留最近的来回。放在内存里，不落盘——
      *  这段是「这次会话在聊什么」，不是「主人是谁」。后者属于人格记忆包。 */
     private final java.util.ArrayList<JSONObject> history = new java.util.ArrayList<>();
@@ -99,24 +128,103 @@ public class MainActivity extends Activity {
         }
 
         orb = findViewById(R.id.orb);
-        status = findViewById(R.id.status);
+        headerSub = findViewById(R.id.subtitle_model);
         subtitle = findViewById(R.id.subtitle);
         btnMic = findViewById(R.id.btnMic);
         btnSend = findViewById(R.id.btnSend);
-        btnSettings = findViewById(R.id.btnSettings);
-        btnPc = findViewById(R.id.btnPc);
-        btnImg = findViewById(R.id.btnImg);
-        btnDev = findViewById(R.id.btnDev);
-        btnModels = findViewById(R.id.btnModels);
-        btnRadio = findViewById(R.id.btnRadio);
-        btnThermal = findViewById(R.id.btnThermal);
-        btnPair = findViewById(R.id.btnPair);
-        btnClear = findViewById(R.id.btnClear);
+        btnAttach = findViewById(R.id.btnAttach);
+        btnSpeak = findViewById(R.id.btnSpeak);
+        btnMenu = findViewById(R.id.btnMenu);
+        btnNewChat = findViewById(R.id.btnNewChat);
+        btnMore = findViewById(R.id.btnMore);
+        chipThink = findViewById(R.id.chipThink);
+        chipWeb = findViewById(R.id.chipWeb);
+        scrim = findViewById(R.id.scrim);
+        drawer = findViewById(R.id.drawer);
+        drawerHistory = findViewById(R.id.drawerHistory);
         input = findViewById(R.id.input);
         chatScroll = findViewById(R.id.chatScroll);
         chatList = findViewById(R.id.chatList);
-        addHint("这上面是对话：在下面的框里打字，或按住大圆说话。\n"
+        addHint("在下面的框里打字，或点麦克风说话。\n"
                 + "说的话会留在这儿，往上翻能看到前几轮。");
+
+        // 抽屉初始藏在屏幕外。不用 DrawerLayout 是因为这个工程没接 AndroidX
+        // （aapt2+javac+d8 手搓），自己滑反而更可控：位移量和时长都在手里。
+        drawer.post(new Runnable() {
+            @Override
+            public void run() {
+                drawer.setTranslationX(-drawer.getWidth());
+            }
+        });
+
+        btnMenu.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { toggleDrawer(); }
+        });
+        scrim.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { closeDrawer(); }
+        });
+        btnNewChat.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { newChat(); }
+        });
+        btnMore.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showMoreMenu(v); }
+        });
+        btnAttach.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showAttachMenu(v); }
+        });
+        btnSpeak.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { toggleSpeak(); }
+        });
+        chipThink.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { toggleThink(); }
+        });
+        chipWeb.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { cycleWeb(); }
+        });
+
+        // ---- 抽屉里那六项。前两项是真的页面，后四项是原有的低频动作，
+        //      从横着滑的胶囊条搬进来：它们本来就不该占顶栏位置。 ----
+        navClick(R.id.navChat, new Runnable() {
+            @Override public void run() { closeDrawer(); }
+        });
+        navClick(R.id.navFleet, new Runnable() {
+            @Override public void run() { closeDrawer(); showPcPanel(); }
+        });
+        navClick(R.id.navModels, new Runnable() {
+            @Override public void run() {
+                closeDrawer();
+                startActivity(new Intent(MainActivity.this, ModelActivity.class));
+            }
+        });
+        navClick(R.id.navBench, new Runnable() {
+            @Override public void run() {
+                closeDrawer();
+                startActivity(new Intent(MainActivity.this, DeviceCheckActivity.class));
+            }
+        });
+        navClick(R.id.navSettings, new Runnable() {
+            @Override public void run() { closeDrawer(); showSettings(); }
+        });
+        navClick(R.id.navAbout, new Runnable() {
+            @Override public void run() { closeDrawer(); showAbout(); }
+        });
+
+        // 副标题的「跟谁说话」这一半：取当前后端名。它不是文件名，
+        // 但比「未连接」有用——出问题时第一句要问的就是走的是哪条路。
+        String bk = Prefs.backend(this);
+        modelLabel = (bk == null || bk.trim().isEmpty()) ? "" : bk.trim();
+        applyThinkUi();
+        applyWebUi();
+        refreshHeaderSub();
+        refreshDrawerHistory();
 
         // 版本号来自 APK 本身（aapt2 link --version-name/--version-code），
         // 不写死在代码里——写死就会出现「代码改了但包没换」还说不清的状况。
@@ -183,71 +291,9 @@ public class MainActivity extends Activity {
             }
         });
 
-        btnPc.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showPcPanel();
-            }
-        });
-
-        btnImg.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startActivity(new Intent(MainActivity.this, ImageActivity.class));
-            }
-        });
-
-        btnDev.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startActivity(new Intent(MainActivity.this, DeviceCheckActivity.class));
-            }
-        });
-
-        btnSettings.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showSettings();
-            }
-        });
-
-        btnModels.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startActivity(new Intent(MainActivity.this, ModelActivity.class));
-            }
-        });
-
-        btnRadio.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                scanRadio();
-            }
-        });
-
-        btnThermal.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                checkThermal();
-            }
-        });
-
-        btnPair.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showPairDialog();
-            }
-        });
-
-        btnClear.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                chatList.removeAllViews();
-                history.clear();
-                addHint("清屏了，上下文也一起清了。");
-                say2("清屏了，上下文也一起清了");
-            }
-        });
+        // 原来这里挂着八颗胶囊的点击绑定（控电脑/出图/检测/模型库/扫频/体温/
+        // 配对/清屏）。现在它们分两处去：高频的进「+」和「更多」，导航的进抽屉。
+        // 语义没变，只是不再全堆在顶栏横着滑。
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
@@ -359,15 +405,17 @@ public class MainActivity extends Activity {
         }
         recording = true;
         orb.setState(OrbView.LISTEN);
-        btnMic.setBackgroundResource(R.drawable.bg_mic_on);
-        btnMic.setText(R.string.mic_active);
-        say2("在听…");
+        // 图标按钮没有文字可改，用「底色变淡绿 + 图标变绿」表示在录。
+        // 双重变化是有意的：只改底色在浅色底上不够显眼，只改图标又看不出"是按钮"。
+        btnMic.setBackgroundResource(R.drawable.bg_touch_on);
+        btnMic.setColorFilter(getResources().getColor(R.color.listen, getTheme()));
+        say2("在听…（松手结束）");
     }
 
     private void stopRecordAndAsk(boolean cancelled) {
         recording = false;
-        btnMic.setBackgroundResource(R.drawable.bg_mic);
-        btnMic.setText(R.string.mic_idle);
+        btnMic.setBackgroundResource(R.drawable.bg_touch);
+        btnMic.clearColorFilter();
         final byte[] wav = recorder.stop();
         orb.setState(OrbView.IDLE);
         if (cancelled) {
@@ -442,6 +490,16 @@ public class MainActivity extends Activity {
         final Net.Auth auth = Net.auth(this);
         final String backend = Prefs.backend(this);
         final StringBuilder acc = new StringBuilder();
+        webSrc = null;          // 新一轮：先把上一轮的来源清掉，免得挂错人
+
+        // 思考开关是**软开关**：不改后端采样参数，只改给模型的指令。
+        // 硬关得让服务端把 chat_template_kwargs.enable_thinking 透传下去，
+        // 那条链要动十几个后端适配器，先不动；这句引导对 Qwen3 这类会吐
+        // 内心戏的模型确实有效（能把「思考>」那一段压掉大半）。
+        // 注意：引导只进这次的请求，不进 history——否则下一轮上下文里全是废话。
+        final String asked = prompt + (thinking
+                ? "\n\n（先在心里把推理理清楚，再给结论；推理过程可以写出来。）"
+                : "\n\n（直接给答案，不要输出思考过程。）");
 
         // 先把「我说的」钉到屏幕上，再看它怎么答。
         // 顺序反了会出现「它答完才看见我问了啥」，很像它答错人。
@@ -453,7 +511,35 @@ public class MainActivity extends Activity {
         worker.execute(new Runnable() {
             @Override
             public void run() {
-                Net.chat(base, auth, prompt, backend, snapshotHistory(), new Net.SseCallback() {
+                Net.chat(base, auth, asked, backend, snapshotHistory(), new Net.SseCallback() {
+                    @Override
+                    public void onWeb(final org.json.JSONObject data) {
+                        // 联网进度。搜索本身就是十几秒的活，不亮状态的话
+                        // 界面上就是一句「在想…」卡着不动，人只会以为死机。
+                        if (data == null) { return; }
+                        final String phase = data.optString("phase", "");
+                        final boolean used = data.optBoolean("used", false);
+                        final String reason = data.optString("reason", "");
+                        org.json.JSONArray srcs = data.optJSONArray("sources");
+                        final int n = srcs == null ? 0 : srcs.length();
+                        if (used && srcs != null) {
+                            webSrc = srcs;      // 留着给 onDone 拼进气泡
+                        }
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if ("searching".equals(phase)) {
+                                    say2("正在联网查…");
+                                } else if (used) {
+                                    say2("已联网 · 引用了 " + n + " 个来源");
+                                } else if ("error".equals(phase)) {
+                                    say2("联网没成功：" + reason);
+                                } else {
+                                    say2("没联网：" + reason);
+                                }
+                            }
+                        });
+                    }
                     @Override
                     public void onLine(final String text) {
                         acc.append(text);
@@ -487,6 +573,9 @@ public class MainActivity extends Activity {
                     @Override
                     public void onDone() {
                         String reply = cleanTags(acc.toString().trim());
+                        // 显示版带来源，进上下文的是纯回答：来源不是「我说过的话」，
+                        // 塞进 history 既撑上下文又会让模型下一轮开始模仿这个格式。
+                        final String shown = withSources(reply);
                         if (reply.isEmpty()) {
                             ui.post(new Runnable() {
                                 @Override
@@ -506,18 +595,48 @@ public class MainActivity extends Activity {
                         ui.post(new Runnable() {
                             @Override
                             public void run() {
-                                bubble.setText(reply);
+                                bubble.setText(shown);
                                 scrollToBottom();
                             }
                         });
                         speak(reply);
                     }
-                });
+                }, webMode);
             }
         });
     }
 
+    /** 在回答末尾附上这一轮参考过的网页。
+     *
+     *  只放「编号 + 标题 + 域名」：手机上贴完整 URL 会把气泡撑成两屏，
+     *  而且这个 TextView 没开 autoLink，长链接只会碍事。
+     *  标题截到 42 字——中文标题常常 60 多字，不截就变成三行。 */
+    private String withSources(String reply) {
+        org.json.JSONArray srcs = webSrc;
+        if (srcs == null || srcs.length() == 0) {
+            return reply;
+        }
+        StringBuilder sb = new StringBuilder(reply);
+        sb.append("\n\n参考来源：");
+        for (int i = 0; i < srcs.length(); i++) {
+            org.json.JSONObject s = srcs.optJSONObject(i);
+            if (s == null) { continue; }
+            String t = s.optString("title", "").trim();
+            String h = s.optString("host", "").trim();
+            if (t.length() > 42) { t = t.substring(0, 42) + "…"; }
+            sb.append("\n[").append(s.optInt("i", i + 1)).append("] ").append(t);
+            if (!h.isEmpty()) { sb.append("（").append(h).append("）"); }
+        }
+        return sb.toString();
+    }
+
     private void speak(final String text) {
+        // 播报关了就别再走一遍合成：合成是有成本的（本地 TTS 要起引擎，
+        // 远端要一次请求），静音状态下算完再丢掉纯属浪费。
+        if (!speakOn) {
+            say2("（播报已关，只显示文字）");
+            return;
+        }
         ui.post(new Runnable() {
             @Override
             public void run() {
@@ -698,7 +817,8 @@ public class MainActivity extends Activity {
         t.setText(text);
         t.setTextIsSelectable(true);       // 能选中复制，比"长按整条复制"更顺手
         t.setTextSize(14f);
-        t.setTextColor(getResources().getColor(R.color.text, getTheme()));
+        // 我说的气泡是淡绿底，正文必须跟着换成深绿——沿用通用正文色在浅绿上对比不够。
+        t.setTextColor(getResources().getColor(mine ? R.color.mine_text : R.color.text, getTheme()));
         t.setLineSpacing(dp(3), 1f);
         t.setPadding(dp(13), dp(9), dp(13), dp(9));
         t.setBackgroundResource(mine ? R.drawable.bg_bubble_me
@@ -727,6 +847,332 @@ public class MainActivity extends Activity {
     private static String cleanTags(String s) {
         if (s == null) { return ""; }
         return s.replaceAll("\\[[a-z0-9][a-z0-9_.\\-]{0,24}\\]\\s*", "");
+    }
+
+    // ---------------- 抽屉 ----------------
+
+    /** 给抽屉里的一项挂点击。id 不存在时静默跳过——布局改版期间不至于整页崩掉。 */
+    private void navClick(int id, final Runnable r) {
+        View v = findViewById(id);
+        if (v == null) { return; }
+        v.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View x) { r.run(); }
+        });
+    }
+
+    /**
+     * 自己滑抽屉，不用 DrawerLayout。
+     *
+     * 为什么手搓：这个工程是 aapt2+javac+d8 直编，没接 AndroidX，
+     * 引 drawerlayout 要连带 appcompat 一起进来，包体翻几倍只为一条侧滑。
+     * 手写就三件事：位移、遮罩、返回键，行为完全一致。
+     */
+    private void openDrawer() {
+        if (drawerOpen) { return; }
+        drawerOpen = true;
+        drawer.setVisibility(View.VISIBLE);
+        scrim.setVisibility(View.VISIBLE);
+        drawer.setTranslationX(-drawer.getWidth());
+        drawer.animate().translationX(0f)
+                .setDuration(220)
+                .setInterpolator(new DecelerateInterpolator())
+                .start();
+        refreshDrawerHistory();
+    }
+
+    private void closeDrawer() {
+        if (!drawerOpen) { return; }
+        drawerOpen = false;
+        drawer.animate().translationX(-drawer.getWidth())
+                .setDuration(180)
+                .setInterpolator(new DecelerateInterpolator())
+                .start();
+        scrim.setVisibility(View.GONE);
+    }
+
+    private void toggleDrawer() {
+        if (drawerOpen) { closeDrawer(); } else { openDrawer(); }
+    }
+
+    @Override
+    public void onBackPressed() {
+        // 抽屉开着时返回键先收抽屉，这是侧边栏的通用预期；
+        // 不接管的话一按就退出 App，人会以为闪退。
+        if (drawerOpen) {
+            closeDrawer();
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    /** 顶栏副标题：「跟谁说话」+「连上没有」。两段分开存，刷新互不干扰。 */
+    private void refreshHeaderSub() {
+        if (headerSub == null) { return; }
+        int dim = getResources().getColor(R.color.text_dim, getTheme());
+        // 两段用不同颜色：模型名恒灰，状态只在异常时上色。
+        // 全行一个颜色的话，"已配对"也会绿成一片，真正该被看见的报错就淹了。
+        android.text.SpannableStringBuilder sb = new android.text.SpannableStringBuilder();
+        if (!modelLabel.isEmpty()) {
+            int s0 = sb.length();
+            sb.append(modelLabel).append("  ·  ");
+            sb.setSpan(new android.text.style.ForegroundColorSpan(dim), s0, sb.length(),
+                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        int s1 = sb.length();
+        sb.append(connLabel);
+        int c = (connColor == R.color.text_dim || connColor == R.color.listen)
+                ? dim : getResources().getColor(connColor, getTheme());
+        sb.setSpan(new android.text.style.ForegroundColorSpan(c), s1, sb.length(),
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        headerSub.setText(sb);
+    }
+
+    /** 抽屉「今天」下面那一行。只报条数，不编造会话标题——
+     *  真要历史列表得先有落盘存储，现在每轮只在内存里。 */
+    private void refreshDrawerHistory() {
+        if (drawerHistory == null) { return; }
+        int turns = history.size() / 2;
+        if (turns <= 0) {
+            drawerHistory.setText(R.string.history_empty);
+            return;
+        }
+        String first = "";
+        synchronized (history) {
+            for (JSONObject o : history) {
+                if ("user".equals(o.optString("role"))) {
+                    first = o.optString("content", "");
+                    break;
+                }
+            }
+        }
+        if (first.length() > 18) { first = first.substring(0, 18) + "…"; }
+        drawerHistory.setText(first.isEmpty() ? (turns + " 轮对话") : first);
+    }
+
+    /** 新对话：清屏 + 清上下文。和原来「清屏」是同一件事，但改了个更准确的名字——
+     *  它清的是上下文，不只是屏幕。 */
+    private void newChat() {
+        chatList.removeAllViews();
+        synchronized (history) { history.clear(); }
+        streaming = null;
+        addHint("新对话。上文已经清掉了。");
+        say2("新对话");
+        refreshDrawerHistory();
+    }
+
+    /**
+     * 「更多」：原来那排胶囊里最不该占顶栏的几个。
+     *
+     * 用 PopupMenu 而不是自绘弹层：它有系统级的位置计算（贴边自动翻转）
+     * 和返回键处理，自己画一遍只会多一堆边界 bug。
+     */
+    private void showMoreMenu(View anchor) {
+        PopupMenu m = new PopupMenu(this, anchor);
+        m.getMenu().add(0, 1, 0, "扫频（WiFi / 蜂窝频段）");
+        m.getMenu().add(0, 2, 1, "体温（热状态与掉频）");
+        m.getMenu().add(0, 3, 2, "设备自检");
+        m.getMenu().add(0, 4, 3, "配对这台手机");
+        m.getMenu().add(0, 5, 4, "设置");
+        m.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
+            @Override
+            public boolean onMenuItemClick(android.view.MenuItem it) {
+                switch (it.getItemId()) {
+                    case 1: scanRadio(); return true;
+                    case 2: checkThermal(); return true;
+                    case 3: startActivity(new Intent(MainActivity.this, DeviceCheckActivity.class)); return true;
+                    case 4: showPairDialog(); return true;
+                    case 5: showSettings(); return true;
+                    default: return false;
+                }
+            }
+        });
+        m.show();
+    }
+
+    /**
+     * 「+」：往里放东西的地方 —— 出图、出视频、换模型。
+     *
+     * 为什么不把 prompt 在这儿吃掉直接生成：出图有尺寸/步数/风格这些参数，
+     * 塞进一个弹窗会挤成一团。跳进出图页，把当前输入框的文字带过去，
+     * 人只用补参数。
+     */
+    private void showAttachMenu(View anchor) {
+        PopupMenu m = new PopupMenu(this, anchor);
+        m.getMenu().add(0, 1, 0, "画一张图（本机 SD）");
+        m.getMenu().add(0, 2, 1, "生成一段视频（电脑出片）");
+        m.getMenu().add(0, 3, 2, "换模型");
+        m.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
+            @Override
+            public boolean onMenuItemClick(android.view.MenuItem it) {
+                switch (it.getItemId()) {
+                    case 1: openImagePage(); return true;
+                    case 2: makeVideo(); return true;
+                    case 3: startActivity(new Intent(MainActivity.this, ModelActivity.class)); return true;
+                    default: return false;
+                }
+            }
+        });
+        m.show();
+    }
+
+    /** 把输入框里已经打好字带进出图页 —— 人多半是先写了描述才想起要画图。 */
+    private void openImagePage() {
+        Intent i = new Intent(this, ImageActivity.class);
+        String seed = input.getText().toString().trim();
+        if (!seed.isEmpty()) {
+            i.putExtra("prompt", seed);
+            input.setText("");
+        }
+        startActivity(i);
+    }
+
+    /**
+     * 出视频：手机不出片，交给电脑。
+     *
+     * 手机端做不了这个量级：编一段 8 秒 512² 已经是它的极限（4 段各 <1s 的
+     * zoompan 推镜拼起来），而且那还是静帧推镜，不是真生成。
+     * 真出片走服务端的 render.reel / video.gen，结果落盘后用系统播放器打开。
+     */
+    private void makeVideo() {
+        final String seed = input.getText().toString().trim();
+        if (seed.isEmpty()) {
+            toast("先在输入框里写一句画面描述");
+            return;
+        }
+        input.setText("");
+        final TextView b = appendMsg(true, "出视频：" + seed);
+        say2("交给电脑出片…");
+        final TextView st = appendMsg(false, "…");
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject r = Net.call(Prefs.baseUrl(MainActivity.this),
+                            Net.auth(MainActivity.this), "video.gen",
+                            new JSONObject().put("prompt", seed));
+                    final String out = r.toString();
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            st.setText(summarizeCap(out));
+                            scrollToBottom();
+                            say2("出片请求已返回");
+                        }
+                    });
+                } catch (final Exception e) {
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            st.setText("出视频失败：" + e.getMessage());
+                            say2("出视频失败");
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    /** 能力返回值的手机版摘要：JSON 原样贴上手机是没法读的。 */
+    private static String summarizeCap(String json) {
+        try {
+            JSONObject o = new JSONObject(json);
+            if (!o.optBoolean("ok", true)) {
+                return "失败：" + o.optString("err", o.optString("error", "未知原因"));
+            }
+            JSONObject d = o.optJSONObject("data");
+            if (d == null) { return json.length() > 400 ? json.substring(0, 400) + "…" : json; }
+            StringBuilder sb = new StringBuilder();
+            java.util.Iterator<String> it = d.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                String v = String.valueOf(d.opt(k));
+                if (v.length() > 200) { v = v.substring(0, 200) + "…"; }
+                sb.append(k).append(": ").append(v).append('\n');
+            }
+            return sb.length() == 0 ? "完成（无返回内容）" : sb.toString().trim();
+        } catch (Exception e) {
+            return json.length() > 400 ? json.substring(0, 400) + "…" : json;
+        }
+    }
+
+    private void toggleThink() {
+        thinking = !thinking;
+        applyThinkUi();
+        say2(thinking ? "思考已开：答得细，但慢" : "思考已关：直接给答案");
+    }
+
+    private void applyThinkUi() {
+        chipThink.setBackgroundResource(thinking ? R.drawable.bg_chip_on : R.drawable.bg_chip);
+        chipThink.setTextColor(getResources().getColor(
+                thinking ? R.color.accent : R.color.text_dim, getTheme()));
+    }
+
+    /** 联网三态循环：当 → 开 → 关 → 当。
+     *  为什么是三态而不是一个开关：一个开关只能表达「联网/不联网」，但
+     *  「每条都搜」和「需要时才搜」体验差一个数量级（前者每问多等十几秒）。
+     *  默认「当」既满足「能联网」，又不会把闲聊拖慢。 */
+    private void cycleWeb() {
+        if ("auto".equals(webMode)) {
+            webMode = "on";
+        } else if ("on".equals(webMode)) {
+            webMode = "off";
+        } else {
+            webMode = "auto";
+        }
+        applyWebUi();
+        if ("auto".equals(webMode)) {
+            say2("联网：自动（像「最新/今天/多少钱」这类才去搜）");
+        } else if ("on".equals(webMode)) {
+            say2("联网：常开（每句都先搜一遍，会慢十几秒）");
+        } else {
+            say2("联网：关（只用模型自己的记忆，问到新事会答旧）");
+        }
+    }
+
+    private void applyWebUi() {
+        int label = "auto".equals(webMode) ? R.string.web_auto
+                : ("on".equals(webMode) ? R.string.web_on : R.string.web_off);
+        chipWeb.setText(label);
+        // 只有「常开」给高亮：默认态和关闭态都灰，靠文字区分 ——
+        // 三态全用不同底色的话，一眼看不出哪个是默认。
+        boolean hot = "on".equals(webMode);
+        chipWeb.setBackgroundResource(hot ? R.drawable.bg_chip_on : R.drawable.bg_chip);
+        chipWeb.setTextColor(getResources().getColor(
+                hot ? R.color.accent : R.color.text_dim, getTheme()));
+    }
+
+    private void toggleSpeak() {
+        speakOn = !speakOn;
+        btnSpeak.setColorFilter(speakOn ? null
+                : getResources().getColor(R.color.text_faint, getTheme()));
+        say2(speakOn ? "播报已开" : "播报已关（只显示文字）");
+    }
+
+    /** 关于：把「这台是什么、连到哪」讲清楚。排查问题第一句问的就是这些。 */
+    private void showAbout() {
+        String ver = "";
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            ver = pi.versionName + " (build " + pi.versionCode + ")";
+        } catch (Exception ignored) { }
+        StringBuilder sb = new StringBuilder();
+        sb.append("天网 · 手机端 ").append(ver).append('\n').append('\n');
+        sb.append("服务端：").append(Prefs.baseUrl(this)).append('\n');
+        sb.append("后端：").append(Prefs.backend(this)).append('\n');
+        sb.append("配对：").append(Prefs.paired(this) ? "已配对" : "未配对").append('\n');
+        sb.append("设备：").append(Prefs.deviceName(this)).append('\n').append('\n');
+        sb.append("这台手机同时是编队里的一个算力节点：").append('\n');
+        sb.append("· 语言模型跑在本机，不走网络").append('\n');
+        sb.append("· 出图用本机 SD（sd.cpp + NEON）").append('\n');
+        sb.append("· 扫频 / 热状态只有手机能做").append('\n').append('\n');
+        sb.append("对话、模型、参数都在抽屉里。");
+        new AlertDialog.Builder(this)
+                .setTitle("关于")
+                .setMessage(sb.toString())
+                .setPositiveButton("知道了", null)
+                .show();
     }
 
     private int dp(int v) {
@@ -1069,8 +1515,9 @@ public class MainActivity extends Activity {
     private void probeHealth() {
         final String base = Prefs.baseUrl(this);
         final boolean paired = Prefs.paired(this);
-        status.setText((paired ? "核对 " : "连接 ") + base + " …");
-        status.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        connLabel = paired ? "核对凭据…" : "连接中…";
+        connColor = R.color.text_dim;
+        refreshHeaderSub();
         worker.execute(new Runnable() {
             @Override
             public void run() {
@@ -1103,8 +1550,9 @@ public class MainActivity extends Activity {
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
-                        status.setText(fLine);
-                        status.setTextColor(getResources().getColor(fColor, getTheme()));
+                        connLabel = fLine;
+                        connColor = fColor;
+                        refreshHeaderSub();
                     }
                 });
             }

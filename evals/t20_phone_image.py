@@ -3,12 +3,22 @@
 """
 t20 · 手机出图功能（N+1c）门禁
 
+⚠️ 2026-10-23 改过静态契约那一段：出图链路已经从「经 Termux RUN_COMMAND 唤起
+shell worker」换成了「App 内 JNI 直调 sd.cpp」（`SdBridge` + `QueueRunner`）。
+旧断言查的是 `com.termux.RUN_COMMAND_*` / `ACTION_RESULT`，这些常量在现在的
+ImageActivity 里**一个都不存在**，于是八条断言齐刷刷失败 —— 不是代码坏了，
+是门禁在查一个已经不存在的实现。查不存在的实现是最糟的状态：它永远红着，
+真有人把这链路改坏时也没人看得见。
+这里改成查**当前**契约（SdBridge 的 JNI 入口 + QueueRunner 的队列调用）。
+worker 脚本（termux/fleet-img.sh）还在，行为测试照旧保留。
+
 两路验证，全离线、全可测：
   [①] 静态契约（读源码/清单，不跑真机）
-      - manifest 声明 com.termux.permission.RUN_COMMAND + <queries>com.termux + ImageActivity
-      - ImageActivity 用对 RUN_COMMAND 契约常量（action/service/6 个 extra/结果 bundle key）
-      - Java 侧**不**写死模型路径（模型只在 worker 侧，符合「APK 不装模型」）
-      - MainActivity 把 btnImg 接到 ImageActivity
+      - manifest 注册 ImageActivity
+      - ImageActivity 走 QueueRunner → SdBridge，而不是自己直接算
+      - SdBridge 真的加载了 JNI 库、真的声明了 generate 入口
+      - Java 侧**不**写死模型路径（模型只由模型库/worker 管）
+      - MainActivity 把出图入口接到 ImageActivity
   [②] worker 行为（bash + 假 sd 桩 + 假 sysfs）
       - 空 prompt / 坏 steps / 坏 size / 超温 / 并发锁 → 拒（ok:false）
       - 正常 → ok:true 且日志含 vulkan（诚实边界：没 Vulkan 就报失败）
@@ -28,6 +38,8 @@ ROOT = os.path.dirname(HERE)
 MANIFEST = os.path.join(ROOT, "tianwang_android", "AndroidManifest.xml")
 IMG = os.path.join(ROOT, "tianwang_android", "src", "app", "skynet", "tianwang", "ImageActivity.java")
 MAIN = os.path.join(ROOT, "tianwang_android", "src", "app", "skynet", "tianwang", "MainActivity.java")
+SDB = os.path.join(ROOT, "tianwang_android", "src", "app", "skynet", "tianwang", "SdBridge.java")
+QRUN = os.path.join(ROOT, "tianwang_android", "src", "app", "skynet", "tianwang", "QueueRunner.java")
 WORKER = os.path.join(ROOT, "tianwang_android", "termux", "fleet-img.sh")
 
 fails = []
@@ -49,33 +61,33 @@ def section(title):
 def t_static():
     section("① 静态契约")
     m = open(MANIFEST, encoding="utf-8").read()
-    check('com.termux.permission.RUN_COMMAND' in m, "manifest 声明 RUN_COMMAND 权限")
-    check('<package android:name="com.termux" />' in m, "manifest <queries> 声明 com.termux（包可见性）")
     check('android:name=".ImageActivity"' in m, "manifest 注册 ImageActivity")
+    check('android:name=".MainActivity"' in m, "manifest 注册 MainActivity")
 
     j = open(IMG, encoding="utf-8").read()
-    for tok in [
-        "com.termux.RUN_COMMAND",
-        "com.termux.app.RunCommandService",
-        "com.termux.RUN_COMMAND_PATH",
-        "com.termux.RUN_COMMAND_ARGUMENTS",
-        "com.termux.RUN_COMMAND_WORKDIR",
-        "com.termux.RUN_COMMAND_BACKGROUND",
-        "com.termux.RUN_COMMAND_PENDING_INTENT",
-        'ACTION_RESULT',                 # 本 App 收结果的自定义 action
-        'getBundleExtra("result")',      # 结果 bundle key
-        "startService(run)",             # 经 Service 唤起
-    ]:
-        check(tok in j, "ImageActivity 含契约常量：" + tok)
-    # 失败不静默：必须出现失败文案关键词
-    check("唤起 Termux 失败" in j and "没回传结果" in j, "ImageActivity 失败路径有文案（不静默）")
-    check("READ_MEDIA_IMAGES" in j or "READ_EXTERNAL_STORAGE" in j, "ImageActivity 请求读图权限")
+    # 出图必须走「队列执行器 + JNI 桥」两层，而不是在 Activity 里自己算：
+    # 队列要能被 PC 侧无人值守触发，所以执行逻辑不能长在 UI 类里。
+    check("QueueRunner.run(" in j, "ImageActivity 经 QueueRunner 执行队列（逻辑不在 UI 类里）")
+    check("SdBridge" in j, "ImageActivity 持有 SdBridge")
+    check("lastError" in j or "失败" in j, "失败路径有文案（不静默）")
+    check("gguf" not in j and ".gguf" not in j and "sd15" not in j,
+          "Java 不写死模型/gguf 路径（留模型库管）")
 
-    # Java 侧不得写死模型路径（模型只在 worker 侧）
-    check("gguf" not in j and "sd15" not in j and ".gguf" not in j, "Java 不写死模型/gguf 路径（留 worker 管）")
+    sd = open(SDB, encoding="utf-8").read()
+    check('System.loadLibrary("fleet_sd")' in sd, "SdBridge 加载 JNI 库 fleet_sd")
+    for tok in ["nativeInit", "nativeGenerate", "nativeCancel", "nativeFree",
+                "nativeLastError"]:
+        check(tok in sd, "SdBridge 声明 JNI 入口：" + tok)
+
+    qr = open(QRUN, encoding="utf-8").read()
+    check("new SdBridge()" in qr, "QueueRunner 直接用 SdBridge")
+    check("Progress" in qr, "QueueRunner 接进度回调（长任务要能看见进度）")
 
     mm = open(MAIN, encoding="utf-8").read()
-    check("btnImg" in mm and "ImageActivity.class" in mm, "MainActivity 把「出图」入口接到 ImageActivity")
+    # 入口从顶栏胶囊搬进了「+」号菜单（跟 PocketPal 一致的入口设计），
+    # 所以查方法名而不是查按钮 id —— 查 id 会把「换了入口位置」误判成「入口没了」。
+    check("openImagePage" in mm and "ImageActivity.class" in mm,
+          "MainActivity 把出图入口接到 ImageActivity")
     check("import android.content.Intent;" in mm, "MainActivity 已 import Intent（编译已验证）")
 
 

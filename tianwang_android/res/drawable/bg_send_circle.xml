@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 发送键：实心圆。它是输入坞里唯一的实色块，视线自然落到这儿。 -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33000000">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="@color/accent" />
+        </shape>
+    </item>
+</ripple>

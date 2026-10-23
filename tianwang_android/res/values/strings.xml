@@ -1,10 +1,39 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">天网</string>
-    <string name="hint_input">说点什么，或者按住下面的圆</string>
+
+    <!-- 抽屉导航 -->
+    <string name="nav_chat">聊天</string>
+    <string name="nav_fleet">编队</string>
+    <string name="nav_models">模型</string>
+    <string name="nav_bench">基准测试</string>
+    <string name="nav_settings">设置</string>
+    <string name="nav_about">关于</string>
+    <string name="group_today">今天</string>
+    <string name="history_empty">还没有会话</string>
+    <string name="model_unknown">未连接</string>
+
+    <!-- 输入坞 -->
+    <string name="hint_input">输入消息</string>
+    <string name="think">思考</string>
+    <!-- 联网三态。「当」是自动判断，读起来最短但意思不含糊：点一下就懂了。 -->
+    <string name="web_auto">联网</string>
+    <string name="web_on">联网·常开</string>
+    <string name="web_off">离线</string>
     <string name="btn_send">发</string>
     <string name="btn_settings">设置</string>
+
+    <!-- 旧版留下的：语音大圆条已收进输入坞做图标，文案仍被代码引用 -->
     <string name="mic_idle">按住说话</string>
     <string name="mic_active">松手结束</string>
-    <string name="idle_sub">点一下圆开始听，说完点一下结束</string>
+    <string name="idle_sub">点麦克风开始听，说完再点一下</string>
+
+    <!-- 无障碍描述：图标没有文字，读屏靠这个 -->
+    <string name="cd_menu">打开菜单</string>
+    <string name="cd_new_chat">新对话</string>
+    <string name="cd_more">更多</string>
+    <string name="cd_attach">素材与生成</string>
+    <string name="cd_mic">说话</string>
+    <string name="cd_speak">语音播报开关</string>
+    <string name="cd_send">发送</string>
 </resources>

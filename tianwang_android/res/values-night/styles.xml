@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 深色时状态栏图标要反过来（浅色图标），否则白底白字看不见。
+     只覆盖这一项，其余继承 values/styles.xml —— 免得两处各写一套主题、改一处忘另一处。 -->
+<resources>
+    <style name="TianWangTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:navigationBarColor">@color/bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorHint">@color/text_faint</item>
+    </style>
+</resources>

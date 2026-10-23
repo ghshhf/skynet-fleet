@@ -88,6 +88,14 @@ public class ImageActivity extends Activity {
         btnStop.setEnabled(false);
         btnRegen.setEnabled(false);
 
+        // 从主界面「+」跳进来时会把已经打好的描述带过来：人多半是先写了
+        // 描述才想起要画图，让他在两个页面各打一遍纯属浪费。
+        String seed = getIntent().getStringExtra("prompt");
+        if (seed != null && !seed.trim().isEmpty()) {
+            editPrompt.setText(seed.trim());
+            editPrompt.setSelection(editPrompt.getText().length());
+        }
+
         View.OnClickListener sizeClick = new View.OnClickListener() {
             @Override public void onClick(View v) {
                 size = (v == btnSize512) ? 512 : (v == btnSize768) ? 768 : 1024;
