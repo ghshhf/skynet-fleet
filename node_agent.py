@@ -110,7 +110,7 @@ def run_node(host, port, name, password, platform="windows",
                     break
             try:
                 _session(host, port, name, password, platform, caps, sandbox, cap_req,
-                         session, models, gpu, ram_gb)
+                         session, models, gpu, ram_gb, relay)
             except OSError as e:
                 if _STOP.is_set():
                     break
@@ -155,7 +155,7 @@ def reset_stop():
 
 
 def _session(host, port, name, password, platform, caps, sandbox, cap_req,
-             session, models, gpu, ram_gb):
+             session, models, gpu, ram_gb, relay=None):
     os.makedirs(sandbox, exist_ok=True)
     # 🔴 建连超时与读超时是两回事，**必须分开**（2026-10-21 真踩）：
     #   create_connection(timeout=N) 留下的 timeout 会**一直留在 socket 上**，
@@ -178,7 +178,7 @@ def _session(host, port, name, password, platform, caps, sandbox, cap_req,
                         "capability_specs": capabilities.describe(caps),
                         "info": {"sandbox": os.path.abspath(sandbox), "session": session,
                                  "relay_port": (relay.port if relay and relay.running else None),
-                        "relay_token": (relay.token if relay and relay.running else None),
+                                 "relay_token": (relay.token if relay and relay.running else None),
                                  "compute": {"cpu": os.cpu_count() or 0, "gpu": gpu,
                                              "ram_gb": ram_gb, "models": models or []}}})
     print(f"[{name}] 已注册（token={resp['token'][:8]}…）caps={caps}", flush=True)
@@ -576,11 +576,21 @@ def _selftest():
     m9 = _read_msgs(s9)[0]
     assert m9["ok"] is False and "prompt" in m9["err"], m9
 
-    # 默认后端未配置时必须明确报错（不许静默交空）
+    # 默认后端：必须在「有后端」与「没后端」两种环境都说得清。
+    # 2026-10-23 更正：这条断言原写成「必然报未配置」，只在没装 ffmpeg 的机器上成立；
+    # 本机装了 ffmpeg 就走 pc_video_backend 的占位路线（真出片），于是门禁在
+    # 有 ffmpeg 的机器上恒红——那是**环境差异**，不是代码坏了。按环境分支断言。
+    import shutil as _sh
+    _video_backend = bool(os.environ.get("FLEET_VIDEO_CLI")
+                          or os.environ.get("FLEET_FFMPEG")
+                          or _sh.which("ffmpeg"))
     se2 = _FakeSock()
     _do_video_gen(se2, {"id": "ve", "prompt": "云"})
     me2 = _read_msgs(se2)[0]
-    assert me2["ok"] is False and "未配置" in me2["err"], me2
+    if _video_backend:
+        assert me2["ok"] is True and me2["path"], me2
+    else:
+        assert me2["ok"] is False and "未配置" in me2["err"], me2
 
     print("[selftest] video.gen 正常/异常/空prompt/未配置后端 全过")
 
