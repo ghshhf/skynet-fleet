@@ -1,5 +1,8 @@
 package app.skynet.tianwang;
 
+import android.content.Context;
+
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
@@ -24,6 +27,40 @@ public final class Net {
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final int CONNECT_MS = 8000;
+    /** 长期设备凭据的头。配对换来的，电脑重启不变——手机主要靠它进门。 */
+    static final String DEVICE_HEADER = "X-Fleet-Device";
+
+    /**
+     * 一次请求要带的两把钥匙。
+     *
+     * token 是老的「一次性令牌」，电脑一重启就变；deviceId/Secret 是配对换来的
+     * 长期凭据。**两把都带上**：新电脑认长期凭据，老电脑只认令牌，
+     * 这样装一版 App 能同时对付两种电脑，不用让主人先升级哪一头。
+     */
+    public static final class Auth {
+        public final String token;
+        public final String deviceId;
+        public final String deviceSecret;
+
+        public Auth(String token, String deviceId, String deviceSecret) {
+            this.token = token == null ? "" : token.trim();
+            this.deviceId = deviceId == null ? "" : deviceId.trim();
+            this.deviceSecret = deviceSecret == null ? "" : deviceSecret.trim();
+        }
+
+        public boolean hasDevice() {
+            return !deviceId.isEmpty() && !deviceSecret.isEmpty();
+        }
+
+        public boolean isEmpty() {
+            return token.isEmpty() && !hasDevice();
+        }
+    }
+
+    /** 从设置里取当前凭据。 */
+    public static Auth auth(Context c) {
+        return new Auth(Prefs.token(c), Prefs.deviceId(c), Prefs.deviceSecret(c));
+    }
 
     public interface SseCallback {
         void onLine(String text);
@@ -36,8 +73,8 @@ public final class Net {
     // ---------------- 三趟：识别 / 对话 / 合成 ----------------
 
     /** 裸 wav 进 → {"ok":true,"text":"..."} 出 */
-    public static String recognize(String base, String token, byte[] wav) throws IOException {
-        HttpURLConnection c = open(base + "/api/voice/recognize", "POST", token, "audio/wav");
+    public static String recognize(String base, Auth auth, byte[] wav) throws IOException {
+        HttpURLConnection c = open(base + "/api/voice/recognize", "POST", auth, "audio/wav");
         c.setReadTimeout(180000);
         try {
             writeBody(c, wav);
@@ -57,14 +94,17 @@ public final class Net {
      * backends：逗号分隔，空串 = 后端自己的默认（全部）。手机语音一次只念一句，
      * 传一个具体的 id 才不会几个后端同屏串台。
      */
-    public static void chat(String base, String token, String prompt, String backends,
-                            SseCallback cb) {
+    public static void chat(String base, Auth auth, String prompt, String backends,
+                            JSONArray history, SseCallback cb) {
         HttpURLConnection c = null;
         try {
             JSONObject req = new JSONObject();
             req.put("prompt", prompt);
             req.put("backends", backends == null ? "" : backends);
-            c = open(base + "/api/chat", "POST", token, "application/json");
+            if (history != null && history.length() > 0) {
+                req.put("history", history);
+            }
+            c = open(base + "/api/chat", "POST", auth, "application/json");
             c.setReadTimeout(300000);          // 后端自己 300s 超时，这边给同样的耐心
             writeBody(c, req.toString().getBytes(UTF8));
 
@@ -137,7 +177,7 @@ public final class Net {
     }
 
     /** {text} 进 → 音频出（wav 或 mp3，看服务端能力） */
-    public static SayResult say(String base, String token, String text) throws IOException {
+    public static SayResult say(String base, Auth auth, String text) throws IOException {
         byte[] payload;
         try {
             JSONObject req = new JSONObject();
@@ -146,7 +186,7 @@ public final class Net {
         } catch (org.json.JSONException e) {
             throw new IOException("拼请求失败：" + e.getMessage());
         }
-        HttpURLConnection c = open(base + "/api/voice/say", "POST", token, "application/json");
+        HttpURLConnection c = open(base + "/api/voice/say", "POST", auth, "application/json");
         c.setReadTimeout(180000);
         try {
             writeBody(c, payload);
@@ -200,14 +240,14 @@ public final class Net {
     // ---------------- 控电脑：看清单 / 让它做事 ----------------
 
     /** GET /api/caps → 电脑那头能做的全部事。原样 JSON 交给界面自己排。 */
-    public static JSONObject caps(String base, String token) throws IOException {
+    public static JSONObject caps(String base, Auth auth) throws IOException {
         HttpURLConnection c = null;
         try {
             c = (HttpURLConnection) new URL(base + "/api/caps").openConnection();
             c.setRequestMethod("GET");
             c.setConnectTimeout(CONNECT_MS);
             c.setReadTimeout(20000);
-            c.setRequestProperty("X-Fleet-Token", token == null ? "" : token);
+            applyAuth(c, auth);
             int code = c.getResponseCode();
             String body = readText(c);
             if (code != 200) { throw new IOException(friendly(code, body)); }
@@ -223,14 +263,14 @@ public final class Net {
      * ⚠️ 要审批的能力会**一直挂着**，直到电脑上的弹窗被点确认（或服务端超时）。
      * 所以调用方要给足读超时，界面也要先说一句「等电脑上确认」——不然人以为卡死了。
      */
-    public static JSONObject call(String base, String token, String cap, JSONObject args)
+    public static JSONObject call(String base, Auth auth, String cap, JSONObject args)
             throws IOException {
         HttpURLConnection c = null;
         try {
             JSONObject req = new JSONObject();
             req.put("cap", cap);
             req.put("args", args == null ? new JSONObject() : args);
-            c = open(base + "/api/call", "POST", token, "application/json");
+            c = open(base + "/api/call", "POST", auth, "application/json");
             c.setReadTimeout(180000);
             writeBody(c, req.toString().getBytes(UTF8));
             int code = c.getResponseCode();
@@ -264,16 +304,82 @@ public final class Net {
         }
     }
 
+    // ---------------- 配对：一次就好 ----------------
+
+    /**
+     * 拿电脑屏幕上的 6 位配对码换长期凭据。
+     *
+     * 这是「配一次、之后不再配」的唯一入口：成功后电脑落一条设备记录
+     * （只存哈希），手机存 deviceId+secret，之后每次请求带 X-Fleet-Device，
+     * **电脑重启也不用重配**——这正是以前天天被令牌烦到的根因。
+     */
+    public static JSONObject claim(String base, String code, String name, String platform)
+            throws IOException {
+        HttpURLConnection c = null;
+        try {
+            JSONObject req = new JSONObject();
+            req.put("code", code == null ? "" : code.trim());
+            req.put("name", name == null ? "" : name);
+            req.put("platform", platform == null ? "" : platform);
+            // 配对请求本身没有凭据（凭据是这次换来的），所以传空 Auth
+            c = open(base + "/api/pair/claim", "POST", new Auth("", "", ""),
+                     "application/json");
+            writeBody(c, req.toString().getBytes(UTF8));
+            int code0 = c.getResponseCode();
+            String body = readText(c);
+            if (code0 != 200) {
+                throw new IOException(friendly(code0, body));
+            }
+            JSONObject o = parse(body);
+            if (!o.optBoolean("ok", false)) {
+                throw new IOException(o.optString("err", "配对失败（电脑没给原因）"));
+            }
+            return o;
+        } catch (org.json.JSONException e) {
+            throw new IOException("配对请求拼不出来：" + e.getMessage());
+        } finally {
+            if (c != null) { c.disconnect(); }
+        }
+    }
+
+    /** 问电脑「我这枚凭据还认不认」。用来判断是不是被撤销了。 */
+    public static JSONObject me(String base, Auth auth) throws IOException {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(base + "/api/pair/me").openConnection();
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(CONNECT_MS);
+            c.setReadTimeout(15000);
+            applyAuth(c, auth);
+            int code = c.getResponseCode();
+            String body = readText(c);
+            if (code != 200) { throw new IOException(friendly(code, body)); }
+            return parse(body);
+        } finally {
+            if (c != null) { c.disconnect(); }
+        }
+    }
+
     // ---------------- 底层 ----------------
 
-    private static HttpURLConnection open(String url, String method, String token, String ctype)
+    private static void applyAuth(HttpURLConnection c, Auth auth) {
+        if (auth == null) { return; }
+        if (!auth.token.isEmpty()) {
+            c.setRequestProperty("X-Fleet-Token", auth.token);
+        }
+        if (auth.hasDevice()) {
+            c.setRequestProperty(DEVICE_HEADER, auth.deviceId + ":" + auth.deviceSecret);
+        }
+    }
+
+    private static HttpURLConnection open(String url, String method, Auth auth, String ctype)
             throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestMethod(method);
         c.setConnectTimeout(CONNECT_MS);
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", ctype);
-        c.setRequestProperty("X-Fleet-Token", token == null ? "" : token);
+        applyAuth(c, auth);
         c.setRequestProperty("Cache-Control", "no-store");
         return c;
     }
@@ -323,10 +429,12 @@ public final class Net {
         } catch (Exception ignored) { }
         if (why == null || why.isEmpty()) { why = snippet(body); }
         if (code == 401) {
-            return "没带令牌（401）——去「设置」填 FLEET_GUI_TOKEN";
+            return "这台手机还没配对（401）——电脑上「编队」页生成 6 位码，"
+                    + "手机点「配对」输进去。配一次就长期有效。";
         }
         if (code == 403) {
-            return "令牌不对（403）——电脑重启后令牌会变，重新抄一枚";
+            return "凭据被拒（403）：要么还没配对，要么这台设备已被电脑撤销。"
+                    + "重新配对一次即可（不用改令牌）。";
         }
         return "HTTP " + code + "：" + why;
     }

@@ -36,8 +36,12 @@ PHONE_MEM = "/data/user/0/com.termux/files/home/skynet/memory"
 PHONE_MODELS = "/data/user/0/com.termux/files/home/models"
 STAGE = "/data/local/tmp/skynet_stage"
 
+#: 下发到手机 ~/skynet/lib 的文件。**只有这两个**：一个是记忆包运行时，
+#: 一个是人格渲染入口。serve.sh 也放这里——它是"怎么把算力跑起来"的说明书，
+#: 手机自己得有一份，否则每次都要从 PC 拼一条长命令过来。
 LIB_FILES = [os.path.join(ROOT, "fleet", "memory_pack.py"),
-             os.path.join(ROOT, "scripts", "phone", "persona.py")]
+             os.path.join(ROOT, "scripts", "phone", "persona.py"),
+             os.path.join(ROOT, "scripts", "phone", "serve.sh")]
 
 
 def _termux_json(script: str, timeout=120):

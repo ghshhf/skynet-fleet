@@ -36,10 +36,49 @@ public final class Speaker {
     private Runnable onDone;
     private String pendingText;
 
-    /** 起引擎并等它 init 完（阻塞最多 timeoutMs）。返回 null = 可用。 */
+    /**
+     * 起引擎并等它 init 完（阻塞最多 timeoutMs）。返回 null = 可用。
+     *
+     * 🔴 实测（红米 25060RK16C / Android 16）：`settings get secure
+     * tts_default_synth` 是 **null** —— 这机器上压根没选过默认语音引擎。
+     * 这种情况下 `new TextToSpeech(ctx, listener)` 直接回调 status=-1，
+     * 但 `com.xiaomi.mibrain.speech` 明明装着、也能用。
+     * 所以不能只试默认那一个：失败后按系统里的 TTS_SERVICE 逐个点名再试一遍。
+     */
     public NotReady open(Context c, long timeoutMs) {
+        NotReady first = openWith(null, c, timeoutMs);
+        if (first == null) { return null; }
+        String last = first.why;
+        for (String eng : engines(c)) {
+            NotReady r = openWith(eng, c, timeoutMs);
+            if (r == null) { return null; }
+            last = r.why;
+        }
+        return new NotReady(last);
+    }
+
+    /** 系统里所有声明了 TTS_SERVICE 的引擎（不依赖"用户有没有选默认"）。 */
+    private static java.util.List<String> engines(Context c) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try {
+            android.content.Intent i =
+                    new android.content.Intent("android.intent.action.TTS_SERVICE");
+            java.util.List<android.content.pm.ResolveInfo> rs =
+                    c.getPackageManager().queryIntentServices(i, 0);
+            for (android.content.pm.ResolveInfo r : rs) {
+                if (r.serviceInfo == null) { continue; }
+                String p = r.serviceInfo.packageName;
+                if (p != null && !out.contains(p)) { out.add(p); }
+            }
+        } catch (Exception ignored) { }
+        return out;
+    }
+
+    private NotReady openWith(String engine, Context c, long timeoutMs) {
         final Object lock = new Object();
-        tts = new TextToSpeech(c.getApplicationContext(), new TextToSpeech.OnInitListener() {
+        inited = false;
+        initErr = null;
+        final TextToSpeech.OnInitListener lis = new TextToSpeech.OnInitListener() {
             @Override
             public void onInit(int status) {
                 synchronized (lock) {
@@ -50,7 +89,14 @@ public final class Speaker {
                     lock.notifyAll();
                 }
             }
-        });
+        };
+        try {
+            tts = (engine == null)
+                    ? new TextToSpeech(c.getApplicationContext(), lis)
+                    : new TextToSpeech(c.getApplicationContext(), lis, engine);
+        } catch (Exception e) {
+            return new NotReady("起不了语音引擎 " + engine + "：" + e.getMessage());
+        }
         synchronized (lock) {
             if (!inited) {
                 try { lock.wait(timeoutMs); } catch (InterruptedException ignored) { }
@@ -62,8 +108,11 @@ public final class Speaker {
                     + "（可能没装任何 TTS 引擎）");
         }
         if (initErr != null) {
+            String why = (engine == null)
+                    ? initErr + "；这台机没设默认语音引擎，去「设置 → 文字转语音」选一个"
+                    : initErr + "（引擎 " + engine + "）";
             close();
-            return new NotReady(initErr);
+            return new NotReady(why);
         }
 
         // 依次试：中文（中国）→ 任意中文 → 系统默认。都不行就如实报。

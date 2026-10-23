@@ -263,9 +263,16 @@
     body.appendChild(el("div", "empty", "读取中…"));
 
     if (tab === "fleet") {
-      api("/api/fleet").then(function (d) {
-        ASSET_CACHE.fleet = d;
-        renderFleetTab(d);
+      // 两个端点并行：总览 + 配对。配对读不到不许拖垮总览——
+      // 总览是「现在什么状态」，配对是「怎么让新设备进来」，两件事。
+      var pPair = api("/api/pair/devices").catch(function (e) {
+        return { ok: false, err: e.message, devices: [] };
+      });
+      Promise.all([api("/api/fleet"), pPair]).then(function (rs) {
+        ASSET_CACHE.fleet = rs[0];
+        ASSET_CACHE.pair = rs[1];
+        renderFleetTab(rs[0]);
+        renderPairBlock(rs[1]);
       }).catch(function (e) { renderTabErr(body, "读不到编队总览：" + e.message); });
       return;
     }
@@ -333,6 +340,88 @@
     if (s < 3600) { return Math.round(s / 60) + " 分钟前"; }
     if (s < 86400) { return Math.round(s / 3600) + " 小时前"; }
     return Math.round(s / 86400) + " 天前";
+  }
+
+  /* ------------------------------------------------------------------ 配对
+     主人提的真问题：令牌每次启动都变，手机天天要重抄。
+     所以这里不是"再显示一个令牌"，而是"把一次配对变成长期关系"：
+     6 位码 → 手机拿去换成设备凭据 → 之后永久有效，电脑重启也不用再配。
+     码只显示在这块屏上（屏幕上肉眼抄），HTTP 里没有任何接口吐它。
+  */
+  function renderPairBlock(p) {
+    var body = $("tabBody");
+    var sec = el("div", "dp-sec");
+    sec.appendChild(el("div", "dp-sech", "配对 · 新设备"));
+
+    if (!p || !p.ok) {
+      sec.appendChild(el("div", "dpnote",
+        "读不到配对状态：" + ((p && p.err) || "未知原因")));
+      body.appendChild(sec);
+      return;
+    }
+
+    var code = p.code || "";
+    var st = p.code_state || {};
+    var row = el("div", "pair-row");
+
+    var codeBox = el("div", "pair-code" + (code ? "" : " off"));
+    codeBox.textContent = code ? code.slice(0, 3) + " " + code.slice(3) : "······";
+    row.appendChild(codeBox);
+
+    var meta = el("div", "pair-meta");
+    if (code) {
+      var left = Math.max(0, Math.round(st.expires_in || 0));
+      meta.appendChild(el("div", "pair-t",
+        "还有 " + Math.floor(left / 60) + " 分 " + (left % 60) + " 秒过期"));
+      meta.appendChild(el("div", "pair-s", "手机：天网 → 设置 → 配对，输这 6 位"));
+    } else if ((st.locked_for || 0) > 0) {
+      meta.appendChild(el("div", "pair-t warn",
+        "已锁定 " + Math.round(st.locked_for) + " 秒（试错太多）"));
+      meta.appendChild(el("div", "pair-s", "重新生成一枚即可解锁"));
+    } else {
+      meta.appendChild(el("div", "pair-t", "现在没有可用的码"));
+      meta.appendChild(el("div", "pair-s", "点右边「生成」"));
+    }
+    row.appendChild(meta);
+
+    var btn = el("button", "hbtn", code ? "换一枚" : "生成");
+    btn.onclick = function () {
+      btn.disabled = true;
+      api("/api/pair/code", { method: "POST", body: {} })
+        .then(loadAssetTab.bind(null, "fleet"))
+        .catch(function (e) { alert("生成失败：" + e.message); btn.disabled = false; });
+    };
+    row.appendChild(btn);
+    sec.appendChild(row);
+
+    sec.appendChild(el("div", "dpnote",
+      "配对一次就好：手机拿到的是长期设备凭据（存在电脑的 ~/.fleet/devices.json），"
+      + "电脑重启也不会失效，以后不用再输码。"));
+
+    var devs = p.devices || [];
+    sec.appendChild(el("div", "dp-sech", "已配对设备 · " + devs.length));
+    if (!devs.length) {
+      sec.appendChild(el("div", "empty", "还没有设备配过对"));
+    }
+    devs.forEach(function (d) {
+      var dr = el("div", "drow");
+      dr.appendChild(el("span", "dot-ok"));
+      dr.appendChild(el("span", "grow",
+        (d.name || "未命名") + (d.platform ? " · " + d.platform : "")
+        + " · " + (d.secret_head || "")));
+      dr.appendChild(el("span", "badge",
+        d.last_seen ? "上次 " + fmtAgo(d.last_seen) : "—"));
+      var rv = el("button", "hbtn", "撤销");
+      rv.onclick = function () {
+        if (!confirm("撤销「" + (d.name || d.id) + "」？它下次请求就会被拒。")) { return; }
+        api("/api/pair/devices/revoke", { method: "POST", body: { device_id: d.id } })
+          .then(loadAssetTab.bind(null, "fleet"))
+          .catch(function (e) { alert("撤销失败：" + e.message); });
+      };
+      dr.appendChild(rv);
+      sec.appendChild(dr);
+    });
+    body.appendChild(sec);
   }
 
   function renderFleetTab(d) {

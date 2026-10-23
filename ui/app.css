@@ -404,6 +404,17 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .card .cmeta .seedin:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .card .cdesc:empty{display:none}
 
+/* 配对：6 位码要能一眼看清、能隔着一米抄下来 */
+.pair-row{display:flex;align-items:center;gap:12px;padding:10px 2px 6px}
+.pair-code{font-family:var(--mono);font-size:26px;letter-spacing:3px;font-weight:600;
+  color:var(--accent-text);background:var(--accent-soft);border-radius:8px;
+  padding:6px 14px;white-space:nowrap}
+.pair-code.off{color:var(--fg-3);background:var(--panel)}
+.pair-meta{flex:1;min-width:0}
+.pair-t{font-size:12px;color:var(--fg)}
+.pair-t.warn{color:var(--warn)}
+.pair-s{font-size:11px;color:var(--fg-3);margin-top:3px}
+
 /* 状态点：在线/离线 */
 .dot-ok{width:6px;height:6px;border-radius:50%;background:var(--ok);flex:0 0 6px}
 .dot-off{width:6px;height:6px;border-radius:50%;background:var(--fg-3);flex:0 0 6px}
