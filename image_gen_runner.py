@@ -17,17 +17,60 @@ import subprocess
 # 默认后端：连手机 SdBridge。没配环境变量就视为「这个节点没接手机出图能力」。
 # 调用方（node_agent / commander）应据此在注册/派发时**不声明/不派发** image.gen，
 # 而不是声明了又交空。
-def _default_backend(prompt, neg, size, steps, seed, cfg, model):
-    bridge = os.environ.get("FLEET_ANDROID_BRIDGE")
+def _android_bridge_backend(prompt, neg, size, steps, seed, cfg, model):
+    """经 android_bridge（手机 SdBridge）出图：HTTP POST 到桥地址，返回 PNG 路径。
+
+    桥协议（约定）：POST {bridge}/gen  body JSON {prompt,neg,size,steps,seed,cfg,model}
+    响应：{"ok":bool,"path":str,"err":str}（path 为手机侧 Pictures/fleet/<id>.png，
+    PC 侧随后可经 adb pull 拉回；若桥直接返回 base64 PNG 则写入临时文件）。
+    未配桥/桥不可达时抛 RuntimeError，消息说清原因，不静默交空。
+    """
+    import json as _j
+    import urllib.request as _u
+    bridge = os.environ.get("FLEET_ANDROID_BRIDGE") or ""
     if not bridge:
         raise RuntimeError(
-            "image.gen 后端未配置：设 FLEET_ANDROID_BRIDGE（android_bridge 地址）"
-            "或注入 backend 再调用；本节点未接手机出图能力时不应声明 image.gen")
-    # TODO(路线甲·阶段2收口): 经 android_bridge 调 SdBridge.enqueue，返回手机侧
-    # Pictures/fleet/<seed>.png 路径。此处先抛明确未实现，等桥接代码落地。
-    raise NotImplementedError(
-        f"android_bridge 出图桥接待实现（bridge={bridge}）；参数已就绪 "
-        f"prompt={prompt!r} size={size} steps={steps} seed={seed}")
+            "image.gen 手机后端未配置：设 FLEET_ANDROID_BRIDGE（如 http://127.0.0.1:18765）"
+            "并启动 android_bridge；或配 FLEET_SD_CLI 走 PC 后端")
+    url = bridge.rstrip("/") + "/gen"
+    payload = _j.dumps({"prompt": prompt, "neg": neg, "size": size, "steps": steps,
+                        "seed": seed, "cfg": cfg, "model": model}).encode("utf-8")
+    try:
+        req = _u.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with _u.urlopen(req, timeout=600) as resp:
+            data = _j.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"android_bridge 调用失败：{type(e).__name__}: {e}")
+    if not data.get("ok"):
+        raise RuntimeError(f"android_bridge 出图失败：{data.get('err') or 'unknown'}")
+    path = data.get("path") or ""
+    # 若桥返回 base64 PNG，落盘到 FLEET_SD_OUT 或临时目录
+    if not path and data.get("png_b64"):
+        import base64 as _b, os as _os, tempfile as _t
+        out_dir = os.environ.get("FLEET_SD_OUT") or os.path.join(
+            os.path.expanduser("~/.fleet"), "sd_out")
+        _os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"bridge_{int(__import__('time').time()*1000)}.png")
+        with open(out_path, "wb") as f:
+            f.write(_b.b64decode(data["png_b64"]))
+        path = out_path
+    if not path:
+        raise RuntimeError("android_bridge 未返回 path 或 png_b64")
+    return path
+
+
+def _default_backend(prompt, neg, size, steps, seed, cfg, model):
+    """默认后端调度：手机桥优先，PC sd-cli 兜底，均未配则如实报错。"""
+    # 1) 手机桥（android_bridge → SdBridge）
+    if os.environ.get("FLEET_ANDROID_BRIDGE"):
+        return _android_bridge_backend(prompt, neg, size, steps, seed, cfg, model)
+    # 2) PC sd-cli 兜底
+    if os.environ.get("FLEET_SD_CLI"):
+        return pc_sd_backend(prompt, neg, size, steps, seed, cfg, model)
+    # 3) 均未配：如实说
+    raise RuntimeError(
+        "image.gen 后端未配置：设 FLEET_ANDROID_BRIDGE（手机 SdBridge 桥）"
+        "或 FLEET_SD_CLI（PC stable-diffusion.cpp）；本节点未接出图能力时不应声明 image.gen")
 
 
 # ---------------------------------------------------------------------------
