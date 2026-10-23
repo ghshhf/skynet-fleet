@@ -451,20 +451,51 @@ class FleetServer:
         def _work():
             try:
                 sys2 = system
-                if web_mode != "off":
-                    q.put({"type": "web", "data": {"phase": "searching",
-                                                   "mode": web_mode}})
-                    try:
+                # ── 工具面（2026-10-24）：决策 → 执行 → 资料回填 ──
+                # 三档语义：
+                #   web=off   → 不做任何工具（用户明确关了）
+                #   web=on    → 强制 web_search（用户明确要联网）
+                #   web=auto  → 问决策模型 7 选 1（6 工具 + none）；
+                #               决策模型 = 手机 1.7B（schema 枚举实测 16/16）
+                # 决策层连不上 / 超时 → 按无工具面继续答，不重试不拖垮对话。
+                try:
+                    if web_mode == "on":
                         import webtool as WEB
-                        sys2, rep = WEB.augment(system, raw_prompt, mode=web_mode)
+                        q.put({"type": "web", "data": {"phase": "searching",
+                                                       "mode": "on"}})
+                        sys2, rep = WEB.augment(system, raw_prompt, mode="on")
                         rep["phase"] = "done"
                         q.put({"type": "web", "data": rep})
-                    except Exception as e:
-                        # 联网是增强，不是前置条件：它挂了这轮照常答，
-                        # 但必须把原因说出来，不许静默降级成「没联网」。
-                        q.put({"type": "web", "data": {
-                            "phase": "error", "used": False, "mode": web_mode,
-                            "reason": f"联网失败：{type(e).__name__}: {e}"}})
+                    elif web_mode == "auto":
+                        import fleet.agent_tools as AT
+                        d = AT.decide(raw_prompt)
+                        if d and d.get("tool") != "none":
+                            tool = d["tool"]
+                            q.put({"type": "web", "data": {
+                                "phase": "searching", "mode": "tool",
+                                "tool": tool}})
+                            if tool == "web_search":
+                                import webtool as WEB
+                                sys2, rep = WEB.augment(
+                                    system, raw_prompt, mode="on")
+                                rep["phase"] = "done"
+                                q.put({"type": "web", "data": rep})
+                            else:
+                                label, text = AT.execute(
+                                    tool, d.get("arg", ""), self.call)
+                                block = AT.render_tool_block(label, text)
+                                sys2 = system + block
+                                q.put({"type": "web", "data": {
+                                    "phase": "done", "used": True,
+                                    "mode": "tool", "tool": tool,
+                                    "label": label,
+                                    "sources": [{"title": f"手机工具 {label}",
+                                                 "url": ""}]}})
+                except Exception as e:
+                    # 工具面是增强不是前置条件：挂了照常答，但要说出来。
+                    q.put({"type": "web", "data": {
+                        "phase": "error", "used": False,
+                        "reason": f"工具面：{type(e).__name__}: {e}"}})
                 r = self.executor.call(
                     "ai.chat",
                     args={"prompt": prompt, "system": sys2,
