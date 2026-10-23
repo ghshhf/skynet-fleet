@@ -45,6 +45,9 @@ HIDDEN = [
     "registry", "ui_automation",
     # 可选音频后端（voice.py 用 __import__ 动态加载）
     "sounddevice", "pyaudio",
+    # 天网语音模式（--voice）：桌面端 + 语音链 + 嵌合件 + 免费在线 TTS
+    "desktop", "voice", "dialogue", "mock_brain", "tianwang_cards",
+    "edge_tts",
     # 设备/通道依赖的第三方
     "adb_shell", "adb_shell.adb_device", "adb_shell.adb_message",
     "adb_shell.auth.sign_pycryptodome", "adb_shell.auth.sign_cryptography",
@@ -73,6 +76,8 @@ for e in EXCLUDES:
 args += ["--collect-submodules", "fleet"]
 # 前端静态资源：整个 ui/ 目录 -> 冻扁后的 ui/
 args += ["--add-data", UI_DIR + os.pathsep + "ui"]
+# 出厂角色卡库（ccv2 json）-> 冻扁后的 cards/；运行时钩子首次种子到 %APPDATA%
+args += ["--add-data", os.path.join(REPO, "cards") + os.pathsep + "cards"]
 # 入口脚本
 args += [APP]
 

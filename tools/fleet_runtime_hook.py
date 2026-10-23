@@ -39,5 +39,19 @@ def _apply():
     for key, val in overrides.items():
         os.environ.setdefault(key, val)
 
+    # 出厂卡种子：FLEET_CARD_DIR 指向的可写目录还是空的（首次运行），而
+    # 打包时 cards/ 已随包放进 MEIPASS——把出厂卡复制过去，用户改卡/下载新卡
+    # 都落在可写目录，升级 exe 不丢卡。
+    try:
+        card_dir = os.environ["FLEET_CARD_DIR"]
+        src_cards = os.path.join(meipass, "cards")
+        if os.path.isdir(src_cards) and not os.path.exists(
+                os.path.join(card_dir, "active.json")) and not any(
+                f.endswith(".json") for f in os.listdir(card_dir)):
+            import shutil
+            shutil.copytree(src_cards, card_dir, dirs_exist_ok=True)
+    except Exception:
+        pass  # 种子失败不拦启动：卡库空时上层有明确报错
+
 
 _apply()

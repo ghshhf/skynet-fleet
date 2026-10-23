@@ -38,7 +38,7 @@ from tkinter import ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dialogue            # noqa: E402
-import persona_card        # noqa: E402
+import tianwang_cards as persona_card   # noqa: E402  嵌合件：走 X6 统一卡层
 
 try:
     import llm             # noqa: E402

@@ -64,7 +64,7 @@ def chat(url, prompt, system=None, timeout=120, temperature=0.7, max_tokens=256)
 
 def build_system(card_id):
     try:
-        import persona_card
+        import tianwang_cards as persona_card
         s = persona_card.build_system(card_id)
         if s:
             return s
