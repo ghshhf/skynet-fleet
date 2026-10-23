@@ -195,12 +195,17 @@ def cmd_sync(args):
             dest = (f"{PHONE_MEM}/{args.name}/manifest.json" if name == "manifest.json"
                     else f"{PHONE_MEM}/{args.name}/shards/{name}")
             lines.append(f"cp -f {staged} {dest}")
-        # 手机侧用同一份 memory_pack 合并后重算 digest：不接受「传完就算成功」
+        # 手机侧合并的规矩：先读 pack.json（已同步的全集），再把 shards/ 目录里
+        # 所有分片并进来（含刚传的那几片），最后重写。
+        # 踩过的坑：只 cp 分片而不更新 pack.json，Pack.load 会优先读旧的 pack.json，
+        # 新片根本看不见 —— 传输显示成功、digest 却没变，比报错更难查。
         lines.append(
             f"cd {PHONE_LIB} && python3 -c \""
-            f"import memory_pack as M;"
-            f"p=M.Pack.load('{PHONE_MEM}/{args.name}');"
-            f"p.save('{PHONE_MEM}/{args.name}');"
+            f"import memory_pack as M,json,glob;"
+            f"d='{PHONE_MEM}/{args.name}';"
+            f"p=M.Pack.load(d);"
+            f"[p.add(json.load(open(f))) for f in glob.glob(d+'/shards/*.json')];"
+            f"p.save(d);"
             f"print(p.digest(), len(p))\"")
         rc, out, err = adbx.termux("\n".join(lines))
         sys.stdout.write(out)

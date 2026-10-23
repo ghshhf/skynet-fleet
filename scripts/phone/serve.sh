@@ -6,13 +6,16 @@
 #   server 一次加载、之后每次请求毫秒级（实测 TTFT 129ms），且是 OpenAI 兼容 JSON。
 #   同一份权重可以同时服务「不同人格」——人格在记忆包里，换包不用重启。
 #
-# 用法：sh serve.sh [模型相对路径] [端口]
+# 用法：sh serve.sh [模型相对路径] [端口] [vision]
+#   vision = 挂视觉投影（能看图，但实测 prefill 慢 4 倍：4B 长 prompt 90.6s → 23.0s）
+#   默认不挂 —— 纯文本对话不该为「能不能看图」付这个代价
 MODEL="${1:-models/北极星-V7-Q8_0.gguf}"
 PORT="${2:-8080}"
+VISION="${3:-}"
 MMPROJ=""
-case "$MODEL" in
-  *Qwen3VL*|*qwen3vl*) MMPROJ="--mmproj $HOME/models/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf" ;;
-esac
+if [ "$VISION" = "vision" ]; then
+  MMPROJ="--mmproj $HOME/models/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf"
+fi
 mkdir -p "$HOME/skynet"
 if [ ! -f "$HOME/$MODEL" ] && [ ! -f "$MODEL" ]; then
   echo "MODEL_MISSING $MODEL"; exit 4

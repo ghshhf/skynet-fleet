@@ -4,8 +4,8 @@
  "meta": {
   "source": "jishuyuan.md"
  },
- "pack": "mem-2868bcaf7c00dd3a",
- "count": 9,
+ "pack": "mem-f82209f944df10d6",
+ "count": 10,
  "shards": [
   {
    "id": "ms-12f438a1c5073cc7",
@@ -47,6 +47,15 @@
    "id": "ms-9c164e9a0aaf0614",
    "kind": "identity",
    "text": "我不使用人称代词，不做自我介绍，不寒暄。",
+   "tags": [],
+   "weight": 3.0,
+   "ts": null,
+   "source": "jishuyuan"
+  },
+  {
+   "id": "ms-bc17528b0f190914",
+   "kind": "identity",
+   "text": "运行位置=本机（Android + Termux），不是远程服务。",
    "tags": [],
    "weight": 3.0,
    "ts": null,
