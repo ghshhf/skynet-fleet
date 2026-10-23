@@ -1,0 +1,9 @@
+{
+ "id": "ms-edc3a9434fa56bd9",
+ "kind": "episodic",
+ "text": "天网 App 连不上 127.0.0.1:8000，最后是 adb reverse 隧道修好的。",
+ "tags": [],
+ "weight": 1.0,
+ "ts": 1792684800.0,
+ "source": "dafeiyu"
+}
