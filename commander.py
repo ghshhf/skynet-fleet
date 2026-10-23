@@ -909,6 +909,7 @@ def _cmd_relay_fetch(name, url):
         return
     info = node.get("info") or {}
     rp = info.get("relay_port")
+    token = info.get("relay_token") or ""
     caps = node.get("capabilities") or []
     if "skynet.relay" not in caps or not rp:
         print(f"  节点 {name} 未上报 skynet.relay 能力（caps={caps}, relay_port={rp}）")
@@ -922,8 +923,11 @@ def _cmd_relay_fetch(name, url):
         print("  说明：relay 默认只绑 127.0.0.1；跨机需经 adb reverse / SSH 隧道转发")
         return
     rid = _next_id("rf")
-    s.sendall(_json.dumps({"type": "task", "id": rid, "kind": "fetch",
-                           "url": url}).encode("utf-8") + b"\n")
+    _req = {"type": "task", "id": rid, "kind": "fetch", "url": url}
+    # 节点若以 --lan 模式带 token 启动 relay，取页请求必须带同款 token 才能过鉴权
+    if token:
+        _req["token"] = token
+    s.sendall(_json.dumps(_req).encode("utf-8") + b"\n")
     data = b""
     try:
         while b"\n" not in data:

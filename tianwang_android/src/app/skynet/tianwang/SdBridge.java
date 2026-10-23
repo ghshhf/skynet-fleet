@@ -147,6 +147,21 @@ public final class SdBridge {
         if (handle != 0L) nativeCancel(handle);
     }
 
+    /** 稳态基准摘要：复用 systemInfo + listDevices，不新增 JNI native。 */
+    public static String benchSummary() {
+        return "systemInfo=" + systemInfo() + " | " + "devices=" + listDevices();
+    }
+
+    /** SDXL 1024 原生分辨率路由：把宽高 clamp 到模型原生尺寸。 */
+    public static int[] clampToNative(int w, int h, int nativeSize) {
+        if (nativeSize <= 0) nativeSize = 1024;
+        if (w > nativeSize) w = nativeSize;
+        if (h > nativeSize) h = nativeSize;
+        if (w < 64) w = 64;
+        if (h < 64) h = 64;
+        return new int[]{w, h};
+    }
+
     public void close() {
         if (handle != 0L) {
             nativeFree(handle);

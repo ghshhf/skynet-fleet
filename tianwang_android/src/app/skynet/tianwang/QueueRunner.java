@@ -23,6 +23,7 @@ import java.util.Locale;
 public final class QueueRunner {
 
     private static final String TAG = "fleet-queue";
+    private static final int MAX_RETRIES = 3;
 
     public interface Sink {
         void onProgress(String line);
@@ -78,13 +79,25 @@ public final class QueueRunner {
 
                 final String tag = "第 " + idx + "/" + total + " 张";
                 long t0 = System.currentTimeMillis();
-                byte[] png = sd.generate(it.prompt, it.neg, it.size, it.size,
-                        it.steps, it.seed, it.cfg, false, it.sampler,
-                        new SdBridge.Progress() {
-                            @Override public void onProgress(int step, int steps) {
-                                emit(sink, tag + " 推理中… " + step + "/" + steps);
-                            }
-                        });
+                byte[] png = null;
+                for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                    png = sd.generate(it.prompt, it.neg, it.size, it.size,
+                            it.steps, it.seed, it.cfg, false, it.sampler,
+                            new SdBridge.Progress() {
+                                @Override public void onProgress(int step, int steps) {
+                                    emit(sink, tag + " 推理中… " + step + "/" + steps);
+                                }
+                            });
+                    if (png != null && png.length > 0) break;
+                    if (attempt < MAX_RETRIES) {
+                        emit(sink, tag + " 失败重试 " + attempt + "/" + MAX_RETRIES
+                                + "：" + sd.lastError);
+                        try { Thread.sleep(2000); } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
                 it.ms = System.currentTimeMillis() - t0;
 
                 if (png == null || png.length == 0) {

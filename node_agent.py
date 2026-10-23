@@ -178,6 +178,7 @@ def _session(host, port, name, password, platform, caps, sandbox, cap_req,
                         "capability_specs": capabilities.describe(caps),
                         "info": {"sandbox": os.path.abspath(sandbox), "session": session,
                                  "relay_port": (relay.port if relay and relay.running else None),
+                        "relay_token": (relay.token if relay and relay.running else None),
                                  "compute": {"cpu": os.cpu_count() or 0, "gpu": gpu,
                                              "ram_gb": ram_gb, "models": models or []}}})
     print(f"[{name}] 已注册（token={resp['token'][:8]}…）caps={caps}", flush=True)
@@ -260,6 +261,8 @@ def _dispatch(s, m, name, sandbox):
         _do_image_gen(s, m)
     elif t == common.VIDEO_GEN:
         _do_video_gen(s, m)
+    elif t == common.MEMORY_SYNC:
+        _do_memory_sync(s, m)
     elif t == common.UI_SKIP:
         _do_ui_skip(s, m)
     elif t == common.CAP_GRANT:
@@ -390,6 +393,28 @@ _DEFAULT_UI_RULES = [{
          "textRegex": r"跳过|skip", "desc": ["关闭"]},
     ],
 }]
+
+
+
+def _do_memory_sync(s, m):
+    """处理 commander 派发的 memory_sync：export/import 本节点记忆。"""
+    mid = m.get("id")
+    try:
+        from fleet.memory_store import get_store
+        store = get_store()
+        op = (m.get("op") or "export").lower()
+        if op == "import":
+            items = m.get("items") or []
+            n = store.import_memories(items)
+            common.send_msg(s, {"t": common.MEMORY_SYNC_RESULT, "id": mid,
+                                "ok": True, "count": n})
+        else:
+            items = store.export_all()
+            common.send_msg(s, {"t": common.MEMORY_SYNC_RESULT, "id": mid,
+                                "ok": True, "items": items, "count": len(items)})
+    except Exception as e:
+        common.send_msg(s, {"t": common.MEMORY_SYNC_RESULT, "id": mid,
+                            "ok": False, "err": str(e)})
 
 
 def _do_ui_skip(s, m, skip_fn=None):
@@ -559,6 +584,34 @@ def _selftest():
 
     print("[selftest] video.gen 正常/异常/空prompt/未配置后端 全过")
 
+    # ---- 跨设备记忆同步（P5c）：export/import 回执路径 ----
+    import os as _os, tempfile as _tf
+    _dbp = _os.path.join(_tf.gettempdir(), f"fleet_ms_{_os.getpid()}.db")
+    for _f in (_dbp, _dbp+"-journal", _dbp+"-wal", _dbp+"-shm"):
+        if _os.path.exists(_f): _os.remove(_f)
+    _os.environ["FLEET_MEMORY"] = "1"
+    from fleet.memory_store import MemoryStore
+    # _do_memory_sync 走全局 get_store()，count 不固定；只验回执形状 + 去重语义
+    sx = _FakeSock()
+    _do_memory_sync(sx, {"id": "ms1", "op": "export"})
+    mx = _read_msgs(sx)[0]
+    assert mx["t"] == common.MEMORY_SYNC_RESULT and mx["ok"] is True, mx
+    assert isinstance(mx["items"], list) and mx["count"] == len(mx["items"]), mx
+    c0 = mx["count"]
+    # import 同内容应全部跳过（去重）
+    sx2 = _FakeSock()
+    _do_memory_sync(sx2, {"id": "ms2", "op": "import", "items": mx["items"]})
+    mx2 = _read_msgs(sx2)[0]
+    assert mx2["ok"] is True and mx2["count"] == 0, mx2
+    # import 全新内容应新增 1
+    sx3 = _FakeSock()
+    _do_memory_sync(sx3, {"id": "ms3", "op": "import", "items": [
+        {"role": "assistant", "content": "selftest-unique-" + str(c0),
+         "tags": "selftest", "ts": 1.0}]})
+    mx3 = _read_msgs(sx3)[0]
+    assert mx3["ok"] is True and mx3["count"] == 1, mx3
+    print("[selftest] memory.sync export/import 去重回执 OK")
+
     print("[selftest] PASS")
 
 
@@ -581,6 +634,21 @@ def _read_msgs(sock):
             break
         out.append(json.loads(buf[4:4 + n].decode("utf-8")))
         buf = buf[4 + n:]
+    return out
+
+
+def _scan_local_models():
+    """扫描本地 models 目录，返回模型名列表（供 info.models 上报）。"""
+    import os as _os
+    d = _os.environ.get("FLEET_MODELS_DIR") or _os.path.join(
+        _os.path.expanduser("~/.fleet"), "models")
+    exts = (".gguf", ".safetensors", ".bin", ".ckpt", ".pt", ".pth")
+    out = []
+    if _os.path.isdir(d):
+        for root, _, files in _os.walk(d):
+            for f in files:
+                if f.lower().endswith(exts):
+                    out.append(f)
     return out
 
 
@@ -609,6 +677,10 @@ def main():
     if args.selftest:
         _selftest()
         return
+    if args.models is None:
+        scanned = _scan_local_models()
+        if scanned:
+            args.models = ",".join(scanned)
     if not args.name:
         raise SystemExit("--name 必填（或使用 --selftest）")
     run_node(args.host, args.port, args.name, args.password, args.platform,
