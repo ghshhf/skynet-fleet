@@ -514,12 +514,16 @@ public class MainActivity extends Activity {
                 Net.chat(base, auth, asked, backend, snapshotHistory(), new Net.SseCallback() {
                     @Override
                     public void onWeb(final org.json.JSONObject data) {
-                        // 联网进度。搜索本身就是十几秒的活，不亮状态的话
-                        // 界面上就是一句「在想…」卡着不动，人只会以为死机。
+                        // 联网/工具进度。搜索和手机工具都是几秒到十几秒的活，
+                        // 不亮状态的话界面上就是一句「在想…」卡着不动，
+                        // 人只会以为死机。
                         if (data == null) { return; }
                         final String phase = data.optString("phase", "");
                         final boolean used = data.optBoolean("used", false);
                         final String reason = data.optString("reason", "");
+                        final String mode = data.optString("mode", "");
+                        final String tool = data.optString("tool", "");
+                        final String label = data.optString("label", "");
                         org.json.JSONArray srcs = data.optJSONArray("sources");
                         final int n = srcs == null ? 0 : srcs.length();
                         if (used && srcs != null) {
@@ -529,11 +533,22 @@ public class MainActivity extends Activity {
                             @Override
                             public void run() {
                                 if ("searching".equals(phase)) {
-                                    say2("正在联网查…");
+                                    if ("tool".equals(mode) && tool.length() > 0) {
+                                        // 手机工具：让用户看见是真的在动设备
+                                        say2("正在用手机工具 " + tool + "…");
+                                    } else {
+                                        say2("正在联网查…");
+                                    }
                                 } else if (used) {
-                                    say2("已联网 · 引用了 " + n + " 个来源");
+                                    if ("tool".equals(mode)) {
+                                        say2("已用手机工具 "
+                                             + (label.length() > 0 ? label : tool));
+                                    } else {
+                                        say2("已联网 · 引用了 " + n + " 个来源");
+                                    }
                                 } else if ("error".equals(phase)) {
-                                    say2("联网没成功：" + reason);
+                                    say2(reason.startsWith("工具面")
+                                         ? reason : ("联网没成功：" + reason));
                                 } else {
                                     say2("没联网：" + reason);
                                 }
