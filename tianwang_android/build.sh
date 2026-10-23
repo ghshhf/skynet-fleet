@@ -122,12 +122,16 @@ find src build/gen -name '*.java' > build/sources.txt
 echo "[2/5] javac 完成"
 
 # ---------------- ⑤ dex ----------------
-CLASSES="$(find build/classes -name '*.class')"
-# shellcheck disable=SC2086
+# 为什么不直接把 $CLASSES 传给 d8：Windows 的 cmd 命令行上限 8191 字符，
+# 类一多（现在十几个类、每个都带 $1$2 内部类）就会撞上，
+# 报成一句中文乱码「输入行太长。命令语法不正确。」——看起来像语法错，其实是长度。
+# 先打成 jar 只传一个参数，既绕开长度问题，d8 也认得 .jar 输入。
+JAR="$(dirname "$JAVAC")/jar"
+"$JAR" cf build/classes.jar -C build/classes .
 # --min-api 28 跟着 manifest 的 minSdkVersion 走（理由见 AndroidManifest.xml 的注释：
 # libfleet_sd.so 要 API 28 的 aligned_alloc）。
 "$D8" --lib "$PLATFORM" --min-api 28 --release \
-  --output build/dex $CLASSES
+  --output build/dex build/classes.jar
 echo "[3/5] d8 完成"
 
 # ---------------- ⑥ 把 dex 塞进 apk ----------------

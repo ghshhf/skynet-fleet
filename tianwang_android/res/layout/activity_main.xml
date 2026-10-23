@@ -106,6 +106,14 @@
                 style="@style/Chip"
                 android:text="扫频" />
 
+            <!-- 体温：这台手机是被动散热，SOC 到 85℃ 就开始压频，同一套参数
+                 tg 能从 50 掉到 30。点一下就知道「刚才还快，现在怎么慢了」
+                 到底是烫了还是别的原因。 -->
+            <TextView
+                android:id="@+id/btnThermal"
+                style="@style/Chip"
+                android:text="体温" />
+
             <TextView
                 android:id="@+id/btnPair"
                 style="@style/Chip"
