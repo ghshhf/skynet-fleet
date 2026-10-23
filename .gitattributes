@@ -3,3 +3,6 @@
 *.bat text eol=crlf working-tree-encoding=GBK
 # shell 脚本走 LF：Linux runner 上 CRLF 会 bad interpreter
 *.sh text eol=lf
+# 无扩展名的 shell 工具也要钉 LF：CRLF 落进手机后报 Permission denied /
+# "Syntax error: word unexpected"（这个坑真踩过一次，排查了两小时）
+tools/phone/glslc-termux text eol=lf
