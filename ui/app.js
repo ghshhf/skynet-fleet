@@ -257,8 +257,19 @@
     loadAssetTab(tab);
   }
 
+  // 页签渲染代号：**只认最后一次加载**，迟到的旧响应一律丢弃。
+  // 为什么要它（2026-10-23 装上 playwright 后活线门禁第一次真跑就踩到）：
+  // loadAssetTab 只是把 #tabBody 清空重画，在途的上一页请求并不会取消。
+  // 于是「点技能页」之后，先前那个更慢的 /api/fleet 响应晚一步回来，
+  // 照样往同一个 #tabBody 里画设备面板 —— 表现为
+  // 「页签高亮在技能、内容却是设备面板」，或者技能页刚画好又被盖掉。
+  // 这不是加载慢，是渲染写错了对象：每单渲染都得先问自己还算不算数。
+  var ASSET_SEQ = 0;
+
   function loadAssetTab(tab) {
     var body = $("tabBody");
+    var my = ++ASSET_SEQ;
+    function stale() { return my !== ASSET_SEQ; }
     body.textContent = "";
     body.appendChild(el("div", "empty", "读取中…"));
 
@@ -269,18 +280,26 @@
         return { ok: false, err: e.message, devices: [] };
       });
       Promise.all([api("/api/fleet"), pPair]).then(function (rs) {
+        if (stale()) { return; }
         ASSET_CACHE.fleet = rs[0];
         ASSET_CACHE.pair = rs[1];
         renderFleetTab(rs[0]);
         renderPairBlock(rs[1]);
-      }).catch(function (e) { renderTabErr(body, "读不到编队总览：" + e.message); });
+      }).catch(function (e) {
+        if (stale()) { return; }
+        renderTabErr(body, "读不到编队总览：" + e.message);
+      });
       return;
     }
     if (tab === "cards") {
       api("/api/cardstore").then(function (d) {
+        if (stale()) { return; }
         ASSET_CACHE.cards = d;
         renderCardsTab(d);
-      }).catch(function (e) { renderTabErr(body, "读不到角色卡：" + e.message); });
+      }).catch(function (e) {
+        if (stale()) { return; }
+        renderTabErr(body, "读不到角色卡：" + e.message);
+      });
       return;
     }
     if (tab === "skills") {
@@ -292,23 +311,35 @@
         return { ok: false, error: e.message, skills: [] };
       });
       Promise.all([api("/api/skills"), pEvolved]).then(function (rs) {
+        if (stale()) { return; }
         ASSET_CACHE.skills = rs[0];
         ASSET_CACHE.evolved = rs[1];
         renderSkillsTab(rs[0], rs[1]);
-      }).catch(function (e) { renderTabErr(body, "读不到技能清单：" + e.message); });
+      }).catch(function (e) {
+        if (stale()) { return; }
+        renderTabErr(body, "读不到技能清单：" + e.message);
+      });
       return;
     }
     if (tab === "audio") {
       api("/api/audio/presets").then(function (d) {
+        if (stale()) { return; }
         ASSET_CACHE.audio = d;
         renderAudioTab(d);
-      }).catch(function (e) { renderTabErr(body, "读不到音频预设：" + e.message); });
+      }).catch(function (e) {
+        if (stale()) { return; }
+        renderTabErr(body, "读不到音频预设：" + e.message);
+      });
       return;
     }
     api("/api/connectors").then(function (d) {
+      if (stale()) { return; }
       ASSET_CACHE.conns = d;
       renderConnsTab(d);
-    }).catch(function (e) { renderTabErr(body, "读不到连接器清单：" + e.message); });
+    }).catch(function (e) {
+      if (stale()) { return; }
+      renderTabErr(body, "读不到连接器清单：" + e.message);
+    });
   }
 
   /* ==================================================================

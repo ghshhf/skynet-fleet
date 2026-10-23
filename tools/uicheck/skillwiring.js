@@ -60,6 +60,15 @@ function note(path, body) {
     }
   });
 
+  /* 请求流水：失败现场只说「找不到」时，靠它判断是走了哪条路把页签换掉的 */
+  const reqLog = [];
+  page.on("request", (r) => {
+    const u = r.url();
+    if (u.indexOf("/api/") >= 0) { reqLog.push(r.method() + " " + u.replace(BASE, "")); }
+  });
+  let navCount = 0;
+  page.on("framenavigated", (f) => { if (f === page.mainFrame()) { navCount += 1; } });
+
   /* ---- 拦截：请求照发，答复我们给 ---- */
   await page.route("**/api/skill/**", async (route) => {
     const req = route.request();
@@ -105,9 +114,24 @@ function note(path, body) {
 
   /* ---- 走到技能页 ---- */
   await page.click('.sb-item[data-view="assets"]');
-  await page.waitForTimeout(500);
+  // 等设备面板真画出来再切：不等就切，首屏 fleet 请求还在途，虽然前端已按
+  // 渲染代号丢弃迟到响应，但先让它稳定能少一类「切态竞态」噪音。
+  await page.waitForFunction(
+    () => !!document.querySelector("#tabBody .fl-grid"), null, { timeout: 8000 }
+  ).catch(() => {});
   await page.click('#tabBar .tab[data-tab="skills"]');
-  await page.waitForTimeout(1500);
+  // 🔴 等**条件**，不睡固定时长。原来硬睡 1500ms：机器慢一点就判「卡没渲染出」，
+  //    那是把环境快慢当缺陷报，门禁不该这样。超时也没关系——下面的断言
+  //    照样会如实报「表单没出来 / 卡是 0 张」。
+  await page.waitForFunction(
+    () => {
+      if (document.querySelector(".esform")) { return true; }
+      // 注意：「读取中…」占位也用 .empty 类，不能直接等 .empty，
+      // 否则一加载就返回、等于没等。只认「已经不是读取中」的空态。
+      const e = document.querySelector("#tabBody .empty");
+      return !!e && e.textContent.indexOf("读取中") < 0;
+    }, null, { timeout: 12000 }
+  ).catch(() => {});
 
   const n = await page.evaluate(() => ({
     eskill: document.querySelectorAll(".card.eskill").length,
@@ -137,8 +161,70 @@ function note(path, body) {
   if (btns.length === 4) { ok("卡上四个操作钮齐全"); }
   else { bad("操作钮数量不对：" + btns.length + "（期望 4）"); }
 
+  /* ---- 点按钮一律「先按签名重找、再点」----
+     为什么（2026-10-23 装上 playwright 后**第一次真跑**这门禁就崩了）：
+     选用 ✓ / 选用 ✗ 都会写证据库并让前端 loadAssetTab 整片重渲染技能卡，
+     之前 $$() 拿到的 elementHandle 全部脱离 DOM。原先只有第 4 个「回滚」
+     重新取过句柄，前三个还捏着第 136 行那批旧句柄——崩不崩纯看重渲染
+     落不落在两次点击之间，所以是**偶发**，比稳定红更难查。
+     这里统一成一个入口：按「卡名 + 按钮序号」现查现点，谁都不许复用旧句柄。
+     不用 waitForTimeout 蒙过去——界面在用整片重渲染代替就地更新，门禁要如实反映。 */
+  async function clickBtn(k, label) {
+    const h = await page.evaluateHandle(({ skill, k }) => {
+      const cards = Array.from(document.querySelectorAll(".card.eskill"));
+      for (let i = 0; i < cards.length; i += 1) {
+        const nm = cards[i].querySelector(".cname");
+        if (nm && nm.textContent.trim() === skill) {
+          return cards[i].querySelectorAll(".cops button")[k] || null;
+        }
+      }
+      return null;
+    }, { skill: SKILL, k });
+    const el = h.asElement();
+    if (!el) {
+      // 失败现场必须打全：只有「找不到」三个字时，看不出是整块被清空、
+      // 还是卡片换了名字、还是重渲染炸了——那只能靠猜，本仓最不许的方式。
+      const snap = await page.evaluate((skill) => {
+        const cards = Array.from(document.querySelectorAll(".card.eskill"));
+        return {
+          cards: cards.length,
+          names: cards.map((c) => {
+            const nm = c.querySelector(".cname");
+            return (nm ? nm.textContent.trim() : "?") + ":" +
+                   c.querySelectorAll(".cops button").length;
+          }),
+          want: skill,
+          form: !!document.querySelector(".esform"),
+          trace: !!document.querySelector("#esTrace"),
+          bodyLen: (document.body.innerHTML || "").length,
+          view: (document.querySelector(".sb-item.on") || {}).textContent || "",
+          tab: (document.querySelector("#tabBar .tab.on") || {}).textContent || "",
+          bodyKids: Array.from((document.querySelector("#tabBody") || {}).children || [])
+            .map((c) => c.tagName.toLowerCase() + "." + (c.className || "")),
+          bodyText: ((document.querySelector("#tabBody") || {}).textContent || "")
+            .replace(/\s+/g, " ").slice(0, 240),
+          url: location.hash ? location.hash.replace(/t=[^&]*/, "t=***") : "",
+        };
+      }, SKILL);
+      console.log("   (现场) " + JSON.stringify(snap));
+      console.log("   (请求流水) " + JSON.stringify(reqLog.slice(-8)));
+      console.log("   (全部请求) " + JSON.stringify(reqLog));
+      console.log("   (导航次数) " + navCount);
+      try {
+        const shot = "/tmp/t18_fail.png";
+        await page.screenshot({ path: shot, fullPage: false });
+        console.log("   (截图) " + shot);
+      } catch (e) { /* 截图失败不影响判定 */ }
+      bad("找不到「" + label + "」按钮（卡名 " + SKILL + "，序号 " + k +
+          "；重渲染后没找回来）");
+      return false;
+    }
+    await el.click();
+    return true;
+  }
+
   /* ---- 选用 ✓ ---- */
-  await btns[0].click();
+  await clickBtn(0, "选用✓");
   await page.waitForTimeout(700);
   let useHits = hits["/api/skill/use"] || [];
   if (useHits.length === 1 && useHits[0] && useHits[0].name === SKILL &&
@@ -156,7 +242,7 @@ function note(path, body) {
   } else { bad("选用✓ 之后没有回执提示（toast=%r）".replace("%r", toast1)); }
 
   /* ---- 选用 ✗ ---- */
-  await btns[1].click();
+  await clickBtn(1, "选用✗");
   await page.waitForTimeout(700);
   useHits = hits["/api/skill/use"] || [];
   if (useHits.length === 2 && useHits[1] && useHits[1].ok === false) {
@@ -166,7 +252,7 @@ function note(path, body) {
   }
 
   /* ---- 记分 ---- */
-  await btns[2].click();
+  await clickBtn(2, "记分");
   await page.waitForTimeout(900);
   const stHits = Object.keys(hits).filter((k) => k.indexOf("/api/skill/stats") === 0);
   if (stHits.length === 1) {
@@ -242,25 +328,12 @@ function note(path, body) {
   }
 
   /* ---- 回滚：confirm 被取消 ⇒ 不该发请求 ---- */
-  // 🔴 句柄必须**重新取**：上一步「确认落盘」成功后前端会 loadAssetTab
-  //    重渲染整个 tab body，先前拿到的 btns 全部脱离 DOM——
-  //    直接点会报 "Element is not attached to the DOM"（实测踩过）。
-  //    这跟 clickaudit 里「重渲染后按签名找回」是同一类问题。
-  const idx2 = await page.evaluate((skill) => {
-    const cards = Array.from(document.querySelectorAll(".card.eskill"));
-    for (let i = 0; i < cards.length; i += 1) {
-      const nm = cards[i].querySelector(".cname");
-      if (nm && nm.textContent.trim() === skill) { return i; }
-    }
-    return -1;
-  }, SKILL);
-  const card2 = idx2 >= 0 ? (await page.$$(".card.eskill"))[idx2] : null;
-  const rbBtn = card2 ? (await card2.$$(".cops button"))[3] : null;
+  // 句柄同样按签名重找（走 clickBtn）：「确认落盘」成功后前端会 loadAssetTab
+  // 重渲染整个 tab body，任何提前拿到的句柄都已脱离 DOM。
   const beforeRb = Object.keys(hits).length;
-  if (!rbBtn) {
+  if (!(await clickBtn(3, "回滚"))) {
     bad("重渲染后找不到回滚按钮（卡片没重新渲染出来）");
   } else {
-    await rbBtn.click();
     await page.waitForTimeout(700);
     const afterRb = Object.keys(hits).length;
     if (confirmSeen >= 1 && afterRb === beforeRb) {
