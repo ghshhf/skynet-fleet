@@ -104,6 +104,14 @@ SPECS = {
             {"name": "model", "type": "str", "required": False, "desc": "模型文件（留给后端）"},
         ],
     },
+    "fleet.memory.sync": {
+        "title": "跨设备记忆同步",
+        "desc": "导出/导入本节点大脑 memory_store 的记忆，实现跨节点记忆同步",
+        "params": [
+            {"name": "op", "type": "str", "required": False, "desc": "export(默认) 或 import"},
+            {"name": "items", "type": "list", "required": False, "desc": "import 时传入的记忆列表"},
+        ],
+    },
     "skynet.relay": {
         "title": "SkyNet relay 状态",
         "desc": "返回本节点是否跑着 SkyNet relay 及其监听端口，供他机经端口转发取页",
@@ -134,6 +142,7 @@ ALIASES = {
     "perceive.report": "perceive",
     "image.gen.run": "image.gen",
     "video.gen.run": "video.gen",
+    "fleet.memory.sync.run": "fleet.memory.sync",
 }
 
 # 旧基线的类型词汇 → 设备层的类型词汇

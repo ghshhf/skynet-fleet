@@ -169,6 +169,13 @@ CAPABILITIES = [
                params=(Param("url", "str", True), Param("dest", "str", True)),
                side_effect=True, check=_skynet_reason,
                note="写本地文件 ⇒ 要过审批闸门。断点续传、落盘按内容去重"),
+    # ---- 跨设备记忆同步（P5c）----
+    Capability("fleet.memory.sync", "跨设备记忆同步（导出/导入本节点记忆）",
+               params=(Param("op", "str", doc="export(默认) 或 import"),
+                       Param("items", "list", doc="import 时传入的记忆列表")),
+               side_effect=True,
+               note="基于 memory_store；export 返回全部记忆，import 去重合并"),
+
     # ---- SkyNet relay：本机出口经端口转发借给别的节点 ----
     Capability("skynet.relay", "本机 SkyNet relay 状态（运行/端口/主机）",
                note="只读：返回本节点是否跑着 SkyNet relay 及其监听端口，供他机经端口转发取页"),

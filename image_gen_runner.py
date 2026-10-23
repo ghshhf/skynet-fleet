@@ -79,6 +79,50 @@ def picgo_upload(local_path, bed=None):
     raise RuntimeError(f"PicGo 未返回可识别的 URL：{out.stdout.strip()}")
 
 
+# ---------------------------------------------------------------------------
+# PC 后端：stable-diffusion.cpp 的 sd-cli（FLEET_SD_CLI 指向可执行文件）。
+# 未配 env 时如实说「未配置」，不静默交空；配了就 shell 出图。
+# ---------------------------------------------------------------------------
+def pc_sd_backend(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0, model=None,
+                  out_dir=None, timeout=300):
+    """经 stable-diffusion.cpp sd-cli 在 PC 上出图，返回 PNG 路径。
+
+    配置：FLEET_SD_CLI（sd 可执行文件路径）；可选 FLEET_SD_MODEL（模型路径，
+    或通过 model 参数传入）；FLEET_SD_OUT（输出目录，默认 ~/.fleet/sd_out）。
+    未配置时抛 RuntimeError，消息说清怎么配。
+    """
+    cli = os.environ.get("FLEET_SD_CLI") or ""
+    if not cli or not os.path.isfile(cli):
+        raise RuntimeError(
+            "PC 出图后端未配置：设 FLEET_SD_CLI 指向 stable-diffusion.cpp 的 sd 可执行文件"
+            "（并设 FLEET_SD_MODEL 或传 model）；本节点未接 PC 出图能力时不应声明 image.gen")
+    model_path = model or os.environ.get("FLEET_SD_MODEL") or ""
+    if not model_path or not os.path.isfile(model_path):
+        raise RuntimeError(
+            "PC 出图缺少模型：设 FLEET_SD_MODEL 或传 model 指向 .gguf/.safetensors 模型文件")
+    out_dir = out_dir or os.environ.get("FLEET_SD_OUT") or os.path.join(
+        os.path.expanduser("~/.fleet"), "sd_out")
+    os.makedirs(out_dir, exist_ok=True)
+    import time as _t
+    out_path = os.path.join(out_dir, f"sd_{int(_t.time()*1000)}.png")
+    w, h = (size or "512x512").lower().split("x") if "x" in (size or "") else ("512", "512")
+    cmd = [cli, "-m", model_path, "-p", prompt, "-o", out_path,
+           "-W", str(w), "-H", str(h), "-s", str(steps), "--cfg-scale", str(cfg)]
+    if neg:
+        cmd += ["-n", neg]
+    if seed is not None and int(seed) >= 0:
+        cmd += ["--seed", str(seed)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"sd-cli 执行失败：{type(e).__name__}: {e}")
+    if proc.returncode != 0 or not os.path.isfile(out_path):
+        raise RuntimeError(
+            f"sd-cli 出图失败（rc={proc.returncode}）："
+            f"{(proc.stderr or proc.stdout or '').strip()[:300]}")
+    return out_path
+
+
 def run(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0, model=None,
         backend=None, upload=False, bed=None):
     """出一张图，可选经 PicGo 上传到图床。

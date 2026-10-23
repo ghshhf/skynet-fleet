@@ -17,10 +17,46 @@
 """
 import base64
 import json
+import os
 import socket
 import threading
 
 from .netforce_skynet import _ensure_path  # 复用 netforce 定位逻辑
+
+# 跨会话持久化：把 relay 的 host/port/token 落到用户目录，进程重启后能复用同一
+# 端口与 token（避免端口漂移，且 relay_client/commander 能发现上次起的 relay）。
+RELAY_STATE_PATH = os.path.join(
+    os.path.expanduser("~/.fleet"), "relay.json")
+
+
+def load_relay_state():
+    """读上次保存的 relay 状态；没有/损坏返回 None。"""
+    try:
+        with open(RELAY_STATE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("port"):
+            return d
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def clear_relay_state():
+    try:
+        os.remove(RELAY_STATE_PATH)
+    except OSError:
+        pass
+
+
+def save_relay_state(host, port, token=""):
+    """把 relay 的 host/port/token 落盘；失败不抛（best-effort）。"""
+    try:
+        os.makedirs(os.path.dirname(RELAY_STATE_PATH), exist_ok=True)
+        with open(RELAY_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"host": host, "port": port, "token": token or ""},
+                      f, ensure_ascii=False)
+    except OSError:
+        pass
 
 
 class SkyNetRelay:
@@ -60,6 +96,7 @@ class SkyNetRelay:
         self._stop.clear()
         self._thread = threading.Thread(target=self._accept_loop, args=(N,), daemon=True)
         self._thread.start()
+        save_relay_state(self.host, self.port, self.token)
         return self.port
 
     @property
@@ -145,10 +182,20 @@ _relay = None
 
 
 def get_relay(host=None, token=None):
-    """单例。host/token 仅在首次创建或显式传入时生效（node_agent --lan 用）。"""
+    """单例。host/token 仅在首次创建或显式传入时生效（node_agent --lan 用）。
+
+    若首次创建且未显式给 host/token，尝试从持久化状态恢复，避免端口漂移。
+    """
     global _relay
     if _relay is None:
-        _relay = SkyNetRelay(host=host or "127.0.0.1", token=token or "")
+        saved = None
+        if host is None and token is None:
+            saved = load_relay_state()
+        _host = host or (saved.get("host") if saved else None) or "127.0.0.1"
+        _token = token if token is not None else ((saved.get("token") if saved else "") or "")
+        _relay = SkyNetRelay(host=_host, token=_token)
+        if saved and saved.get("port") and host is None:
+            _relay.port = int(saved["port"])
     else:
         if host is not None:
             _relay.host = host

@@ -208,6 +208,46 @@ class MemoryStore:
         self._con.execute("DELETE FROM memory")
         self._con.commit()
 
+    # ---------------- 跨设备同步 ----------------
+
+    def export_all(self):
+        """导出全部记忆为 list[dict]（含 id/ts/role/content/tags）。"""
+        if not self.enabled:
+            return []
+        if self._con is None:
+            self._open()
+        rows = self._con.execute(
+            "SELECT id, ts, role, content, tags FROM memory ORDER BY id ASC").fetchall()
+        return [{"id": r[0], "ts": r[1], "role": r[2], "content": r[3],
+                 "tags": r[4]} for r in rows]
+
+    def import_memories(self, items):
+        """从 list[dict] 导入；跳过内容重复的条目，返回实际新增数。"""
+        if not self.enabled or not items:
+            return 0
+        if self._con is None:
+            self._open()
+        added = 0
+        existing = set(r[0] for r in self._con.execute(
+            "SELECT content FROM memory").fetchall())
+        for it in items:
+            content = (it.get("content") or "").strip()
+            if not content or content in existing:
+                continue
+            role = it.get("role") or "user"
+            ts = it.get("ts") or time.time()
+            tags = it.get("tags") or ""
+            if isinstance(tags, (list, tuple)):
+                tags = ",".join(tags)
+            emb = json.dumps(_tfvec(_grams(content)), ensure_ascii=False)
+            self._con.execute(
+                "INSERT INTO memory(ts, role, content, tags, emb) VALUES(?,?,?,?,?)",
+                (ts, role, content, tags, emb))
+            existing.add(content)
+            added += 1
+        self._con.commit()
+        return added
+
 
 # 单例：llm.py 与其他模块复用这一个实例
 _store = None
