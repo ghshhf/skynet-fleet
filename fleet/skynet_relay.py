@@ -24,17 +24,32 @@ from .netforce_skynet import _ensure_path  # 复用 netforce 定位逻辑
 
 
 class SkyNetRelay:
-    """SkyNet 兼容的 relay server（line-JSON over TCP，守护线程常驻）。"""
+    """SkyNet 兼容的 relay server（line-JSON over TCP，守护线程常驻）。
 
-    def __init__(self, host="127.0.0.1", port=0):
+    host 默认 127.0.0.1（只本机/adb reverse 进来的手机）；传 host="0.0.0.0"
+    即 --lan 模式，允许局域网其他节点借本机出口。--lan 必须配 token（弱共享
+    密钥，够拦住局域网的误连/扫描），token 为空时拒绝所有非本机请求。
+    """
+
+    def __init__(self, host="127.0.0.1", port=0, token=""):
         self.host = host
         self.port = port
+        self.token = token or ""
         self._srv = None
         self._thread = None
         self._stop = threading.Event()
 
-    def start(self):
-        """起守护线程里的 TCP server，返回实际监听端口。"""
+    def start(self, host=None, port=None, token=None):
+        """起守护线程里的 TCP server，返回实际监听端口。
+
+        host/port/token 可在此覆盖构造值（node_agent --lan 用）。
+        """
+        if host is not None:
+            self.host = host
+        if port is not None:
+            self.port = port
+        if token is not None:
+            self.token = token or ""
         _ensure_path()                       # 确认 netforce 在，再绑端口
         from skynet import net as N        # noqa: F401（运行期才需要 net 模块）
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -68,8 +83,7 @@ class SkyNetRelay:
                 break
             threading.Thread(target=self._handle, args=(conn, N), daemon=True).start()
 
-    @staticmethod
-    def _handle(conn, N):
+    def _handle(self, conn, N):
         buf = b""
         try:
             conn.settimeout(25.0)
@@ -91,6 +105,13 @@ class SkyNetRelay:
                         continue
                     rid = req.get("id")
                     kind = req.get("kind")
+                    # token 鉴权：仅当本 relay 设了 token（--lan 模式）才校验，
+                    # 没设 token（默认 127.0.0.1）则不拦，保持本机/adb 直连零摩擦。
+                    if self.token and req.get("token") != self.token:
+                        conn.sendall(json.dumps(
+                            {"type": "result", "id": rid, "ok": False,
+                             "error": "unauthorized: token 不匹配"}).encode("utf-8") + b"\n")
+                        continue
                     if kind == "fetch":
                         url = req.get("url", "")
                         try:
@@ -123,10 +144,16 @@ class SkyNetRelay:
 _relay = None
 
 
-def get_relay():
+def get_relay(host=None, token=None):
+    """单例。host/token 仅在首次创建或显式传入时生效（node_agent --lan 用）。"""
     global _relay
     if _relay is None:
-        _relay = SkyNetRelay()
+        _relay = SkyNetRelay(host=host or "127.0.0.1", token=token or "")
+    else:
+        if host is not None:
+            _relay.host = host
+        if token is not None:
+            _relay.token = token
     return _relay
 
 

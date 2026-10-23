@@ -119,8 +119,10 @@ class FleetNode(BaseDevice):
             rid = f"rf-{self.name}-{int(time.time() * 1000)}"
             try:
                 import json as _json
-                s.sendall(_json.dumps({"type": "task", "id": rid, "kind": "fetch",
-                                       "url": url}).encode("utf-8") + b"\n")
+                _req = {"type": "task", "id": rid, "kind": "fetch", "url": url}
+                if relay.token:          # --lan 模式下 relay 设了 token，本地调用也要带
+                    _req["token"] = relay.token
+                s.sendall(_json.dumps(_req).encode("utf-8") + b"\n")
                 data = b""
                 while b"\n" not in data:
                     chunk = s.recv(65536)
