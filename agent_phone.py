@@ -8,6 +8,7 @@
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -23,20 +24,33 @@ SYSTEM = """你是手机操作员。你每次只能做一个动作，从下面�
 只输出一行 JSON，不要解释、不要代码块：
 
 {"action":"tap","label":"控件上原样的字"}
-{"action":"type","text":"要输入的内容"}
+{"action":"tap_id","id":"控件的 ID"}
+{"action":"set_text","target":"先点的控件（文字或 ID）","text":"要输入的内容"}
+{"action":"set_seek","target":"滑条那行的字或 ID","percent":72}
+{"action":"scroll","direction":"down"}
 {"action":"back"}
 {"action":"home"}
+{"action":"open","package":"com.android.settings"}
+{"action":"wait","text":"要等它出现的字"}
 {"action":"done","answer":"任务完成时的结果"}
 
 规则：
 - 每次只推进一步，别想一次点完
-- label 必须是清单里原样出现的文字，不要自己编、不要写坐标
-- 以「= 」开头的是结果显示，不是按钮，不要点它；看到它说明题目已经算出来了，
+- label / id / target 必须是清单里原样出现的值，不要自己编、不要写坐标
+- 清单里带 [可点] 的才点得动；不带的多半是容器或纯文字，别点
+- 要输入内容用 set_text，一次就能把字填进去；target 填那个输入框那行的字或 ID
+- 滑条（亮度、音量这类）用 set_seek，percent 是**滑条自己的位置 0~100**，
+  不等于它控制的东西的百分比。实测这颗 MIUI 亮度条：72≈亮度30%、80≈41%、90≈64%、100=100%
+- 以「= 」开头的是结果显示，不是按钮，不要点它；看到它说明已经算出来了，
   直接把那个数抄进 done 的 answer
 - 不许自己心算或推断答案：结果只能来自屏幕上真实显示的内容，
   你能算出来也必须点出来，否则算失败
-- 界面上没有你要的字，就先用 back 或 home 换界面，或直接 done 说明做不到
+- 界面上没有你要的字，就先 scroll 往下找，或 back/home 换界面，
+  或直接 done 说明做不到
 - 任务完成后才用 done，answer 里抄屏幕上显示的那个结果"""
+
+# 动作白名单：模型只能从这 8 里挑，碰不到 shell / 文件 / 网络。
+ACTIONS = ("tap", "tap_id", "set_text", "set_seek", "scroll", "back", "home", "open", "wait")
 
 
 def settings():
@@ -130,13 +144,15 @@ def usable_models():
 # 实测能出字的里面，按"能不能听话"排：参数大、指令跟随好的优先。
 # 不按延迟排——最快的 cohere/north-mini-code 是代码模型，做 UI 决策容易跑偏。
 PREFER = [
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-    "dots-studio/dots-3-note-preview:free",
-    "reflection/beam-free",
+    # 实测：nemotron 系是 reasoning 模型，爱把思考过程一起吐出来，输出不是纯 JSON，
+    # 单步动作这种"只回一行"的场合会被解析器丢掉。所以把非 reasoning 的放前面。
+    "stealth/glyph-cluster",
+    "kilo-auto/free",
+    "openrouter/free",
     "poolside/laguna-s-2.1:free",
+    "reflection/beam-free",
     "nvidia/nemotron-3.5-lightning:free",
-    "cohere/north-mini-code:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ]
 
 
@@ -164,36 +180,184 @@ def parse_action(text):
     return act if isinstance(act, dict) and "action" in act else None
 
 
-def screen_brief(serial):
-    """把界面压成模型能读的东西：文字清单 + 当前输入框内容。
+def screen_brief(serial, limit=40):
+    """把界面压成模型能读的清单：一行一个可操作元素，带 ID 和「可点」标记。
 
-    输入框内容必须给——不给的话模型看不见自己的进展，会一直点同一个键。
+    读屏走编队桥直读（毫秒级），不再用 uiautomator dump——后者每次 1~3 秒，
+    一步一读的话光读屏就把一个任务拖到几十秒。
+
+    返回 (前台包, 清单行, 输入框当前内容, 错误)。
     """
-    scr = P.read_screen(serial)
-    val = P.read_value(serial)
-    seen, items = set(), []
-    for n in scr["nodes"]:
-        lb = A.label(n)
-        if not lb or lb in seen:
+    sc = A.bridge_screen(serial, max_lines=300)
+    if not sc["ok"]:
+        return "", [], "", sc.get("err", "")
+    items, seen = [], {}
+    for n in sc["nodes"]:
+        t = (n["text"] or n["desc"]).strip()
+        vid = n["id"]
+        if not t and not vid:
             continue
-        seen.add(lb)
-        items.append(f"- {lb}" + ("  [可点]" if n["clickable"] else ""))
-    return scr["foreground"], items, (val.get("value") or "") if val.get("ok") else ""
+        if not t and not n["clickable"]:
+            continue                      # 有 id 没字又不可点：纯容器，操作不了
+        short = vid.rsplit("/", 1)[-1] if vid else ""
+        key = (t, short)
+        seen[key] = seen.get(key, 0) + 1
+        row = "- " + (t or short or n["cls"])
+        if short:
+            row += f"  [id:{short}]"
+        if n["clickable"]:
+            row += "  [可点]"
+        if seen[key] > 1:
+            row += f"  (第{seen[key]}个)"
+        items.append(row)
+        if len(items) >= limit:
+            break
+    val = P.read_value(serial)
+    value = (val.get("value") or "") if val.get("ok") else ""
+    return sc["pkg"], items, value, ""
+
+
+def _ambiguous_n(err):
+    m = re.search(r"ambiguous (\d+)", err or "")
+    return int(m.group(1)) if m else 0
+
+
+def _tap_el(serial, kind, value, what):
+    """按元素点。同名/同 id 多个时取视觉顺序第一个，但把这件事写进 note——
+    不静默，也不含糊：调用方和日志都能看见"为什么点的是这一个"。
+    """
+    r = A.bridge_tap_el(serial, kind, value)
+    if not r["ok"]:
+        n = _ambiguous_n(r.get("err", ""))
+        if n:
+            r = A.bridge_tap_el(serial, kind, value, index=1)
+            if r["ok"]:
+                r["note"] = f"界面上有 {n} 个{what}「{value}」，点了最上面那个"
+                r["changed"] = True
+                return r
+        r["changed"] = False
+        return r
+    r["changed"] = True
+    return r
+
+
+def _set_text(serial, target, text):
+    """点一下输入框拿焦点，再把文本整体设进去。
+
+    为什么不直接 ACTION_SET_TEXT：多数输入框在未聚焦时会被拒（text-rejected），
+    而"先点后设"是有序的两步，哪步失败都在结果里说清楚。
+    """
+    target = target.strip()
+    if not target:
+        return {"ok": False, "changed": False,
+                "err": "set_text 需要 target：先说清点哪个输入框（用清单里的字或 ID）"}
+    if ":" in target or "/" in target:
+        loc = _tap_el(serial, "id", target, " ID ")
+        kind = "id"
+    else:
+        loc = _tap_el(serial, "text", target, "控件")
+        kind = "text"
+        if not loc["ok"] and "not-found" in loc.get("err", ""):
+            # 模型可能直接把短 id 当 target 抄过来（清单里是 [id:btn_send] 这种），
+            # 按 id 再解析一次。两种都是精确寻址，不会点到别处。
+            alt = A.bridge_tap_el(serial, "id", target)
+            if alt["ok"]:
+                loc, kind = alt, "id"
+                loc["changed"] = True
+    if not loc["ok"]:
+        return {"ok": False, "changed": False,
+                "err": "找不到输入框：" + str(loc.get("err", ""))[:120]}
+    time.sleep(0.25)
+    r = A.bridge_set_text(serial, kind, target, text)
+    if not r["ok"] and kind == "text":
+        r = A.bridge_set_text(serial, "id", target, text)
+    r["changed"] = True
+    if loc.get("note"):
+        r["note"] = loc["note"]
+    return r
+
+
+def _set_seek(serial, target, percent):
+    """把滑条设到控件区间的 percent%。
+
+    不先点：ACTION_SET_PROGRESS 不要求焦点，先点反而可能点到旁边的开关
+    （亮度条紧挨着"自动调整亮度"）。三种寻址依次试 id → desc → text，
+    因为滑条本体通常只有 ID 和 contentDescription，没有 text。
+    """
+    target = str(target if target is not None else "").strip()
+    if not target:
+        return {"ok": False, "changed": False,
+                "err": "set_seek 需要 target：滑条那行的字或它的 ID"}
+    try:
+        pct = int(round(float(str(percent).strip().rstrip("%"))))
+    except (TypeError, ValueError):
+        return {"ok": False, "changed": False,
+                "err": "set_seek 的 percent 要是 0~100 的数字，收到：" + str(percent)}
+    pct = max(0, min(100, pct))
+    r = A.bridge_set_seek(serial, "id", target, pct)
+    for kind in ("desc", "text"):
+        if r["ok"] or "not-found" not in r.get("err", ""):
+            break
+        r = A.bridge_set_seek(serial, kind, target, pct)
+    r["changed"] = bool(r["ok"])
+    return r
+
+
+def _wait_text(serial, want, timeout=8.0):
+    """等某段字出现在界面上（比死睡固定秒数靠谱：真的等到了才算）。"""
+    if not want:
+        return {"ok": False, "changed": False, "err": "wait 需要 text"}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sc = A.bridge_screen(serial, max_lines=300)
+        if sc["ok"]:
+            for n in sc["nodes"]:
+                if want in n["text"] or want in n["desc"] or want == n["id"]:
+                    return {"ok": True, "changed": True, "err": "", "hit": n["cls"]}
+        time.sleep(0.4)
+    return {"ok": False, "changed": False, "err": f"{timeout}s 内界面上没等到「{want}」"}
 
 
 def do(serial, act):
-    a = str(act.get("action", "")).lower()
+    """执行一个动作。白名单之外的一律拒绝，模型碰不到 shell/文件/网络。"""
+    a = str(act.get("action", "")).strip().lower()
+    if a not in ACTIONS:
+        return {"ok": False, "changed": False,
+                "err": f"不允许的动作：{a or '(空)'}；只能用 {' / '.join(ACTIONS)}"}
+
     if a == "tap":
-        return P.press(serial, str(act.get("label", "")))
-    if a == "type":
-        return P.type_text(serial, str(act.get("text", "")))
+        label = str(act.get("label", "")).strip()
+        if not label:
+            return {"ok": False, "changed": False, "err": "tap 需要 label"}
+        return _tap_el(serial, "text", label, "控件")
+    if a == "tap_id":
+        vid = str(act.get("id", "")).strip()
+        if not vid:
+            return {"ok": False, "changed": False, "err": "tap_id 需要 id"}
+        return _tap_el(serial, "id", vid, " ID ")
+    if a == "set_text":
+        return _set_text(serial, str(act.get("target", "")), str(act.get("text", "")))
+    if a == "set_seek":
+        return _set_seek(serial, act.get("target", ""), act.get("percent", ""))
+    if a == "scroll":
+        r = A.bridge_scroll(serial, str(act.get("direction", "down")))
+        r["changed"] = bool(r["ok"])
+        return r
+    if a == "wait":
+        return _wait_text(serial, str(act.get("text", "")).strip())
     if a == "back":
         r = A.bridge_cmd(serial, "BACK")
         return {"ok": r["ok"], "changed": True, "err": r.get("err", "")}
     if a == "home":
         r = A.bridge_cmd(serial, "HOME")
         return {"ok": r["ok"], "changed": True, "err": r.get("err", "")}
-    return {"ok": False, "err": f"不允许的动作：{a}"}
+    # open
+    pkg = str(act.get("package", "")).strip()
+    if not pkg:
+        return {"ok": False, "changed": False, "err": "open 需要 package"}
+    r = A.launch(serial, pkg)
+    return {"ok": bool(r["ok"]), "changed": True,
+            "err": "" if r["ok"] else str(r.get("out", ""))[:120]}
 
 
 def solve(serial, task, model="", max_steps=14, verbose=True):
@@ -207,9 +371,14 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
     log, done_steps = [], []
     feedback = "（还没开始）"
     repeat = 0
+    fail_streak = 0
     prev_act = None
     for step in range(1, max_steps + 1):
-        fg, items, value = screen_brief(serial)
+        fg, items, value, rerr = screen_brief(serial)
+        if not items:
+            # 读不到界面就停：没有清单，模型只能瞎猜，跟着瞎点比不点更糟
+            log.append({"step": step, "err": "读不到界面，停止", "detail": rerr[:160]})
+            break
         history = "；".join(done_steps[-8:]) or "（无）"
         user = (f"任务：{task}\n当前应用：{fg}\n"
                 f"输入框当前内容：{value or '（空）'}\n"
@@ -270,10 +439,20 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
         changed = r.get("changed")
         feedback = ("成功" if ok else "失败：" + str(r.get("err", ""))[:80]) + \
                    ("，界面已变化" if changed else "，界面没变化（这一下可能没点到）")
-        done_steps.append(f"{act.get('action')} {act.get('label') or act.get('text') or ''}".strip())
+        if r.get("note"):
+            feedback += "（" + str(r["note"]) + "）"
+        step_desc = act.get("action", "")
+        for k in ("label", "id", "target", "text", "percent", "direction", "package"):
+            if act.get(k):
+                step_desc += " " + str(act[k])
+        done_steps.append(step_desc.strip())
         log.append({"step": step, "action": act, "ok": ok, "changed": changed,
                     "model": used, "note": feedback})
-        if not ok:
+        # 单步失败不判死：动作多了以后「这次没找到」是很正常的反馈，
+        # 该让模型看了错误自己换招。连错 3 次才是真卡住。
+        fail_streak = 0 if ok else fail_streak + 1
+        if fail_streak >= 3:
+            log.append({"step": step, "err": f"连续 {fail_streak} 次动作失败，停止"})
             break
         time.sleep(0.3)
     return log
@@ -309,10 +488,30 @@ def _selftest():
         assert api_key(), "settings.json 存在时应能读到 forwardKey"
 
     # ⑦ 偏好表里的模型必须都是探到过的名字，别写成瞎编的
+    #    形状按探测返回的**真格式**：`vendor/model`（斜杠分隔，可再带 `:free`
+    #    后缀）。原断言写成 `含 ":" 或以 -free 结尾` 是拍脑袋格式——
+    #    实测缓存里的真名是 `stealth/glyph-cluster`、`kilo-auto/free` 这种，
+    #    既没冒号也不是 -free 结尾，把真名字全毙了（2026-10-22 误报）。
+    #    "真的能出字"由 probe() 现场逐个调验证，不在这条形状检查里假装能验。
     for m in PREFER:
-        assert ":" in m or m.endswith("-free"), m
+        assert "/" in m and not m.startswith("/") and not m.endswith("/"), m
 
-    print("agent_phone \u81ea\u6d4b\uff1a7 \u9879\u5168\u8fc7")
+    # ⑧ 白名单之外的动作一律拒绝——模型碰不到 shell / 文件 / 网络。
+    #    用假 serial：这些分支在校验阶段就返回，根本不会去碰设备。
+    for bad in ("shell", "exec", "press", "type", "done", ""):
+        r = do("FAKE-SERIAL", {"action": bad, "cmd": "reboot"})
+        assert r["ok"] is False and "\u4e0d\u5141\u8bb8\u7684\u52a8\u4f5c" in r["err"], (bad, r)
+
+    # ⑨ 参数缺失必须在校验阶段说清楚，不能拿着空参数去碰设备
+    assert "\u9700\u8981 label" in do("FAKE-SERIAL", {"action": "tap"})["err"]
+    assert "\u9700\u8981 id" in do("FAKE-SERIAL", {"action": "tap_id"})["err"]
+    assert "\u9700\u8981 target" in do("FAKE-SERIAL", {"action": "set_text", "text": "x"})["err"]
+    assert "\u9700\u8981 text" in do("FAKE-SERIAL", {"action": "wait"})["err"]
+    assert "\u9700\u8981 package" in do("FAKE-SERIAL", {"action": "open"})["err"]
+    assert "up/down/left/right" in do("FAKE-SERIAL",
+                                      {"action": "scroll", "direction": "\u4fa7\u6ed1"})["err"]
+
+    print("agent_phone \u81ea\u6d4b\uff1a9 \u9879\u5168\u8fc7")
 
 
 def main(argv=None):

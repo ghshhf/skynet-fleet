@@ -214,6 +214,87 @@ def _code_strings(src):
     return out
 
 
+def _bind_strings(src):
+    """只抽**绑定地址**里出现的字符串字面量。
+
+    为什么不能拿全部字面量一刀切（2026-10-22 实测误报）：
+    `dial_host` 为了把「监听 0.0.0.0」归一成「连 127.0.0.1」，代码里本来就带
+    `("0.0.0.0", "::", "")` 这个**比较元组**——那是「去连」的地址，恰恰是
+    防连错的代码，不是「绑错」的违规。拿子串一查就把防错的代码判成犯错。
+
+    所以只认两种真绑定形状：
+      ① `XxxServer((host, port), ...)` 这类调用的**第一个参数**元组/列表里；
+      ② `FleetServer.__init__` 的 `host` **默认值**。
+    别处的 "0.0.0.0" 一律不看——那是说明文字或连接侧归一化，不是监听地址。
+    """
+    import ast
+    out = set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return out
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "attr", None) or getattr(fn, "id", None) or ""
+        if not str(name).endswith("Server") or not node.args:
+            continue
+        first = node.args[0]
+        if not isinstance(first, (ast.Tuple, ast.List)):
+            continue
+        for e in first.elts:
+            if isinstance(e, ast.Constant) and isinstance(e.value, str):
+                out.add(e.value)
+    # FleetServer.__init__ 的 host 默认值（真正的「默认绑哪个网卡」）
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef) or item.name != "__init__":
+                continue
+            args = item.args
+            pos = list(args.args)
+            defaults = list(args.defaults)
+            # 位置参数默认值：对齐到末尾几个
+            for i, d in enumerate(defaults):
+                idx = len(pos) - len(defaults) + i
+                if idx < 0 or pos[idx].arg != "host":
+                    continue
+                if isinstance(d, ast.Constant) and isinstance(d.value, str):
+                    out.add(d.value)
+            for kw, d in zip(args.kwonlyargs, args.kw_defaults):
+                if kw.arg == "host" and isinstance(d, ast.Constant) \
+                        and isinstance(d.value, str):
+                    out.add(d.value)
+    return out
+
+
+def _default_host(src):
+    """FleetServer.__init__ 的 host 默认值（拿不到返回 None）。"""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef) or item.name != "__init__":
+                continue
+            args = item.args
+            pos, defaults = list(args.args), list(args.defaults)
+            for i, d in enumerate(defaults):
+                idx = len(pos) - len(defaults) + i
+                if idx >= 0 and pos[idx].arg == "host":
+                    return d.value if isinstance(d, ast.Constant) else None
+            for kw, d in zip(args.kwonlyargs, args.kw_defaults):
+                if kw.arg == "host":
+                    return d.value if isinstance(d, ast.Constant) else None
+    return None
+
+
 def _sse_collect(base, token, prompt, timeout=30):
     """用裸 socket 读 /api/chat 的 SSE。
 
@@ -488,12 +569,29 @@ try:
     check("/app.js" in html and "/app.css" in html, "index.html 引用本地 app.js / app.css")
     check("<script" in html and "src=\"/app.js\"" in html, "index.html 用本地脚本")
 
-    # id 契约：app.js 里 $("xxx") 拿到的 id 必须在 index.html 里存在。
+    # id 契约：app.js 里 $("xxx") 拿到的 id 必须**有着落**。
     # 少一个 id 就是「界面某个角落永远不动」，是最难肉眼发现的那种坏。
+    #
+    # 🔴 「有着落」有两处，不是一处（N+1 立项时实测踩过）：
+    #    ① index.html 里静态写着的；
+    #    ② app.js 自己运行时创建的（`el("div", ...)` 之后 `.id = "xxx"`）。
+    #    只认 ① 会把一切动态界面误报——自写技能表单那 5 个 id 全是运行时建的，
+    #    但它们真实存在、点点就有反应，报「缺 id」是假的。
+    #    认了 ② 之后契约仍然完整：每个引用要么静态存在、要么被代码创建，
+    #    拼错的那个照样抓得到（拼错的 id 两边都不会出现）。
     html_ids = set(re.findall(r"""\bid\s*=\s*["']([^"']+)["']""", html))
     used_ids = set(re.findall(r"""\$\(\s*["']([^"']+)["']\s*\)""", js))
-    missing = sorted(used_ids - html_ids)
-    check(not missing, f"app.js 用到的 id 在 index.html 里都有（缺 {missing or '无'}）")
+    dyn_ids = set(re.findall(r"""\.id\s*=\s*["']([^"']+)["']""", js))
+    missing = sorted(used_ids - html_ids - dyn_ids)
+    check(not missing,
+          f"app.js 用到的 id 都有着落（静态或运行时创建；缺 {missing or '无'}）")
+    # 反向也钉一下：声称动态创建的 id 必须真被创建（防止有人靠加一行
+    # `.id = "xxx"` 把检查糊弄过去——那样 $("xxx") 还是会拿到 null）。
+    # 用正则而不是字符串 count：`.id = "x"` 和 `.id="x"` 都算，别在空格上误报。
+    fake_dyn = sorted(
+        i for i in (used_ids & dyn_ids)
+        if not re.search(r"""\.id\s*=\s*["']%s["']""" % re.escape(i), js))
+    check(not fake_dyn, f"动态 id 的赋值写在代码里（不是注释掉的）：{fake_dyn or '无'}")
 
     # JS 语法：node 在就查一遍（在不在都无所谓，查了更严）。
     import shutil
@@ -526,11 +624,16 @@ try:
     # ================================================================ ⑧ 静态纪律
     with open(os.path.join(ROOT, "fleet", "gui", "server.py"), encoding="utf-8") as f:
         srv_src = f.read()
-    # 只查「代码里的字符串字面量」，不查注释/文档字符串的措辞——
+    # 只查「绑定地址里的字符串字面量」，不查注释/文档字符串的措辞——
     # 文档里写「不绑 0.0.0.0」是在讲纪律，不是在绑它。
-    srv_literals = _code_strings(srv_src)
-    check("127.0.0.1" in srv_literals, "server.py 绑 127.0.0.1")
-    check("0.0.0.0" not in srv_literals, "server.py 代码里没有 0.0.0.0")
+    # 也不查连接侧归一化（dial_host 里的 ("0.0.0.0","::","") 是比较元组，
+    # 是防连错的代码）——只认 Server((host,port)) 首参与 __init__ 默认值。
+    srv_bind = _bind_strings(srv_src)
+    check("127.0.0.1" in srv_bind, "server.py 绑 127.0.0.1")
+    check("0.0.0.0" not in srv_bind, "server.py 的绑定地址里没有 0.0.0.0")
+    _dh = _default_host(srv_src)
+    check(_dh == "127.0.0.1",
+          f"FleetServer 默认就绑 127.0.0.1（实际默认 {_dh!r}；要对外得 --lan 显式开）")
     check("secrets" in srv_src and "token_urlsafe" in srv_src,
           "server.py 用 secrets 生成一次性令牌")
     check("compare_digest" in srv_src, "server.py 用常数时间比对令牌")
@@ -539,7 +642,8 @@ try:
     check("ThreadingHTTPServer" in srv_src, "server.py 用 stdlib http.server（没引 Flask）")
     check("flask" not in srv_src.lower() and "fastapi" not in srv_src.lower(),
           "server.py 没有 Flask/FastAPI 依赖")
-    check(not any("local.env" in s for s in srv_literals),
+    srv_all_strings = _code_strings(srv_src)
+    check(not any("local.env" in s for s in srv_all_strings),
           "server.py 代码里不读 local.env（令牌只存内存）")
 
     # token 绝不入库

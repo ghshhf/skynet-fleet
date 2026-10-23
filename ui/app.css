@@ -9,7 +9,18 @@
   --line:#e3e5e8; --line-soft:#edeef0;
   --fg:#1b1d21; --fg-2:#5c626d; --fg-3:#666e78;
   --accent:#2f6bd8; --accent-soft:#f1f5fd;
-  --user:#eef0f3; --danger:#d8453c; --ok:#1f9d55; --warn:#c98a00;
+  /* 实心 accent 底（承载白字）：必须与 #fff 达 WCAG AA 4.5:1，故与 --accent 分离 */
+  --accent-solid:#2f6bd8;
+  /* accent 当**文字色**用时的变量：#2f6bd8 落在 --panel-2(#f2f3f5) 上只有
+     4.487，差 0.013 不达标（axe 在技能页实测抓到，激活 tab 就是这一例）。
+     压深一档到 #2d66cf = 4.834，其余底色也全过（白底 5.367 / accent-soft 4.912）。
+     边框仍用 --accent（边框无对比度要求，不动品牌色）。 */
+  --accent-text:#2d66cf;
+  --user:#eef0f3; --danger:#c0332a; --ok:#147a41; --warn:#8a5d00;
+  /* 实心色底（承载白字）：上面的 --danger/--ok/--warn 同时当文字色用，
+     而「白字压在中间明度底色上」所需的亮度与「浅底上的文字」相反，
+     故分开：*-solid 专用于背景 + #fff。均实测 ≥ 4.5:1。 */
+  --warn-solid:#8a5d00; --danger-solid:#c0332a; --ok-solid:#147a41;
   --radius:10px; --radius-lg:14px;
   --shadow:0 1px 2px rgba(16,20,28,.06),0 8px 24px rgba(16,20,28,.06);
   --mono:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;
@@ -19,7 +30,14 @@ html[data-theme="dark"]{
   --line:#2b3036; --line-soft:#24282d;
   --fg:#e6e8eb; --fg-2:#a2a9b3; --fg-3:#8f97a5;
   --accent:#5b8def; --accent-soft:#182338;
-  --user:#242930; --warn:#d0a63c;
+  /* 深色主题下 #5b8def + 白字只有 3.23，实心底压到 #3b6fd4 = 4.76 */
+  --accent-solid:#3b6fd4;
+  /* 深色主题 --accent 作文字色四种底色全过（4.711~5.560，实测），故直接沿用 */
+  --accent-text:#5b8def;
+  --user:#242930; --warn:#e0b44c;
+  /* 深色底上的文字用亮色；实心底（+白字）仍用浅底那套深色，两边才都达 4.5 */
+  --danger:#f0756c; --ok:#4ec97f;
+  --warn-solid:#8a5d00; --danger-solid:#c0332a; --ok-solid:#147a41;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -55,7 +73,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .tb-win i{width:30px;height:26px;display:grid;place-items:center;border-radius:6px;
   color:var(--fg-3);font-style:normal;font-size:11px}
 .tb-win i:hover{background:var(--panel-2);color:var(--fg)}
-.tb-win i.close:hover{background:var(--danger);color:#fff}
+.tb-win i.close:hover{background:var(--danger-solid);color:#fff}
 .tb-theme{width:28px;height:26px;border-radius:6px;display:grid;place-items:center;
   color:var(--fg-3);font-size:12px}
 .tb-theme:hover{background:var(--panel-2);color:var(--fg)}
@@ -85,7 +103,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .sb-item{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:8px;
   font-size:13px;color:var(--fg-2);cursor:pointer;margin-bottom:1px}
 .sb-item:hover{background:var(--panel);color:var(--fg)}
-.sb-item.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.sb-item.on{background:var(--accent-soft);color:var(--accent-text);font-weight:600}
 .sb-item .ic{width:16px;height:16px;flex:0 0 16px;opacity:.9}
 .sb-item .tag{font-size:9.5px;padding:1px 5px;border-radius:5px;
   background:var(--panel-2);color:var(--fg-3);font-weight:500}
@@ -102,7 +120,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .sb-conv .txt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sb-foot{padding:9px 12px;border-top:1px solid var(--line);display:flex;
   align-items:center;gap:9px;font-size:12.5px;color:var(--fg-2)}
-.sb-foot .ava{width:24px;height:24px;border-radius:50%;background:var(--accent);
+.sb-foot .ava{width:24px;height:24px;border-radius:50%;background:var(--accent-solid);
   color:#fff;display:grid;place-items:center;font-size:11px}
 
 /* 中栏 */
@@ -115,7 +133,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .hbtn{width:28px;height:28px;border-radius:7px;display:grid;place-items:center;
   color:var(--fg-3);cursor:pointer}
 .hbtn:hover{background:var(--panel-2);color:var(--fg)}
-.hbtn.on{background:var(--accent-soft);color:var(--accent)}
+.hbtn.on{background:var(--accent-soft);color:var(--accent-text)}
 
 /* 消息流 */
 .stream{flex:1;overflow-y:auto;padding:22px 0 8px}
@@ -138,7 +156,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .msg.bot .txt{font-size:13.5px;line-height:1.72}
 .msg.bot .txt p{margin:0 0 9px}
 .msg.bot .txt p:last-child{margin-bottom:0}
-.msg.bot .txt .hl{background:var(--accent-soft);color:var(--accent);padding:0 4px;
+.msg.bot .txt .hl{background:var(--accent-soft);color:var(--accent-text);padding:0 4px;
   border-radius:4px;font-family:var(--mono);font-size:12.5px}
 .msg.bot .txt ul{margin:0 0 9px;padding-left:18px}
 .msg.bot .txt li{margin:2px 0}
@@ -158,7 +176,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   border:1px solid var(--line);border-radius:var(--radius);background:var(--panel-2);
   padding:9px 13px;display:flex;align-items:center;gap:11px;font-size:12.5px}
 .voicebar[hidden]{display:none}
-.voicebar .mic{width:26px;height:26px;border-radius:50%;background:var(--danger);
+.voicebar .mic{width:26px;height:26px;border-radius:50%;background:var(--danger-solid);
   color:#fff;display:grid;place-items:center;flex:0 0 26px;animation:pulse 1.4s infinite}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(216,69,60,.5)}50%{box-shadow:0 0 0 7px rgba(216,69,60,0)}}
 .voicebar .wv{display:flex;align-items:center;gap:2.5px;height:18px}
@@ -181,8 +199,8 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   font-size:12px;color:var(--fg-2);cursor:pointer}
 .cbtn:hover{background:var(--panel-2);color:var(--fg)}
 .cbtn.mic{margin-left:auto;width:27px;padding:0;justify-content:center}
-.cbtn.mic.on{background:var(--danger);color:#fff}
-.cbtn.send{background:var(--accent);color:#fff}
+.cbtn.mic.on{background:var(--danger-solid);color:#fff}
+.cbtn.send{background:var(--accent-solid);color:#fff}
 .cbtn.send:hover{filter:brightness(1.08)}
 .cbtn:disabled{opacity:.45;cursor:default}
 .cbtn .kbd{font-size:10px;color:var(--fg-3);font-family:var(--mono)}
@@ -215,10 +233,10 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .caprow .tags{margin-top:4px;display:flex;gap:4px;flex-wrap:wrap}
 .badge{font-size:9.5px;padding:1px 5px;border-radius:5px;font-family:var(--mono);
   background:var(--panel-2);color:var(--fg-3)}
-.badge.se{background:var(--warn);color:#fff}
-.badge.ask{background:var(--accent);color:#fff}
-.badge.deny{background:var(--danger);color:#fff}
-.badge.ok{background:var(--ok);color:#fff}
+.badge.se{background:var(--warn-solid);color:#fff}
+.badge.ask{background:var(--accent-solid);color:#fff}
+.badge.deny{background:var(--danger-solid);color:#fff}
+.badge.ok{background:var(--ok-solid);color:#fff}
 
 /* 结果条（能力调用的真实 DeviceResult） */
 .resbar{margin:0 28px 8px;max-width:760px;margin-inline:auto;font-size:11.5px;
@@ -266,14 +284,14 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .apprrow .acts{display:flex;gap:6px;justify-content:flex-end;margin-top:8px}
 .apprrow .hbtn{font-size:11.5px;padding:3px 10px;border-radius:7px;
   border:1px solid var(--line);background:var(--panel)}
-.apprrow .hbtn.yes{background:var(--accent);color:#fff;border-color:transparent}
+.apprrow .hbtn.yes{background:var(--accent-solid);color:#fff;border-color:transparent}
 .apprrow .hbtn.no{color:var(--danger)}
 .apprfoot{display:flex;align-items:center;gap:8px;margin-top:10px;
   padding-top:8px;border-top:1px solid var(--line-soft);font-size:11px;color:var(--fg-3)}
 .apprfoot .grow{flex:1}
 .caprow .hbtn.go{font-size:10.5px;padding:2px 9px;border-radius:6px;
   border:1px solid var(--line);color:var(--fg-2);margin-top:6px}
-.caprow .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
+.caprow .hbtn.go:hover{border-color:var(--accent);color:var(--accent-text)}
 
 /* ==========================================================================
    右栏：设备页（W3·主机可视化）
@@ -324,7 +342,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .prow .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prow .ppid{font-family:var(--mono);font-size:10px;color:var(--fg-3);width:44px;text-align:right}
 .prow .pcpu{font-family:var(--mono);font-size:10.5px;color:var(--fg-2);width:42px;text-align:right}
-.prow .sortarrow{font-size:9px;color:var(--accent);width:9px}
+.prow .sortarrow{font-size:9px;color:var(--accent-text);width:9px}
 
 /* 失败原因：说清楚为什么空着 */
 .dp-notes{padding:8px 12px 14px;display:flex;flex-direction:column;gap:6px}
@@ -342,10 +360,13 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 /* ---------- 三 Tab 条 ---------- */
 .tabbar{flex:0 0 auto;display:flex;align-items:center;gap:2px;
   padding:10px 20px 0;border-bottom:1px solid var(--line-soft)}
+/* tab 的专用容器：role="tablist" 只允许 role="tab" 的子元素，
+   刷新按钮因此挪到容器外（见 index.html 里的说明）。 */
+.tabbar .tablist{display:flex;align-items:center;gap:2px;min-width:0}
 .tab{padding:7px 14px;font-size:13px;color:var(--fg-2);border-bottom:2px solid transparent;
   border-radius:6px 6px 0 0}
 .tab:hover{color:var(--fg);background:var(--panel-2)}
-.tab.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:500}
+.tab.on{color:var(--accent-text);border-bottom-color:var(--accent);font-weight:500}
 .tab:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 
 /* ---------- Tab 内容区 ---------- */
@@ -375,13 +396,24 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .card .cmeta .hbtn.go{width:auto;height:auto;font-size:10.5px;padding:2px 9px;
   border-radius:6px;border:1px solid var(--line);background:var(--panel);
   color:var(--fg-2);font-family:inherit;white-space:nowrap}
-.card .cmeta .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
+.card .cmeta .hbtn.go:hover{border-color:var(--accent);color:var(--accent-text)}
 .card .cmeta .hbtn.go:disabled{opacity:.55;cursor:default}
 .card .cmeta .seedin{width:104px;font-size:11px;padding:2px 7px;border-radius:6px;
   background:var(--panel-2);border:1px solid var(--line);color:var(--fg);
   font-family:var(--mono)}
 .card .cmeta .seedin:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .card .cdesc:empty{display:none}
+
+/* 配对：6 位码要能一眼看清、能隔着一米抄下来 */
+.pair-row{display:flex;align-items:center;gap:12px;padding:10px 2px 6px}
+.pair-code{font-family:var(--mono);font-size:26px;letter-spacing:3px;font-weight:600;
+  color:var(--accent-text);background:var(--accent-soft);border-radius:8px;
+  padding:6px 14px;white-space:nowrap}
+.pair-code.off{color:var(--fg-3);background:var(--panel)}
+.pair-meta{flex:1;min-width:0}
+.pair-t{font-size:12px;color:var(--fg)}
+.pair-t.warn{color:var(--warn)}
+.pair-s{font-size:11px;color:var(--fg-3);margin-top:3px}
 
 /* 状态点：在线/离线 */
 .dot-ok{width:6px;height:6px;border-radius:50%;background:var(--ok);flex:0 0 6px}
@@ -390,7 +422,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 
 /* 来源徽标：内建 / 外接 */
 .badge-src{font-size:10px;padding:1px 6px;border-radius:9px;
-  background:var(--accent-soft);color:var(--accent);font-family:var(--mono)}
+  background:var(--accent-soft);color:var(--accent-text);font-family:var(--mono)}
 .badge-src.ext{background:var(--panel);color:var(--fg-2);border:1px solid var(--line)}
 .badge-role{font-size:10px;padding:1px 6px;border-radius:9px;
   background:var(--panel);color:var(--fg-2);border:1px solid var(--line)}
@@ -398,6 +430,64 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 /* 卡片里的原因（不可用时） */
 .card .creason{font-size:11px;color:var(--warn);line-height:1.5;word-break:break-word}
 .card .creason.err{color:var(--danger)}
+
+/* ==================================================================
+   自写技能区（专家 Tab 的「自写」段，skills_evolved/）
+   —— 与前两区的唯一区别：这边有**动作**（选用/记分/提交/回滚）。
+   配色一律取既有变量，不引入新色值（N 环刚把实心底拆成 *-solid，
+   这里不新增「白字压中间明度底」的组合）。
+   ================================================================== */
+.card.eskill{gap:7px}
+.card .cops{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  margin-top:3px;padding-top:7px;border-top:1px solid var(--line-soft)}
+.card .cops .hbtn{width:auto;height:auto;font-size:10.5px;padding:3px 10px;
+  border-radius:6px;border:1px solid var(--line);background:var(--panel);
+  color:var(--fg-2);white-space:nowrap;cursor:pointer;font-family:inherit}
+.card .cops .hbtn:hover{border-color:var(--accent);color:var(--accent-text)}
+.card .cops .hbtn:disabled{opacity:.55;cursor:default}
+/* 回滚是破坏性动作：红字 + 红边，但不铺红底——铺了就跟「选用 ✓」抢注意力 */
+.card .cops .hbtn.danger{color:var(--danger);border-color:var(--danger)}
+.card .cops .hbtn.danger:hover{background:var(--danger-solid);color:#fff;
+  border-color:var(--danger-solid)}
+.badge-role.err{color:var(--danger);border-color:var(--danger)}
+
+/* 记分盒：默认收起（点了「记分」才拉） */
+.sstat{display:none;flex-direction:column;gap:4px;font-size:11px;
+  color:var(--fg-2);font-family:var(--mono);background:var(--panel);
+  border:1px solid var(--line-soft);border-radius:8px;padding:7px 9px;
+  margin-top:2px;line-height:1.6;word-break:break-word}
+.sstat:not(:empty){display:flex}
+.sstat .srow{display:flex;align-items:baseline;justify-content:space-between;
+  gap:8px;font-size:11px;color:var(--fg-2);border-bottom:none;padding:0}
+.sstat .srate{color:var(--ok);font-weight:500}
+.sstat .sverdict{color:var(--fg-3);font-size:10.5px;margin-top:2px;
+  padding-top:4px;border-top:1px dashed var(--line)}
+.sstat .err{color:var(--danger);font-family:inherit}
+
+/* 长新技能的表单：两步（预览四闸 → 确认落盘），
+   四闸全过前「确认落盘」保持 disabled——后端也会再拦一遍，前端只是别让人白点。 */
+.esform{display:flex;flex-direction:column;gap:7px;background:var(--panel-2);
+  border:1px solid var(--line);border-radius:10px;padding:11px 12px;margin-bottom:12px}
+.esform .esform-t{font-size:11px;color:var(--fg-3);letter-spacing:.04em;
+  text-transform:uppercase}
+.esform .esrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.esform .esrow input{flex:1;min-width:170px;font-size:12px;padding:5px 9px;
+  border-radius:7px;background:var(--panel);border:1px solid var(--line);
+  color:var(--fg);font-family:var(--mono)}
+.esform .esrow input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.esform .esrow .hbtn{width:auto;height:auto;font-size:11px;padding:4px 11px;
+  border-radius:7px;border:1px solid var(--line);background:var(--panel);
+  color:var(--fg-2);white-space:nowrap;cursor:pointer;font-family:inherit}
+.esform .esrow .hbtn:hover{border-color:var(--accent);color:var(--accent-text)}
+.esform .esrow .hbtn:disabled{opacity:.55;cursor:default}
+.esform .esgates{display:none;flex-direction:column;gap:3px;font-size:11px;
+  font-family:var(--mono);line-height:1.6}
+.esform .esgates:not(:empty){display:flex}
+.esform .gate{padding:3px 8px;border-radius:6px;word-break:break-word}
+.esform .gate.ok{color:var(--ok);background:var(--panel)}
+.esform .gate.no{color:var(--danger);background:var(--panel)}
+.esform .esnote{color:var(--fg-3);font-size:10.5px;padding:2px 8px;
+  word-break:break-word}
 
 /* ==================================================================
    角色卡商店（专家 Tab 下半段）
@@ -413,7 +503,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .storebar .hbtn.go{width:auto;height:auto;font-size:11.5px;padding:5px 12px;
   border-radius:7px;border:1px solid var(--line);background:var(--panel-2);
   color:var(--fg-2);white-space:nowrap}
-.storebar .hbtn.go:hover{border-color:var(--accent);color:var(--accent)}
+.storebar .hbtn.go:hover{border-color:var(--accent);color:var(--accent-text)}
 .storebar .hbtn.go:disabled{opacity:.55;cursor:default}
 
 .storeinbox{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
@@ -423,7 +513,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .storeinbox .hbtn{width:auto;height:auto;font-size:11px;padding:3px 10px;
   border-radius:7px;border:1px solid var(--line);background:var(--panel);
   color:var(--fg-2);font-family:inherit}
-.storeinbox .hbtn:hover{border-color:var(--accent);color:var(--accent)}
+.storeinbox .hbtn:hover{border-color:var(--accent);color:var(--accent-text)}
 
 .storeres{min-height:40px}
 .storeres .wall{margin-top:8px}
@@ -477,3 +567,76 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   border:1px solid var(--line-soft);overflow:hidden}
 .dmtrack i{display:block;height:100%;background:var(--accent)}
 .dmv{width:36px;text-align:right;font-family:var(--mono)}
+
+/* ==========================================================================
+   语音对话视图（光球）
+   --------------------------------------------------------------------------
+   形态照 desktop.py 的「独立语音模式」：一屏一球 + 一行字幕 + 底栏三件，
+   不堆聊天记录（堆了就退化成聊天窗口，失去语音优先的意义）。
+   光球由 JS Canvas 画（IDLE 慢呼吸 / LISTEN 波纹 / THINK 转圈 / SPEAK 脉冲），
+   CSS 只管摆放与手感。不用位图、不引 CDN：这台机器要离线可跑。
+   ========================================================================== */
+.view-voice{position:relative}
+.vv-wrap{
+  flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:20px;padding:20px 24px 8px;
+}
+.vv-orb{width:260px;height:260px;flex:0 0 auto;display:block}
+.vv-sub{
+  max-width:640px;text-align:center;font-size:16px;line-height:1.75;
+  color:var(--fg);min-height:3.5em;word-break:break-word;
+}
+.vv-hint{font-size:12.5px;line-height:1.5;color:var(--fg-3);text-align:center;min-height:1.4em}
+.vv-hint:empty{display:none}
+
+.vv-bar{
+  flex:0 0 auto;display:flex;align-items:center;gap:10px;
+  padding:10px 20px 18px;border-top:1px solid var(--line-soft);background:var(--panel);
+}
+.vv-mic{
+  width:50px;height:50px;flex:0 0 50px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;font-size:20px;
+  background:var(--panel-2);border:1px solid var(--line);color:var(--fg);
+  transition:background .15s,border-color .15s,transform .1s;
+}
+.vv-mic:hover{background:var(--accent-soft);border-color:var(--accent)}
+.vv-mic:active{transform:scale(.96)}
+.vv-mic.rec{background:var(--danger-solid);border-color:var(--danger-solid);color:#fff}
+.vv-input{
+  flex:1;min-width:0;height:46px;padding:0 14px;font:inherit;color:var(--fg);
+  background:var(--bg);border:1px solid var(--line);border-radius:23px;outline:none;
+}
+.vv-input:focus{border-color:var(--accent)}
+.vv-send,.vv-hands{
+  height:46px;padding:0 18px;border-radius:23px;border:1px solid var(--line);
+  background:var(--panel-2);color:var(--fg);font-size:13.5px;white-space:nowrap;
+}
+.vv-send{background:var(--accent-solid);border-color:var(--accent-solid);color:#fff}
+.vv-send:disabled{opacity:.5;cursor:not-allowed}
+.vv-hands.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-text)}
+
+@media (max-width:900px){
+  .vv-orb{width:200px;height:200px}
+  .vv-bar{padding:8px 12px 14px;gap:8px}
+  .vv-send,.vv-hands{padding:0 12px;font-size:12.5px}
+}
+
+/* ==========================================================================
+   编队总览（X2）
+   四格指标 + 分区列表。颜色按「有没有问题」走，不用固定色——
+   全部正常时不该满屏警示色，那会让人对告警脱敏。
+   ========================================================================== */
+.fl-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+  gap:8px;padding:12px;border-bottom:1px solid var(--line-soft)}
+.fl-kpi{padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+  background:var(--panel);display:flex;flex-direction:column;gap:3px;min-width:0}
+.fl-k{font-size:11px;color:var(--fg-3);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.fl-v{font-size:21px;font-weight:650;line-height:1.15;font-variant-numeric:tabular-nums}
+.fl-s{font-size:11px;color:var(--fg-3);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.fl-kpi.good .fl-v{color:var(--ok)}
+.fl-kpi.warn{border-color:var(--warn)}
+.fl-kpi.warn .fl-v{color:var(--warn)}
+.fl-kpi.bad{border-color:var(--danger)}
+.fl-kpi.bad .fl-v{color:var(--danger)}

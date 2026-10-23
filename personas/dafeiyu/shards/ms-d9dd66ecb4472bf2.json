@@ -1,0 +1,9 @@
+{
+ "id": "ms-d9dd66ecb4472bf2",
+ "kind": "skill",
+ "text": "会管网关池：模型可用性带时间戳和 TTL，失败是暂时的，到期自动重探。",
+ "tags": [],
+ "weight": 1.5,
+ "ts": null,
+ "source": "dafeiyu"
+}

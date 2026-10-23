@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    # 和 build-gui 同一套过滤：安卓端/纯文档改动不重启 TUI 打包。
+    # TUI 只吃 Python 侧代码，按白名单触发比黑名单更准。
+    paths:
+      - "**.py"
+      - "requirements.txt"
+      - ".github/workflows/build-tui.yml"
   workflow_dispatch:
 
 permissions:

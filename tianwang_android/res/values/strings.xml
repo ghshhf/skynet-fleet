@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">天网</string>
+    <string name="hint_input">说点什么，或者按住下面的圆</string>
+    <string name="btn_send">发</string>
+    <string name="btn_settings">设置</string>
+    <string name="mic_idle">按住说话</string>
+    <string name="mic_active">松手结束</string>
+    <string name="idle_sub">点一下圆开始听，说完点一下结束</string>
+</resources>

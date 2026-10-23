@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  天网 · 手机原生端
+
+  纯原生 View 实现，不走 WebView：光球是自定义 Canvas，录音是 AudioRecord，
+  网络是 HttpURLConnection。唯一的后端依赖是电脑上那个 fleet/gui 服务，
+  通过 adb reverse 把手机的回环口接到电脑上。
+-->
+<!-- versionCode / versionName 故意不写在这里：写死就会出现"代码改了包没换"
+     还说不清的状况。由 build.sh 每次构建 +1，经 aapt2 link 的
+     version-code / version-name 参数注入（manifest 里写了会覆盖参数，必须留空）。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="app.skynet.tianwang">
+
+    <!-- minSdk 28（Android 9）而不是 26：出图那条 libfleet_sd.so 用到
+         std::aligned_alloc，Android 的 libc 到 API 28 才提供。不抬的话老机器能装上、
+         loadLibrary 也会成功，但一真的出图就在 native 层崩，日志里只看得到信号，
+         看不出是 API 版本问题。抬到 28 后安装阶段就挡住，用户根本遇不到。 -->
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="35" />
+
+    <!-- 只连 127.0.0.1（adb reverse 转出去），不主动外联 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 录音：运行时申请 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- 包可见性（Android 11+）：targetSdk 30 起，queryIntentServices 默认
+         什么都查不到——于是"逐个点名试 TTS 引擎"那段永远拿到空列表，
+         表现出来的就是"明明装了小米语音引擎，却一直报没引擎"。
+         这条 queries 就是让它能看见语音引擎。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:hasCode="true"
+        android:theme="@style/TianWangTheme"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 本地语音自检：用来单独确认「.so / 模型 / 音频格式」哪一环出问题。
+             设为导出是为了让 adb shell am start 能拉起（不导出的话 shell 起不来，
+             自检就失去意义）。它只读本地文件、做一次识别，不写外部状态，
+             也不返回任何数据给调用方，被别的应用拉起的风险可以接受。 -->
+        <activity
+            android:name=".SelfTestActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+
+        <!-- 设备检测：Vulkan 清单 / MemTotal / 基准 s/步，结果落盘当默认配置。
+             导出 + 支持 auto 参数，是为了让 PC 侧 am start 无人值守跑完，
+             不用人每次在手机上点。硬件不变，所以这个页面正常只跑一次。
+             （XML 注释里不能写连续两个连字符，所以这里不写命令行开关的原样） -->
+        <activity
+            android:name=".DeviceCheckActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 出图：手机本地 stable-diffusion.cpp（libfleet_sd.so，Vulkan），
+             不经过电脑、不借 Termux。从主界面"出图"入口拉起。 -->
+        <activity
+            android:name=".ImageActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 模型库：App 内本地下载（断点续传 + 系统代理直连 HF）。从主界面"模型库"入口拉起。 -->
+        <activity
+            android:name=".ModelActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+    </application>
+</manifest>

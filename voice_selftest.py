@@ -87,7 +87,7 @@ def main():
     results.append(ok)
     if ok:
         # 拿最新产物做识别输入
-        d = os.environ.get("FLEET_VOICE_TMP", "G:/_tmp/fleet_voice")
+        d = voice.TMP_DIR
         try:
             cands = [os.path.join(d, f) for f in os.listdir(d)
                      if f.lower().endswith((".wav", ".mp3"))]
@@ -117,7 +117,7 @@ def main():
         ok, _dt = step("录音", _rec)
         results.append(ok)
         if ok:
-            d = os.environ.get("FLEET_VOICE_TMP", "G:/_tmp/fleet_voice")
+            d = voice.TMP_DIR
             cands = [os.path.join(d, f) for f in os.listdir(d)
                      if f.lower().endswith(".wav")]
             src = max(cands, key=os.path.getmtime) if cands else None

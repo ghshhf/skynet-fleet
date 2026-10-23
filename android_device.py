@@ -100,16 +100,81 @@ def devices():
     return out
 
 
-def pick_serial(prefer_wireless=True):
-    """挑一台设备。优先无线调试的（手机），其次第一台。没有就返回空。"""
+_PROFILES = {}
+
+
+def profile(serial, timeout=10):
+    """一台设备的「身份指纹」：{model, board, mem_mb, phone}。
+
+    为什么需要它：adb 列表里有手机也有电视盒子/广告机（RK3568 那种 2GB 板子，
+    开机吃掉 1.7GB）。两者 `adb shell` 都能通、截图点按都不报错，光看「连上了」
+    分不出谁真能干算力活。`android.hardware.telephony` 是手机与盒子最稳的分界。
+
+    一次 shell 走完四项（无线调试下每次往返 200–400ms，分四次问就慢了）。
+    """
+    if serial in _PROFILES:
+        return _PROFILES[serial]
+    cmd = ("getprop ro.product.model; getprop ro.board.platform; "
+           "grep MemTotal /proc/meminfo; "
+           # grep -c 计数为 0 时退出码是 1，会被当成整条命令失败 ⇒ 用 || echo 0 兜住
+           "pm list features 2>/dev/null | grep -c android.hardware.telephony || echo 0")
+    rc, txt = shell(serial, cmd, timeout=timeout)
+    p = {"model": "", "board": "", "mem_mb": 0, "phone": False, "ok": rc == 0}
+    if rc == 0:
+        lines = [x.strip() for x in txt.replace("\r", "").splitlines() if x.strip()]
+        if lines:
+            p["model"] = lines[0]
+        if len(lines) > 1:
+            p["board"] = lines[1]
+        for x in lines:
+            if x.startswith("MemTotal"):
+                digits = "".join(ch for ch in x if ch.isdigit())
+                if digits:
+                    p["mem_mb"] = int(digits) // 1024
+        if lines and lines[-1].isdigit():
+            p["phone"] = int(lines[-1]) > 0
+    _PROFILES[serial] = p
+    return p
+
+
+def pick_serial(prefer_wireless=True, prefer=None):
+    """挑一台给编队用的设备。没有就返回空。
+
+    为什么不「取第一台」：同时接着手机和一块安卓板子时，adb 列表顺序取决于谁先
+    连上。按顺序取会把编队绑到最没用的那台上——而且它能截图能点按，不会报错，
+    活照派、慢十倍、还查不出原因。这种错最贵。
+
+    优先级（高 → 低）：
+      ① 显式指定：prefer 参数 或 环境变量 FLEET_ANDROID_SERIAL（可给完整序列/子串/型号名）
+      ② 有电话功能的真手机（盒子/一体机/广告机没有 telephony）
+      ③ 无线调试的（手机常态是无线）
+      ④ 还是平手就维持 adb 原顺序（绝不因为分不清就报错）
+    """
     ds = [d for d in devices() if d["state"] == "device"]
     if not ds:
         return ""
-    if prefer_wireless:
-        for d in ds:
-            if d["wireless"]:
+
+    want = (prefer or os.environ.get("FLEET_ANDROID_SERIAL") or "").strip()
+    if want:
+        def keys(d):
+            return (d["serial"], d["model"], d["device"], d["product"])
+        for d in ds:                                  # 先整字命中（避免子串歧义）
+            if want in keys(d):
                 return d["serial"]
-    return ds[0]["serial"]
+        for d in ds:                                  # 再放宽到子串（rk3568 / 25060 这种半截名）
+            if any(want in str(k) for k in keys(d)):
+                return d["serial"]
+
+    if len(ds) == 1:
+        return ds[0]["serial"]
+
+    def rank(i_d):
+        i, d = i_d
+        p = profile(d["serial"])
+        return (0 if p["phone"] else 1,          # 真手机优先
+                0 if (d["wireless"] or not prefer_wireless) else 1,
+                i)                                # 最后才看原顺序，保证确定性
+    return sorted(enumerate(ds), key=rank)[0][1]["serial"]
 
 
 # ---------------------------------------------------------------- 自动接入
@@ -501,6 +566,7 @@ def notifications(serial, limit=10):
 BRIDGE_LOCAL_PORT = 18765     # 电脑侧 adb forward 端口
 BRIDGE_REMOTE_PORT = 8765     # 手机侧编队桥监听端口
 BRIDGE_TOKEN_ENV = "FLEET_BRIDGE_TOKEN"
+BRIDGE_SVC = "app.fleet.bridge/app.fleet.bridge.BridgeService"
 
 
 def bridge_token():
@@ -516,11 +582,64 @@ def bridge_token():
     return ""
 
 
+def bridge_health(serial):
+    """无障碍服务在没在系统里登记着（不是问它活没活，是问系统认不认它）。
+
+    为什么要单独查：小米/HyperOS 这类 ROM 会在重启后把「侧载应用的无障碍服务」
+    静默关掉——`pm list packages` 里有、App 也在，但系统不再往它派事件，
+    表现就是「桥连上了、鉴权回空」。这不是坏了，是被关掉了，写回去就能好。
+    """
+    rc, txt = shell(serial, "settings get secure enabled_accessibility_services")
+    on = BRIDGE_SVC in (txt or "")
+    return {"ok": rc == 0, "enabled": on, "raw": (txt or "").strip()}
+
+
+def bridge_ensure(serial, wait=1.6):
+    """把无障碍服务写回系统设置（幂等）。返回是否「本来就在」。
+
+    只写设置、不弹 UI：shell 有 WRITE_SECURE_SETTINGS，一步到位，
+    不需要人去「设置 → 无障碍」里点。写不进去（ROM 限制）就返回 False，
+    由上层如实报「需要手动开一次」。
+    """
+    h = bridge_health(serial)
+    if h.get("enabled"):
+        return {"ok": True, "healed": False, "why": "本来就在"}
+    shell(serial, f"settings put secure enabled_accessibility_services {BRIDGE_SVC}")
+    shell(serial, "settings put secure accessibility_enabled 1")
+    time.sleep(wait)
+    h2 = bridge_health(serial)
+    return {"ok": bool(h2.get("enabled")), "healed": True,
+            "why": "已写回" if h2.get("enabled") else f"写不进去：{h2.get('raw','')[:60]}"}
+
+
 def bridge_cmd(serial, cmd, timeout=8):
     """经 adb forward 隧道给编队桥发一条指令。
 
     手机侧服务只听 127.0.0.1，隧道由 adb 建，所以不需要把端口暴露到局域网。
+
+    失败时自愈一次：先查无障碍服务有没有被 ROM 关掉，没有就写回去再重试。
+    加了这层之后，「重启后中文打不进去」这类事故会自己好，不用人再去设置里点。
     """
+    r = _bridge_once(serial, cmd, timeout)
+    if r.get("ok"):
+        return r
+    heal = bridge_ensure(serial)
+    if not heal.get("ok"):
+        r["err"] = f"{r.get('err','')}（无障碍服务没开，自动写回也失败：{heal.get('why')}）"
+        return r
+    if not heal.get("healed"):
+        time.sleep(0.6)          # 服务在但不是没响应，给一次喘息再问
+    r2 = _bridge_once(serial, cmd, timeout)
+    if r2.get("ok"):
+        r2["healed"] = heal.get("healed")
+        return r2
+    r2.setdefault("err", "")
+    r2["err"] = f"{r2['err']}（自愈已尝试：{heal.get('why')}）"
+    return r2
+
+
+def _bridge_once(serial, cmd, timeout=8):
+    """单次尝试，不带任何自愈逻辑（自愈放在 bridge_cmd 里，避免递归爆炸）。"""
     tok = bridge_token()
     if not tok:
         return {"ok": False, "err": "找不到编队桥令牌（先跑 android_bridge/build.sh）"}
@@ -546,6 +665,230 @@ def bridge_cmd(serial, cmd, timeout=8):
             return {"ok": ok, "out": out, "err": "" if ok else out}
     except OSError as e:
         return {"ok": False, "err": f"桥通信失败：{e}"}
+
+
+def bridge_bulk(serial, cmd, timeout=25, max_bytes=1 << 20):
+    """给桥发一条「多行回复」的指令（目前只有 UI），读到 END 为止。
+
+    和 bridge_cmd 的区别：那条一问一答只用 readline 取一行，而 UI 树是多行，
+    必须按 END 哨兵收尾，否则后面的行会残留在 socket 里污染下一次读取。
+    """
+    tok = bridge_token()
+    if not tok:
+        return {"ok": False, "err": "找不到编队桥令牌（先跑 android_bridge/build.sh）"}
+    _run(serial, ["forward", f"tcp:{BRIDGE_LOCAL_PORT}", f"tcp:{BRIDGE_REMOTE_PORT}"])
+    try:
+        s = socket.create_connection(("127.0.0.1", BRIDGE_LOCAL_PORT), timeout=timeout)
+    except OSError as e:
+        return {"ok": False, "err": f"桥隧道连不上：{e}"}
+    try:
+        with s:
+            f = s.makefile("rwb")
+
+            def send(line):
+                f.write((line + "\n").encode("utf-8"))
+                f.flush()
+
+            def read():
+                raw = f.readline()
+                if not raw:
+                    return None
+                return raw.decode("utf-8", "replace").rstrip("\r\n")
+
+            send("AUTH " + tok)
+            auth = read()
+            if auth is None:
+                return {"ok": False, "err": "桥无应答（服务可能刚被杀，重试一次）"}
+            if not auth.startswith("OK"):
+                return {"ok": False, "err": f"鉴权失败：{auth}"}
+
+            send(cmd)
+            head = read()
+            if head is None:
+                return {"ok": False, "err": "桥无应答"}
+            if not head.startswith("OK ui"):
+                # 单行回复（如 ERR …）或非 UI 指令
+                return {"ok": head.startswith("OK"), "head": head,
+                        "err": "" if head.startswith("OK") else head, "lines": []}
+
+            lines, size = [], 0
+            while True:
+                ln = read()
+                if ln is None:
+                    return {"ok": False, "err": "桥在树传完之前断开（服务被杀或读超时）"}
+                if ln == "END":
+                    break
+                lines.append(ln)
+                size += len(ln.encode("utf-8")) + 1
+                if size > max_bytes:
+                    return {"ok": False,
+                            "err": f"UI 树超过 {max_bytes} 字节仍未结束，桥侧截断可能失效"}
+            # header 形如：OK ui <keep> <bytes> <ms>ms pkg=<pkg> n=<遍历节点数> root=<取根ms>ms
+            # 按 key=value 取，不按下标取——以后桥再加字段不会把解析打歪。
+            def kv(key, cast=int, default=-1):
+                m = re.search(rf"(?:^|\s){key}=(\d+(?:ms)?)", head)
+                if not m:
+                    return default
+                v = m.group(1)
+                return cast(v[:-2]) if v.endswith("ms") else cast(v)
+
+            ms = kv("ms", int, -1)
+            if ms < 0:                                  # 兼容旧 header：第 5 个字段就是 3ms 这种
+                parts = head.split()
+                if len(parts) > 4 and parts[4].endswith("ms"):
+                    try:
+                        ms = int(parts[4][:-2])
+                    except ValueError:
+                        pass
+            m = re.search(r"(?:^|\s)pkg=(\S+)", head)
+            pkg = m.group(1) if m else ""
+            return {"ok": True, "head": head, "lines": lines, "bytes": size,
+                    "ms": ms, "pkg": pkg,
+                    "nodes": kv("n", int, 0), "root_ms": kv("root", int, -1), "err": ""}
+    except OSError as e:
+        return {"ok": False, "err": f"桥通信失败：{e}"}
+
+
+def bridge_ui(serial="", max_lines=150, timeout=20):
+    """经编队桥读当前窗口 UI 树（同进程直读，毫秒级）。
+
+    刻意**不做**自动回退到 uiautomator dump：两条路径的耗时差一个数量级，
+    静默回退会让人以为桥在正常工作，实际每次都慢在 dump 上。
+    要走 dump 的调用方自己去调 ui_xml()，那是显式选择。
+    """
+    return bridge_bulk(serial, f"UI {int(max_lines)}", timeout=timeout)
+
+
+# ---------------------------------------------------------------- 桥树解析
+#
+# 桥渲染的每一行长这样（两空格缩进表父子，▶可点 ◢不可点）：
+#   ▶[Button]T:"发送"ID:btn_send⮞[100,200][300,400]
+# 不编序号是刻意的：序号只在一次快照内有效，跨快照即失效，容易诱发
+# "拿旧序号点错位置"。寻址只认 id / 文字 / bounds 这三样真实存在的属性。
+
+_RE_UI_LINE = re.compile(
+    r'\[(?P<cls>[^\]]*)\]'
+    r'(?:T:"(?P<text>[^"]*)")?'
+    r'(?:D:"(?P<desc>[^"]*)")?'
+    r'(?:ID:(?P<id>\S+?))?'
+    r'⮞\[(?P<l>-?\d+),(?P<t>-?\d+)\]\[(?P<r>-?\d+),(?P<b>-?\d+)\]'
+)
+
+
+def parse_bridge_ui(lines):
+    """桥的渲染行 -> 结构化节点表（含 depth，供缩进还原层级）。
+
+    行里认不出来的（截断提示行、空行）直接跳过，不做静默猜测。
+    """
+    nodes = []
+    for raw in lines:
+        if not raw.strip():
+            continue
+        depth = (len(raw) - len(raw.lstrip(" "))) // 2
+        m = _RE_UI_LINE.search(raw)
+        if not m:
+            continue
+        b = (int(m["l"]), int(m["t"]), int(m["r"]), int(m["b"]))
+        nodes.append({
+            "depth": depth,
+            "clickable": raw.lstrip()[:1] == "▶",
+            "cls": m["cls"],
+            "text": m["text"] or "",
+            "desc": m["desc"] or "",
+            "id": m["id"] or "",
+            "bounds": b,
+            "center": ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2),
+        })
+    return nodes
+
+
+def bridge_screen(serial="", max_lines=200, timeout=20):
+    """一步拿到「前台包 + 结构化节点表」，比 ui_xml + parse_ui 快一个数量级。"""
+    got = bridge_ui(serial, max_lines=max_lines, timeout=timeout)
+    if not got["ok"]:
+        return {"ok": False, "err": got.get("err", ""), "nodes": [], "pkg": ""}
+    return {"ok": True, "err": "", "pkg": got.get("pkg", ""),
+            "nodes": parse_bridge_ui(got["lines"]),
+            "ms": got.get("ms", -1), "bytes": got.get("bytes", 0)}
+
+
+# ---------------------------------------------------------------- 元素级动作（P1）
+#
+# 和坐标动作（tap/swipe）的区别：调用方只说"哪个元素"，坐标由设备侧解析。
+# 界面一变，坐标动作得全部重算；元素动作不用。而且模型说得清"点发送"，
+# 说不清"点 1024,2388"。
+#
+# 选择器：id:xxx / text:xxx / desc:xxx / bounds:[l,t][r,b]，可加 #n 消歧。
+# 桥侧找不到会明确回 not-found + 界面候选，匹配多个回 ambiguous + 候选列表，
+# 一律不静默。
+
+def _sel(kind, value, index=0):
+    v = str(value)
+    if not v.strip():
+        raise ValueError("选择器不能为空")
+    # 值里的 # 只有在末尾跟数字时才当消歧序号，其余原样保留
+    return f"{kind}:{v}" + (f"#{int(index)}" if index else "")
+
+
+def bridge_tap_el(serial, kind, value, index=0):
+    """按元素点一下。失败时 err 是桥给的原话（找不到/歧义/越界/不可见）。"""
+    r = bridge_cmd(serial, "TAPEL " + _sel(kind, value, index))
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", ""), "sel": kind + ":" + str(value)}
+    head = "OK tapel "
+    rest = r["out"][len(head):] if r["out"].startswith(head) else ""
+    p = rest.split(" ", 2)
+    if len(p) < 2:
+        return {"ok": False, "via": "bridge", "err": f"桥的回报看不懂：{r['out'][:80]}"}
+    return {"ok": True, "via": "bridge", "x": int(p[0]), "y": int(p[1]),
+            "hit": p[2] if len(p) > 2 else "", "err": ""}
+
+
+def bridge_set_text(serial, kind, value, text, index=0):
+    """按元素设文本（ACTION_SET_TEXT）。
+
+    文本里若含 '|' 会和选择器分隔符打架，按桥的约定转义成 %7C；'%' 先转 %25，
+    否则一个原始 %7C 会被误还原。
+    """
+    safe = str(text).replace("%", "%25").replace("|", "%7C")
+    r = bridge_cmd(serial, "SETTEXT " + _sel(kind, value, index) + "|" + safe)
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", "")}
+    return {"ok": True, "via": "bridge", "hit": r["out"][len("OK settext "):], "err": ""}
+
+
+def bridge_set_seek(serial, kind, value, percent, index=0):
+    """把滑条设到控件自身区间的 percent%（0~100），走 ACTION_SET_PROGRESS。
+
+    注意语义：这是**控件区间的百分比**，不等于它控制的东西的百分比。
+    实测 MIUI 亮度条 seekbar 72% ≈ 系统亮度 30%（0~255 的 76），因为中间有伽马映射。
+    要"亮度 30%"就得设 seekbar 72%，别按 30% 传。
+    """
+    r = bridge_cmd(serial, "SETSEEK " + _sel(kind, value, index) + "|" + str(int(percent)))
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", "")}
+    out = r["out"][len("OK setseek "):]
+    # 形如：30%=4915 [SeekBar]D:"屏幕亮度"ID:...
+    pct_part, _, rest = out.partition(" ")
+    raw = pct_part.split("=")[1] if "=" in pct_part else ""
+    return {"ok": True, "via": "bridge", "raw": raw, "hit": rest, "err": ""}
+
+
+def bridge_scroll(serial, direction):
+    """滚动。direction: up/down/left/right。
+
+    走手势滑动而不是 ACTION_SCROLL_FORWARD —— 后者实测会返回 true 但界面不动
+    （详见桥里 SCROLL 那段注释）。
+    """
+    d = str(direction).strip().lower()
+    if d not in ("up", "down", "left", "right"):
+        return {"ok": False, "err": f"方向只能是 up/down/left/right，收到 {direction!r}"}
+    r = bridge_cmd(serial, "SCROLL " + d)
+    if not r["ok"]:
+        return {"ok": False, "via": "bridge", "err": r.get("err", "")}
+    return {"ok": True, "via": "bridge", "hit": r["out"][len("OK scroll " + d + " "):], "err": ""}
+
+
 
 
 def can_inject(serial):
@@ -695,6 +1038,22 @@ def _selftest():
         bounds="[10,10][20,20]" clickable="false"/></hierarchy>""")
     assert clickable_of(alone, alone[0])["center"] == (15, 15)
 
+    # ⑧ 桥渲染行 -> 结构化节点：层级、可点、ID、bounds 一个都不能丢
+    ui = parse_bridge_ui([
+        "\u25b6[FrameLayout]\u2b9e[1,1][1280,2771]",
+        "  \u25b6[Button]T:\"\u53d1\u9001\"ID:btn_send\u2b9e[100,200][300,400]",
+        "  \u25c2[TextView]D:\"\u641c\u7d22\"\u2b9e[0,0][10,10]",
+        "\u2026 \u5df2\u622a\u65ad 3 \u884c",          # 非节点行，必须被跳过
+    ])
+    assert len(ui) == 3, ui
+    assert ui[0]["depth"] == 0 and ui[0]["clickable"] is True
+    assert ui[1]["depth"] == 1 and ui[1]["text"] == "\u53d1\u9001"
+    assert ui[1]["id"] == "btn_send" and ui[1]["center"] == (200, 300)
+    assert ui[2]["clickable"] is False and ui[2]["desc"] == "\u641c\u7d22"
+    # 只有 ID 没有文字的行也要解析出来（图标按钮常见）
+    only_id = parse_bridge_ui(["\u25b6[ImageView]ID:app:id/ic_menu\u2b9e[0,0][96,96]"])
+    assert only_id and only_id[0]["id"] == "app:id/ic_menu", only_id
+
     # ⑧ 桥没令牌时必须明确失败，不能假装点成了
     real = globals()["bridge_token"]
     globals()["bridge_token"] = lambda: ""
@@ -704,7 +1063,62 @@ def _selftest():
     finally:
         globals()["bridge_token"] = real
 
-    print("android_device \u81ea\u6d4b\uff1a8 \u9879\u5168\u8fc7")
+    # ⑨ 选设备：手机优先于盒子——这是「2GB 板子排前面就把活全派给砖头」的防线
+    _real_devices, _real_shell = globals()["devices"], globals()["shell"]
+    _real_env = os.environ.pop("FLEET_ANDROID_SERIAL", None)
+
+    def _fake_devices(_rows):
+        return lambda: _rows
+
+    def _fake_shell(_prof):
+        def f(serial, cmd, timeout=60):
+            p = _prof.get(serial, {})
+            if not p:
+                return 1, ""
+            txt = "%s\n%s\nMemTotal:       %d kB\n%d\n" % (
+                p.get("model", ""), p.get("board", ""),
+                p.get("mem_mb", 0) * 1024, 1 if p.get("phone") else 0)
+            return 0, txt
+        return f
+
+    BOARD = {"serial": "192.168.0.105:5555", "state": "device", "model": "SYKJ_18C",
+             "product": "rk3568_d", "device": "rk3568_d", "wireless": True}
+    PHONE = {"serial": "192.168.137.40:5555", "state": "device", "model": "25060RK16C",
+             "product": "dali", "device": "dali", "wireless": True}
+    prof = {BOARD["serial"]: {"model": "SYKJ_18C", "board": "rk356x", "mem_mb": 1957, "phone": False},
+            PHONE["serial"]: {"model": "25060RK16C", "board": "kalama", "mem_mb": 11285, "phone": True}}
+    try:
+        _PROFILES.clear()
+        # 板子排在前面（这正是 adb 的真实顺序），仍然要选手机
+        globals()["devices"], globals()["shell"] = _fake_devices([BOARD, PHONE]), _fake_shell(prof)
+        assert pick_serial() == PHONE["serial"], "只连一台手机一台盒子时必须选手机"
+        # 显式指定能翻盘（就要那块板子也得听得懂）
+        assert pick_serial(prefer="SYKJ") == BOARD["serial"]
+        assert pick_serial(prefer=BOARD["serial"]) == BOARD["serial"]
+        assert pick_serial(prefer="25060") == PHONE["serial"]
+        # 环境变量同权，且优先于自动排序
+        os.environ["FLEET_ANDROID_SERIAL"] = "rk3568"
+        assert pick_serial() == BOARD["serial"], "FLEET_ANDROID_SERIAL 没生效"
+        os.environ.pop("FLEET_ANDROID_SERIAL")
+        # 只有一台：不去 profile 也直接给（少一次往返）
+        globals()["shell"] = _fake_shell({})           # 任何 shell 都失败
+        globals()["devices"] = _fake_devices([BOARD])
+        assert pick_serial() == BOARD["serial"]
+        # 一台都没有：空串，不抛
+        globals()["devices"] = _fake_devices([])
+        assert pick_serial() == ""
+        # 两台都是盒子：维持原顺序（分不清就按列表来，不瞎猜）
+        _PROFILES.clear()
+        globals()["devices"], globals()["shell"] = _fake_devices([BOARD, PHONE]), _fake_shell(
+            {BOARD["serial"]: {"phone": False}, PHONE["serial"]: {"phone": False}})
+        assert pick_serial() == BOARD["serial"]
+    finally:
+        globals()["devices"], globals()["shell"] = _real_devices, _real_shell
+        _PROFILES.clear()
+        if _real_env is not None:
+            os.environ["FLEET_ANDROID_SERIAL"] = _real_env
+
+    print("android_device \u81ea\u6d4b\uff1a9 \u9879\u5168\u8fc7")
 
 
 # ---------------------------------------------------------------- CLI
@@ -721,8 +1135,11 @@ def main(argv=None):
     p = sub.add_parser("shot", help="截屏到本地")
     p.add_argument("path")
 
-    p = sub.add_parser("ui", help="列 UI 树（可带关键字过滤）")
+    p = sub.add_parser("ui", help="列 UI 树（默认走 uiautomator dump；--bridge 走编队桥，毫秒级）")
     p.add_argument("keyword", nargs="?", default="")
+    p.add_argument("--bridge", action="store_true",
+                   help="经编队桥直读（带层级、毫秒级）；需要桥已授权且 adb forward 可用")
+    p.add_argument("--max", type=int, default=150, help="--bridge 时最多输出多少行")
 
     p = sub.add_parser("launch", help="启动应用/intent")
     p.add_argument("target")
@@ -796,6 +1213,18 @@ def main(argv=None):
         r = shot(serial, args.path)
         print(r.get("path") or r.get("err"))
     elif args.cmd == "ui":
+        if args.bridge:
+            got = bridge_ui(serial, max_lines=args.max)
+            if not got["ok"]:
+                print(got["err"], file=sys.stderr)
+                return 1
+            print(f"包名 {got['pkg'] or '?'} · {len(got['lines'])} 行 · "
+                  f"{got['bytes']} 字节 · 服务端遍历 {got['ms']}ms")
+            for ln in got["lines"]:
+                if args.keyword and args.keyword not in ln:
+                    continue
+                print(ln)
+            return 0
         got = ui_xml(serial)
         if not got["ok"]:
             print(got["err"], file=sys.stderr)

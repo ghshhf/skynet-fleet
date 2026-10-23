@@ -1,0 +1,9 @@
+{
+ "id": "ms-9b40eaec708afec3",
+ "kind": "skill",
+ "text": "读取设备状态、内存、存储、进程。",
+ "tags": [],
+ "weight": 2.0,
+ "ts": null,
+ "source": "jishuyuan"
+}

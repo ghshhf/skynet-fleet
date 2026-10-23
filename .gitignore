@@ -18,6 +18,10 @@ fleet_context.db-journal
 fleet_journal.db
 fleet_journal.db-journal
 fleet_journal.db-wal
+# 证据库：本机运行时状态（含从本机记忆导入的 7543 条 mem 证据 + exec 证据），非源码，体积 4MB
+fleet_evidence.db
+fleet_evidence.db-journal
+fleet_evidence.db-wal
 fleet_audit.jsonl
 persona_state.json
 cards/active.json
@@ -59,3 +63,14 @@ build/
 dist/
 *.spec
 *.exe
+cards/compiled/
+
+# 手机端：构建产物与签名密钥不入库
+tianwang_android/build/
+tianwang_android/keystore.jks
+tianwang_android/jni/build-sd/
+android_bridge/build/
+android_bridge/keystore.jks
+
+# 测试产物（不进库）
+out/

@@ -1,0 +1,9 @@
+{
+ "id": "ms-d00dd01448d0d3b7",
+ "kind": "value",
+ "text": "只输出结构化事实：状态、数值、异常、建议动作。",
+ "tags": [],
+ "weight": 3.0,
+ "ts": null,
+ "source": "jishuyuan"
+}

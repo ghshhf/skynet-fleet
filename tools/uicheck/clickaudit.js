@@ -224,16 +224,38 @@ const PHASES = [
     setup: () => {
       // 走真入口：点侧栏 ⇒ app.js 会 showView + setAssetTab（拉接口渲染内容）
       const item = document.querySelector('.sb-item[data-view="assets"]');
-      if (item) { item.click(); return; }
-      document.querySelectorAll(".view").forEach((v) => {
-        v.classList.toggle("on", v.id === "viewAssets");
-      });
+      if (item) { item.click(); }
+      else {
+        document.querySelectorAll(".view").forEach((v) => {
+          v.classList.toggle("on", v.id === "viewAssets");
+        });
+      }
+      // 🔴 tab 必须复位到「专家」：相位初始态不确定，就不知道本轮到底在测哪个 tab。
+      // 实测踩出来的坑：跨相位残留让 ASSET_TAB 停在「连接器」时，
+      // 卡片墙（含 16 个「切换到这张」）根本没渲染 ⇒ 覆盖率凭空掉一截。
+      const on = document.querySelector("#tabBar .tab.on");
+      if (on && on.getAttribute("data-tab") !== "cards") {
+        const back = document.querySelector('#tabBar .tab[data-tab="cards"]');
+        if (back) { back.click(); }
+      }
     },
     restore: () => {
       // 轻量：只切视图显示，**不重渲染**（保住 data-audit-id 标记）
       document.querySelectorAll(".view").forEach((v) => {
         v.classList.toggle("on", v.id === "viewAssets");
       });
+      // 🔴 例外：tab 也必须复位，否则**点击本身就毁掉了后续测量**。
+      // 实测踩出来的坑（覆盖率从 81% 掉到 78% 的真因）：
+      // 相位里 .tab（专家/技能/连接器/声音）本身就是要被测的元素，
+      // 点「技能」「连接器」「声音」会把 #tabBody 整个换掉，
+      // 卡片墙（含 16 个「切换到这张」）随之消失；而 restore 只切 .view，
+      // 于是该相位后面的卡片按钮全被记成「元素已不在 DOM」。
+      // 只在 tab 真被切走时才点回来（未切则不重渲染，标记仍保住）。
+      const on = document.querySelector("#tabBar .tab.on");
+      if (on && on.getAttribute("data-tab") !== "cards") {
+        const back = document.querySelector('#tabBar .tab[data-tab="cards"]');
+        if (back) { back.click(); }
+      }
     },
   },
   {
@@ -416,6 +438,21 @@ const FINGERPRINT = () => {
       await page.evaluate(phase.setup);
       await page.waitForTimeout(900);
       const phItems = await page.evaluate(ENUMERATE, phase.name);
+      // 🔴 给每个元素标「签名 + 同签名内序号」。
+      // 用途：相位内一旦某次点击让列表**重渲染**（换角色卡 / 刷新卡片墙），
+      // 先前打的 data-audit-id 全部作废。只按下标或只按 id 都定位不到，
+      // 于是同类元素从第 2 个起全被记成「元素已不在 DOM」——
+      // 实测「专家·技能·连接器」相位 19 个跳过里 14 个是这种**假跳过**，
+      // 覆盖率被压到 81%，「死链 0」的可信度跟着掉。
+      // 有了签名+序号，重渲染后仍能按 DOM 顺序把同一个元素找回来。
+      const sigOf = (x) => x.tag + "|" + x.cls + "|" + x.text;
+      (() => {
+        const seen = new Map();
+        phItems.forEach((x) => {
+          const k = sigOf(x), n = seen.get(k) || 0;
+          x.sigKey = k; x.sigOrd = n; seen.set(k, n + 1);
+        });
+      })();
       const visible = phItems.filter((x) => x.visible);
       const pAlive = [], pDead = [], pSkip = [];
       console.log("\n[clickaudit] 相位「" + phase.name + "」可见可点 " +
@@ -430,10 +467,72 @@ const FINGERPRINT = () => {
           pSkip.push({ ...it, phase: phase.name, why: "按钮是 disabled 状态（现在不能点，不是死链）" });
           continue;
         }
-        const node = await page.$('[data-audit-id="' + it.auditId + '"]');
+        let node = await page.$('[data-audit-id="' + it.auditId + '"]');
         if (!node) {
-          pSkip.push({ ...it, phase: phase.name, why: "元素已不在 DOM" });
-          continue;
+          // 🔴 重渲染后的补救（而不是直接记「已不在 DOM」）：
+          // 先回到相位初始态，重新枚举一遍，再按「签名 + 同签名序号」
+          // 把目标元素找回来，并顺手**重建整批标记**——否则后面每个元素
+          // 都会因为旧标记作废而连环假跳过。
+          // 实测：修前该相位 19 个跳过里 14 个是「切换到这张」，其实全健在可点。
+          // 🔴 复位要用 setup 而不是 restore：restore 只是轻量切 class，
+          // 而「切换到这张」走的是 useCard → loadAssetTab("cards")，
+          // 卡片墙会**重新拉接口异步渲染**。等 300ms 时枚举到的是空壳，
+          // 于是 14 个按钮全被判「按签名也找不回」。等够 900ms 才拿得到真列表。
+          await page.evaluate(RESTORE);
+          await page.evaluate(phase.setup);
+          // 重试前确认 tab 已在「专家」（卡片墙所在 tab），否则重枚举注定为空壳
+          await page.evaluate(() => {
+            const on = document.querySelector("#tabBar .tab.on");
+            if (on && on.getAttribute("data-tab") !== "cards") {
+              const back = document.querySelector('#tabBar .tab[data-tab="cards"]');
+              if (back) { back.click(); }
+            }
+          });
+          // 🔴 「切换到这张」走 useCard → loadAssetTab("cards")，
+          // 而 useCard 先把 ASSET_CACHE.cards 置空、再重新拉接口。
+          // 固定等 900ms 时接口还没回来 ⇒ 卡片墙是空的（实测重枚举只剩 12 个、
+          // 「切换到这张」0 个）⇒ 又被判「按签名也找不回」。
+          // ⇒ 改成**轮询到目标签名重新出现**，最多等 6 秒，不猜固定时长。
+          const sigBuild = (arr) => {
+            const m = new Map();
+            arr.forEach((x) => {
+              const k = sigOf(x);
+              if (!m.has(k)) { m.set(k, []); }
+              m.get(k).push(x);
+            });
+            return m;
+          };
+          let reItems = [], buckets = sigBuild([]);
+          const reDeadline = Date.now() + 6000;
+          for (;;) {
+            await page.waitForTimeout(500);
+            reItems = await page.evaluate(ENUMERATE, phase.name);
+            buckets = sigBuild(reItems);
+            if (buckets.has(it.sigKey) || Date.now() > reDeadline) { break; }
+          }
+          let rebuilt = 0;
+          phItems.forEach((x) => {
+            const arr = buckets.get(x.sigKey) || [];
+            const t = arr[x.sigOrd];
+            if (t) {
+              x.auditId = t.auditId; x.rect = t.rect; x.visible = t.visible;
+              x.disabled = t.disabled; x.gone = false; rebuilt++;
+            } else {
+              x.gone = true;
+            }
+          });
+          if (it.gone || !it.visible) {
+            pSkip.push({ ...it, phase: phase.name,
+                         why: "元素已不在 DOM（重渲染后按签名也找不回）" });
+            continue;
+          }
+          node = await page.$('[data-audit-id="' + it.auditId + '"]');
+          if (!node) {
+            pSkip.push({ ...it, phase: phase.name,
+                         why: "元素已不在 DOM（重建标记后仍取不到句柄）" });
+            continue;
+          }
+          console.log("  · 重渲染后按签名找回：「" + it.text + "」(重建 " + rebuilt + " 个标记)");
         }
         // 🔴 「已经是当前选中项」的元素点下去**本来就不该有变化**。
         // 实测案例：三 Tab 里「专家」是默认激活的那个（class="tab on"），

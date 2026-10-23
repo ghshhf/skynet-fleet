@@ -50,6 +50,18 @@ COMPUTE_RESULT = "compute_result"  # node -> commander: {id, ok, out, model}
 UI_SKIP = "ui_skip"                 # commander -> node: {id, package, serial?, rounds?, use_vision?, rules?}
 UI_SKIP_RESULT = "ui_skip_result"   # node -> commander: {id, ok, log[], err}
 
+# ---- 安卓出图节点 fleet 化（路线甲 · N+2 实质落地）：PC 派发 -> 手机出图 -> PNG 回传 ----
+IMAGE_GEN = "image_gen"                 # commander -> node: {id, prompt, neg?, size?, steps?, seed?, cfg?, model?}
+IMAGE_GEN_RESULT = "image_gen_result"   # node -> commander: {id, ok, path?, err?}
+
+# ---- 跨设备记忆同步（P5c）----
+MEMORY_SYNC = "memory_sync"              # commander -> node: {id, op: export|import, items?}
+MEMORY_SYNC_RESULT = "memory_sync_result" # node -> commander: {id, ok, items?, count?, err?}
+
+# ---- 视频生成（P3 壳 + 远端路由）：本地算力撑不住，壳登记 + 路由到 PC/云端节点 ----
+VIDEO_GEN = "video_gen"                 # commander -> node: {id, prompt, duration?, fps?, size?, seed?, model?}
+VIDEO_GEN_RESULT = "video_gen_result"   # node -> commander: {id, ok, path?, err?}
+
 # ---- 她 P4 能力请求 + 授权门 ----
 CAP_REQ = "cap_req"           # node(她) -> commander: {cap, reason}
 CAP_GRANT = "cap_grant"       # commander -> node(她): {cap, session_min, token}

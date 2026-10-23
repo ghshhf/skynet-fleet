@@ -45,9 +45,17 @@ HIDDEN = [
     "registry", "ui_automation",
     # 可选音频后端（voice.py 用 __import__ 动态加载）
     "sounddevice", "pyaudio",
-    # 天网语音模式（--voice）：桌面端 + 语音链 + 嵌合件 + 免费在线 TTS
-    "desktop", "voice", "dialogue", "mock_brain", "tianwang_cards",
-    "edge_tts",
+    # ---- 对话语音（语音对话视图用；server.py 的 /api/voice/* 走它）----
+    # 🔴 这里是**仓库根**的 voice.py，不是 fleet/gui/voice.py（命令式那套）。
+    #    --paths REPO 已把根放进搜索路径，所以 `voice` 解析到根那个。
+    "voice",
+    "faster_whisper", "ctranslate2", "edge_tts",
+    # 天网语音模式（--voice）：桌面端 + 语音链 + 嵌合件
+    "desktop", "dialogue", "mock_brain", "tianwang_cards",
+    # 刻意**不**列 kokoro：它 import torch，而 torch 在 EXCLUDES 里（架构铁律：
+    # fleet 解释器绝不 import torch）。列进来只会让 PyInstaller 报一堆 torch 缺失。
+    # 结果：冻扁包里 TTS 只剩 edge_tts（联网）一路，voice.say() 会自动回落。
+    # 要离线 kokoro，得让语音走子进程（用系统 Python），不是把它塞进这个包。
     # 设备/通道依赖的第三方
     "adb_shell", "adb_shell.adb_device", "adb_shell.adb_message",
     "adb_shell.auth.sign_pycryptodome", "adb_shell.auth.sign_cryptography",
@@ -74,9 +82,17 @@ for h in HIDDEN:
 for e in EXCLUDES:
     args += ["--exclude-module", e]
 args += ["--collect-submodules", "fleet"]
+# faster_whisper 带的是 tokenizer 资产、ctranslate2 带一串 dll/vc runtime，
+# 光 --hidden-import 只收 .py，收不到这些东西 —— 冻扁后一 import 就炸。
+# 用 collect-all 把 data/binaries 一起带走（2026-10-22 补）。
+args += ["--collect-all", "faster_whisper"]
+args += ["--collect-all", "ctranslate2"]
+# edge_tts 是纯 py，没有资产，hidden-import 够了（但它得真装上，见 requirements.txt）
 # 前端静态资源：整个 ui/ 目录 -> 冻扁后的 ui/
 args += ["--add-data", UI_DIR + os.pathsep + "ui"]
-# 出厂角色卡库（ccv2 json）-> 冻扁后的 cards/；运行时钩子首次种子到 %APPDATA%
+# 角色卡源卡：整个 cards/ -> 冻扁后的 cards/（ccv2 json + _protocols/）
+# 冻扁包里它只读；fleet_runtime_hook.py 会在首次启动时把卡播种到
+# %APPDATA%/fleet/cards（可写），否则语音对话视图打开是空卡库、没有音色。
 args += ["--add-data", os.path.join(REPO, "cards") + os.pathsep + "cards"]
 # 入口脚本
 args += [APP]

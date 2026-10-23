@@ -1,0 +1,10 @@
+{
+  "name": "_evolve_audit",
+  "dir": "D:\\code\\device-fleet\\fleet\\..\\tmp\\_evolve_audit",
+  "verdict": "clean",
+  "license": "internal",
+  "findings": [],
+  "scanned": [
+    "SKILL.md"
+  ]
+}

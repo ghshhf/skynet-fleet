@@ -106,9 +106,9 @@ def run(url, card_id):
     print("\n--- 模板对齐 ---")
     print("  回复：%s" % t1.replace("\n", " ")[:160])
     results.append(check("无 think 残留", not has_think,
-                         "检测到 </think> 泄漏，需 --chat-template 修正"))
+                         "" if not has_think else "检测到 think 标签泄漏，需 --chat-template 修正"))
     results.append(check("无 markdown 围栏", not has_fence,
-                         "模型爱用 ``` 包裹自己"))
+                         "" if not has_fence else "模型爱用 ``` 包裹自己"))
 
     # 2) 终止符 + 复读
     print("\n--- 终止符 / 复读 ---")
@@ -127,11 +127,20 @@ def run(url, card_id):
     b = chat(url, "我叫什么名字？", system)
     print("  答：%s" % b["text"].replace("\n", " ")[:120])
     hit = ("阿泽" in b["text"]) or ("aze" in b["text"].lower())
-    results.append(check("记住称呼", hit, "答非所问说明上下文没接上"))
+    results.append(check("记住称呼", hit,
+                         "" if hit else "答非所问说明上下文没接上"))
 
     # 4) 速度基准
     print("\n--- 速度基准 ---")
-    rb = chat(url, "用一句话说明你今天打算做什么。", system, max_tokens=128)
+    # 🔴 踩过的坑：用「用一句话说明…」这种会早停的 prompt 测速，模型 4 个
+    # token 就收工，算出 4.5 tok/s 的假数（llama-bench 硬数 5.23）。
+    # 速度基准必须采够样本：强制长输出（数数），且 tokens < 32 时明说
+    # 样本不足——数字不可信要比数字错更早说出来。
+    rb = chat(url, "请从 1 数到 60，每行一个数字，只输出数字。",
+              system, max_tokens=200)
+    if rb["tokens"] < 32:
+        print("  [WARN] 只生成 %d token，样本不足，下面的速度数字不可信"
+              % rb["tokens"])
     print("  %d tokens / %.1fs = %.1f tok/s" % (rb["tokens"], rb["seconds"], rb["tps"]))
     tps = rb["tps"]
     if tps >= 20:
