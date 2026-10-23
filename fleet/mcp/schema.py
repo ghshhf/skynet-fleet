@@ -54,6 +54,7 @@ def is_valid_mcp_name(name):
 _JSON_TYPES = {
     "str": "string",
     "int": "integer",
+    "float": "number",
     "bool": "boolean",
     "json": "object",
 }
