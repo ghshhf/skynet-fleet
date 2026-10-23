@@ -33,39 +33,22 @@ MAX_RESULT_CHARS = 1200
 #: 决策调用超时（秒）。手机 1.7B 实测平均 5.1s，超了就当没有工具面。
 DECIDE_TIMEOUT = 10.0
 
+#: 权限三档。定义提前到文件顶部是因为 TOOLS 表要引用它们。
+#: auto = 直接跑；ask = 交给审批闸门（无闸门即 fail-closed 拒绝）；forbid = 永不跑。
+#: 与 Operit 的三档对齐，但**默认更保守**：有副作用的默认 ask，
+#: 短信/联系人/通讯录类能力压根没进工具表（隐私边界，不跟随 Operit 的激进面）。
+#: DEFAULT_TIERS 不再是手写字典——它由 TOOLS 表派生（见 _derive）。
+PERM_AUTO, PERM_ASK, PERM_FORBID = "auto", "ask", "forbid"
+
 # ---------------------------------------------------------------- 决策
 
-DECIDE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "tool": {
-            "type": "string",
-            "enum": ["web_search", "app_launch", "notify_read",
-                     "screenshot_describe", "device_status",
-                     "wifi_survey", "none"],
-        },
-        "arg": {"type": "string"},
-    },
-    "required": ["tool", "arg"],
-}
-
-_TOOLS_LINE = (
-    "可选工具：\n"
-    "- web_search：联网搜索最新事实/价格/新闻/版本号\n"
-    "- app_launch：打开手机上的某个应用\n"
-    "- notify_read：读取手机最近的通知（谁发消息了、几个未读）\n"
-    "- screenshot_describe：看一眼当前屏幕上显示的内容\n"
-    "- device_status：查手机电量、温度、运行状态\n"
-    "- wifi_survey：扫描附近的 Wi-Fi 网络及信号\n"
-    "- none：以上都不需要\n"
-)
-
-DECIDE_SYSTEM = (
-    "你是手机助手的调度器。根据用户消息判断该调用哪个工具，"
-    "需要参数的填在 arg（如搜索词、应用名），不需要参数的 arg 留空。\n"
-    + _TOOLS_LINE +
-    "纯代码、算术、翻译、闲聊一律选 none。只输出 JSON。"
-)
+#: DECIDE_SCHEMA / _TOOLS_LINE / DECIDE_SYSTEM / EXECUTORS / DEFAULT_TIERS
+#: 全部从文件后面的 TOOLS 表派生（单一事实源）。加工具只改 TOOLS 一处——
+#: 曾经分散在四处，加工具必漏一处，且漏了不会报错、只会静默不生效。
+#: 这里只放占位，真正的值在 TOOLS 定义之后由 _derive() 写回模块全局。
+DECIDE_SCHEMA = None
+_TOOLS_LINE = ""
+DECIDE_SYSTEM = ""
 
 #: 规则短路：命中的问题直接 none，不花 5 秒问模型。
 #: 刻意收窄（只挡高频且无歧义的），宁多问模型也别错杀真需求。
@@ -249,14 +232,513 @@ def _render_web(res):
     return out
 
 
-#: 工具名 → (注册表能力名, 渲染器, 是否有副作用)
-EXECUTORS = {
-    "app_launch":          ("app.launch", _render_app_launch, True),
-    "notify_read":         ("notify.read", _render_notify, False),
-    "screenshot_describe": ("screen.read", _render_screen, False),
-    "device_status":       ("thermal.read", _render_thermal, False),
-    "wifi_survey":         ("radio.wifi.survey", _render_wifi, False),
+# ---------------------------------------------------------------- 通用渲染器
+
+def _fmt_val(v, limit=200):
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if isinstance(v, (dict, list)):
+        return _clip(json.dumps(v, ensure_ascii=False), limit)
+    return str(v)
+
+
+def _mk_kv(*fields):
+    """字段型渲染器：fields = (data里的键, 中文标签[, 单位])。
+
+    取不到就跳过（不编造），一个都取不到就**明说**并把原始字段给出去——
+    静默返回「没有数据」会让模型以为设备真的空，那是谎报。
+    """
+    def _r(r, arg):
+        if not r.get("ok"):
+            return f"失败：{r.get('err') or '未知原因'}"
+        d = _d(r)
+        parts = []
+        for f in fields:
+            key, label = f[0], f[1]
+            unit = f[2] if len(f) > 2 else ""
+            v = d.get(key)
+            if v is None or v == "":
+                continue
+            parts.append(f"{label} {_fmt_val(v)}{unit}")
+        note = d.get("note")
+        if isinstance(note, str) and note:
+            parts.append(f"（注：{note}）")
+        if not parts:
+            return ("读到了，但没有可报告的字段。原始："
+                    + _clip(json.dumps(d, ensure_ascii=False), 300))
+        return "；".join(parts)
+    return _r
+
+
+def _mk_rows(list_key, label, limit=15, keys=()):
+    """列表型渲染器：data[list_key] 是数组，逐条摘出可读字段。
+
+    **不能假设它是数组**：实测 bt.scan 在蓝牙关着的时候 devices 是一个
+    {"ok": False, "err": ...} 的字典，直接切片会 KeyError 崩掉整个工具。
+    """
+    def _r(r, arg):
+        if not r.get("ok"):
+            return f"失败：{r.get('err') or '未知原因'}"
+        d = _d(r)
+        rows = d.get(list_key)
+        if rows is None:
+            rows = []
+        if isinstance(rows, dict):
+            # 能力把「出错/不可用」也塞在这个键里了：把话说清楚，别当成空列表
+            if rows.get("ok") is False or rows.get("err"):
+                return f"{label}：不可用——{rows.get('err') or '未知原因'}"
+            return f"{label}：" + _clip(json.dumps(rows, ensure_ascii=False), 400)
+        if isinstance(rows, str):
+            return f"{label}：{_clip(rows, 600)}"
+        if not isinstance(rows, list):
+            return f"{label}：{_fmt_val(rows, 300)}"
+        if not rows:
+            return f"{label}：0 条（空）。"
+        lines = [f"{label}共 {len(rows)} 条："]
+        for i, row in enumerate(rows[:limit], 1):
+            if isinstance(row, dict):
+                if keys:
+                    picked = "｜".join(
+                        f"{_fmt_val(row[k], 80)}"
+                        for k in keys if row.get(k) not in (None, ""))
+                    seg = picked or _fmt_val(row, 120)
+                else:
+                    seg = _fmt_val(row, 120)
+            else:
+                seg = str(row)
+            lines.append(f"[{i}] {seg}")
+        if len(rows) > limit:
+            lines.append(f"…还有 {len(rows) - limit} 条")
+        return "\n".join(lines)
+    return _r
+
+
+def _render_web2(r, arg):
+    return _render_web(r)
+
+
+def _gb(n):
+    """字节 → GB。传进来的可能是字符串（能力层没统一），先试转。"""
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if v < 1024 or unit == "TB":
+            return f"{v:.0f}{unit}" if unit == "B" else f"{v:.1f}{unit}"
+        v /= 1024
+    return str(n)
+
+
+def _render_sysinfo(r, arg):
+    """电脑系统信息。字段名是**实测**的（pcctl.sysinfo 真返回的键）。"""
+    if not r.get("ok"):
+        return f"读电脑状态失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    parts = []
+    if d.get("hostname"):
+        parts.append(f"主机名 {d['hostname']}")
+    if d.get("os"):
+        parts.append(f"系统 {d['os']} {d.get('release', '')}".strip())
+    if d.get("cpu_count"):
+        parts.append(f"CPU {d['cpu_count']} 核")
+    if d.get("mem_total") is not None:
+        mem = f"内存 {_gb(d['mem_total'])}"
+        if d.get("mem_percent") is not None:
+            mem += f"（已用 {d['mem_percent']}%）"
+        parts.append(mem)
+    if d.get("disk_free") is not None:
+        disk = f"磁盘可用 {_gb(d['disk_free'])}"
+        if d.get("disk_total") is not None:
+            disk += f"/共 {_gb(d['disk_total'])}"
+        parts.append(disk)
+    if d.get("user"):
+        parts.append(f"用户 {d['user']}")
+    return "；".join(parts) or "读到了，但没有可报告的字段。"
+
+
+def _render_cell(r, arg):
+    """蜂窝。subs 是数组，每条含 operator / rat / 信号。"""
+    if not r.get("ok"):
+        return f"读蜂窝失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    subs = d.get("subs")
+    if isinstance(subs, list) and subs:
+        lines = []
+        for i, s in enumerate(subs[:4], 1):
+            if not isinstance(s, dict):
+                lines.append(f"[{i}] {s}")
+                continue
+            seg = f"[{i}] {s.get('operator') or '未知运营商'}"
+            if s.get("rat"):
+                seg += f"（{s['rat']}）"
+            for k in ("signal", "level", "dbm", "band", "freq_mhz"):
+                if s.get(k) not in (None, ""):
+                    seg += f" {k}={s[k]}"
+            lines.append(seg)
+        out = "\n".join(lines)
+        if isinstance(d.get("note"), str) and d["note"]:
+            out += f"\n（注：{d['note']}）"
+        return out
+    return "没读到蜂窝信息。" + _clip(json.dumps(d, ensure_ascii=False), 200)
+
+
+def _render_wifi2(r, arg):
+    """Wi-Fi 扫描。真返回的键是 aps / summary / table / bands / count。"""
+    if not r.get("ok"):
+        return f"扫 Wi-Fi 失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    # 键名在不同设备/版本上不统一（实测有 aps，老代码写过 networks/nets/rows）
+    aps = d.get("aps")
+    if not aps:
+        aps = d.get("networks") or d.get("nets") or d.get("rows")
+    lines = []
+    if d.get("count") is not None:
+        lines.append(f"扫到 {d['count']} 个网络")
+    bands = d.get("bands")
+    if isinstance(bands, dict) and bands:
+        lines.append("频段分布：" + "、".join(f"{k} {v} 个" for k, v in bands.items()))
+    summary = d.get("summary")
+    if isinstance(summary, dict):
+        kinds = summary.get("kinds")
+        if isinstance(kinds, dict) and kinds:
+            lines.append("类型：" + "、".join(f"{k} {v}" for k, v in kinds.items()))
+    if isinstance(aps, list) and aps:
+        for i, a in enumerate(aps[:12], 1):
+            if not isinstance(a, dict):
+                lines.append(f"[{i}] {a}")
+                continue
+            seg = f"[{i}] {a.get('ssid') or '(隐藏)'}"
+            for k in ("level", "signal", "freq", "band", "vendor"):
+                if a.get(k) not in (None, ""):
+                    seg += f"｜{k}={a[k]}"
+            lines.append(seg)
+        if len(aps) > 12:
+            lines.append(f"…还有 {len(aps) - 12} 个")
+    elif isinstance(d.get("table"), str) and d["table"].strip():
+        lines.append(d["table"].strip()[:600])
+    if isinstance(d.get("note"), str) and d["note"]:
+        lines.append(f"（注：{d['note']}）")
+    return "\n".join(lines) or "扫描完成，但没有解析出网络。"
+
+
+def _render_node(r, arg):
+    """编队节点状态。device 是一大段文本，截断后给，别整段塞。"""
+    if not r.get("ok"):
+        return f"读节点状态失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    parts = []
+    if d.get("endpoint"):
+        parts.append(f"服务端点 {d['endpoint']}")
+    if d.get("service") is not None:
+        parts.append(f"推理服务 {'在跑' if d['service'] else '没在跑'}")
+    models = d.get("models")
+    if isinstance(models, dict):
+        ms = models.get("models")
+        if isinstance(ms, list) and ms:
+            names = [m.get("name", "?").rsplit("/", 1)[-1] for m in ms[:3]
+                     if isinstance(m, dict)]
+            parts.append("模型：" + "、".join(names))
+    if isinstance(d.get("device"), str) and d["device"].strip():
+        parts.append("设备摘要：" + _clip(d["device"].strip(), 300))
+    return "\n".join(parts) or "读到了，但没有可报告的字段。"
+
+
+def _render_tree(r, arg):
+    """控件树：tree 是一整段文本，node_count 是节点数。"""
+    if not r.get("ok"):
+        return f"读控件树失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    out = ""
+    if d.get("node_count") is not None:
+        out += f"共 {d['node_count']} 个控件\n"
+    if isinstance(d.get("tree"), str) and d["tree"].strip():
+        out += _clip(d["tree"].strip(), 900)
+    return out.strip() or "读到了，但没有可报告的字段。"
+
+
+# ------------------------------------------------- 应用名 → 包名
+
+#: 模型给的是人话（「微信」），设备要的是包名（com.tencent.mm）。
+#: 这台手机拿不到系统给的应用标签（dumpsys 只给资源 ID，机器上也没有 aapt），
+#: 所以这里放一张**候选包名表**：命中且不在这台机器上就跳过，继续试下一个。
+#: 表是通用的（换手机也能用），不是给这一台硬编码的。
+APP_ALIASES = {
+    "微信": ["com.tencent.mm"],
+    "wechat": ["com.tencent.mm"],
+    "weixin": ["com.tencent.mm"],
+    "支付宝": ["com.eg.android.AlipayGphone"],
+    "alipay": ["com.eg.android.AlipayGphone"],
+    "钉钉": ["com.alibaba.android.rimet"],
+    "知乎": ["com.zhihu.android"],
+    "微博": ["com.sina.weibo"],
+    "weibo": ["com.sina.weibo"],
+    "京东": ["com.jd.jrapp"],
+    "京东金融": ["com.jd.jrapp"],
+    "百度地图": ["com.baidu.BaiduMap"],
+    "地图": ["com.baidu.BaiduMap", "com.autonavi.minimap"],
+    "高德": ["com.autonavi.minimap"],
+    "chrome": ["com.android.chrome"],
+    "浏览器": ["com.android.chrome", "com.tencent.mtt"],
+    "qq浏览器": ["com.tencent.mtt"],
+    "termux": ["com.termux"],
+    "wps": ["cn.wps.moffice_eng.xiaomi.lite"],
+    "网易邮箱": ["com.netease.mail"],
+    "邮箱": ["com.netease.mail"],
+    "计算器": ["com.miui.calculator", "com.android.calculator2"],
+    "天气": ["com.miui.weather2"],
+    "便签": ["com.miui.notes"],
+    "笔记": ["com.miui.notes", "com.orion.notein"],
+    "扫描": ["com.xiaomi.scanner"],
+    "小米商城": ["com.xiaomi.shop"],
+    "应用商店": ["com.xiaomi.market", "com.android.vending"],
+    "市场": ["com.xiaomi.market"],
+    "设置": ["com.android.settings"],
+    "相机": ["com.android.camera", "com.miui.camera"],
+    "拍照": ["com.android.camera", "com.miui.camera"],
+    "相册": ["com.miui.gallery", "com.android.gallery3d"],
+    "文件管理": ["com.android.fileexplorer", "com.mi.android.globalFileexplorer",
+                 "com.android.documentsui"],
+    "文件": ["com.android.fileexplorer", "com.android.documentsui"],
+    "混元": ["com.tencent.hunyuan.app.chat"],
+    "ima": ["com.tencent.ima"],
+    "王者荣耀": ["com.tencent.tmgp.sgame"],
+    "音乐": ["com.miui.player", "com.tencent.qqmusic"],
+    "视频": ["com.miui.video"],
+    "日历": ["com.android.calendar"],
+    "时钟": ["com.android.deskclock"],
+    "闹钟": ["com.android.deskclock"],
+    "电话": ["com.android.dialer", "com.android.contacts"],
+    "拨号": ["com.android.dialer"],
 }
+
+#: 已装包名缓存。`pm list packages` 每次 ~1s，一轮对话里不该跑第二遍。
+_INSTALLED = {"ts": 0.0, "pkgs": []}
+_INSTALL_TTL = 300.0
+
+
+def _installed(caller, ttl=_INSTALL_TTL):
+    """拿这台手机上装的全部包名（含系统应用），带 5 分钟缓存。"""
+    now = time.time()
+    if _INSTALLED["pkgs"] and now - _INSTALLED["ts"] < ttl:
+        return _INSTALLED["pkgs"]
+    try:
+        r = caller("apps.list", {"third_only": False})
+        pkgs = (_d(r).get("packages") or []) if isinstance(r, dict) else []
+    except Exception:
+        pkgs = []
+    if pkgs:
+        _INSTALLED["ts"], _INSTALLED["pkgs"] = now, pkgs
+    return _INSTALLED["pkgs"] or pkgs
+
+
+def resolve_app(arg, caller):
+    """「微信」→ com.tencent.mm。返回 (包名, "") 或 (None, 为什么不行)。
+
+    失败也返回**有信息量的文字**（带上相似的候选），因为这条文字会被回填给
+    模型：它得知道自己没找到，而不是以为手机里真的没有。
+    """
+    a = (arg or "").strip()
+    if not a:
+        return None, "（没说要打开哪个应用）"
+    # 1. 看起来本身就是包名 / activity / intent，别多此一举去查表
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:/-]*", a) and (
+            "." in a or "/" in a or ":" in a):
+        return a, ""
+    pkgs = _installed(caller)
+    if not pkgs:
+        # 拿不到清单也要 fail-open 地试一把：包名解析失败不等于不能启动
+        return a, ""
+    # 2. 别名表（认得出名字，但要确认真装了）
+    for cand in APP_ALIASES.get(a.lower(), []):
+        if cand in pkgs:
+            return cand, ""
+    if a.lower() in APP_ALIASES:
+        return None, (f"「{a}」没装在这台手机上"
+                      f"（常是 {APP_ALIASES[a.lower()][0]}，但已装列表里没有）。")
+    # 3. 包名末段正好等于它（如说「mm」指 com.tencent.mm）
+    low = a.lower()
+    tail = [p for p in pkgs if p.rsplit(".", 1)[-1].lower() == low]
+    if len(tail) == 1:
+        return tail[0], ""
+    # 4. 子串唯一命中
+    fuzzy = [p for p in pkgs if low in p.lower()]
+    if len(fuzzy) == 1:
+        return fuzzy[0], ""
+    if fuzzy:
+        return None, (f"没确定是哪个「{a}」。手机上装的里有这几个相似的："
+                      + "、".join(fuzzy[:5]))
+    return None, f"没找到应用「{a}」：这台手机没装，或这个名字我认不出。"
+
+
+# ---------------------------------------------------------------- 工具表（唯一事实源）
+
+class Tool:
+    """一个工具 = 一行。schema / 描述 / 权限 / 执行器全部由这张表派生。
+
+    cap=None 表示不走注册表（web_search 走 webtool）。
+    side=True 表示有副作用（会改变设备状态），权限默认 ask。
+    """
+
+    def __init__(self, name, cap, desc, perm=PERM_AUTO, side=False,
+                 render=None, args=None, argkey=None, resolve=None):
+        self.name = name
+        self.cap = cap
+        self.desc = desc
+        self.perm = perm
+        self.side = side
+        self.render = render
+        self.args = args or {}
+        #: argkey：模型给的 arg 塞进能力的哪个参数（None = 这个工具不吃参数）。
+        self.argkey = argkey
+        #: resolve(arg, caller) -> (值, "") 或 (None, 为什么不行)。
+        #: 用来把「人话」翻译成设备认的东西（如「微信」→ com.tencent.mm）。
+        self.resolve = resolve
+
+    @property
+    def line(self):
+        return f"- {self.name}：{self.desc}\n"
+
+
+#: 描述是**给 1.7B 看的**，写得好不好直接决定选对选错。实测（tmp/probe_scale.py）：
+#: 枚举从 6 涨到 18 准确率没掉（94%→90~98%），失败**全部**是「两个工具边界重叠」
+#: 而非容量不够。所以每条描述都显式点名容易混的那个邻居（见 radio_cell /
+#: wifi_survey、file_pull / screenshot_describe、apps_list / app_launch）。
+TOOLS = (
+    Tool("web_search", None,
+         "联网搜索：最新事实/价格/新闻/版本号/不知道的知识性问题。"
+         "纯代码、算术、翻译、闲聊不用它。",
+         render=_render_web2),
+
+    Tool("notify_read", "notify.read",
+         "读手机最近的通知（谁发消息了、几条未读）。只管通知栏，"
+         "要看当前界面选 screenshot_describe。",
+         render=_render_notify),
+
+    Tool("app_launch", "app.launch",
+         "打开/启动手机上的某个应用（会给应用名）。只是查看装了什么选 apps_list。",
+         perm=PERM_ASK, side=True, render=_render_app_launch,
+         argkey="target", resolve=resolve_app),
+
+    Tool("screenshot_describe", "screen.read",
+         "看一眼手机当前屏幕上显示的内容（有什么文字、在哪个界面）。",
+         render=_render_screen),
+
+    Tool("device_status", "thermal.read",
+         "查手机自身状态：电量、温度、存储、CPU。电脑的状态选 pc_sysinfo。",
+         render=_render_thermal),
+
+    Tool("wifi_survey", "radio.wifi.survey",
+         "扫描附近的 Wi-Fi 无线网络（会明说 Wi-Fi/无线网/wlan/热点）。"
+         "手机卡的「信号」不是这个，选 radio_cell。",
+         render=_render_wifi2),
+
+    Tool("radio_cell", "radio.cell",
+         "查蜂窝移动网络：运营商、几 G、信号格（手机卡的信号）。"
+         "问「信号」默认是这个；只有明说 Wi-Fi 才是 wifi_survey。",
+         render=_render_cell),
+
+    Tool("bt_scan", "bt.scan",
+         "扫描附近的蓝牙设备（耳机、手表、音箱）。Wi-Fi 选 wifi_survey，"
+         "蜂窝选 radio_cell。",
+         render=_mk_rows("devices", "蓝牙设备", keys=("name", "addr", "rssi"))),
+
+    Tool("apps_list", "apps.list",
+         "列出手机上都装了哪些应用（只要清单）。要打开某个应用选 app_launch。",
+         render=_mk_rows("packages", "已装应用", limit=25), args={"third_only": True}),
+
+    Tool("app_foreground", "app.foreground",
+         "查当前前台是哪个应用、用了多久（只看现在这一个）。"
+         "要全部清单选 apps_list。",
+         render=_mk_kv(("foreground", "前台应用"), ("screen", "界面"))),
+
+    Tool("node_status", "phone.node.status",
+         "查编队里各设备（其他手机/板子/电脑/本机）是否在线、忙不忙。"
+         "问「其他设备」「哪些在线」「别的机器」都选这个。",
+         render=_render_node),
+
+    Tool("clipboard_read", "pcctl.clipboard.read",
+         "读电脑剪贴板的内容（复制了什么）。手机屏幕上的字选 screenshot_describe。",
+         render=_mk_kv(("text", "剪贴板"), ("preview", "内容"))),
+
+    Tool("pc_sysinfo", "pcctl.sysinfo",
+         "查电脑的系统信息：CPU、内存、磁盘、开机时长。手机的状态选 device_status。",
+         render=_render_sysinfo),
+
+    Tool("pc_proc_list", "pcctl.proc.list",
+         "列出电脑上正在运行的进程/程序。",
+         render=_mk_rows("procs", "进程", keys=("name", "pid"))),
+
+    Tool("pc_windows", "pcctl.windows",
+         "列出电脑上打开的窗口标题（问「开了哪些窗口」「窗口列表」就选这个）。"
+         "要看屏幕画面选 pc_screenshot，手机的界面选 screenshot_describe。",
+         render=_mk_rows("windows", "窗口", keys=("title", "pid"))),
+
+    Tool("pc_screenshot", "pcctl.screenshot",
+         "截一张电脑屏幕的画面（只是列出窗口标题选 pc_windows；"
+         "手机的屏幕选 screenshot_describe）。",
+         render=_mk_kv(("path", "截图文件"), ("size", "尺寸"))),
+
+    Tool("net_scan", "net.scan",
+         "扫描局域网里有哪些设备（IP、端口、主机名）。"
+         "编队设备的在线状态选 node_status。",
+         render=_mk_rows("devices", "局域网设备",
+                         keys=("ip", "mac", "vendor", "hostname"))),
+
+    Tool("artifact_list", "artifact.list",
+         "列出编队产物中心里已经存了哪些东西（只要清单，不搬运）。",
+         render=_mk_rows("artifacts", "产物", keys=("id", "kind", "size", "name"))),
+
+    Tool("job_list", "job.list",
+         "列出编队里的作业/任务及其状态（在跑、完成、失败）。",
+         render=_mk_rows("jobs", "作业", keys=("id", "state", "cap", "owner"))),
+
+    Tool("tree_read", "tree.read",
+         "读手机当前界面的控件树：有哪些按钮、输入框及其位置。"
+         "只要可见文字选 screenshot_describe。",
+         render=_render_tree),
+
+    Tool("input_tap", "input.tap",
+         "点击手机屏幕上某个按钮或文字（会真的点下去）。"
+         "只是看看屏幕上有什么选 screenshot_describe。",
+         perm=PERM_ASK, side=True, argkey="text",
+         render=_mk_kv(("ok", "已点击"), ("text", "目标"), ("err", "错误"))),
+
+    Tool("input_type", "input.type",
+         "在手机当前输入框里输入文字（会真的打字）。",
+         perm=PERM_ASK, side=True, argkey="text",
+         render=_mk_kv(("ok", "已输入"), ("len", "输入长度"), ("err", "错误"))),
+)
+
+
+# ------------------------------------------------- 从 TOOLS 派生出各处常量
+
+def _derive():
+    """把 TOOLS 表展开成老代码用的四个结构。加工具只改 TOOLS。"""
+    names = [t.name for t in TOOLS]
+    enum = names + ["none"]
+    schema = {
+        "type": "object",
+        "properties": {
+            "tool": {"type": "string", "enum": enum},
+            "arg": {"type": "string"},
+        },
+        "required": ["tool", "arg"],
+    }
+    lines = "".join(t.line for t in TOOLS) + "- none：以上都不需要\n"
+    system = (
+        "你是手机助手的调度器。根据用户消息判断该调用哪个工具，"
+        "需要参数的填在 arg（如搜索词、应用名），不需要参数的 arg 留空。\n"
+        "可选工具：\n" + lines +
+        "纯代码、算术、翻译、闲聊一律选 none。只输出 JSON。"
+    )
+    executors = {t.name: t for t in TOOLS}
+    tiers = {t.name: t.perm for t in TOOLS}
+    return schema, lines, system, executors, tiers
+
+
+(DECIDE_SCHEMA, _TOOLS_LINE, DECIDE_SYSTEM,
+ EXECUTORS, DEFAULT_TIERS) = _derive()
 
 
 # ---------------------------------------------------------------- 权限三档
@@ -264,17 +746,6 @@ EXECUTORS = {
 #: auto = 直接跑；ask = 交给审批闸门（无闸门即 fail-closed 拒绝）；forbid = 永不跑。
 #: 与 Operit 的三档对齐，但**默认更保守**：唯一有副作用的 app_launch 默认 ask，
 #: 短信/联系人/通讯录类能力压根没进工具表（隐私边界，不跟随 Operit 的激进面）。
-PERM_AUTO, PERM_ASK, PERM_FORBID = "auto", "ask", "forbid"
-
-DEFAULT_TIERS = {
-    "web_search":           PERM_AUTO,
-    "notify_read":          PERM_AUTO,
-    "screenshot_describe":  PERM_AUTO,
-    "device_status":        PERM_AUTO,
-    "wifi_survey":          PERM_AUTO,
-    "app_launch":           PERM_ASK,
-}
-
 AUDIT_PATH = os.path.join(os.path.expanduser("~"), ".fleet", "tool_audit.log")
 
 
@@ -368,15 +839,26 @@ def execute(tool, arg, caller, tiers=None):
     if spec is None:
         _audit(tool, arg, tier, "unknown-tool")
         return (tool, f"未知工具 {tool}（内部错误）", False)
-    cap, render, side_effect = spec
-    args = {}
-    if tool == "app_launch":
+    cap, render = spec.cap, spec.render
+    args = dict(spec.args)
+    if spec.argkey:
         if not (arg or "").strip():
-            _audit(tool, arg, tier, "no-target")
-            return (cap, "（没说要打开哪个应用）", False)
-        args = {"target": arg.strip()}
+            _audit(tool, arg, tier, "no-arg")
+            return (cap, f"（没说要{spec.desc[:4]}什么）", False)
+        val, why = arg.strip(), ""
+        if spec.resolve is not None:
+            val, why = spec.resolve(val, caller)
+        if val is None:
+            _audit(tool, arg, tier, "unresolved")
+            return (cap, why, False)
+        args[spec.argkey] = val
     try:
         r = caller(cap, args)
+        # 调用方给的是对象还是字典都要能干活。曾经踩过：拿到 DeviceResult
+        # 对象而不转 as_dict()，每个工具都回「读到了但没有可报告的字段」——
+        # 看起来像设备真的空，其实是类型不对。**静默的空比报错危险得多**。
+        if hasattr(r, "as_dict"):
+            r = r.as_dict()
     except Exception as e:
         _audit(tool, arg, tier, f"exception: {type(e).__name__}")
         return (cap, f"调用 {cap} 异常：{type(e).__name__}: {e}", False)
@@ -487,6 +969,11 @@ def run_tools(question, caller, url=None, max_rounds=MAX_ROUNDS,
         if tool in used:                       # 模型没听话 → 直接收手
             break
         used.add(tool)
+        # ask 档这一步会挂起等人工确认（最长 30 秒）。不先说一句，界面上就是
+        # 两分钟的死寂——看着像卡死，其实是在等人点头。先推一条，让人知道在等什么。
+        if permission_for(tool, tiers) == PERM_ASK:
+            fire("awaiting", {"tool": tool, "round": rnd,
+                              "note": "这个工具要你确认才执行"})
         fire("searching", {"tool": tool, "round": rnd})
         label, text, ok = execute(tool, d.get("arg", ""), caller, tiers)
         out.append({"tool": tool, "label": label, "text": text,

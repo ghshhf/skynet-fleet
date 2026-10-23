@@ -183,6 +183,7 @@ CASES = [
     # ④ 资料块带引用纪律且结果硬限 1200 字符（31 万字撑爆上下文的事故不再可能）。
     # 全离线：registry 与决策模型都打桩。
     ("eval_t24_agent_tools_v2", ["evals/t24_agent_tools_v2.py"], HERE, 120),
+    ("eval_t25_tool_catalog", ["evals/t25_tool_catalog.py"], HERE, 120),
 ]
 
 
