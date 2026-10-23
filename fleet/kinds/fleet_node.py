@@ -89,20 +89,26 @@ class FleetNode(BaseDevice):
                 return R.error(cap, f"读取 relay 状态失败：{type(e).__name__}: {e}",
                                device=self.name, via=self.via)
 
-        # skynet.relay.fetch：经该节点的 SkyNet relay 代取 URL（只对本机/可达节点有效）
+        # skynet.relay.fetch：经本机（或可达）节点的 SkyNet relay 代取 URL。
+        # 与 caps() 同一数据源：relay 是否真在跑以 get_relay() 为准，
+        # 不再查 self.rec（带外启动 relay 时 rec 里可能没有 skynet.relay，
+        # 那样 caps() 会谎报「有」而 invoke 会拒，自相矛盾）。
         if cap == "skynet.relay.fetch":
             args = dict(args or {})
             url = args.get("url", "")
             if not url:
                 return R.error(cap, "缺少 url 参数", device=self.name, via=self.via)
-            info = self.rec.get("info") or {}
-            rp = info.get("relay_port")
-            caps = self.rec.get("capabilities") or []
-            if "skynet.relay" not in caps or not rp:
+            try:
+                relay = get_relay()
+            except Exception as e:
+                return R.error(cap, f"读取 relay 状态失败：{type(e).__name__}: {e}",
+                               device=self.name, via=self.via)
+            if not relay.running:
                 return R.error(
-                    cap, f"节点 {self.name} 未上报 skynet.relay 能力或未配 relay_port"
-                    f"（caps={caps}, relay_port={rp}）",
+                    cap, f"节点 {self.name} 的 relay 未启动（未以 --relay-port 启动，"
+                    f"或 get_relay() 还没 start）",
                     device=self.name, via=self.via)
+            rp = relay.port
             try:
                 s = socket.create_connection(("127.0.0.1", int(rp)), timeout=20)
             except OSError as e:
