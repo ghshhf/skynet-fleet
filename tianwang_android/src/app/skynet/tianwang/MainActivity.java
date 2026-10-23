@@ -1555,7 +1555,21 @@ public class MainActivity extends Activity {
                         String host = m.optString("host", "");
                         line = "已配对 " + (host.isEmpty() ? "" : "· " + host);
                         color = R.color.listen;
+                    } catch (java.net.ConnectException e) {
+                        // 连不上 ≠ 凭据失效。以前这两种都写「凭据失效」，
+                        // 于是隧道没通（电脑端没起服务 / adb reverse 掉了）
+                        // 时，人被指挥去重新配对——配一百次也是同一个错。
+                        // 处置完全不同，文案就必须分开。
+                        line = "连不上 " + base + "（电脑端服务没起，或 adb 隧道断了）";
+                        color = R.color.alert;
+                    } catch (java.net.SocketTimeoutException e) {
+                        line = "超时 " + base + "（电脑在但没应答）";
+                        color = R.color.alert;
+                    } catch (java.net.UnknownHostException e) {
+                        line = "地址不对 " + base;
+                        color = R.color.alert;
                     } catch (Exception e) {
+                        // 走到这儿才是真的凭据问题（401/403 已被 Net 转成可读文案）
                         line = "凭据失效：" + e.getMessage();
                         color = R.color.alert;
                     }
@@ -1624,6 +1638,34 @@ public class MainActivity extends Activity {
         });
         row.addView(bForget);
         box.addView(row);
+
+        // ---- ②·b Sky MCP：把电脑那 70 项能力暴露成 MCP server ----
+        // 手机上别的 agent（Operit 之类）填这个地址就能用本仓的能力。
+        // 只能摸到**只读**能力：有副作用的默认不导出，注册表层还会再 fail-closed 一次。
+        final TextView mMcp = new TextView(this);
+        mMcp.setTextSize(12);
+        mMcp.setPadding(0, dp(10), 0, dp(4));
+        final String mcpUrl = Prefs.baseUrl(this) + "/api/mcp";
+        mMcp.setText("Sky MCP：" + mcpUrl + "\n（HTTP JSON-RPC 2.0，默认只导出只读能力）");
+        mMcp.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        box.addView(mMcp);
+
+        LinearLayout rowMcp = new LinearLayout(this);
+        rowMcp.setOrientation(LinearLayout.HORIZONTAL);
+        TextView bMcp = chip("复制 MCP 地址", R.color.accent);
+        bMcp.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                android.content.ClipboardManager cm =
+                        (android.content.ClipboardManager)
+                                getSystemService(CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(android.content.ClipData.newPlainText(
+                        "fleet-mcp", mcpUrl));
+                toast("已复制：" + mcpUrl);
+            }
+        });
+        rowMcp.addView(bMcp);
+        box.addView(rowMcp);
 
         // ---- ③ 后端 ----
         final EditText eBackend = new EditText(this);

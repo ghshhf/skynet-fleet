@@ -228,11 +228,30 @@ class FleetServer:
         #   凭据库（devices）= 「这台设备被允许进门」的事实，落盘，重启仍在。
         # 手机走的是后者——主人要的是「配对完就不用再配」，不是「每次开机重配」。
         self.devices = DEVAUTH.DeviceVault(name=socket.gethostname())
+        # ---- Sky MCP（2026-10-24）：把编队能力做成**手机能连的 MCP server** ----
+        # 「设备也是 MCP」不是口号：手机上的 agent（天网 App / Termux 脚本 /
+        # 任意 MCP 客户端）走 HTTP JSON-RPC 就能摸到本仓的只读能力。
+        # 懒建：第一次有人调 /api/mcp 才组装（工具表要扫注册表，别拖慢启动）。
+        self._mcp = None
         self.pair_httpd = None
         self.pair_tls = None          # {cert, key, fp, dir}
         self.pair_beacon = None
         self.pair_port = 0
         self.pair_host = ""
+
+    # ---------------- Sky MCP ----------------
+
+    def mcp_server(self):
+        """编队能力 → MCP server（懒建、进程内单例）。
+
+        闸门给 `self.gate`：GUI 场景有审批中枢时，ask 档能力真的能过闸；
+        没有时注册表自己 fail-closed 拒绝——**默认不导出有副作用的能力**，
+        所以从手机侧最多只能「看」，动不了手。
+        """
+        if self._mcp is None:
+            from fleet.mcp.server import MCPServer
+            self._mcp = MCPServer(registry=self.registry, gate=self.gate)
+        return self._mcp
 
     # ---------------- 截图登记（W3 的屏幕预览）----------------
 
@@ -467,29 +486,43 @@ class FleetServer:
                         rep["phase"] = "done"
                         q.put({"type": "web", "data": rep})
                     elif web_mode == "auto":
+                        # 工具面 v2（2026-10-24）：**多轮 = 结果感知的第二轮**。
+                        # 第一轮拿到结果后，把结果喂回去让模型再判一次
+                        # 「还缺别的吗」，轮次硬上限 2、总预算 60s——
+                        # 缰绳在代码里，不在模型嘴里（BFCL：1.7B 多轮会崩）。
                         import fleet.agent_tools as AT
-                        d = AT.decide(raw_prompt)
-                        if d and d.get("tool") != "none":
-                            tool = d["tool"]
-                            q.put({"type": "web", "data": {
-                                "phase": "searching", "mode": "tool",
-                                "tool": tool}})
-                            if tool == "web_search":
-                                import webtool as WEB
-                                sys2, rep = WEB.augment(
-                                    system, raw_prompt, mode="on")
-                                rep["phase"] = "done"
-                                q.put({"type": "web", "data": rep})
-                            else:
-                                label, text = AT.execute(
-                                    tool, d.get("arg", ""), self.call)
-                                block = AT.render_tool_block(label, text)
-                                sys2 = system + block
+
+                        def _ev(phase, data=None):
+                            d2 = dict(data or {})
+                            d2["phase"] = phase
+                            d2["mode"] = "tool"
+                            q.put({"type": "web", "data": d2})
+
+                        results = AT.run_tools(raw_prompt, self.call,
+                                               tiers=AT.load_tiers(),
+                                               on_event=_ev)
+                        # web_search 单独走 webtool.augment——它有资料块与
+                        # 引用链路（sources），别在工具面里重写一遍。
+                        web_hit = [r for r in results
+                                   if r.get("tool") == "web_search"]
+                        others = [r for r in results
+                                  if r.get("tool") != "web_search"]
+                        if web_hit:
+                            import webtool as WEB
+                            sys2, rep = WEB.augment(
+                                system, raw_prompt, mode="on")
+                            rep["phase"] = "done"
+                            q.put({"type": "web", "data": rep})
+                        if others:
+                            sys2 = sys2 + AT.render_blocks(others)
+                            for r in others:
                                 q.put({"type": "web", "data": {
                                     "phase": "done", "used": True,
-                                    "mode": "tool", "tool": tool,
-                                    "label": label,
-                                    "sources": [{"title": f"手机工具 {label}",
+                                    "mode": "tool", "tool": r.get("tool"),
+                                    "label": r.get("label"),
+                                    "round": r.get("round"),
+                                    "sources": [{"title": f"手机工具 "
+                                                         f"{r.get('label')}",
                                                  "url": ""}]}})
                 except Exception as e:
                     # 工具面是增强不是前置条件：挂了照常答，但要说出来。
@@ -681,6 +714,10 @@ class _Handler(BaseHTTPRequestHandler):
         # 分流，否则会被判成「请求体不是合法 JSON」。
         if path == "/api/voice/recognize":
             return self._post_voice_recognize()
+        # /api/mcp 也要赶在 _read_json 之前分流：JSON-RPC 的批请求是一个
+        # **数组**，而 _read_json 只认对象（它会先把请求体读走，再回 400）。
+        if path == "/api/mcp":
+            return self._post_mcp()
         try:
             body = self._read_json()
         except ValueError as e:
@@ -759,6 +796,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _pair_api(self, path):
         f = self.fleet
+        # Sky MCP 也挂在配对监听器上——**手机要走网络地址连它**（热点里是
+        # http://192.168.137.1:<pair_port>/api/mcp），而主 GUI 只绑 127.0.0.1。
+        # 鉴权与主控端同一套（令牌或已配对设备凭据），没有匿名入口。
+        if path == "/api/mcp":
+            ok, code, why = self._authorized()
+            if not ok:
+                return self._err(code, why)
+            return self._post_mcp(self._read_json_loose())
         # ---- 长期设备凭据（手机端配对走这组）----
         # 码本身**没有任何接口吐出来**：只能从电脑屏幕上肉眼抄。
         # 码一旦能通过网络读，配对就退化成「谁先连上谁赢」。
@@ -1663,6 +1708,58 @@ class _Handler(BaseHTTPRequestHandler):
             return self._err(409, why)
         return self._json({"ok": True, "request_id": rid,
                            "decision": "approved" if approve else "denied"})
+
+    def _read_json_loose(self):
+        """读请求体，允许**数组**（JSON-RPC 批请求）。
+
+        普通接口只收对象（多一层类型约束，错得更早）；MCP 是唯一例外——
+        JSON-RPC 2.0 明确规定批请求是一个数组，按对象的规矩拒了，
+        客户端就只能一条一条发，MCP 的批能力等于没接。
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b""
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise ValueError(f"请求体不是合法 JSON: {e}")
+        if not isinstance(obj, (dict, list)):
+            raise ValueError("请求体必须是 JSON 对象或数组")
+        return obj
+
+    def _post_mcp(self, body=None):
+        """Sky MCP over HTTP：一个 JSON-RPC 请求进、一个 JSON-RPC 响应出。
+
+        与 stdio 传输**共用同一份派发逻辑**（fleet/mcp/server.py 的 MCPServer），
+        差别只在字节怎么进、怎么出——这样以后改协议不用改两遍。
+
+        三条纪律不变：
+          · 只导出只读能力（有副作用的默认不导出，且注册表层 fail-closed）；
+          · 失败一律 `isError: true` 带原因，绝不用空结果假装成功；
+          · 通知（没有 id）不回——HTTP 层用 204 表达「收到了，但按规矩不回」。
+        """
+        if body is None:
+            try:
+                body = self._read_json_loose()
+            except ValueError as e:
+                return self._err(400, str(e))
+        try:
+            resp = self.fleet.mcp_server().handle(body)
+        except Exception as e:
+            rid = body.get("id") if isinstance(body, dict) else None
+            resp = {"jsonrpc": "2.0", "id": rid,
+                    "error": {"code": -32603,
+                              "message": f"{type(e).__name__}: {e}"}}
+        if resp is None:
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+        return self._json(resp)
 
     def _post_call(self, body):
         cap = (body.get("cap") or "").strip()
