@@ -15,7 +15,10 @@ PY = sys.executable
 
 # (名字, 命令参数, 工作目录, 超时秒)
 CASES = [
-    ("commander", ["commander.py", "--self-test", "--password", "demo123"], HERE, 120),
+    # 120s 不够了：2026-10-23 合并后编队扩到 5 个模拟节点 + 统一意图编排
+    # （6 步带依赖 + 逆序回滚），本机实测 3.5 分钟。超时预算小于真实耗时
+    # ＝门禁恒红，且红得没有信息量（看起来像代码坏了）。
+    ("commander", ["commander.py", "--self-test", "--password", "demo123"], HERE, 420),
     ("node_agent", ["node_agent.py", "--selftest"], HERE, 30),
     ("install_windows", ["install_windows.py", "--selftest", "--password", "demo123"], HERE, 90),
     ("ui_automation", ["ui_automation.py", "--selftest"], os.path.join(HERE, "ui_automation"), 30),
