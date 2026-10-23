@@ -70,5 +70,12 @@
             android:exported="false"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 模型库：App 内本地下载（断点续传 + 系统代理直连 HF）。从主界面"模型库"入口拉起。 -->
+        <activity
+            android:name=".ModelActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
     </application>
 </manifest>

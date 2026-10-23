@@ -91,6 +91,16 @@
             android:textColor="@color/text_dim"
             android:textSize="13sp"
             android:padding="8dp" />
+
+        <!-- 模型库：App 内本地下载 GGUF（出图 SD + 4B 级 LLM/VL）。放在设置右边：先看模型，再调连接。 -->
+        <TextView
+            android:id="@+id/btnModels"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="模型库"
+            android:textColor="@color/text_dim"
+            android:textSize="13sp"
+            android:padding="8dp" />
     </LinearLayout>
 
     <app.skynet.tianwang.OrbView

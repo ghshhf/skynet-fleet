@@ -193,7 +193,7 @@ public class ImageActivity extends Activity {
     }
 
     private void showModelPicker() {
-        final List<ModelManager.Spec> av = ModelManager.available(this);
+        final List<ModelManager.Spec> av = ModelManager.availableSd(this);
         if (av.isEmpty()) { ModelManager.showMissingDialog(this); return; }
         String[] names = new String[av.size()];
         for (int i = 0; i < av.size(); i++) names[i] = av.get(i).label;

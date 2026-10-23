@@ -48,6 +48,7 @@ public class MainActivity extends Activity {
     private TextView btnPc;
     private TextView btnImg;
     private TextView btnDev;
+    private TextView btnModels;
     private EditText input;
 
     private final WavRecorder recorder = new WavRecorder();
@@ -91,6 +92,7 @@ public class MainActivity extends Activity {
         btnPc = findViewById(R.id.btnPc);
         btnImg = findViewById(R.id.btnImg);
         btnDev = findViewById(R.id.btnDev);
+        btnModels = findViewById(R.id.btnModels);
         input = findViewById(R.id.input);
 
         // 版本号来自 APK 本身（aapt2 link --version-name/--version-code），
@@ -186,6 +188,13 @@ public class MainActivity extends Activity {
             }
         });
 
+        btnModels.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(MainActivity.this, ModelActivity.class));
+            }
+        });
+
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
         }
@@ -249,7 +258,7 @@ public class MainActivity extends Activity {
     }
 
     private void startBench(final int steps, final int size, final String model) {
-        java.util.List<ModelManager.Spec> av = ModelManager.available(this);
+        java.util.List<ModelManager.Spec> av = ModelManager.availableSd(this);
         if (av.isEmpty()) {
             Log.e(TAG, "BENCH_SKIP 没有可用模型");
             return;
