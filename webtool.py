@@ -207,15 +207,32 @@ def _clean_html(s):
         它们洗掉标签后是半截键值串，对模型只有干扰。
     """
     s = s or ""
-    s = re.sub(r"(?is)<(script|style|noscript|svg)\b[^>]*>.*?</\1>", " ", s)
-    s = re.sub(r"(?s)<!--.*?-->", " ", s)
-    s = re.sub(r"(?s)<[^>]{0,400}>", " ", s)
+    s = re.sub(r"(?is)<(script|style|noscript|svg|symbol|defs)\b[^>]*>.*?</\1>", " ", s)
+    # SVG 图形元素常常没有闭合标签（<path ... /> 或干脆裸着），上面那条按
+    # 「配对标签」删的规则吃不到。实测 android.com：洗完之后正文里冒出
+    # `<path fill="currentColor" d="m6.593 9.016-1.88...` —— path data 动辄
+    # 几百字符、全是字母数字，会被当成「有信息量的正文」喂给模型。
+    s = re.sub(r"(?is)<(path|use|circle|rect|line|polygon|polyline|ellipse|image)\b[^>]*>",
+               " ", s)
+    s = re.sub(r'(?s)<!--.*?-->', " ", s)
+    # 上限从 400 提到 1500：内联 SVG/log 标签的属性经常超 400，
+    # 匹配不上就整段留下来（正文里 `<` 后面紧跟 1500 字符还没有 `>` 的情况极少）。
+    s = re.sub(r"(?s)<[^>]{0,1500}>", " ", s)
+    # 兜底：抓取有字符预算（80000），页面在这里被**截断**时，最后一个标签
+    # 往往根本没有闭合的 `>`——实测 android.com 末尾停在 path data 中间
+    # `...34.1381 15.1046 32.`，于是上面所有「按标签删」的规则全部失效，
+    # 几千字符的路径数据被当成正文留下来。
+    # 只锚在**末尾**（截断只可能发生在末尾），不加 `$` 会把正文里带 `<` 的
+    # 段落一路吃掉——实测加宽后 android.com 的正文直接归零。
+    s = re.sub(r"(?s)<[a-zA-Z/!][^<>]{150,}$", " ", s)
     s = _html.unescape(s)
     # 多行标签被截断时，标签壳没了、属性却留下（实测 CSDN 页面末尾残留
     # `class="layout-menu-item_inner" href="https://www.csdn.net"`）。
     # 只清**有名的 HTML 属性**，不动正文里可能出现的英文引号。
     s = re.sub(r'\b(href|src|srcset|class|id|style|alt|title|rel|target|role|'
-               r'data-[\w-]+|aria-[\w-]+)="[^"]{0,300}"', " ", s)
+               r'data-[\w-]+|aria-[\w-]+|d|fill|stroke|viewBox|points|transform|'
+               r'xmlns|stroke-width|stroke-linecap|stroke-linejoin|fill-rule|'
+               r'clip-rule)="[^"]{0,1500}"', " ", s)
     s = re.sub(r"[ \t\u00a0]+", " ", s)
     lines = []
     for ln in s.split("\n"):
@@ -452,6 +469,58 @@ def cached_research(query, **kw):
         d["cached"] = True
         return d
     return research(query, **kw)
+
+
+def open_page(url, max_chars=1800, timeout=10.0, kws=None):
+    """打开指定网页，返回**已清洗**的正文。给 agent loop（模型自主点链接）用。
+
+    与 research 的分工：research 是「搜一批、挑相关段落拼资料块」；
+    open_page 是「模型点名了这一页，就看这一页」。
+
+    清洗必须复用 _extract_paras，不能另写一份 —— 实测过另写一份的下场：
+    agent loop 直接把 `<meta charset=...><style>...` 当正文喂给模型，
+    1500 字预算全被标签吃掉，模型什么也没读到，还把上下文撑大、
+    让下一轮 prefill 从 4 秒涨到 73 秒。
+
+    返回 dict，不抛异常：{"ok", "url", "text", "chars", "error"}
+    """
+    out = {"ok": False, "url": url, "text": "", "chars": 0, "error": ""}
+    u = (url or "").strip()
+    if not re.match(r"^https?://", u):
+        out["error"] = "不是 http(s) 链接"
+        return out
+    try:
+        import fleet.netforce_skynet as NS
+    except Exception as e:
+        out["error"] = f"联网组件加载失败：{type(e).__name__}: {e}"
+        return out
+    try:
+        d = NS.fetch_text(u, timeout=timeout, budget=timeout + 6, max_chars=80000)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+    if not d.get("ok"):
+        out["error"] = d.get("error") or f"HTTP {d.get('status')}"
+        return out
+    raw = d.get("text") or ""
+    if not raw.strip():
+        out["error"] = "页面没有内容"
+        return out
+    body = _extract_paras(raw)
+    if len(body) < 80:
+        # 必须和「抓取失败」分开说：这不是网络问题，是页面用脚本填内容。
+        # 而且要说清「换同类站也没用」——实测 4B 拿着「脚本渲染」这句话，
+        # 又连着打开 binance / coinbase，结果一模一样，白烧 60 秒。
+        # 工具的输出就是模型唯一的判断依据，含糊一句它就会一路试下去。
+        out["error"] = ("页面是脚本渲染，HTML 里没有可读正文（不是抓取失败）。"
+                        "行情、交易所、社交平台这类站点普遍如此，"
+                        "换同类的其他站也一样拿不到，别重复试——"
+                        "要么换个信息型站点（新闻/博客/文档），要么直接说拿不到。")
+        return out
+    if kws:
+        body = _pick_relevant(body, kws, max_chars)
+    out.update(ok=True, text=body[:max_chars], chars=len(body))
+    return out
 
 
 # --------------------------------------------------------------- 拼资料块
