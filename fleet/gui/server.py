@@ -476,6 +476,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(self._caps())
         if path == "/api/devices":
             return self._json(self._devices())
+        if path == "/api/fleet":
+            return self._json(self._fleet())
         if path == "/api/persona":
             return self._json({"ok": True, **f.persona.snapshot()})
         if path == "/api/cards":
@@ -714,6 +716,166 @@ class _Handler(BaseHTTPRequestHandler):
     def _devices(self):
         rows = self.fleet.registry.availability()
         return {"ok": True, "count": len(rows), "devices": rows}
+
+    def _fleet(self):
+        """编队总览：一屏看完「谁在线 / 有没有活 / 活干成没干成 / 产物堆了多少」。
+
+        为什么值得单独做一个聚合口
+        --------------------------
+        GUI 已经有 20 多个单项接口，但「现在整个编队什么状态」得自己拼好几个
+        接口、还得自己算失败率 —— 一算就容易算错。口径必须在**这里**定一次。
+
+        两条口径钉死（前端不许自己再算一遍）：
+          1. `success_rate` 的分母是 done + failed，**cancelled 不算失败**。
+             主动取消是主人的决定，不是系统出错；把它算进失败率会让
+             「我一取消就变红」这种假警报天天出现。
+          2. 一个作业都没跑过时 `success_rate` 是 **None（未知）而不是 0%**。
+             0% 会读成「全失败了」，但真相是「还没数据」——这两件事不能混。
+
+        凡是取不到的部分一律带 notes 说明原因，不给假 0、不装成功。
+        """
+        f = self.fleet
+        reg = f.registry
+        now = time.time()
+        notes = []
+
+        # ---- 1) 设备：谁在线、能干什么 ----
+        try:
+            rows = reg.availability()
+        except Exception as e:
+            rows = []
+            notes.append("注册表读不到设备清单：%s" % (str(e)[:80]))
+        dev_rows = []
+        for r in rows:
+            dev_rows.append({
+                "name": r.get("name", ""),
+                "kind": r.get("kind", ""),
+                "via": r.get("via", ""),
+                "ok": bool(r.get("ok")),
+                "reason": r.get("reason") or "",
+                "caps": len(r.get("caps") or []),
+                "sample": (r.get("caps") or [])[:3],
+            })
+        online = [d for d in dev_rows if d["ok"]]
+        # 离线设备按名字排前面：出问题的那台应该第一眼看到，不是沉在列表底下
+        dev_rows.sort(key=lambda d: (d["ok"], d["name"]))
+
+        # ---- 2) 作业：排队/在跑/成败/卡住 ----
+        jobs_out = {"queued": 0, "running": 0, "done": 0, "failed": 0,
+                    "cancelled": 0, "total": 0, "success_rate": None,
+                    "stale": 0, "recent": []}
+        try:
+            from fleet import jobs as J
+            js = J.get_store()
+            st = js.stats()
+            for k in ("queued", "running", "done", "failed", "cancelled", "total"):
+                jobs_out[k] = int(st.get(k) or 0)
+            tried = jobs_out["done"] + jobs_out["failed"]
+            if tried:
+                jobs_out["success_rate"] = round(jobs_out["done"] / tried, 3)
+            for j in js.list(limit=8):
+                # 租约过期还在 running = 卡住（节点掉线没回报），提示可以 reap
+                stale = (j.get("state") == "running"
+                         and float(j.get("lease_until") or 0) < now)
+                if stale:
+                    jobs_out["stale"] += 1
+                jobs_out["recent"].append({
+                    "id": j.get("id", ""), "cap": j.get("cap", ""),
+                    "state": j.get("state", ""), "node": j.get("node") or "",
+                    "attempts": j.get("attempts", 0),
+                    "max_attempts": j.get("max_attempts", 0),
+                    "created_at": j.get("created_at"),
+                    "err": ((j.get("result") or {}).get("err") or "")[:80],
+                    "artifacts": len(j.get("artifacts") or []),
+                    "stale": stale,
+                })
+            if jobs_out["stale"]:
+                notes.append("有 %d 个作业租约过期还在 running：节点掉线没回报，"
+                             "跑一次 job reap 会退回队列换机重跑" % jobs_out["stale"])
+        except Exception as e:
+            notes.append("作业账本读不到：%s" % (str(e)[:80]))
+
+        # ---- 3) 产物 ----
+        art_out = {"count": 0, "bytes": 0, "kinds": {}}
+        try:
+            from fleet import artifacts as A
+            art_out.update(A.get_store().stats())
+        except Exception as e:
+            notes.append("产物仓库读不到：%s" % (str(e)[:80]))
+
+        # ---- 4) 手机快照（只读能力，失败就明说） ----
+        phone = {"available": False, "brief": "", "anomalies": [], "device": ""}
+        android_devs = [d for d in dev_rows if d["kind"] in ("android", "adb_wifi", "phone")]
+        if not android_devs:
+            phone["note"] = "编队里没有手机类设备"
+        elif not any(d["ok"] for d in android_devs):
+            phone["device"] = android_devs[0]["name"]
+            phone["note"] = "手机不在线：%s" % (android_devs[0]["reason"] or "原因不明")
+        else:
+            r = reg.call("state.read", args={}, gate=f.gate)
+            phone["device"] = next((d["name"] for d in android_devs if d["ok"]), "")
+            if r.ok:
+                d = r.data or {}
+                phone.update({"available": True,
+                              "brief": d.get("brief", ""),
+                              "anomalies": d.get("anomalies") or []})
+            else:
+                phone["note"] = "读不到手机状态：%s" % (r.err or "原因不明")
+
+        # ---- 5) 两台本机网关（有缓存文件才报，没有就 null，不假装） ----
+        gws = self._gateway_digest()
+
+        return {
+            "ok": True,
+            "ts": now,
+            "devices": {"total": len(dev_rows), "online": len(online),
+                        "offline": len(dev_rows) - len(online), "rows": dev_rows},
+            "caps": {"online": sum(d["caps"] for d in online),
+                     "total": sum(d["caps"] for d in dev_rows)},
+            "jobs": jobs_out,
+            "artifacts": art_out,
+            "phone": phone,
+            "gateways": gws,
+            "notes": notes,
+        }
+
+    @staticmethod
+    def _gateway_digest():
+        """两台本机免费网关的当前账：活几条、几条在等额度刷新。
+
+        只读缓存文件，**不触发探活**——总览页必须秒开，不能因为探活卡 30 秒。
+        要刷新就点「重探」按钮（/api/llm/refresh），或者命令行跑 gateway_pool。
+        缓存不存在时返回 None，前端显示「没探过」，而不是显示 0。
+        """
+        import json as _json
+        p = os.path.expanduser(os.environ.get(
+            "FLEET_GW_HEALTH", "~/.workbuddy/gateway_health.json"))
+        try:
+            with open(p, encoding="utf-8") as fh:
+                d = _json.load(fh)
+        except (OSError, ValueError):
+            return None
+        now = time.time()
+        out = {}
+        for name, gw in (d.get("gateways") or {}).items():
+            ms = gw.get("models") or {}
+            live = [m for m, r in ms.items() if r.get("ok")]
+            waiting = [m for m, r in ms.items() if not r.get("ok")]
+            quota = [m for m in waiting
+                     if (ms[m].get("kind") in ("quota", "rate"))]
+            # 最近一次「等 TTL 到期」的时间：过期后会自动重探，所以给前端看
+            soonest = None
+            for m in waiting:
+                t = float(ms[m].get("ts") or 0) + float(ms[m].get("ttl") or 0)
+                if soonest is None or t < soonest:
+                    soonest = t
+            out[name] = {"total": len(ms), "live": len(live),
+                         "waiting": len(waiting), "quota_waiting": len(quota),
+                         "probed_at": gw.get("probed_at"),
+                         "next_reprobe_in": (max(0, int(soonest - now))
+                                             if soonest else None),
+                         "live_models": live[:6]}
+        return out or None
 
     def _cards(self):
         import persona_card as pc
