@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 图标按钮的按下底色：圆形，按下才出现。没有它，点按钮没有任何反馈。 -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="@color/surface2">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#00FFFFFF" />
+        </shape>
+    </item>
+</ripple>

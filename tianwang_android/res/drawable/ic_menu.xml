@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 所有图标统一 1.7 描边、圆头圆角，不填色。
+     为什么不用 Material 现成的实心 path：参考页那一套是细线图标，
+     实心块在浅色抽屉里视觉重量太大，六个排下来像一排黑方块。
+     细线的另一个好处是换主题只改 strokeColor 一个值。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="@color/icon"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M3,6 H21 M3,12 H21 M3,18 H21" />
+</vector>

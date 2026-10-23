@@ -1,214 +1,387 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  主界面：一屏三带。
-    顶栏（谁 / 连没连上 / 设置）
-    功能条（控电脑 · 出图 · 检测 · 模型库）——可横向滑，按钮再长也不会挤爆
-    对话带（球 + 对话流），占满中间
-    输入坞（打字 / 按住说话）
+  主界面：抽屉 + 一屏对话。
 
-  为什么把「一行字幕」换成对话流：单行字幕只能看见最后一轮，
-  几句之后就没法回头核对它到底答了什么。对话是**多轮**的，
-  界面必须留得住上文，否则多轮在界面上等于不存在。
+  版式参考 PocketPal AI（chat 页 + 侧边抽屉）：
+    顶栏    ← 汉堡 / 标题「聊天」+ 当前模型名 / 新对话 / 更多
+    光球    这台端子的表情，固定高度，不跟对话抢地方
+    对话带  占满中间，留白要多（浅色底上留白就是层次）
+    输入坞  一整块圆角灰面，输入框在上、按钮排在下
+
+  为什么把原来那排胶囊（控电脑/出图/检测/模型库/扫频/体温/配对/清屏）
+  收进「更多」和抽屉：八颗胶囊横着滑，找东西要划两下，而且每加一个能力
+  就更挤。它们不是高频动作——高频只有「说一句话」。低频的进菜单，
+  顶栏和输入坞才留得住呼吸。
+
+  DrawerLayout 用不了：这个工程走 aapt2+javac+d8 手搓，没接 AndroidX。
+  抽屉自己用 translationX + 遮罩做，行为一样（含点遮罩关闭、返回键关闭）。
 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="@color/bg"
-    android:fitsSystemWindows="true"
-    android:paddingLeft="14dp"
-    android:paddingRight="14dp">
+    android:fitsSystemWindows="true">
 
-    <!-- ============ 顶栏 ============ -->
+    <!-- ==================== 主内容 ==================== -->
     <LinearLayout
+        android:id="@+id/content"
         android:layout_width="match_parent"
-        android:layout_height="50dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
+        android:layout_height="match_parent"
+        android:orientation="vertical">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/app_name"
-            android:textColor="@color/text"
-            android:textSize="17sp"
-            android:textStyle="bold"
-            android:letterSpacing="0.12" />
-
-        <TextView
-            android:id="@+id/ver"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="7dp"
-            android:textColor="@color/text_dim"
-            android:textSize="10sp" />
-
-        <TextView
-            android:id="@+id/status"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:layout_marginStart="10dp"
-            android:text="未配对"
-            android:textColor="@color/text_dim"
-            android:textSize="11sp"
-            android:singleLine="true"
-            android:ellipsize="middle" />
-
-        <TextView
-            android:id="@+id/btnSettings"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/btn_settings"
-            android:textColor="@color/text_dim"
-            android:textSize="13sp"
-            android:padding="8dp" />
-    </LinearLayout>
-
-    <!-- ============ 功能条 ============
-         横向滚动：以后再加按钮也不会把这一行挤成一堆斜杠。 -->
-    <HorizontalScrollView
-        android:layout_width="match_parent"
-        android:layout_height="34dp"
-        android:scrollbars="none"
-        android:fillViewport="false">
-
+        <!-- ========== 顶栏 ========== -->
         <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="match_parent"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
             android:orientation="horizontal"
-            android:gravity="center_vertical">
+            android:gravity="center_vertical"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp">
 
-            <TextView
-                android:id="@+id/btnPc"
-                style="@style/Chip"
-                android:text="控电脑" />
+            <ImageView
+                android:id="@+id/btnMenu"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:padding="10dp"
+                android:background="@drawable/bg_touch"
+                android:src="@drawable/ic_menu"
+                android:contentDescription="@string/cd_menu" />
 
-            <TextView
-                android:id="@+id/btnImg"
-                style="@style/Chip"
-                android:text="出图" />
+            <!-- 标题两行：大字是页面名，小字是「现在在跟哪个模型说话」。
+                 副标题很关键——出问题第一句要问的就是「你用的是哪个权重」。 -->
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:orientation="vertical">
 
-            <TextView
-                android:id="@+id/btnDev"
-                style="@style/Chip"
-                android:text="检测" />
+                <TextView
+                    android:id="@+id/title"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/nav_chat"
+                    android:textColor="@color/text"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
 
-            <TextView
-                android:id="@+id/btnModels"
-                style="@style/Chip"
-                android:text="模型库" />
+                <TextView
+                    android:id="@+id/subtitle_model"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="1dp"
+                    android:text="@string/model_unknown"
+                    android:textColor="@color/text_dim"
+                    android:textSize="12sp"
+                    android:singleLine="true"
+                    android:ellipsize="middle" />
+            </LinearLayout>
 
-            <!-- 扫频：手机是编队里唯一有天线的东西。电脑的射频被自己开的
-                 热点占满、也不再扫周边 AP，蜂窝频段电脑连基带都没有。 -->
-            <TextView
-                android:id="@+id/btnRadio"
-                style="@style/Chip"
-                android:text="扫频" />
+            <ImageView
+                android:id="@+id/btnNewChat"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:padding="10dp"
+                android:background="@drawable/bg_touch"
+                android:src="@drawable/ic_edit"
+                android:contentDescription="@string/cd_new_chat" />
 
-            <!-- 体温：这台手机是被动散热，SOC 到 85℃ 就开始压频，同一套参数
-                 tg 能从 50 掉到 30。点一下就知道「刚才还快，现在怎么慢了」
-                 到底是烫了还是别的原因。 -->
-            <TextView
-                android:id="@+id/btnThermal"
-                style="@style/Chip"
-                android:text="体温" />
-
-            <TextView
-                android:id="@+id/btnPair"
-                style="@style/Chip"
-                android:text="配对" />
-
-            <TextView
-                android:id="@+id/btnClear"
-                style="@style/Chip"
-                android:text="清屏" />
+            <ImageView
+                android:id="@+id/btnMore"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:padding="10dp"
+                android:background="@drawable/bg_touch"
+                android:src="@drawable/ic_more"
+                android:contentDescription="@string/cd_more" />
         </LinearLayout>
-    </HorizontalScrollView>
 
-    <!-- 光球：这台端子的表情。高度固定 84dp —— 它不该和对话抢地方。 -->
-    <app.skynet.tianwang.OrbView
-        android:id="@+id/orb"
-        android:layout_width="match_parent"
-        android:layout_height="84dp"
-        android:layout_marginTop="2dp" />
+        <!-- 光球：这台端子的表情。高度固定 76dp —— 它不该和对话抢地方。 -->
+        <app.skynet.tianwang.OrbView
+            android:id="@+id/orb"
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:layout_marginTop="0dp" />
 
-    <!-- ============ 对话流 ============ -->
-    <ScrollView
-        android:id="@+id/chatScroll"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:scrollbars="none"
-        android:paddingTop="4dp"
-        android:paddingBottom="4dp">
+        <!-- ========== 对话流 ========== -->
+        <ScrollView
+            android:id="@+id/chatScroll"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:scrollbars="none"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:clipToPadding="false">
 
-        <LinearLayout
-            android:id="@+id/chatList"
+            <LinearLayout
+                android:id="@+id/chatList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+        </ScrollView>
+
+        <!-- 状态小字：只放过程（在听/识别中/失败原因），不放对话内容 -->
+        <TextView
+            android:id="@+id/subtitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical" />
-    </ScrollView>
+            android:minHeight="18dp"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:text="@string/idle_sub"
+            android:textColor="@color/text_faint"
+            android:textSize="11sp"
+            android:singleLine="true"
+            android:ellipsize="end" />
 
-    <!-- 状态小字：在听/识别中/失败原因。**只放过程，不放对话内容**。 -->
-    <TextView
-        android:id="@+id/subtitle"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:minHeight="20dp"
-        android:text="@string/idle_sub"
-        android:textColor="@color/text_dim"
-        android:textSize="12sp"
-        android:singleLine="true"
-        android:ellipsize="end" />
+        <!-- ========== 输入坞 ========== -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_composer"
+            android:layout_marginStart="12dp"
+            android:layout_marginEnd="12dp"
+            android:layout_marginTop="6dp"
+            android:layout_marginBottom="10dp"
+            android:paddingStart="14dp"
+            android:paddingEnd="8dp"
+            android:paddingTop="10dp"
+            android:paddingBottom="6dp">
 
-    <!-- ============ 输入坞 ============ -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:layout_marginTop="6dp">
+            <EditText
+                android:id="@+id/input"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="40dp"
+                android:maxHeight="132dp"
+                android:background="@null"
+                android:hint="@string/hint_input"
+                android:inputType="textMultiLine|textCapSentences"
+                android:imeOptions="actionSend|flagNoEnterAction"
+                android:maxLines="6"
+                android:paddingTop="8dp"
+                android:paddingBottom="8dp"
+                android:textColor="@color/text"
+                android:textColorHint="@color/text_faint"
+                android:textSize="15sp" />
 
-        <EditText
-            android:id="@+id/input"
-            android:layout_width="0dp"
-            android:layout_height="44dp"
-            android:layout_weight="1"
-            android:background="@drawable/bg_input"
-            android:hint="@string/hint_input"
-            android:inputType="text"
-            android:imeOptions="actionSend"
-            android:maxLines="1"
-            android:paddingLeft="14dp"
-            android:paddingRight="14dp"
-            android:textColor="@color/text"
-            android:textColorHint="@color/text_dim"
-            android:textSize="14sp" />
+            <!-- 按钮排：左「加」（素材/生成）「麦克风」，右「思考」「喇叭」「发送」。
+                 左右分组是有意的——左边是"往里放东西"，右边是"把它发出去"。 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
 
-        <TextView
-            android:id="@+id/btnSend"
-            android:layout_width="52dp"
-            android:layout_height="44dp"
-            android:layout_marginStart="8dp"
-            android:background="@drawable/bg_send"
-            android:gravity="center"
-            android:text="@string/btn_send"
-            android:textColor="@color/text"
-            android:textSize="14sp" />
+                <ImageView
+                    android:id="@+id/btnAttach"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:padding="9dp"
+                    android:background="@drawable/bg_touch"
+                    android:src="@drawable/ic_plus"
+                    android:contentDescription="@string/cd_attach" />
+
+                <ImageView
+                    android:id="@+id/btnMic"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:padding="9dp"
+                    android:background="@drawable/bg_touch"
+                    android:src="@drawable/ic_mic"
+                    android:contentDescription="@string/cd_mic" />
+
+                <Space
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
+
+                <!-- 思考开关：关掉能省掉一大段内心戏，短问答快很多。
+                     状态要看得见，所以用底色 + 文字色双重区分，不只靠图标。 -->
+                <TextView
+                    android:id="@+id/chipThink"
+                    android:layout_width="wrap_content"
+                    android:layout_height="32dp"
+                    android:layout_marginEnd="4dp"
+                    android:paddingStart="9dp"
+                    android:paddingEnd="11dp"
+                    android:background="@drawable/bg_chip"
+                    android:drawableStart="@drawable/ic_think"
+                    android:drawablePadding="5dp"
+                    android:gravity="center_vertical"
+                    android:text="@string/think"
+                    android:textColor="@color/text_dim"
+                    android:textSize="12sp" />
+
+                <!-- 联网：三态循环（当 / 开 / 关）。
+                     默认「当」= 服务端按问题判断该不该搜，平时闲聊不会多等十几秒；
+                     点一次变「开」强制搜，再点变「关」彻底不联网。
+                     必须让人能看见当前状态 —— 悄悄联网和悄悄不联网都不行，
+                     前者会莫名其妙慢，后者会把旧知识当新闻讲。 -->
+                <TextView
+                    android:id="@+id/chipWeb"
+                    android:layout_width="wrap_content"
+                    android:layout_height="32dp"
+                    android:layout_marginEnd="4dp"
+                    android:paddingStart="9dp"
+                    android:paddingEnd="11dp"
+                    android:background="@drawable/bg_chip"
+                    android:drawableStart="@drawable/ic_web"
+                    android:drawablePadding="5dp"
+                    android:gravity="center_vertical"
+                    android:text="@string/web_auto"
+                    android:textColor="@color/text_dim"
+                    android:textSize="12sp" />
+
+                <ImageView
+                    android:id="@+id/btnSpeak"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:padding="9dp"
+                    android:background="@drawable/bg_touch"
+                    android:src="@drawable/ic_spk"
+                    android:contentDescription="@string/cd_speak" />
+
+                <ImageView
+                    android:id="@+id/btnSend"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:padding="9dp"
+                    android:background="@drawable/bg_send_circle"
+                    android:src="@drawable/ic_send"
+                    android:contentDescription="@string/cd_send" />
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
 
-    <!-- 大圆：按一下开录，再按一下结束（也支持按住-松手，两种都认） -->
-    <TextView
-        android:id="@+id/btnMic"
+    <!-- ==================== 抽屉遮罩 ==================== -->
+    <View
+        android:id="@+id/scrim"
         android:layout_width="match_parent"
-        android:layout_height="58dp"
-        android:layout_marginTop="8dp"
-        android:layout_marginBottom="12dp"
-        android:background="@drawable/bg_mic"
-        android:gravity="center"
-        android:text="@string/mic_idle"
-        android:textColor="@color/text"
-        android:textSize="15sp"
-        android:textStyle="bold" />
-</LinearLayout>
+        android:layout_height="match_parent"
+        android:background="@color/scrim"
+        android:visibility="gone"
+        android:clickable="true"
+        android:focusable="true" />
+
+    <!-- ==================== 抽屉 ==================== -->
+    <LinearLayout
+        android:id="@+id/drawer"
+        android:layout_width="304dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:orientation="vertical"
+        android:background="@color/drawer"
+        android:clickable="true"
+        android:focusable="true"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:gravity="center_vertical"
+            android:paddingStart="20dp"
+            android:paddingEnd="16dp">
+
+            <!-- 那一点绿就是参考页左上角的标记，也是 accent 色的来源 -->
+            <View
+                android:layout_width="9dp"
+                android:layout_height="9dp"
+                android:background="@drawable/bg_dot" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="9dp"
+                android:text="@string/app_name"
+                android:textColor="@color/text"
+                android:textSize="17sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.04" />
+
+            <TextView
+                android:id="@+id/ver"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="7dp"
+                android:textColor="@color/text_faint"
+                android:textSize="10sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/navChat"
+            style="@style/DrawerItem"
+            android:drawableStart="@drawable/ic_chat"
+            android:text="@string/nav_chat" />
+
+        <TextView
+            android:id="@+id/navFleet"
+            style="@style/DrawerItem"
+            android:drawableStart="@drawable/ic_pals"
+            android:text="@string/nav_fleet" />
+
+        <TextView
+            android:id="@+id/navModels"
+            style="@style/DrawerItem"
+            android:drawableStart="@drawable/ic_models"
+            android:text="@string/nav_models" />
+
+        <TextView
+            android:id="@+id/navBench"
+            style="@style/DrawerItem"
+            android:drawableStart="@drawable/ic_bench"
+            android:text="@string/nav_bench" />
+
+        <TextView
+            android:id="@+id/navSettings"
+            style="@style/DrawerItem"
+            android:drawableStart="@drawable/ic_settings"
+            android:text="@string/nav_settings" />
+
+        <TextView
+            android:id="@+id/navAbout"
+            style="@style/DrawerItem"
+            android:drawableStart="@drawable/ic_info"
+            android:text="@string/nav_about" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginStart="20dp"
+            android:layout_marginEnd="20dp"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="10dp"
+            android:background="@color/line" />
+
+        <TextView
+            android:id="@+id/drawerGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:paddingBottom="6dp"
+            android:text="@string/group_today"
+            android:textColor="@color/text_faint"
+            android:textSize="11sp" />
+
+        <!-- 会话摘要：只有一行。做历史列表要先有落盘存储，
+             现在每轮对话只在内存里，硬造一个列表出来是骗人。 -->
+        <TextView
+            android:id="@+id/drawerHistory"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:text="@string/history_empty"
+            android:textColor="@color/text_dim"
+            android:textSize="13sp"
+            android:singleLine="true"
+            android:ellipsize="end" />
+    </LinearLayout>
+</FrameLayout>
