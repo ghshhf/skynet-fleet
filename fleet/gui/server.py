@@ -41,6 +41,7 @@ from .. import device_auth as DEVAUTH
 from .. import pair as PAIR
 from .. import pairtls as PTLS
 from ..catalog import build
+from .. import VERSION as FLEET_VERSION
 from .approval import ApprovalBroker
 
 # 仓库根（fleet/gui/server.py → 上三级）。角色卡、人格状态这些平铺模块都在根下。
@@ -976,6 +977,7 @@ class _Handler(BaseHTTPRequestHandler):
             be_reason = r.err
         return {
             "ok": True,
+            "version": FLEET_VERSION,
             "devices": len(reg.devices()),
             "caps_count": len(reg.capabilities()),
             "backend": backends[0] if backends else None,

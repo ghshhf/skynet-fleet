@@ -19,4 +19,5 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 __all__ = ["core", "transports", "kinds"]
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+__version__ = VERSION
