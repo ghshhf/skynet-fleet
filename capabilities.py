@@ -91,6 +91,19 @@ SPECS = {
             {"name": "model", "type": "str", "required": False, "desc": "模型文件（默认 Turbo）"},
         ],
     },
+    "video.gen": {
+        "title": "视频生成（壳 + 远端路由）",
+        "desc": "生成一段短视频；手机本地算力撑不住视频扩散模型，本节点未配视频后端时"
+                "如实说「未配置」，由编排层路由到 PC/云端视频节点（经 relay 端口转发）",
+        "params": [
+            {"name": "prompt", "type": "str", "required": True, "desc": "正向提示词"},
+            {"name": "duration", "type": "int", "required": False, "desc": "时长秒（默认 3）"},
+            {"name": "fps", "type": "int", "required": False, "desc": "帧率（默认 24）"},
+            {"name": "size", "type": "str", "required": False, "desc": "尺寸，如 512x512"},
+            {"name": "seed", "type": "int", "required": False, "desc": "随机种子，-1 随机"},
+            {"name": "model", "type": "str", "required": False, "desc": "模型文件（留给后端）"},
+        ],
+    },
     "skynet.relay": {
         "title": "SkyNet relay 状态",
         "desc": "返回本节点是否跑着 SkyNet relay 及其监听端口，供他机经端口转发取页",
@@ -120,6 +133,7 @@ ALIASES = {
     "persona.tick": "persona",
     "perceive.report": "perceive",
     "image.gen.run": "image.gen",
+    "video.gen.run": "video.gen",
 }
 
 # 旧基线的类型词汇 → 设备层的类型词汇

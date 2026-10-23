@@ -54,6 +54,10 @@ UI_SKIP_RESULT = "ui_skip_result"   # node -> commander: {id, ok, log[], err}
 IMAGE_GEN = "image_gen"                 # commander -> node: {id, prompt, neg?, size?, steps?, seed?, cfg?, model?}
 IMAGE_GEN_RESULT = "image_gen_result"   # node -> commander: {id, ok, path?, err?}
 
+# ---- 视频生成（P3 壳 + 远端路由）：本地算力撑不住，壳登记 + 路由到 PC/云端节点 ----
+VIDEO_GEN = "video_gen"                 # commander -> node: {id, prompt, duration?, fps?, size?, seed?, model?}
+VIDEO_GEN_RESULT = "video_gen_result"   # node -> commander: {id, ok, path?, err?}
+
 # ---- 她 P4 能力请求 + 授权门 ----
 CAP_REQ = "cap_req"           # node(她) -> commander: {cap, reason}
 CAP_GRANT = "cap_grant"       # commander -> node(她): {cap, session_min, token}

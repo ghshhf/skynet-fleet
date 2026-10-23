@@ -206,6 +206,17 @@ CAPABILITIES = [
                        Param("model", "str", doc="模型名，留给桥接层")),
                side_effect=True,
                note="出图落手机 Pictures/fleet/；本节点没接 android_bridge 时如实说「后端未配置」"),
+    # ---- 视频生成（P3 壳 + 远端路由）：手机本地算力撑不住视频扩散，先登记能力壳 ----
+    Capability("video.gen", "生成一段视频（壳 + 远端路由）",
+               params=(Param("prompt", "str", True, "画面描述"),
+                       Param("duration", "int", doc="时长秒，默认 3"),
+                       Param("fps", "int", doc="帧率，默认 24"),
+                       Param("size", "str", doc="如 512x512，默认 512x512"),
+                       Param("seed", "int", doc="随机种子，-1=随机，默认 -1"),
+                       Param("model", "str", doc="模型名，留给后端")),
+               side_effect=True,
+               note="手机本地不跑视频扩散（算力/显存/耗时撑不住）；本节点未配视频后端时"
+                    "如实说「未配置」，路由远端走 relay 到 PC/云端节点"),
     # ---- 本机操控（kind=host：这台机器既是控制面也是被控端，学 Cherry computerUse）----
     Capability("host.monitor", "本机资源监控（CPU/内存/磁盘/网速 + 进程表）",
                note="可视化主屏的数据源；纯读，不碰系统"),
