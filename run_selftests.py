@@ -37,6 +37,8 @@ CASES = [
     ("followups", ["followups.py", "--selftest"], HERE, 30),
     ("android_device", ["android_device.py", "--selftest"], HERE, 30),
     ("infrared", ["infrared.py", "--selftest"], HERE, 30),
+    ("radio", ["radio.py", "--selftest"], HERE, 30),
+    ("thermal", ["thermal.py", "--selftest"], HERE, 30),
     ("agent_phone", ["agent_phone.py", "--selftest"], HERE, 60),
     ("survey", ["survey.py", "--selftest"], HERE, 30),
     ("ble", ["ble.py", "--selftest"], HERE, 30),
@@ -153,6 +155,18 @@ CASES = [
     # 仓库 skills/ 下每个 vendored 技能必须带 _audit.json 且结论 clean，
     # 且 MANIFEST.json 登记与实际目录一一对应。未审查进仓 = 红。
     ("eval_p4_skills_integrity", ["evals/p4_skills_integrity.py"], HERE, 120),
+    # N+1 桌面端技能机制：列出/选用/记分/提交/回滚 + 按钮到端点活线。
+    # 超时给宽一点：里面要起一次真 FleetServer + 一次 Playwright。
+    ("eval_t18_skill_desktop", ["evals/t18_skill_desktop.py"], HERE, 300),
+    # N+1b 第 1 步 配对信箱内核：广播字段最小化（AST 静态扫）/验证码
+    # 一次性+过期+试爆锁/fail-closed/会话令牌 revoke 即死/审计闭环且
+    # 令牌不进 journal/fleetpair:// 链接往返/组播 TTL=1 LAN-only/tap 滤坏包。
+    # 全离线：socket 全假、journal 用临时 sqlite。
+    ("eval_t19_pair_mailbox", ["evals/t19_pair_mailbox.py"], HERE, 180),
+    # N+1c 手机出图：manifest/java 契约静态扫（RUN_COMMAND 常量/权限/不写死模型）
+    # + worker 行为（假 sd+假 sysfs：prompt/steps/size/插电/温度/并发锁/Vulkan
+    # 诚实边界/二进制缺失）。全离线、可测。
+    ("eval_t20_phone_image", ["evals/t20_phone_image.py"], HERE, 120),
 ]
 
 

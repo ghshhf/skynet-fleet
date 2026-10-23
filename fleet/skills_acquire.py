@@ -48,14 +48,17 @@ def _write_manifest(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def acquire(src_dir, source_label, force=False):
+def acquire(src_dir, source_label, force=False, allow_assets=False):
     """把一个本地技能目录 vendoring 进仓库 skills/。
 
     返回 (ok: bool, report: dict)。ok=False 表示被拒绝（未落盘）。
+
+    `allow_assets=True` 时，图片/字体/媒体这类资产文件不再算审查失败，
+    但会登记进 MANIFEST 的 assets 字段 —— **放行要留痕**。
     """
     if not os.path.isdir(src_dir):
         return False, {"error": "源目录不存在：%s" % src_dir}
-    audit = SA.audit_skill(src_dir)
+    audit = SA.audit_skill(src_dir, allow_assets=allow_assets)
     if audit["verdict"] == "error":
         return False, {"error": "审计失败", "audit": audit}
     if audit["verdict"] != "clean" and not force:
@@ -87,6 +90,7 @@ def acquire(src_dir, source_label, force=False):
         "verdict": audit["verdict"],
         "acquired_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M"),
         "dir": os.path.relpath(dest, os.path.dirname(SK.REPO_SKILLS_DIR)),
+        "assets": audit.get("assets") or [],
     })
     _write_manifest(manifest)
     return True, {"name": name, "dest": dest, "audit": audit,
@@ -145,7 +149,8 @@ def _clone_repo(url, insecure_ok):
     return _locate_skill_root(tmp), {}
 
 
-def acquire_from_url(url, source_label, force=False, insecure_ok=False):
+def acquire_from_url(url, source_label, force=False, insecure_ok=False,
+                     allow_assets=False):
     """从 URL 拉取技能并 vendoring 进仓。
 
     - url 为 .zip/.tar.gz 归档 → 下载解压；
@@ -164,7 +169,8 @@ def acquire_from_url(url, source_label, force=False, insecure_ok=False):
     if root is None:
         return False, err
     # 拉到的内容交给与本地完全相同的闭环
-    ok, rep = acquire(root, source_label or url, force=force)
+    ok, rep = acquire(root, source_label or url, force=force,
+                      allow_assets=allow_assets)
     if not ok:
         shutil.rmtree(root, ignore_errors=True)
     return ok, rep
@@ -174,14 +180,18 @@ def _main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
         print("用法：")
-        print("  本地：python -m fleet.skills_acquire <src_dir> --source <label> [--force]")
-        print("  URL：python -m fleet.skills_acquire --url <url> --source <label> [--force] --insecure-ok")
+        print("  本地：python -m fleet.skills_acquire <src_dir> --source <label> "
+              "[--force] [--allow-assets]")
+        print("  URL：python -m fleet.skills_acquire --url <url> --source <label> "
+              "[--force] [--allow-assets] --insecure-ok")
+        print("  --allow-assets：图片/字体/媒体等资产文件显式放行（会登记进 MANIFEST 的 assets）")
         sys.exit(2)
     src = None
     url = None
     source = "manual"
     force = False
     insecure_ok = False
+    allow_assets = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -189,6 +199,8 @@ def _main():
             force = True
         elif a == "--insecure-ok":
             insecure_ok = True
+        elif a == "--allow-assets":
+            allow_assets = True
         elif a == "--source":
             i += 1
             source = args[i]
@@ -203,9 +215,11 @@ def _main():
             src = a
         i += 1
     if url:
-        ok, rep = acquire_from_url(url, source or url, force=force, insecure_ok=insecure_ok)
+        ok, rep = acquire_from_url(url, source or url, force=force,
+                                   insecure_ok=insecure_ok, allow_assets=allow_assets)
     else:
-        ok, rep = acquire(src, source or "manual", force=force)
+        ok, rep = acquire(src, source or "manual", force=force,
+                          allow_assets=allow_assets)
     print(json.dumps(rep, ensure_ascii=False, indent=2))
     sys.exit(0 if ok else 1)
 

@@ -54,6 +54,35 @@ python run_selftests.py ui rule    # 只跑名字含 ui/rule 的
 
 ---
 
+## 作业层 + 产物中心（长任务的地基）
+
+同步调用（`call`）适合「点一下、读一屏」，撑不住手机算力的真实形态——SDXL 实测 **179s/步**、视频生成、4B 长文都是分钟级。所以补了两层：
+
+**作业层（`fleet/jobs.py`）** —— 把「提交」与「执行」拆开：
+
+| 能力 | 说明 |
+|---|---|
+| `job.submit` | 提交长任务，进盘账本（`~/.fleet/jobs.json`） |
+| `job.list` / `job.get` | 按状态筛、查状态历史（每次尝试都有记录） |
+| `job.cancel` | 排队中/运行中都能取消；终态作业**如实说不必取消** |
+
+三条硬语义：**① 租约**——节点领走后必须在 180s 内续租或回报，过期即判掉线；**② 掉线迁移**——过期未超次数就退回队列、清空节点，换台机器接着跑；**③ 永久失败不重试**——能力不认识/参数不可能对这类错误一次判死，不浪费别的节点再跑一遍。
+
+REPL：`job submit image.gen {"prompt":"一只蓝鲸"} node=phone1` / `job list failed` / `job show <id>` / `job cancel <id>` / `job reap` / `job pump <节点>`。
+
+**产物中心（`fleet/artifacts.py`）** —— 把文件变成有身份的东西：
+
+- 内容寻址：`art-` + sha256 前 16 位，**同内容不重复存盘**，跨机器只认 id 不认路径；
+- 元数据：kind / size / 来源节点 / 关联作业 / TTL；
+- `artifact.put`（路径或 base64）/ `artifact.get`（回 base64）/ `artifact.list` / `gc`；
+- 取不到时**分清「没这条」和「索引在但文件丢了」**，不冒充成功。
+
+这层解开三个断链：换机引用不到、重复传输、记忆/技能无法指向一个产物。
+
+**对外可见性**（自动，无需改三份清单）：两项都进了注册表与能力说明书，因此终端补全、MCP 工具表、「她」能看见的东西同时生效——只读项（`job.list`/`job.get`/`artifact.get`/`artifact.list`）默认导出给外部 AI 客户端，副作用项（`job.submit`/`job.cancel`/`artifact.put`）只在 `--unsafe` 下导出，且过注册表闸门（无 gate 一律 fail-closed）。
+
+门禁：`evals/test_jobs_artifacts.py`（38 项，含状态机、去重、GC、注册表真表、MCP 导出）。
+
 ## 四原则（设计铁律）
 
 1. **锚定最底层 OS 平台层**：只对接 Android / Windows / Linux / Apple 四大平台原生能力，绝不对接厂商 App / 云。米家 leaf（灯/插座/传感器）是 MCU+RTOS 非安卓，经你自控的 Linux/Android 网关桥接；Apple 标「半可达」（仅屏共/快捷指令）。

@@ -198,12 +198,15 @@ def _session_cleanup(name):
         if q:
             queue_store.save(OFFLINE_QUEUE, QUEUE_PATH)
         out["queued"] = len(q)
-    # 清完留痕：以后要查「那台机器到底清没清」只看这一条
+    # 清完留痕：以后要查「那台机器到底清没清」只看这一条。
+    # 写成**已闭环**：清理是当场做完的事，不是一笔待办；否则它会一直挂在
+    # 「未闭环」里，还会被记忆沉淀当成值得一提的事。
     try:
         _journal().log(
             "task", name,
             f"临时节点下机清理：凭据 {out['psk']} 枚 / 令牌 {out['tokens']} 个 / "
-            f"丢弃排队命令 {out['queued']} 条")
+            f"丢弃排队命令 {out['queued']} 条",
+            topic=f"node:forget:{name}", status="done")
     except Exception:
         pass
     return out
@@ -892,6 +895,301 @@ def _cmd_pull(name, remotepath, outpath):
         return
     open(outpath, "wb").write(base64.b64decode(r["data"]))
     print(f"  已拉取 -> {outpath} ({len(r['data'])}B base64)")
+
+
+def _cmd_relay_fetch(name, url):
+    """经指定节点的 SkyNet relay 取页（该节点需上报 skynet.relay 能力）。
+
+    走节点本机出口：relay 用 skynet.net.fetch_text(url) 取页面，
+    返回 base64 正文 + 文本。适合让「出口好的」节点代取。
+    """
+    node = REGISTRY.with_lock(lambda d: d.get(name))
+    if not node:
+        print(f"  节点 {name} 不在线")
+        return
+    info = node.get("info") or {}
+    rp = info.get("relay_port")
+    token = info.get("relay_token") or ""
+    caps = node.get("capabilities") or []
+    if "skynet.relay" not in caps or not rp:
+        print(f"  节点 {name} 未上报 skynet.relay 能力（caps={caps}, relay_port={rp}）")
+        print("  提示：在该节点上 node_agent.py --relay-port <端口> 启动 relay 后再试")
+        return
+    import socket as _sock, json as _json
+    try:
+        s = _sock.create_connection(("127.0.0.1", int(rp)), timeout=20)
+    except OSError as e:
+        print(f"  连不上 {name} 的 relay 端口 {rp}：{e}")
+        print("  说明：relay 默认只绑 127.0.0.1；跨机需经 adb reverse / SSH 隧道转发")
+        return
+    rid = _next_id("rf")
+    _req = {"type": "task", "id": rid, "kind": "fetch", "url": url}
+    # 节点若以 --lan 模式带 token 启动 relay，取页请求必须带同款 token 才能过鉴权
+    if token:
+        _req["token"] = token
+    s.sendall(_json.dumps(_req).encode("utf-8") + b"\n")
+    data = b""
+    try:
+        while b"\n" not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    if not data:
+        print(f"  relay 无回执（{name} 可能已掉线）")
+        return
+    msg = _json.loads(data.split(b"\n", 1)[0].decode("utf-8", "ignore"))
+    if not msg.get("ok"):
+        print(f"  取页失败：{msg.get('error', '未知原因')}")
+        return
+    text = msg.get("text", "") or ""
+    status = msg.get("status", 0)
+    print(f"  ← {name} relay 取页 OK（HTTP {status}, {len(text)} 字）")
+    print(text[:2000] + (" …[截断]" if len(text) > 2000 else ""))
+
+
+# ---------------------------------------------------------------- 作业层（长任务）
+#
+# 为什么控制面要有一个作业入口：手机出图/出视频是分钟级的长任务，同步调用
+# 「发一条等一条」在连接断、手机没电时就全丢了。作业层把「提交」与「执行」拆开，
+# 账本落盘、可查、可取消，掉线自动换机重跑（见 fleet/jobs.py）。
+#
+# 派发映射：作业的 cap -> 节点消息类型。只映射**节点真能跑**的那几项；
+# 没映射的如实拒，不许猜。
+
+_JOB_MSG = {
+    "image.gen": common.IMAGE_GEN,
+    "video.gen": common.VIDEO_GEN,
+    "shell.exec": common.EXEC,
+    "exec": common.EXEC,
+    "fleet.memory.sync": common.MEMORY_SYNC,
+}
+
+
+def _jobs():
+    from fleet import jobs as J
+    return J.get_store()
+
+
+def _arts():
+    from fleet import artifacts as A
+    return A.get_store()
+
+
+def _job_dispatch(job):
+    """把一个作业派给节点执行。返回 (ok, data, err, artifacts)。
+
+    dispatch 的契约由 fleet.jobs.pump 定义：抛异常也算失败（会被结算），
+    但这里仍主动把异常转成人话，避免账本里只有一句 traceback。
+    """
+    cap = job.get("cap") or ""
+    args = dict(job.get("args") or {})
+    node = job.get("node") or ""
+    mtype = _JOB_MSG.get(cap)
+    if not mtype:
+        # 永久失败：换个节点也不可能跑通，别浪费重试
+        return (False, {},
+                "作业层还不认识这个能力：%s（已接：%s）"
+                % (cap, "、".join(sorted(_JOB_MSG))), None, False)
+    msg = {"t": mtype}
+    if mtype == common.EXEC:
+        msg["cmd"] = args.get("cmd", "")
+    else:
+        msg.update({k: v for k, v in args.items() if v is not None})
+    timeout = int(args.get("timeout") or 900)      # 长任务默认给 15 分钟
+    r = send_to_node(node, msg, timeout=timeout)
+    if not r.get("ok"):
+        return False, {}, r.get("err") or "节点无回执", None
+    if r.get("ok") is False:                        # 节点回了 ok=False（业务失败）
+        return False, {}, r.get("err") or "节点回报失败（未给原因）", None
+    data = {k: v for k, v in r.items()
+            if k not in ("id", "t") and not str(k).startswith("_")}
+    # 产物入库：节点回的是它本机的路径。只有文件真在控制面本机可读时才收，
+    # 否则如实留路径、不入库——不假装「产物已经在仓库里了」。
+    arts = []
+    path = r.get("path") or ""
+    if path:
+        try:
+            rec = _arts().put_file(path, kind=cap.split(".")[0],
+                                   source=node, job=job.get("id"))
+            arts.append(rec["id"])
+            data["artifact"] = rec["id"]
+        except (OSError, ValueError):
+            data["artifact_note"] = "产物在节点本机（%s），未入库：控制面读不到该路径" % path
+    return True, data, "", arts
+
+
+def _cmd_job(rest):
+    j = _jobs()
+    sp = rest.split(" ", 1)
+    sub = (sp[0] or "").strip().lower()
+    arg = (sp[1] if len(sp) > 1 else "").strip()
+
+    if sub == "submit":
+        if not arg:
+            print("  用法：job submit <cap> [参数JSON] [node=名字]")
+            return
+        parts = arg.split(" ", 1)
+        cap = parts[0]
+        raw = parts[1].strip() if len(parts) > 1 else ""
+        node = ""
+        if "node=" in raw:
+            import re as _re
+            m = _re.search(r"node=(\S+)", raw)
+            if m:
+                node = m.group(1)
+                raw = (raw[:m.start()] + raw[m.end():]).strip()
+        try:
+            args = json.loads(raw) if raw else {}
+        except ValueError as e:
+            print(f"  参数不是合法 JSON：{e}")
+            return
+        if not isinstance(args, dict):
+            print("  参数必须是 JSON 对象")
+            return
+        job = j.submit(cap, args=args, node=node)
+        print(f"  已提交 {job['id']} · {cap} · 状态 {job['state']}")
+        if node:
+            print(f"  指定节点：{node}")
+
+    elif sub in ("list", "ls", ""):
+        state = arg or None
+        rows = j.list(state=state, limit=30)
+        if not rows:
+            print("  （没有作业）" + ("（状态=%s）" % state if state else ""))
+            return
+        for x in rows:
+            extra = ""
+            if x.get("state") == "failed":
+                extra = " · " + (x.get("result") or {}).get("err", "")[:40]
+            print(f"  {x['id']}  {x['state']:<9} {x['cap']:<16} "
+                  f"{(x.get('node') or '-'):<10} 尝试{x.get('attempts', 0)}/{x.get('max_attempts')}{extra}")
+        print("  " + str(j.stats()))
+
+    elif sub in ("show", "get"):
+        if not arg:
+            print("  用法：job show <id>")
+            return
+        job = j.get(arg)
+        if not job:
+            print(f"  没有这个作业：{arg}")
+            return
+        print(f"  id      : {job['id']}")
+        print(f"  能力    : {job['cap']}  参数: {json.dumps(job.get('args') or {}, ensure_ascii=False)}")
+        print(f"  状态    : {job['state']}  尝试 {job.get('attempts')}/{job.get('max_attempts')}")
+        print(f"  节点    : {job.get('node') or '（未指派）'}")
+        print(f"  结果    : {json.dumps(job.get('result') or {}, ensure_ascii=False)[:300]}")
+        if job.get("artifacts"):
+            print(f"  产物    : {', '.join(job['artifacts'])}")
+        print("  历史    :")
+        for h in job.get("history") or []:
+            import time as _t
+            print("    %s  %-9s %s" % (_t.strftime("%m-%d %H:%M:%S",
+                                                  _t.localtime(h.get("ts") or 0)),
+                                       h.get("state"), h.get("note") or ""))
+
+    elif sub == "cancel":
+        if not arg:
+            print("  用法：job cancel <id>")
+            return
+        ok, err = j.cancel(arg)
+        print(f"  {'已取消' if ok else '未取消'}：{arg} {err}")
+
+    elif sub == "reap":
+        rows = j.reap()
+        if not rows:
+            print("  （没有租约过期的作业）")
+        for x in rows:
+            print(f"  {x['id']} → {x['state']}（节点 {x.get('node') or '-'}）")
+
+    elif sub == "pump":
+        node = arg.strip()
+        if not node:
+            print("  用法：job pump <节点名>")
+            return
+        if not _gate("job"):
+            return
+        rows = j.pump(_job_dispatch, node=node, max_jobs=5)
+        if not rows:
+            print("  （这个节点没有可领的活）")
+        for x in rows:
+            tail = ""
+            if x.get("state") == "failed":
+                tail = " · " + (x.get("result") or {}).get("err", "")[:60]
+            print(f"  {x['id']} → {x['state']}{tail}")
+
+    else:
+        print("  用法：job submit <cap> [JSON] | job list [状态] | job show <id> | "
+              "job cancel <id> | job reap | job pump <节点>")
+
+
+def _cmd_artifact(rest):
+    a = _arts()
+    sp = rest.split(" ", 1)
+    sub = (sp[0] or "").strip().lower()
+    arg = (sp[1] if len(sp) > 1 else "").strip()
+
+    if sub in ("list", "ls", ""):
+        kind = arg or None
+        rows = a.list(kind=kind, limit=30)
+        if not rows:
+            print("  （产物仓库是空的）")
+            return
+        for x in rows:
+            print(f"  {x['id']}  {x.get('kind') or '-':<8} {x.get('size', 0):>10}B  "
+                  f"{x.get('name')}  来源: {','.join(x.get('sources') or []) or '-'}")
+        print("  " + str(a.stats()))
+
+    elif sub == "get":
+        parts = arg.split(" ", 1)
+        aid = parts[0] if parts else ""
+        if not aid:
+            print("  用法：artifact get <id> [输出路径]")
+            return
+        rec = a.get(aid)
+        if not rec:
+            print(f"  没有这个产物：{aid}")
+            return
+        try:
+            data = a.open_bytes(aid)
+        except FileNotFoundError as e:
+            print(f"  {e}")
+            return
+        if len(parts) > 1:
+            out = parts[1].strip()
+            try:
+                with open(out, "wb") as f:
+                    f.write(data)
+                print(f"  已写出 {len(data)}B → {out}")
+            except OSError as e:
+                print(f"  写不出去：{e}")
+        else:
+            print(f"  {rec['id']} · {rec.get('name')} · {len(data)}B "
+                  f"（加输出路径可落盘：artifact get {aid} out.bin）")
+
+    elif sub == "put":
+        if not arg:
+            print("  用法：artifact put <文件路径> [kind]")
+            return
+        parts = arg.split(" ", 1)
+        path = parts[0]
+        kind = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            rec = a.put_file(path, kind=kind)
+        except (OSError, ValueError) as e:
+            print(f"  收不进来：{e}")
+            return
+        print(f"  已入库 {rec['id']} · {rec.get('size')}B · {rec.get('name')}")
+
+    elif sub == "gc":
+        removed, freed = a.gc()
+        print(f"  清掉 {removed} 个过期产物，释放 {freed} 字节")
+
+    else:
+        print("  用法：artifact list [kind] | artifact get <id> [输出路径] | "
+              "artifact put <路径> [kind] | artifact gc")
 
 
 def _cmd_broadcast(cmd):
@@ -1754,6 +2052,7 @@ def repl():
     print("cmd> nodes | exec <节点> <命令> | broadcast <命令> | push <节点> <文件> | pull <节点> <远程> [输出]")
     print("      | ctx_put <ns> <key> <值> | ctx_get <ns> <key> | ctx_search <ns> <查询> | ctx_del <ns> <key>")
     print("      | token <节点> | queue <节点> | compute <提示词> | computemap <p1;p2;...> | computepool")
+    print("      | relay_fetch <节点> <URL>   # 经节点 SkyNet relay 代取网页（节点需先 --relay-port 启动 relay）")
     print("      | enroll <节点> [有效期秒] | enroll_list | enroll_revoke <节点>   # 扫码入网（离线验签）")
     print("      | ui <节点> <包名|*> [--vision] | rules | rules_get [版本] | rules_put <文件> [备注] | rules_rollback <版本>")
     print("      | policy | policy_eval <事件JSON> | her | her_memory | her_followups | her_say <文本> | intent <一句话> | quit")
@@ -1804,6 +2103,14 @@ def repl():
             sp = rest.split(" ", 2)
             if len(sp) >= 2:
                 _cmd_pull(sp[0], sp[1], sp[2] if len(sp) >= 3 else sp[1].split("/")[-1])
+        elif op == "relay_fetch":
+            sp = rest.split(" ", 1)
+            if len(sp) == 2:
+                _cmd_relay_fetch(sp[0], sp[1])
+        elif op == "job":
+            _cmd_job(rest)
+        elif op == "artifact":
+            _cmd_artifact(rest)
         elif op == "ctx_put":
             sp = rest.split(" ", 2)
             if len(sp) == 3:

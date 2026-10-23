@@ -62,6 +62,7 @@ def parse_frontmatter(text, where=""):
     if not lines or lines[0].strip() != "---":
         return {}, text
     meta = {}
+    last_key = None
     for i in range(1, len(lines)):
         line = lines[i]
         if line.strip() == "---":
@@ -71,21 +72,80 @@ def parse_frontmatter(text, where=""):
         if line.lstrip().startswith("#"):
             continue                     # frontmatter 里允许注释行
         if ":" not in line:
-            raise SkillError(
-                f"{where or 'SKILL.md'} 的 frontmatter 第 {i + 1} 行不是 key: value：{line!r}")
+            # 不是 key: value —— 但真实世界的前置元数据有两种常见写法，
+            # 2026-10-22 实测 38 条真实技能里有 7 条因此读不出来
+            # （多行描述、YAML 列表项）：
+            #   · 缩进续行   `  描述文字……`
+            #   · 列表项     `  - bash`
+            # 两种都并进上一个 key，不再一律报错。
+            # 仍要报错的是「既不是续行也不是列表项」的乱行
+            # （自测里那一行就是这种，必须继续报错——不然真错误会被静默吞掉）。
+            stripped = line.strip()
+            if last_key is None:
+                raise SkillError(
+                    f"{where or 'SKILL.md'} 的 frontmatter 第 {i + 1} 行不是 key: value：{line!r}")
+            if stripped.startswith("- "):
+                item = stripped[2:].strip()
+                cur = meta.get(last_key)
+                if isinstance(cur, list):
+                    cur.append(item)
+                elif cur in (None, ""):
+                    meta[last_key] = [item]
+                else:
+                    meta[last_key] = [str(cur), item]
+            elif line[:1] in (" ", "\t"):
+                meta[last_key] = (str(meta.get(last_key) or "") + " " + stripped).strip()
+            else:
+                raise SkillError(
+                    f"{where or 'SKILL.md'} 的 frontmatter 第 {i + 1} 行不是 key: value：{line!r}")
+            continue
         key, _, val = line.partition(":")
         key = key.strip()
         val = val.strip()
         # 去掉一层引号（YAML 风格），但不做完整 YAML 解析
         if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
             val = val[1:-1]
+        last_key = key
         if key in ("name", "description", "agent_created", "license", "version"):
+            meta[key] = val
+        elif key in ("evolved_from", "caps"):
+            # 这两个是列表。frontmatter 只支持标量的解析器在这里加一条
+            # 明确支持的单行列表语法：`key: [a, b, c]`。
+            # 为什么值得加：技能进化要声明「我从哪几条证据长出来」
+            # （evolved_from）和「我要用哪些能力」（caps），
+            # 没这两个字段，技能就只是一段散文，没法验证。
+            meta[key] = _parse_inline_list(val, where)
+        elif key == "guard":
             meta[key] = val
         else:
             # 未知键也留着（可能是别人生态的字段），但不报错
             meta.setdefault("extra", {})[key] = val
     raise SkillError(
         f"{where or 'SKILL.md'} 的 frontmatter 没有闭合（少了收尾的 ---）")
+
+
+def _parse_inline_list(val, where=""):
+    """解析 `key: [a, b, c]` 这种单行列表。
+
+    只支持这一种形状（方括号 + 逗号分隔）。遇到别的形状**如实报错**，
+    不猜、不静默返回空列表——空列表会让技能看起来"没有引用任何能力"，
+    那是假的。
+    """
+    s = (val or "").strip()
+    if not (s.startswith("[") and s.endswith("]")):
+        raise SkillError(
+            f"{where or 'SKILL.md'} 的列表字段必须写成 [a, b, c]，得到 {val!r}")
+    inner = s[1:-1].strip()
+    if not inner:
+        return []
+    out = []
+    for part in inner.split(","):
+        p = part.strip()
+        if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'":
+            p = p[1:-1]
+        if p:
+            out.append(p)
+    return out
 
 
 # ---------------------------------------------------------------- 读一个技能
@@ -126,6 +186,18 @@ def load_skill(path):
     if not desc:
         desc = _first_heading(body)
 
+    # evolved_from 的 id 必须是整数（证据是 journal 的自增 id）。
+    # 这里只做**形状**校验（是不是整数），不查存在性——
+    # 存在性要问证据库，那是 P2 验证门的事，两边职责不混。
+    ev_from = []
+    for raw in (meta.get("evolved_from") or []):
+        try:
+            ev_from.append(int(str(raw).strip()))
+        except (TypeError, ValueError):
+            raise SkillError(
+                f"{path} 的 evolved_from 里有不是整数 id 的项：{raw!r}")
+    caps = [str(c).strip() for c in (meta.get("caps") or []) if str(c).strip()]
+
     return {
         "name": name,
         "description": desc,
@@ -135,7 +207,28 @@ def load_skill(path):
         "heading": _first_heading(body),
         "body_len": len(body),
         "agent_created": str(meta.get("agent_created", "")).lower() == "true",
+        "evolved_from": ev_from,
+        "caps": caps,
+        "guard": (meta.get("guard") or "").strip(),
+        "body": body,
     }
+
+
+def validate_caps(skill, cap_names):
+    """核技能声明的能力名是否都真实存在。
+
+    返回 (ok, 缺失列表, 说明)。缺失时**指名道姓**说是哪个能力不存在，
+    不许只说「有错」——使用者得知道去改哪一行。
+    """
+    caps = list(skill.get("caps") or [])
+    if not caps:
+        return False, [], "这张技能没有声明 caps（不许留空：空 = 没法验证它做过什么）"
+    known = set(cap_names or [])
+    missing = [c for c in caps if c not in known]
+    if missing:
+        return False, missing, ("caps 里这些能力在注册表里不存在：%s"
+                                % "、".join(missing))
+    return True, [], "caps 里的 %d 个能力都存在" % len(caps)
 
 
 def _is_repo(path):
@@ -175,6 +268,7 @@ def scan_dir(root):
             out.append({"name": fn, "description": "", "dir": d, "file": SKILL_FILE,
                         "source": "repo" if _is_repo(sk) else "user",
                         "heading": "", "body_len": 0, "agent_created": False,
+                        "evolved_from": [], "caps": [], "guard": "", "body": "",
                         "error": "这个技能的 SKILL.md 解析失败"})
     return out
 
@@ -194,9 +288,19 @@ def list_skills(roots=None):
 
 
 def summary():
-    """给 /api/skills 的返回体。"""
+    """给 /api/skills 的返回体。
+
+    正文（body）不往外发：38 张技能的正文字数加起来不小，
+    而 /api/skills 只是给前端看清单，不是给模型读全文。
+    要读正文请按目录自己开文件。
+    """
     skills = list_skills()
-    return {"ok": True, "count": len(skills), "skills": skills,
+    brief = []
+    for s in skills:
+        s = dict(s)
+        s.pop("body", None)
+        brief.append(s)
+    return {"ok": True, "count": len(brief), "skills": brief,
             "roots": [REPO_SKILLS_DIR, USER_SKILLS_DIR]}
 
 
@@ -239,6 +343,46 @@ def _selftest():
     # 引号剥掉
     meta3, _ = parse_frontmatter('---\nname: "q"\n---\n')
     assert meta3["name"] == "q"
+
+    # 列表字段：单行 [a, b, c]
+    meta4, _ = parse_frontmatter(
+        "---\nname: d4\nevolved_from: [12, 15]\ncaps: [a.b, c.d]\n"
+        "guard: 任一步失败即停\n---\n")
+    assert meta4["evolved_from"] == ["12", "15"], meta4
+    assert meta4["caps"] == ["a.b", "c.d"], meta4
+    assert meta4["guard"] == "任一步失败即停", meta4
+
+    # 列表字段写成别的形状 ⇒ 如实报错，不静默给空列表
+    try:
+        parse_frontmatter("---\nname: d5\ncaps: a.b, c.d\n---\n", where="t.md")
+    except SkillError as e:
+        assert "[a, b, c]" in str(e), str(e)
+    else:
+        raise AssertionError("列表字段形状不对应该报错")
+
+    # evolved_from 里的非整数 id ⇒ 报错（id 是 journal 自增号）
+    with tempfile.TemporaryDirectory() as td:
+        d = os.path.join(td, "ev")
+        os.makedirs(d)
+        p = os.path.join(d, SKILL_FILE)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("---\nname: ev\ndescription: x\n"
+                    "evolved_from: [12, 不是数字]\ncaps: [a.b]\n---\n\n# 正文\n")
+        try:
+            load_skill(p)
+        except SkillError as e:
+            assert "不是整数" in str(e), str(e)
+        else:
+            raise AssertionError("非整数证据 id 应该报错")
+
+    # validate_caps：指名道姓说是哪个能力不存在
+    ok, missing, why = validate_caps({"caps": ["x.y", "z.w"]}, ["x.y"])
+    assert not ok and missing == ["z.w"], (missing, why)
+    assert "z.w" in why, why
+    ok2, _, _ = validate_caps({"caps": ["x.y", "z.w"]}, ["x.y", "z.w"])
+    assert ok2
+    ok3, _, why3 = validate_caps({"caps": []}, ["x.y"])
+    assert not ok3 and "没有声明 caps" in why3, why3
 
     # 扫目录：临时造一个技能
     with tempfile.TemporaryDirectory() as td:

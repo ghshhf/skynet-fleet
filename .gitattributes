@@ -1,3 +1,8 @@
 # bat 必须是 GBK + CRLF：cmd 只认这个（UTF-8 的中文提示会是乱码，LF 行尾会让
 # if/set 整段被吞掉）。这里声明编码，GitHub 上才不会把它显示成一坨问号。
 *.bat text eol=crlf working-tree-encoding=GBK
+# shell 脚本走 LF：Linux runner 上 CRLF 会 bad interpreter
+*.sh text eol=lf
+# 无扩展名的 shell 工具也要钉 LF：CRLF 落进手机后报 Permission denied /
+# "Syntax error: word unexpected"（这个坑真踩过一次，排查了两小时）
+tools/phone/glslc-termux text eol=lf

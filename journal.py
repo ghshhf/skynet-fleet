@@ -33,6 +33,9 @@ OPEN_STATUS = "open"
 DONE_STATUS = "done"
 DEFAULT_CAP = 5000
 
+# 一条记录对外暴露的字段顺序（读方法共用，避免各处 zip 各写一份而漏列）
+FIELDS = ("id", "ts", "kind", "actor", "topic", "body", "ref", "status", "trace")
+
 # 不该以明文进流水的东西（打码而非丢弃：保留「这里本来有个秘密」的痕迹）
 _REDACT_PATTERNS = [
     (re.compile(r"fleet://enroll\?p=\S+"), "fleet://enroll?p=<已打码>"),
@@ -62,21 +65,51 @@ class Journal:
             self.con.execute("""CREATE TABLE IF NOT EXISTS journal(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, kind TEXT, actor TEXT, topic TEXT,
-                body TEXT, ref INTEGER, status TEXT)""")
+                body TEXT, ref INTEGER, status TEXT, trace TEXT)""")
             self.con.execute("CREATE INDEX IF NOT EXISTS journal_ts ON journal(ts)")
             self.con.execute("CREATE INDEX IF NOT EXISTS journal_topic ON journal(topic, status)")
+            self._migrate()
             self.con.commit()
 
+    def _migrate(self):
+        """老库补 `trace` 列。
+
+        为什么加 trace 而不是把 trace 编进 topic：
+          topic 是给人读的自由文本，随时会改措辞；trace 是结构，要按它聚一组调用。
+          把结构塞进文本，后面每解析一次就赌一次格式没变。
+
+        ALTER TABLE ADD COLUMN 只加不删：既有行的 trace 为 NULL，
+        语义 = 「这条记录没有归到任何一次执行」，不许当成空字符串。
+        """
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(journal)").fetchall()}
+        if "trace" not in cols:
+            self.con.execute("ALTER TABLE journal ADD COLUMN trace TEXT")
+        self.con.execute("CREATE INDEX IF NOT EXISTS journal_trace ON journal(trace)")
+
     # ---------- 写 ----------
-    def log(self, kind, actor, body, topic=None, ref=None, ts=None):
-        """追加一条事件，返回自增 id（供上层引用为证据）。"""
+    def log(self, kind, actor, body, topic=None, ref=None, ts=None, status=OPEN_STATUS,
+            trace=None):
+        """追加一条事件，返回自增 id（供上层引用为证据）。
+
+        `status` 可以显式指定：有些事**写下来时就已经了结了**（比如「这台临时节点
+        已清理干净」）。默认 open 会让它变成一笔永远挂着的账，`followups` 和记忆
+        沉淀都会把它当成待办，纯属自找噪音。
+
+        `trace` 把「一次用户意图下的多次调用」串起来。命名约定（技能进化用）：
+          · `exec:<trace_id>` —— 能力真的跑过（`fleet/execute.py` 写），证据最强；
+          · `mem:<文件>#L<a>-<b>` —— 从记忆日志导入的事实陈述，可回查原文，证据次之。
+        两种前缀不许混：技能验证按前缀分级，混了就分不清「真跑过」和「我写过」。
+        """
         if kind not in KINDS:
             raise ValueError(f"未知事件类型: {kind}（应为 {KINDS} 之一）")
+        if status not in (OPEN_STATUS, DONE_STATUS):
+            raise ValueError(f"未知状态: {status}（应为 {OPEN_STATUS}/{DONE_STATUS}）")
         ts = time.time() if ts is None else ts
         with self._lk:
             cur = self.con.execute(
-                "INSERT INTO journal(ts,kind,actor,topic,body,ref,status) VALUES(?,?,?,?,?,?,?)",
-                (ts, kind, actor, topic, redact(body), ref, OPEN_STATUS))
+                "INSERT INTO journal(ts,kind,actor,topic,body,ref,status,trace) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (ts, kind, actor, topic, redact(body), ref, status, trace))
             self.con.commit()
             self._trim()
             return cur.lastrowid
@@ -117,18 +150,17 @@ class Journal:
         lo = now - hours * 3600
         with self._lk:
             rows = self.con.execute(
-                "SELECT id,ts,kind,actor,topic,body,ref,status FROM journal "
+                "SELECT id,ts,kind,actor,topic,body,ref,status,trace FROM journal "
                 "WHERE status=? AND topic IS NOT NULL AND kind IN (%s) AND ts>=? "
                 "ORDER BY ts ASC" % ",".join("?" * len(kinds)),
                 (OPEN_STATUS, *kinds, lo)).fetchall()
-        return [dict(zip(("id", "ts", "kind", "actor", "topic", "body", "ref", "status"), r))
-                for r in rows]
+        return [dict(zip(FIELDS, r)) for r in rows]
 
     def recent(self, hours=24, now=None, kinds=None, limit=200):
         """窗口内的全部流水（含已闭环）——复盘用。"""
         now = time.time() if now is None else now
         lo = now - hours * 3600
-        q = ("SELECT id,ts,kind,actor,topic,body,ref,status FROM journal WHERE ts>=?")
+        q = ("SELECT id,ts,kind,actor,topic,body,ref,status,trace FROM journal WHERE ts>=?")
         args = [lo]
         if kinds:
             q += " AND kind IN (%s)" % ",".join("?" * len(kinds))
@@ -137,8 +169,25 @@ class Journal:
         args.append(limit)
         with self._lk:
             rows = self.con.execute(q, args).fetchall()
-        return [dict(zip(("id", "ts", "kind", "actor", "topic", "body", "ref", "status"), r))
-                for r in rows]
+        return [dict(zip(FIELDS, r)) for r in rows]
+
+    def by_trace(self, trace, only_done=False):
+        """取一次执行的全部事件，按时间正序（= 步骤发生的顺序）。
+
+        技能生成的唯一取数入口：只认 trace 精确匹配，不做模糊聚合。
+        没这条纪律，就会出现「看了一堆同期事件就以为是同一次执行」。
+        """
+        if not trace:
+            return []
+        q = "SELECT id,ts,kind,actor,topic,body,ref,status,trace FROM journal WHERE trace=?"
+        args = [trace]
+        if only_done:
+            q += " AND status=?"
+            args.append(DONE_STATUS)
+        q += " ORDER BY ts ASC, id ASC"
+        with self._lk:
+            rows = self.con.execute(q, args).fetchall()
+        return [dict(zip(FIELDS, r)) for r in rows]
 
     def close_all(self, kinds=("task", "her")):
         """全部闭环（自测复位用；生产上不做这种批量动作）。"""
@@ -149,15 +198,25 @@ class Journal:
             self.con.commit()
             return cur.rowcount
 
-    def close(self, topic, ts=None):
-        """一件事闭环了：该 topic 下所有 open 记录标 done（不是删——闭环也要留痕）。"""
-        ts = time.time() if ts is None else ts
+    def exists(self, ids):
+        """给定 id 里哪些真的存在。
+
+        写记忆时要拿流水当证据，就必须能核验这些 id 不是编出来的。
+        返回集合而不是布尔：这样调用方能指出**具体哪几个**不存在。
+        """
+        ints = []
+        for i in ids:
+            try:
+                ints.append(int(i))
+            except (TypeError, ValueError):
+                continue
+        if not ints:
+            return set()
+        q = ",".join("?" * len(ints))
         with self._lk:
-            cur = self.con.execute(
-                "UPDATE journal SET status=? WHERE topic=? AND status=?",
-                (DONE_STATUS, topic, OPEN_STATUS))
-            self.con.commit()
-            return cur.rowcount
+            rows = self.con.execute(
+                "SELECT id FROM journal WHERE id IN (%s)" % q, ints).fetchall()
+        return {r[0] for r in rows}
 
     def count(self):
         with self._lk:
@@ -209,6 +268,44 @@ def _selftest():
         assert j.purge(row["id"]) == 1
         assert all(r["topic"] != "t:enroll" for r in j.recent(hours=1, now=now))
         print("[selftest] 逐条可删（E-7） OK")
+
+        # trace：一次执行的多次调用能按时间正序取回；别的 trace 不许混进来
+        t1 = j.log("task", "PC-A", "第1步 adb.wifi.info", topic="cap:adb.wifi.info",
+                   trace="exec:T1", ts=now + 10, status=DONE_STATUS)
+        t2 = j.log("task", "PC-A", "第2步 adb.wifi.connect", topic="cap:adb.wifi.connect",
+                   trace="exec:T1", ts=now + 12, status=DONE_STATUS)
+        j.log("task", "PC-B", "别人的调用", topic="cap:adb.wifi.info",
+              trace="exec:T2", ts=now + 11, status=DONE_STATUS)
+        seq = j.by_trace("exec:T1")
+        assert [r["id"] for r in seq] == [t1, t2], seq
+        assert all(r["trace"] == "exec:T1" for r in seq)
+        assert len(j.by_trace("exec:T1", only_done=True)) == 2
+        assert j.by_trace("") == [] and j.by_trace("exec:nope") == []
+        print("[selftest] trace 聚组（按时间正序，不串组） OK")
+
+        # 老库迁移：没有 trace 列的历史库打开就补列，历史行 trace 为 NULL（不是空串）
+        import sqlite3
+        fd2, p2 = tempfile.mkstemp(suffix=".db")
+        os.close(fd2)
+        os.remove(p2)
+        raw = sqlite3.connect(p2)
+        raw.execute("CREATE TABLE journal(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "ts REAL, kind TEXT, actor TEXT, topic TEXT, body TEXT, "
+                    "ref INTEGER, status TEXT)")
+        raw.execute("INSERT INTO journal(ts,kind,actor,body,status) "
+                    "VALUES(1,'task','PC-X','老记录','open')")
+        raw.commit()
+        raw.close()
+        j2 = Journal(p2)
+        try:
+            old = j2.recent(hours=10 ** 7, now=now)
+            assert len(old) == 1 and old[0]["trace"] is None, old
+            j2.log("task", "PC-A", "新记录", trace="exec:T9", ts=now)
+            assert j2.by_trace("exec:T9")[0]["body"] == "新记录"
+        finally:
+            j2.close_connection()
+            os.remove(p2)
+        print("[selftest] 老库自动补 trace 列（历史行 NULL） OK")
 
         # 上限：超 cap 自动砍最旧
         for i in range(60):

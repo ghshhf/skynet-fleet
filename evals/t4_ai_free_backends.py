@@ -131,8 +131,14 @@ check(any("空回" in (v or "") for v in ans.values()),
       "空回的说明里点名「空回」")
 AB.chat = fake_chat                       # 还原，后面的断言还要用它
 
+# ai.complete 现在走 chat_fallback（降级链），门禁里要把它一起假掉，
+# 否则会真去敲网络。只在这一处临时替换，别影响后面的 §⑤(真 _chat_stream) / ⑦(真 chat_fallback)。
+_orig_cf = AB.chat_fallback
+AB.chat_fallback = lambda bs, prompt, system="", on_token=None, max_tokens=2048, timeout=120: (
+    fake_chat(bs[0], prompt, system, on_token, max_tokens, timeout), bs[0]["id"])
 r = reg.call("ai.complete", args={"prompt": "你好"})
 check(r.ok and r.data.get("text"), "ai.complete 正常路径拿到正文")
+AB.chat_fallback = _orig_cf
 
 # ⑤b3 默认 max_tokens 必须够推理模型用（防止将来被改回 512 重新踩坑）
 from fleet.kinds.ai import DEFAULT_MAX_TOKENS
@@ -266,6 +272,73 @@ r = reg.call("probe.ask_demo", args={}, gate=gate_no)
 check(r.code == "denied", "approval=ask 无确认→拒绝")
 r = reg.call("probe.ask_demo", args={}, gate=gate_yes)
 check(r.ok, "approval=ask 有确认→放行")
+
+
+# ⑦ 失败分类 + 降级链 failover + 冷却（2026-10-23 新增；学 dsh-our-free-model）
+#    这是「API 兼容层」的核心：一条免费腿挂了要透明切到下一条，且挂掉的端点
+#    要被踢出轮转一段时间（冷却），别反复硬砸把限流/封禁坐实。
+#    全离线：直接驱动 chat_fallback / classify_failure，不碰网络。
+import urllib.error as _ue
+
+_orig_stream = AB._chat_stream
+
+
+def _cf_check():
+    v = AB.classify_failure(_ue.HTTPError("http://x", 429, "rate", None, None))
+    check(v["kind"] == AB.FAIL_RATE and v["retryable"] and v["bench"] and v["advance"],
+          "429→rate_limit(可重试+冷却+可降级)")
+    v = AB.classify_failure(_ue.HTTPError("http://x", 401, "no", None, None))
+    check(v["kind"] == AB.FAIL_AUTH and v["bench"] and v["cooldown"] == AB._COOLDOWN_LONG,
+          "401/403/404→auth 记死踢出轮转")
+    v = AB.classify_failure(_ue.HTTPError("http://x", 500, "err", None, None))
+    check(v["kind"] == AB.FAIL_TRANSIENT and v["bench"], "5xx→transient 短冷却")
+    v = AB.classify_failure(_ue.HTTPError("http://x", 418, "teapot", None, None))
+    check(v["kind"] == AB.FAIL_REQUEST and not v["bench"] and v["advance"],
+          "未匹配4xx→request(不冷却但可换端点)")
+
+
+_cf_check()
+
+# 降级链：第一条 500、第二条空回、第三条成功 → via=第三条
+AB._COOLDOWN.clear()
+def _fb_stream(b, prompt, system, on_token, max_tokens, timeout):
+    if b["id"] == "p":
+        raise _ue.HTTPError("http://x", 500, "err", None, None)
+    if b["id"] == "o":
+        return ""
+    return "第三条赢了"
+_cands = [{"id": "p", "title": "P", "protocol": "openai", "base_url": "http://x", "model": "m"},
+          {"id": "o", "title": "O", "protocol": "openai", "base_url": "http://x", "model": "m"},
+          {"id": "l", "title": "L", "protocol": "openai", "base_url": "http://x", "model": "m"}]
+AB._chat_stream = _fb_stream
+_text, _via = AB.chat_fallback("hi", candidates=_cands)
+check(_via == "l" and _text == "第三条赢了", f"降级链首条非空白胜出(via={_via})")
+check(AB.cooldown_remaining("p") > 0, "失败端点被冷却(踢出轮转)")
+check(AB.cooldown_remaining("l") == 0, "成功端点无冷却")
+
+# 健康门控：冷却中的端点不进 healthy_backends；成功即恢复
+# 🔴 必须用真实后端 id（pollinations，永远在 backends() 里）测，不能用合成 id——
+# healthy_backends() 只返回 backends() 里的真实端点，合成 id 从不在其中。
+AB._COOLDOWN.clear()
+AB.mark_failure("pollinations", {"kind": AB.FAIL_TRANSIENT, "bench": True, "cooldown": AB._COOLDOWN_SHORT})
+_hb = [b["id"] for b in AB.healthy_backends()]
+check("pollinations" not in _hb, "冷却中端点被 healthy_backends 过滤")
+AB.mark_success("pollinations")
+check("pollinations" in [b["id"] for b in AB.healthy_backends()], "成功后端点回到健康集")
+
+# 优先级：云端免费优先、本地模型垫底(不作主力)
+AB._COOLDOWN.clear()
+_order = [b["id"] for b in AB._fallback_order()]
+check(_order.index("pollinations") < _order.index("ovh"),
+      "降级优先级 pollinations < ovh")
+if "llm7" in _order:
+    check(_order.index("ovh") < _order.index("llm7"), "降级优先级 ovh < llm7")
+if "local" in _order:
+    check(_order.index("local") > _order.index("llm7") if "llm7" in _order
+          else _order.index("local") > _order.index("ovh"),
+          "本地模型垫底(不作主力)")
+
+AB._chat_stream = _orig_stream
 
 
 print("t4 ai_free:", "PASS" if not FAIL else f"FAIL ({len(FAIL)} 项)", flush=True)

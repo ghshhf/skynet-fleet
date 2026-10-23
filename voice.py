@@ -26,14 +26,64 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import wave
 
+def _pick_tmp_dir():
+    """语音临时目录：环境变量 > 按盘存在性探测（E→D→G 兼容）> 系统 temp。
+
+    历史上这里写死 `G:/_tmp/fleet_voice`，换到没有 G 盘的机器时
+    makedirs 被 except 静默吞掉，直到写盘才炸出一个看不懂的 Errno 2——
+    典型的「静默失败最阴」。现在：探测时真写一个探针文件，确认可写
+    才采用；全部候选都不可用时退系统 temp。
+    """
+    env = os.environ.get("FLEET_VOICE_TMP")
+    cands = ([env] if env else []) + [
+        "E:/_tmp/fleet_voice", "D:/_tmp/fleet_voice",
+        "G:/_tmp/fleet_voice",                     # 兼容老配置
+        os.path.join(os.environ.get("TEMP") or ".", "fleet_voice"),
+    ]
+    for c in cands:
+        if not c:
+            continue
+        try:
+            os.makedirs(c, exist_ok=True)
+            probe = os.path.join(c, ".probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            return c
+        except Exception:
+            continue
+    return os.path.join(os.environ.get("TEMP") or ".", "fleet_voice")
+
+
 # ---- 全局常量（可被环境变量覆盖）----
-TMP_DIR = os.environ.get("FLEET_VOICE_TMP", "G:/_tmp/fleet_voice")
+TMP_DIR = _pick_tmp_dir()
 KEEP_TMP = os.environ.get("FLEET_VOICE_KEEP", "") == "1"
 SAMPLE_RATE = 16000
 BLOCK_SEC = 0.03                       # 30ms 一块：够短做 VAD，够长不空转
+
+# 说完之后的静音等多久算一句结束。
+# 实测：VAD 的判定延迟 ≈ min_silence_duration，所以这个值直接就是用户的等待。
+# 0.8（旧值）-> 0.35（新值）省 450ms；切太短的代价由 listen() 续听兜底。
+# 现场能改：set FLEET_SILENCE_END=0.5 之类，不用改代码。
+SILENCE_END = float(os.environ.get("FLEET_SILENCE_END", "0.35"))
+
+# 流式那一层（切块 / 边合边播 / 打断）单独一个文件，见 voice_stream.py。
+# 这里用 try 包住的原因和本文件第 5 行那条一致：**模块 import 永远成功**。
+# 缺文件时语音链路降级成「整段念」，而不是整个 import 崩掉。
+try:
+    from voice_stream import MicWatcher as _MicWatcher
+    from voice_stream import Speech as _Speech
+    from voice_stream import normalize_zh as _norm_zh
+    HAVE_STREAM = True
+except Exception:                                    # pragma: no cover
+    HAVE_STREAM = False
+
+    def _norm_zh(t):
+        return t
 DEFAULT_EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
 DEFAULT_KOKORO_VOICE = "zf_xiaoxiao"
 
@@ -137,11 +187,13 @@ def _have(mod_name):
 
 
 def _tmp_dir():
-    """临时目录（不存在就建）。"""
+    """临时目录（不存在就建）。建失败必须带原因抛，不许静默。"""
     try:
         os.makedirs(TMP_DIR, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        raise RuntimeError(
+            "语音临时目录不可用：%s（%s）。设 FLEET_VOICE_TMP 指向一个存在的盘。"
+            % (TMP_DIR, e))
     return TMP_DIR
 
 
@@ -333,14 +385,33 @@ def _wav_is_silent(path, thresh=0.0015):
 
 
 def _ffmpeg():
-    """找 ffmpeg：环境变量 FLEET_FFMPEG > 已知路径 > PATH。找不到返回 None。"""
+    """找 ffmpeg：环境变量 FLEET_FFMPEG > 已知路径 > PATH > imageio 自带的那份。
+
+    最后一档是这次加的：本机 PATH 里一直没有 ffmpeg，于是 edge 合成完的 mp3
+    没法转 wav，整条在线 TTS 就静默跳过——caps() 里那句「没找到 ffmpeg，
+    转码会跳过」就是这么来的。imageio_ffmpeg 这个包自带一份静态 ffmpeg，
+    装了就能直接用，不必再让人手动装到 PATH。
+    """
     cand = os.environ.get("FLEET_FFMPEG")
     if cand and os.path.isfile(cand):
         return cand
-    fixed = "G:/dev/ffmpeg/bin/ffmpeg.exe"
-    if os.path.isfile(fixed):
-        return fixed
-    return shutil.which("ffmpeg")
+    for fixed in ("E:/dev/ffmpeg/bin/ffmpeg.exe",
+                  "E:/_tools/ffmpeg/bin/ffmpeg.exe",
+                  "D:/tools/ffmpeg/bin/ffmpeg.exe",
+                  "G:/dev/ffmpeg/bin/ffmpeg.exe"):     # 兼容老配置
+        if os.path.isfile(fixed):
+            return fixed
+    got = shutil.which("ffmpeg")
+    if got:
+        return got
+    try:
+        import imageio_ffmpeg
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        if p and os.path.isfile(p):
+            return p
+    except Exception:
+        pass
+    return None
 
 
 def _run_hidden(cmd):
@@ -348,6 +419,80 @@ def _run_hidden(cmd):
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           creationflags=flags, check=False)
+
+
+def any_to_wav(src, dst, sr=16000):
+    """任意音频容器（mp3/webm/opus/ogg/m4a…）→ 16k 单声道 s16 wav。
+
+    为什么不用 ffmpeg：冻扁包里没有外部 ffmpeg，但 **PyAV 一定在**——
+    faster-whisper 自己就依赖它解音频。2026-10-22 实测：手机端上行的是
+    16k wav（能过），但把 edge_tts 产出的 mp3 回喂给 /api/voice/recognize
+    就报「收到非 wav 音频（头 fff3），但找不到 ffmpeg 转码」。用 av 一条
+    路径覆盖所有格式，外部 ffmpeg 只作为 av 缺失时的兜底。
+
+    返回 True 表示 dst 已写好；False 表示两种解码器都不可用。
+    """
+    try:
+        import av
+        from av.audio.resampler import AudioResampler
+    except Exception:
+        return _any_to_wav_ffmpeg(src, dst, sr)
+
+    try:
+        res = AudioResampler(format="s16", layout="mono", rate=sr)
+        chunks = []
+        with av.open(src, mode="r") as cont:
+            if not cont.streams.audio:
+                return False
+            stream = cont.streams.audio[0]
+            for frame in cont.decode(stream):
+                for out in res.resample(frame):
+                    chunks.append(out.to_ndarray().tobytes())
+            for out in res.resample(None):        # flush 尾巴
+                chunks.append(out.to_ndarray().tobytes())
+        data = b"".join(chunks)
+        if not data:
+            return False
+        import wave
+        with wave.open(dst, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(data)
+        return True
+    except Exception as e:
+        print("[voice] av 解码失败（%s: %s），退回 ffmpeg" % (type(e).__name__, e))
+        return _any_to_wav_ffmpeg(src, dst, sr)
+
+
+def _any_to_wav_ffmpeg(src, dst, sr=16000):
+    """av 不可用时的兜底：外部 ffmpeg。"""
+    ff = _ffmpeg()
+    if not ff:
+        return False
+    r = _run_hidden([ff, "-y", "-loglevel", "error", "-i", src,
+                     "-ar", str(sr), "-ac", "1", "-f", "wav", dst])
+    return r.returncode == 0 and os.path.isfile(dst)
+
+
+def audio_kind(path):
+    """按文件头猜真实容器，给 Content-Type 用。不猜扩展名——扩展名会骗人。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return "application/octet-stream"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "audio/wav"
+    if head[:4] == b"OggS":
+        return "audio/ogg"
+    if head[:4] == b"fLaC":
+        return "audio/flac"
+    if head[4:8] == b"ftyp":
+        return "audio/mp4"
+    if head[:3] == b"ID3" or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "audio/mpeg"
+    return "application/octet-stream"
 
 
 # ============================ 能力探测 ============================
@@ -371,12 +516,25 @@ def caps():
         why["asr"] = ("不可用：缺少 " + "、".join(missing)
                       + "（pip install " + " ".join(missing) + "）")
 
-    # --- TTS：与 say() 的实际顺序保持一致（kokoro 先，edge 后）---
-    # 顺序必须和 say() 一致，否则体检说「用 edge」、实际走 kokoro，人会被绕晕。
+    # --- TTS：与 say() 的实际顺序保持一致（sherpa 先，kokoro 次，edge 后）---
+    # 顺序必须和 say() 一致，否则体检说「用 edge」、实际走 sherpa，人会被绕晕。
     has_edge = _have("edge_tts")
     has_kokoro = _have("kokoro") and _have("onnxruntime")
+    sherpa_ok, sherpa_why = _sherpa_status()
     extra = []
+    all_backends = []
+    if sherpa_ok:
+        all_backends.append("sherpa")
     if has_kokoro:
+        all_backends.append("kokoro")
+    if has_edge:
+        all_backends.append("edge")
+
+    if sherpa_ok:
+        tts = "sherpa"
+        extra.append("sherpa-onnx 离线（%s）" % sherpa_why)
+            # 加载一次约 3.7s，之后常驻；首音约 200ms
+    elif has_kokoro:
         tts = "kokoro"
         extra.append("kokoro + onnxruntime（本地，离线可用；首次加载约 20 秒，之后每句数秒）")
     elif has_edge:
@@ -392,14 +550,24 @@ def caps():
         if not has_kokoro:
             miss.append("kokoro/onnxruntime")
         extra.append("不可用：缺少 " + "、".join(miss) + "（pip install edge_tts 即可）")
-    # 兜底后端也报出来，别让人以为只有一个
-    if tts == "kokoro" and has_edge:
-        extra.append("；edge 作为兜底")
-    elif tts == "edge" and has_kokoro:
-        extra.append("；kokoro 也可用")
+    # 兜底链也报出来，别让人以为只有一个
+    tail = [b for b in all_backends if b != tts]
+    if tail:
+        extra.append("兜底依次：" + " → ".join(tail))
     why["tts"] = "；".join(extra)
 
-    return {"asr": asr, "tts": tts, "why": why}
+    return {"asr": asr, "tts": tts, "why": why,
+            "backends": all_backends, "silence_end": SILENCE_END,
+            "stream": HAVE_STREAM}
+
+
+def _sherpa_status():
+    """sherpa 能不能用，不抛异常。"""
+    try:
+        import voice_sherpa
+        return voice_sherpa.available()
+    except Exception as e:
+        return False, "voice_sherpa 导入失败：%s" % e
 
 
 # ============================ 录音（能量 VAD） ============================
@@ -442,9 +610,14 @@ class _Vad:
       - 说过话之后连续静音 silence_end 秒 -> 收尾
       - 一直没声音超过 no_speech_timeout 秒 -> 判定为没人说话
       - 总时长超过 max_s -> 强制收尾
+
+    silence_end 默认 0.35 而不是 0.8：实测 Silero 和 TEN VAD 的判定延迟都恰好
+    等于 min_silence_duration（差 30ms，见 docs/语音_开源全景调研与融合设计），
+    也就是说这 0.8 秒里等着的 450ms 全是白等。
+    切太短的风险（说到一半被切断）由 listen() 的续听兜底。
     """
 
-    def __init__(self, samplerate=SAMPLE_RATE, vad_rms=0.012, silence_end=0.8,
+    def __init__(self, samplerate=SAMPLE_RATE, vad_rms=0.012, silence_end=SILENCE_END,
                  no_speech_timeout=3.0, max_s=15.0, block_sec=BLOCK_SEC):
         self.block_sec = block_sec
         self.vad_rms = vad_rms
@@ -510,10 +683,11 @@ class _Vad:
         return (self.last - self.first + 1) * bs
 
 
-def record(max_s=15.0, samplerate=16000, silence_end=0.8, no_speech_timeout=3.0,
+def record(max_s=15.0, samplerate=16000, silence_end=None, no_speech_timeout=3.0,
            vad_rms=0.012, device=None, on_level=None):
     """录一段话并自动切出话段。
 
+    `silence_end` 不传就用模块级 SILENCE_END（默认 0.35，可用 FLEET_SILENCE_END 覆盖）。
     `on_level` 是可选回调，每块音频调一次 `on_level(rms01)`（0~1）。
     界面拿它驱动「球跟着你说话的音量跳」——这就是语音模式里那个球的跃动感。
 
@@ -521,6 +695,7 @@ def record(max_s=15.0, samplerate=16000, silence_end=0.8, no_speech_timeout=3.0,
       info["reason"] = "ok" | "no_speech" | "audio_error" | "no_sounddevice"
       info["duration"] 实际写进 wav 的秒数；info["speech_duration"] VAD 判定的话段秒数
     """
+    silence_end = SILENCE_END if silence_end is None else silence_end
     try:
         import sounddevice as sd
     except Exception as e:
@@ -562,8 +737,8 @@ def record(max_s=15.0, samplerate=16000, silence_end=0.8, no_speech_timeout=3.0,
     pcm = b"".join(frames[start:end + 1])
     if vad.gain > 1.001:
         pcm = _agc_boost_pcm(pcm, vad.gain)
-    path = os.path.join(_tmp_dir(), "rec_%d.wav" % int(time.time() * 1000))
     try:
+        path = os.path.join(_tmp_dir(), "rec_%d.wav" % int(time.time() * 1000))
         _write_wav(path, pcm, samplerate=samplerate)
     except Exception as e:
         return None, {"reason": "audio_error", "error": "写 wav 失败：%s" % e}
@@ -592,6 +767,57 @@ def record(max_s=15.0, samplerate=16000, silence_end=0.8, no_speech_timeout=3.0,
 
 # ============================ 语音识别 ============================
 
+def _whisper_root():
+    """决定 whisper 模型落盘目录。
+
+    2026-10-22 实测事故：兜底值写死 `E:/_models/whisper`，E 盘一拔，
+    ctranslate2 建目录直接 `[WinError 3] 系统找不到指定的路径: 'E:\\'`，
+    ASR 全哑——而且报错里只有盘符，完全看不出是模型目录的问题。
+
+    规则改成：① 显式环境变量最优先（仍会建目录）；
+    ② 老位置**只在真存在时**才用（不再硬造）；
+    ③ 都没有就落到用户可写目录 `%LOCALAPPDATA%/fleet/whisper`；
+    ④ 连那儿都不行就退系统临时目录。
+    任何一步都带原因返回，不再静默。
+    """
+    def _try_make(p):
+        if not p:
+            return None
+        try:
+            os.makedirs(p, exist_ok=True)
+            # 建完要真能写：只读盘上 makedirs 可能"成功"
+            probe = os.path.join(p, ".w")
+            with open(probe, "wb") as f:
+                f.write(b"1")
+            os.remove(probe)
+            return p
+        except OSError:
+            return None
+
+    env_root = os.environ.get("FLEET_WHISPER_DIR")
+    if env_root:
+        got = _try_make(env_root)
+        if got:
+            return got
+        print("[voice] FLEET_WHISPER_DIR=%r 不可写，改用默认位置" % env_root)
+
+    for c in ("E:/_models/whisper", "G:/_models/whisper",
+              "D:/work/_local_ai/whisper"):
+        if os.path.isdir(c):
+            got = _try_make(c)
+            if got:
+                return got
+
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
+    for c in (os.path.join(local, "fleet", "whisper"),
+              os.path.join(os.path.expanduser("~"), ".cache", "fleet", "whisper"),
+              os.path.join(tempfile.gettempdir(), "fleet_whisper")):
+        got = _try_make(c)
+        if got:
+            return got
+    return None
+
+
 def _load_whisper(model, device):
     """懒加载 faster_whisper 模型（模块级单例，只加载一次）。
 
@@ -617,7 +843,7 @@ def _load_whisper(model, device):
 
     # 镜像与落盘位置：必须在 import faster_whisper 之前设好
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-    root = os.environ.get("FLEET_WHISPER_DIR", "G:/_models/whisper")
+    root = _whisper_root()
     local_only = os.environ.get("FLEET_WHISPER_LOCAL", "") == "1"
 
     try:
@@ -625,6 +851,13 @@ def _load_whisper(model, device):
     except Exception as e:
         _WHISPER_CACHE[key] = (None, "none", "缺少 faster_whisper：%s" % e)
         return None, "none", "缺少 faster_whisper：%s" % e
+
+    if root is None:
+        msg = ("找不到可写的 whisper 模型目录（试过 FLEET_WHISPER_DIR、"
+               "E:/_models/whisper、%LOCALAPPDATA%/fleet/whisper 与临时目录）。"
+               "请设环境变量 FLEET_WHISPER_DIR 指到一个可写目录")
+        _WHISPER_CACHE[key] = (None, "none", msg)
+        return None, "none", msg
 
     def _mk(dev, compute):
         kw = {"download_root": root}
@@ -841,7 +1074,11 @@ def _say_edge(text, voice=None, rate=0, play=True, style=None, pitch=None, volum
         print("[voice] edge_tts 不可用：%s" % e)
         return None
 
-    d = _tmp_dir()
+    try:
+        d = _tmp_dir()
+    except RuntimeError as e:
+        print("[voice] edge_tts 跳过：%s" % e)
+        return None
     stamp = int(time.time() * 1000)
     mp3 = os.path.join(d, "tts_%d.mp3" % stamp)
     wav = os.path.join(d, "tts_%d.wav" % stamp)
@@ -940,7 +1177,11 @@ def _say_kokoro(text, voice=None, rate=0, play=True):
         print("[voice] kokoro 不可用：%s" % e)
         return None
 
-    d = _tmp_dir()
+    try:
+        d = _tmp_dir()
+    except RuntimeError as e:
+        print("[voice] kokoro 跳过：%s" % e)
+        return None
     wav = os.path.join(d, "kokoro_%d.wav" % int(time.time() * 1000))
     try:
         speed = 1.0 + (float(rate) / 100.0 if rate else 0.0)
@@ -961,6 +1202,46 @@ def _say_kokoro(text, voice=None, rate=0, play=True):
     if play:
         _play(wav)
     return "kokoro", wav
+
+
+def _say_sherpa(text, rate=0, play=True):
+    """sherpa-onnx 离线合成。返回 (backend, path) 或 None。
+
+    放在 kokoro/edge 前面，理由是实测过的三条：
+      · 离线，断网也能念（edge 断网就哑）
+      · 不用 ffmpeg（edge 出 mp3 必须转码，本机 PATH 里一直没有）
+      · 首音 211ms（首短尾长切块），且加载一次 3.7s 后进程内常驻
+    huayan 的数据集许可未声明（上游 License: Unknown，且微调自非商用音色），
+    所以这条只用于自用；要对外发布用 icefall-aishell3（双 Apache-2.0，8kHz）。
+    换模型设 FLEET_TTS_MODEL=icefall 即可，不用改代码。
+    """
+    try:
+        import voice_sherpa
+    except Exception as e:
+        print("[voice] voice_sherpa 不可用：%s" % e)
+        return None
+    ok, why = voice_sherpa.available()
+    if not ok:
+        return None
+    try:
+        d = _tmp_dir()
+    except RuntimeError as e:
+        print("[voice] sherpa 跳过：%s" % e)
+        return None
+    wav = os.path.join(d, "sherpa_%d.wav" % int(time.time() * 1000))
+    speed = 1.0 + (float(rate) / 100.0 if rate else 0.0)
+    try:
+        p, sr = voice_sherpa.synth_to_wav(
+            text, wav, speed=speed,
+            prefer=os.environ.get("FLEET_TTS_MODEL") or None)
+        if not p:
+            return None
+    except Exception as e:
+        print("[voice] sherpa 合成失败：%s" % e)
+        return None
+    if play:
+        _play(wav)
+    return "sherpa", wav
 
 
 _ACTION_RE = re.compile(r"[（(][^）)]{0,40}[）)]")
@@ -985,23 +1266,35 @@ def strip_actions(text):
 
 
 def say(text, voice=None, rate=0, play=True, pitch=None, volume=None,
-        kokoro_voice=None):
+        kokoro_voice=None, cleanup=True):
     """把文字念出来。返回 (backend, path|None)。
 
-    backend 依次尝试：kokoro（本地，音色更自然） -> edge（在线，音色多） -> none。
+    backend 依次尝试：sherpa（离线，最快） -> kokoro（本地） -> edge（在线） -> none。
+    * sherpa 要装了 sherpa-onnx 且找得到模型，否则跳过（见 voice_sherpa.py）；
     * 本机没装 kokoro 或合成失败，自动落到 edge；
-    * 两个都不可用返回 ("none", None)，只打印不抛。
+    * 都不可用返回 ("none", None)，只打印不抛。
 
-    念之前会剥掉括号动作与 markdown 记号（见 `strip_actions`）。
-    play=False 时只合成不播放（自测/网页取音频用）。
+    念之前会：
+      · 剥掉括号动作与 markdown 记号（见 `strip_actions`）
+      · 把数字/日期/金额/百分比展开成中文读法（见 `voice_stream.normalize_zh`）
+    这两步顺序不能反：先剥动作，免得把「（看了 3 次）」里的数字也念出来。
+    play=False 时只合成不播放（自测/网页取音频/流式合成的原料）。
+    cleanup=False 时不清理临时目录——流式合成要预取下一块，清早了会把正在播的删掉。
     """
     text = strip_actions(text or "")
+    text = _norm_zh(text)
     if not text:
         return "none", None
 
-    _cleanup_tmp()
+    if cleanup:
+        _cleanup_tmp()
 
     # 本地优先：离线、隐私、音色连续（edge 走网络，断网就哑）
+    # sherpa 排最前：不依赖 ffmpeg、加载后常驻、首音最快
+    res = _say_sherpa(text, rate=rate, play=play)
+    if res:
+        return res
+
     res = _say_kokoro(text, voice=kokoro_voice or voice, rate=rate, play=play)
     if res:
         return res
@@ -1011,8 +1304,47 @@ def say(text, voice=None, rate=0, play=True, pitch=None, volume=None,
     if res:
         return res
 
-    print("[voice] 没有任何可用的 TTS 后端（kokoro / edge_tts 都没装或都失败）")
+    print("[voice] 没有任何可用的 TTS 后端（sherpa / kokoro / edge_tts 都没装或都失败）")
     return "none", None
+
+
+def speak_streamed(text, interruptible=True, mic_device=None, on_first_audio=None,
+                   on_chunk=None, head=7, tail=18):
+    """边合成边播放，且能被用户打断。返回一份统计 dict。
+
+    和 say() 的区别只有两点，但都是体感级：
+      1. **首音先出**：say() 要等整段合成完（实测 39 字 906ms）；
+         这里首块只 7 字，约 211ms 就出声，后面的块在播的时候继续合成。
+      2. **能打断**：播放期间盯着麦克风，听到连续人声就立刻停。
+         不能打断的助手会让人本能地缩短句子——这比音色重要。
+
+    synth 复用 say(play=False)，所以 kokoro/edge 的择优逻辑、动作剥离、
+    文本规范化全都还在，没有第二套合成链。
+
+    返回 dict 里 first_audio_ms 是「从调用到出声」的毫秒数，
+    interrupted 是「被用户打断」，errors 是某几块合成失败的原因。
+    """
+    if not HAVE_STREAM:
+        # 降级：整段念完（旧行为），并如实报告
+        backend, path = say(text, play=True)
+        return {"chunks": 1, "served": 1 if path else 0, "interrupted": False,
+                "first_audio_ms": None, "why": "voice_stream 不可用，已降级整段",
+                "backend": backend}
+
+    def synth(t):
+        _backend, path = say(t, play=False, cleanup=False)
+        return path
+
+    mic = None
+    if interruptible:
+        mic = _MicWatcher(device=mic_device)
+
+    sp = _Speech(synth=synth, mic=mic)
+    r = sp.run(text, interruptible=interruptible,
+               on_first_audio=on_first_audio, on_chunk=on_chunk)
+    if mic is not None and mic.why:
+        r["mic_why"] = mic.why
+    return r
 
 
 # ============================ 自测 ============================
@@ -1035,7 +1367,11 @@ def _selftest():
         ok = False
         print("[FAIL] caps():", e)
 
-    d = _tmp_dir()
+    try:
+        d = _tmp_dir()
+    except RuntimeError as e:
+        print("[FAIL] 临时目录：", e)
+        return False
 
     # 2) VAD：用 numpy 合成 静音0.5s + 1kHz正弦1.0s + 静音1.2s，验证能切出约 1.0s 话段
     try:

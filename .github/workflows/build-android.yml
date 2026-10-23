@@ -1,0 +1,52 @@
+name: build-android
+
+# 手机端独立一条流水线。跟 build-gui 用 paths 过滤隔开：
+# 改安卓不会连带重启桌面打包，反之亦然——这是"一次只构一个"的机制保证，
+# 不靠人记。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tianwang_android/**"
+      - ".github/workflows/build-android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # AGP 之外手搓构建只需要 JDK；17 足够跑 d8/apksigner
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 打印工具链
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/build-tools" || true
+          ls "$ANDROID_HOME/platforms" || true
+          java -version 2>&1 | head -3
+
+      - name: 构建 APK
+        env:
+          # 签名密钥用 secret 注入；没配就退回临时密钥（能装，但重装会因签名不同失败）
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: bash tianwang_android/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tianwang-android
+          path: tianwang_android/build/tianwang.apk
+          if-no-files-found: error
+
+      - name: 打成 tag 就挂到 release 上
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tianwang_android/build/tianwang.apk

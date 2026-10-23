@@ -1,0 +1,53 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# glslc 兼容层：llama.cpp 的着色器生成器只会调 glslc（shaderc 那套），
+# 而 Termux 没有 shaderc 包，只有 glslangValidator。输入语言是同一个 GLSL，
+# 差别只在参数拼法，翻译过去就行，不必去编整个 shaderc。
+#
+# 要处理的四个坑（每一条都是被实际的编译错误逼出来的）：
+#  ① 参数名不同：glslc 的 -fshader-stage=compute 对应 glslang 的 -S comp。
+#  ② 这些着色器用 #include 组织公共函数，glslc 默认允许，glslang 必须先声明
+#     GL_GOOGLE_include_directive。用 --preamble-text 注入——它插在 #version
+#     之后，正好是 #extension 合法出现的位置（插在 #version 之前直接语法错）。
+#  ③ glslc 的 -MD/-MF/-MT 是生成 .d 依赖文件，glslang 没有。必须把它们的
+#     **参数**也吃掉，否则那个路径会被当成输入文件，报 unable to open input file。
+#     但 ninja 那边又确实要 .d，所以这里自己写一份最小的：目标: 依赖。
+#  ④ 生成器的失败判定是 `exit_code != 0 || !stderr_str.empty()`——
+#     glslang 成功时也会往 stderr 打一行输入文件名，于是「编译成功」被判成失败。
+#     所以成功时必须完全闭嘴，只把日志留在失败时吐出来。
+out=""; stage=""; target="vulkan1.0"; pass=""; input=""; dep=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -fshader-stage=*) stage="${1#-fshader-stage=}"; shift ;;
+    --target-env=*) target="${1#--target-env=}"; shift ;;
+    -D*|-I*|-U*) pass="$pass $1"; shift ;;
+    -x) shift 2 ;;
+    -MF|-MT) dep="$2"; [ "$1" = "-MT" ] && dep=""; shift 2 ;;
+    -MD|-MP|-O) shift ;;
+    -*) shift ;;
+    *) [ -z "$input" ] && input="$1"; shift ;;
+  esac
+done
+case "$stage" in
+  vertex) stage=vert ;; fragment) stage=frag ;; compute) stage=comp ;;
+  geometry) stage=geom ;; tesscontrol) stage=tesc ;; tesseval) stage=tese ;;
+  "") stage=comp ;;
+esac
+[ -n "$out" ] || out=a.spv
+
+LOG="${TMPDIR:-$HOME}/.glslc_$$.log"
+glslangValidator -V --target-env "$target" -S "$stage" \
+  --preamble-text "#extension GL_GOOGLE_include_directive : require" \
+  $pass -o "$out" "$input" > "$LOG" 2>&1
+rc=$?
+if [ $rc -ne 0 ] || grep -q "ERROR" "$LOG"; then
+  cat "$LOG" >&2
+  rm -f "$LOG"
+  exit 1
+fi
+rm -f "$LOG"
+# 给 ninja 一个能用的依赖文件（内容粗糙但合法：目标依赖输入）
+if [ -n "$dep" ]; then
+  printf '%s: %s\n' "$out" "$input" > "$dep"
+fi
+exit 0

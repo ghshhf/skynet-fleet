@@ -12,6 +12,7 @@
   FLEET_QUEUE     fleet_queue.json      —— 待办队列账本
 """
 import os
+import shutil
 import sys
 import tempfile
 
@@ -39,19 +40,25 @@ def _apply():
     for key, val in overrides.items():
         os.environ.setdefault(key, val)
 
-    # 出厂卡种子：FLEET_CARD_DIR 指向的可写目录还是空的（首次运行），而
-    # 打包时 cards/ 已随包放进 MEIPASS——把出厂卡复制过去，用户改卡/下载新卡
-    # 都落在可写目录，升级 exe 不丢卡。
+    # 卡片库不只是「可写路径」，还是**初始数据**：语音对话视图没有卡就没有
+    # 人格、没有音色（say_for_card 查不到卡就落到默认音色）。而 %APPDATA%/fleet/cards
+    # 首次是空的 ⇒ 从冻扁包内置的 cards/ 播种一次。
+    # 只补缺，不覆盖：用户自己改过/加过的卡永远优先。
+    card_dir = overrides["FLEET_CARD_DIR"]
     try:
-        card_dir = os.environ["FLEET_CARD_DIR"]
-        src_cards = os.path.join(meipass, "cards")
-        if os.path.isdir(src_cards) and not os.path.exists(
-                os.path.join(card_dir, "active.json")) and not any(
-                f.endswith(".json") for f in os.listdir(card_dir)):
-            import shutil
-            shutil.copytree(src_cards, card_dir, dirs_exist_ok=True)
-    except Exception:
-        pass  # 种子失败不拦启动：卡库空时上层有明确报错
+        os.makedirs(card_dir, exist_ok=True)
+        src = os.path.join(meipass, "cards")
+        if os.path.isdir(src):
+            for fn in os.listdir(src):
+                sp = os.path.join(src, fn)
+                dp = os.path.join(card_dir, fn)
+                # 只拷文件，compiled/ 这类子目录是缓存，不播
+                if os.path.isfile(sp) and not os.path.exists(dp):
+                    shutil.copy2(sp, dp)
+    except OSError:
+        # 播种失败不阻塞启动：卡库空会在界面上表现为「没有卡」，
+        # 比启动直接崩掉要好查得多。
+        pass
 
 
 _apply()
