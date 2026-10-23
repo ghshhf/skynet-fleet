@@ -81,6 +81,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="设备编队 · Windows 图形版")
     ap.add_argument("--no-window", action="store_true",
                     help="只跑本地服务，不开窗口（无 GUI 环境用）")
+    ap.add_argument("--voice", action="store_true",
+                    help="天网语音模式：不开网页壳，直接进大光球语音桌面（Tk）")
     ap.add_argument("--smoke", action="store_true",
                     help="起服务探 /api/health 后退出（CI / 打包冒烟，不开窗）")
     ap.add_argument("--port", type=int, default=0,
@@ -91,6 +93,16 @@ def main(argv=None):
 
     if args.smoke:
         return _smoke()
+
+    # 天网语音模式：独立 Tk 界面（大光球 + 字幕 + 通话式连续对话），
+    # 不开网页壳也不起本地服务——语音栈直接走 llm 后端链。
+    # 嵌合而非分叉：同一份卡库（cards/）、同一个统一卡层（persona_card）。
+    if args.voice:
+        try:
+            import desktop as _tianwang
+        except Exception as e:
+            raise SystemExit("语音模式起不来：%s\n（缺依赖就先 pip install -r requirements.txt）" % e)
+        return _tianwang.main()
 
     # W2：注入审批中枢。有副作用的能力会被注册表拦在闸门上，挂起等主人在
     # 弹窗里点确认。判定权始终在注册表层（要不要审批、几级、要不要双确认），

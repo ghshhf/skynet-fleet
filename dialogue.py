@@ -52,7 +52,7 @@ except Exception:                    # pragma: no cover
     persona = None
 
 try:
-    import persona_card
+    import tianwang_cards as persona_card   # 嵌合件：走 X6 统一卡层
 except Exception:                    # pragma: no cover - 角色卡模块由同事并行实现
     persona_card = None
 

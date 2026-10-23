@@ -18,6 +18,7 @@
 pywebview>=5
 
 # —— 设备能力依赖的第三方 ——
+edge-tts>=6.1
 adb-shell>=0.4
 cryptography>=42
 pycryptodome>=3.20
