@@ -27,10 +27,8 @@ public class OrbView extends View {
     public static final int THINK = 2;
     public static final int SPEAK = 3;
 
-    private static final int COLOR_IDLE = 0xFF30363D;
-    private static final int COLOR_LISTEN = 0xFF3FB950;
-    private static final int COLOR_THINK = 0xFFD29922;
-    private static final int COLOR_SPEAK = 0xFF58A6FF;
+    // 配色统一走 values/colors.xml（含 values-night 的深色版），
+    // 这里不再写死 ARGB —— 写死就会在另一套主题下变成看不见或太黑。
 
     private final Paint corePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -83,12 +81,16 @@ public class OrbView extends View {
     }
 
     private int color() {
+        // 颜色必须从资源取，不能写死：这个 App 有浅色和深色两套底，
+        // 原来待机色是写死的深灰 —— 换到浅色底上，球就成了一个黑洞。
+        int res;
         switch (state) {
-            case LISTEN: return COLOR_LISTEN;
-            case THINK:  return COLOR_THINK;
-            case SPEAK:  return COLOR_SPEAK;
-            default:     return COLOR_IDLE;
+            case LISTEN: res = R.color.listen; break;
+            case THINK:  res = R.color.think;  break;
+            case SPEAK:  res = R.color.accent; break;
+            default:     res = R.color.orb_idle;
         }
+        return getResources().getColor(res, null);
     }
 
     /** 速度：待机最慢，听/说中等，想最快。 */

@@ -66,6 +66,14 @@ public final class Net {
         void onLine(String text);
         void onError(String message);
         void onDone();
+
+        /** 联网进度。用 default 方法，老调用方不用改。
+         *
+         * 服务端在真正开始生成之前会推两条：phase=searching（正在搜）、
+         * phase=done（搜完了，带 sources）。搜索要十几秒，不推这条的话
+         * 界面上就是一块不动的空白，用的人会以为卡死。
+         */
+        default void onWeb(org.json.JSONObject data) { }
     }
 
     private Net() { }
@@ -96,11 +104,18 @@ public final class Net {
      */
     public static void chat(String base, Auth auth, String prompt, String backends,
                             JSONArray history, SseCallback cb) {
+        chat(base, auth, prompt, backends, history, cb, "auto");
+    }
+
+    /** web：off / on / auto。不传或空 = auto（服务端按问题判断要不要搜）。 */
+    public static void chat(String base, Auth auth, String prompt, String backends,
+                            JSONArray history, SseCallback cb, String web) {
         HttpURLConnection c = null;
         try {
             JSONObject req = new JSONObject();
             req.put("prompt", prompt);
             req.put("backends", backends == null ? "" : backends);
+            req.put("web", (web == null || web.isEmpty()) ? "auto" : web);
             if (history != null && history.length() > 0) {
                 req.put("history", history);
             }
@@ -137,6 +152,9 @@ public final class Net {
                         got = true;
                         cb.onLine(t);
                     }
+                } else if ("web".equals(type)) {
+                    // 联网进度帧：不影响"有没有答出来"的判断，单独回调。
+                    cb.onWeb(ev.optJSONObject("data"));
                 } else if ("error".equals(type)) {
                     lastErr = ev.optString("err", "后端报了错但没给原因");
                 } else if ("done".equals(type)) {

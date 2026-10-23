@@ -1,12 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  浅色为默认，深色放 values-night —— 跟随系统，不另做开关。
+
+  为什么默认浅色：参考页是浅色底、大留白的聊天布局，对话区纯白才能让
+  「气泡」和「留白」拉开层次。原来的深色版并没有删，只是挪到 values-night，
+  两套用同名资源，所有 drawable 自动跟着变，不需要写两套布局。
+-->
 <resources>
-    <color name="bg">#0B0F14</color>
-    <color name="surface">#161B22</color>
-    <color name="line">#30363D</color>
-    <color name="text">#E6EDF3</color>
-    <color name="text_dim">#8B949E</color>
-    <color name="accent">#58A6FF</color>
-    <color name="listen">#3FB950</color>
-    <color name="think">#D29922</color>
-    <color name="alert">#DA3633</color>
+    <color name="bg">#FFFFFF</color>            <!-- 聊天区底色 -->
+    <color name="surface">#F4F4F5</color>       <!-- 输入坞 / AI 气泡 -->
+    <color name="surface2">#EBEBEE</color>      <!-- 抽屉选中项 / 按下的胶囊 -->
+    <color name="drawer">#FCFCFD</color>        <!-- 抽屉底色，比纯白差一点点 -->
+    <color name="line">#E4E4E7</color>          <!-- 分隔线 / 描边 -->
+    <color name="text">#18181B</color>
+    <color name="text_dim">#71717A</color>
+    <color name="text_faint">#A1A1AA</color>
+
+    <color name="accent">#00A67E</color>        <!-- 就是参考页顶部那个绿点 -->
+    <color name="accent_soft">#E6F6F1</color>   <!-- 胶囊选中底 -->
+    <color name="on_accent">#FFFFFF</color>
+
+    <color name="mine_bg">#E6F6F1</color>       <!-- 我说的气泡：淡绿，跟 accent 同族 -->
+    <color name="mine_line">#BFE9DC</color>
+    <color name="mine_text">#0B3B30</color>
+
+    <color name="icon">#3F3F46</color>          <!-- 图标本体 -->
+    <color name="orb_idle">#C4C9D0</color>      <!-- 待机光球：浅底上要"在"但不能黑 -->
+    <color name="listen">#16A34A</color>
+    <color name="think">#B45309</color>
+    <color name="alert">#DC2626</color>
+    <color name="scrim">#66101010</color>       <!-- 抽屉后面的遮罩 -->
 </resources>

@@ -176,12 +176,19 @@ def engine_health():
 # 取正文
 # --------------------------------------------------------------------------
 
-def fetch_text(url, timeout=15.0, budget=25.0, gap=0.8, force_channel=None):
+def fetch_text(url, timeout=15.0, budget=25.0, gap=0.8, force_channel=None,
+               max_chars=4000):
     """取一个 URL 的正文。返回 dict（不抛异常，失败也带原因）。
 
     🔴 skynet 的 `net.fetch_text()` 返回 `FetchResult`（dataclass），字段是
     `url/ok/status/size/final_url/channel/elapsed/text/data/error/cached/hops`。
     这里把它拍平成 dict，好让上层能力信封直接 JSON 化。
+
+    `max_chars` 控制 `text` 的截断长度，默认 4000（能力信封回传体积别太大）。
+    ⚠️ **调用方要正文时务必调大**：`skynet` 的 text 是**整页原始 HTML**，
+    4000 字往往连 `<head>` 都没走完 —— 正文压根不在里面。联网检索
+    （`webtool.py`）就是踩了这个坑：拿到的「正文」全是 og:/meta 标签。
+    注意 `chars` 字段始终是**全文**长度，与截断无关。
     """
     _ensure_path()
     from skynet import net as N
@@ -196,7 +203,7 @@ def fetch_text(url, timeout=15.0, budget=25.0, gap=0.8, force_channel=None):
         "channel": getattr(res, "channel", ""),
         "size": getattr(res, "size", 0),
         "chars": len(text),
-        "text": text[:4000],
+        "text": text[:max_chars],
         "hops": list(getattr(res, "hops", []) or []),
         "error": getattr(res, "error", "") or "",
     }

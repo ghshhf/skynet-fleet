@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 抽屉菜单项：按下才出现浅底，平时完全隐形（参考页就是纯文字 + 图标） -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="@color/surface2">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#00FFFFFF" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+</ripple>

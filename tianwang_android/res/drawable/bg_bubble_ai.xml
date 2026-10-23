@@ -1,11 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 它说的：左下角切平 -->
+<!-- 它说的：左下一个角切平 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
     <solid android:color="@color/surface" />
     <corners
-        android:topLeftRadius="14dp"
-        android:topRightRadius="14dp"
-        android:bottomLeftRadius="4dp"
-        android:bottomRightRadius="14dp" />
-    <stroke android:width="1dp" android:color="@color/line" />
+        android:topLeftRadius="18dp"
+        android:topRightRadius="18dp"
+        android:bottomLeftRadius="5dp"
+        android:bottomRightRadius="18dp" />
 </shape>

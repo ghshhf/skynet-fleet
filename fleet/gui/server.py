@@ -417,7 +417,7 @@ class FleetServer:
                            "at": time.time()})
         return r.as_dict()
 
-    def chat(self, prompt, backends="", history=None):
+    def chat(self, prompt, backends="", history=None, web="auto"):
         """对话：走 registry.call('ai.chat')，带 _on_line 回调。
 
         backends：逗号分隔的后端白名单（空 = 全部后端，跟以前一样）。
@@ -428,21 +428,46 @@ class FleetServer:
         在这一层改成 messages 会让所有适配器一起崩。折成带标记的转写，
         语义等价、零回归，代价是历史也算进 prompt 的 token。
 
+        web：「off」不联网 /「on」强制联网 /「auto」按问题判断（默认）。
+        联网在这里做、**不在 ai.chat 里做**：ai.chat 挂着十几个后端，
+        每个后端都去搜一遍是浪费；而且搜索是 10~20 秒的阻塞活，必须在
+        这一层先把「正在查」推给前端，否则人看到的是一块不动的空白。
+
         reg.call 是阻塞的（生成完才返回），所以这里在**工作线程**里跑它，
         把 _on_line 收到的行推进队列；调用方（HTTP 线程）从队列取，边收边写 SSE。
         """
+        # 联网只该看「这一轮问了什么」。必须先存下原始问题：下面 prompt 会被
+        # 折成「用户:… 助手:… 用户:…」的转写，拿它去搜会变成一堆对话标记，
+        # 搜出来全是垃圾；而且缓存 key 每轮都不同，缓存等于没有。
+        raw_prompt = prompt
         prompt = _fold_history(history, prompt)
         system = self.persona.system_prompt(prompt)
         q = queue.Queue()
+        web_mode = (web or "auto").strip().lower() if isinstance(web, str) else "auto"
 
         def _on_line(text):
             q.put({"type": "line", "text": text})
 
         def _work():
             try:
+                sys2 = system
+                if web_mode != "off":
+                    q.put({"type": "web", "data": {"phase": "searching",
+                                                   "mode": web_mode}})
+                    try:
+                        import webtool as WEB
+                        sys2, rep = WEB.augment(system, raw_prompt, mode=web_mode)
+                        rep["phase"] = "done"
+                        q.put({"type": "web", "data": rep})
+                    except Exception as e:
+                        # 联网是增强，不是前置条件：它挂了这轮照常答，
+                        # 但必须把原因说出来，不许静默降级成「没联网」。
+                        q.put({"type": "web", "data": {
+                            "phase": "error", "used": False, "mode": web_mode,
+                            "reason": f"联网失败：{type(e).__name__}: {e}"}})
                 r = self.executor.call(
                     "ai.chat",
-                    args={"prompt": prompt, "system": system,
+                    args={"prompt": prompt, "system": sys2,
                           "backends": backends, "_on_line": _on_line},
                     gate=self.chat_gate)
                 q.put({"type": "done", "result": r.as_dict()})
@@ -1817,7 +1842,12 @@ class _Handler(BaseHTTPRequestHandler):
         # 多轮：手机/网页可以带上前几轮，这里只做透传，折叠在 Fleet.chat 里做
         # （放那儿是因为「怎么折」是对话层的事，不是 HTTP 层的事）。
         hist = body.get("history")
-        q = self.fleet.chat(prompt, backends, history=hist)
+        # 联网开关：off / on / auto（不传 = auto，保持老行为不变的前提下默认能联网）。
+        # 之所以默认 auto 而不是 off：用户说「让模型能联网」，默认就该有这个能力；
+        # auto 又只在判到时效问题时才真去搜，不会让每条闲聊都等十几秒。
+        web = body.get("web")
+        web = web if isinstance(web, str) and web.strip() else "auto"
+        q = self.fleet.chat(prompt, backends, history=hist, web=web)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
