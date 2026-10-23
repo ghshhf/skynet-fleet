@@ -112,6 +112,66 @@ SPECS = {
             {"name": "items", "type": "list", "required": False, "desc": "import 时传入的记忆列表"},
         ],
     },
+    "job.submit": {
+        "title": "提交长任务（作业）",
+        "desc": "把一项耗时任务提交成作业：可排队、可查询、可取消；节点掉线会退回队列换机重跑",
+        "params": [
+            {"name": "cap", "type": "str", "required": True, "desc": "要执行的能力名，如 image.gen"},
+            {"name": "args", "type": "json", "required": False, "desc": "该能力的参数"},
+            {"name": "node", "type": "str", "required": False, "desc": "指定节点，留空自动挑"},
+            {"name": "max_attempts", "type": "int", "required": False, "desc": "最多尝试次数，默认 3"},
+            {"name": "note", "type": "str", "required": False, "desc": "备注"},
+        ],
+    },
+    "job.list": {
+        "title": "作业列表",
+        "desc": "按提交时间倒序列出作业，可按状态过滤",
+        "params": [
+            {"name": "state", "type": "str", "required": False,
+             "desc": "queued/running/done/failed/cancelled"},
+            {"name": "limit", "type": "int", "required": False, "desc": "最多几条，默认 50"},
+        ],
+    },
+    "job.get": {
+        "title": "作业详情",
+        "desc": "查一个作业的状态、尝试次数、结果与状态历史",
+        "params": [{"name": "id", "type": "str", "required": True, "desc": "作业 id"}],
+    },
+    "job.cancel": {
+        "title": "取消作业",
+        "desc": "取消排队中或运行中的作业；已终态的作业会如实说不必取消",
+        "params": [
+            {"name": "id", "type": "str", "required": True, "desc": "作业 id"},
+            {"name": "reason", "type": "str", "required": False, "desc": "取消原因"},
+        ],
+    },
+    "artifact.put": {
+        "title": "收产物",
+        "desc": "把一个文件或一段字节收进产物仓库，返回内容寻址 id（换机器也能引用）",
+        "params": [
+            {"name": "path", "type": "str", "required": False, "desc": "本机文件路径"},
+            {"name": "b64", "type": "str", "required": False, "desc": "base64 内容（与 path 二选一）"},
+            {"name": "kind", "type": "str", "required": False, "desc": "image/video/text/blob"},
+            {"name": "name", "type": "str", "required": False, "desc": "显示名"},
+            {"name": "job", "type": "str", "required": False, "desc": "关联作业 id"},
+            {"name": "source", "type": "str", "required": False, "desc": "来源节点"},
+            {"name": "ttl_days", "type": "float", "required": False, "desc": "保留天数，0=永久"},
+        ],
+    },
+    "artifact.get": {
+        "title": "取产物",
+        "desc": "按 id 取回产物内容（base64）",
+        "params": [{"name": "id", "type": "str", "required": True, "desc": "产物 id"}],
+    },
+    "artifact.list": {
+        "title": "产物列表",
+        "desc": "列出产物仓库里的内容，可按 kind/job 过滤",
+        "params": [
+            {"name": "kind", "type": "str", "required": False, "desc": "按类型过滤"},
+            {"name": "job", "type": "str", "required": False, "desc": "按作业过滤"},
+            {"name": "limit", "type": "int", "required": False, "desc": "最多几条"},
+        ],
+    },
     "skynet.relay": {
         "title": "SkyNet relay 状态",
         "desc": "返回本节点是否跑着 SkyNet relay 及其监听端口，供他机经端口转发取页",
@@ -143,6 +203,10 @@ ALIASES = {
     "image.gen.run": "image.gen",
     "video.gen.run": "video.gen",
     "fleet.memory.sync.run": "fleet.memory.sync",
+    "job.run": "job.submit",
+    "art.put": "artifact.put",
+    "art.get": "artifact.get",
+    "art.list": "artifact.list",
 }
 
 # 旧基线的类型词汇 → 设备层的类型词汇
