@@ -566,6 +566,7 @@ def notifications(serial, limit=10):
 BRIDGE_LOCAL_PORT = 18765     # 电脑侧 adb forward 端口
 BRIDGE_REMOTE_PORT = 8765     # 手机侧编队桥监听端口
 BRIDGE_TOKEN_ENV = "FLEET_BRIDGE_TOKEN"
+BRIDGE_SVC = "app.fleet.bridge/app.fleet.bridge.BridgeService"
 
 
 def bridge_token():
@@ -581,11 +582,64 @@ def bridge_token():
     return ""
 
 
+def bridge_health(serial):
+    """无障碍服务在没在系统里登记着（不是问它活没活，是问系统认不认它）。
+
+    为什么要单独查：小米/HyperOS 这类 ROM 会在重启后把「侧载应用的无障碍服务」
+    静默关掉——`pm list packages` 里有、App 也在，但系统不再往它派事件，
+    表现就是「桥连上了、鉴权回空」。这不是坏了，是被关掉了，写回去就能好。
+    """
+    rc, txt = shell(serial, "settings get secure enabled_accessibility_services")
+    on = BRIDGE_SVC in (txt or "")
+    return {"ok": rc == 0, "enabled": on, "raw": (txt or "").strip()}
+
+
+def bridge_ensure(serial, wait=1.6):
+    """把无障碍服务写回系统设置（幂等）。返回是否「本来就在」。
+
+    只写设置、不弹 UI：shell 有 WRITE_SECURE_SETTINGS，一步到位，
+    不需要人去「设置 → 无障碍」里点。写不进去（ROM 限制）就返回 False，
+    由上层如实报「需要手动开一次」。
+    """
+    h = bridge_health(serial)
+    if h.get("enabled"):
+        return {"ok": True, "healed": False, "why": "本来就在"}
+    shell(serial, f"settings put secure enabled_accessibility_services {BRIDGE_SVC}")
+    shell(serial, "settings put secure accessibility_enabled 1")
+    time.sleep(wait)
+    h2 = bridge_health(serial)
+    return {"ok": bool(h2.get("enabled")), "healed": True,
+            "why": "已写回" if h2.get("enabled") else f"写不进去：{h2.get('raw','')[:60]}"}
+
+
 def bridge_cmd(serial, cmd, timeout=8):
     """经 adb forward 隧道给编队桥发一条指令。
 
     手机侧服务只听 127.0.0.1，隧道由 adb 建，所以不需要把端口暴露到局域网。
+
+    失败时自愈一次：先查无障碍服务有没有被 ROM 关掉，没有就写回去再重试。
+    加了这层之后，「重启后中文打不进去」这类事故会自己好，不用人再去设置里点。
     """
+    r = _bridge_once(serial, cmd, timeout)
+    if r.get("ok"):
+        return r
+    heal = bridge_ensure(serial)
+    if not heal.get("ok"):
+        r["err"] = f"{r.get('err','')}（无障碍服务没开，自动写回也失败：{heal.get('why')}）"
+        return r
+    if not heal.get("healed"):
+        time.sleep(0.6)          # 服务在但不是没响应，给一次喘息再问
+    r2 = _bridge_once(serial, cmd, timeout)
+    if r2.get("ok"):
+        r2["healed"] = heal.get("healed")
+        return r2
+    r2.setdefault("err", "")
+    r2["err"] = f"{r2['err']}（自愈已尝试：{heal.get('why')}）"
+    return r2
+
+
+def _bridge_once(serial, cmd, timeout=8):
+    """单次尝试，不带任何自愈逻辑（自愈放在 bridge_cmd 里，避免递归爆炸）。"""
     tok = bridge_token()
     if not tok:
         return {"ok": False, "err": "找不到编队桥令牌（先跑 android_bridge/build.sh）"}

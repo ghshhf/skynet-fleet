@@ -99,6 +99,13 @@
                 style="@style/Chip"
                 android:text="模型库" />
 
+            <!-- 扫频：手机是编队里唯一有天线的东西。电脑的射频被自己开的
+                 热点占满、也不再扫周边 AP，蜂窝频段电脑连基带都没有。 -->
+            <TextView
+                android:id="@+id/btnRadio"
+                style="@style/Chip"
+                android:text="扫频" />
+
             <TextView
                 android:id="@+id/btnPair"
                 style="@style/Chip"

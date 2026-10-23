@@ -52,6 +52,7 @@ public class MainActivity extends Activity {
     private TextView btnImg;
     private TextView btnDev;
     private TextView btnModels;
+    private TextView btnRadio;
     private TextView btnPair;
     private TextView btnClear;
     private EditText input;
@@ -106,6 +107,7 @@ public class MainActivity extends Activity {
         btnImg = findViewById(R.id.btnImg);
         btnDev = findViewById(R.id.btnDev);
         btnModels = findViewById(R.id.btnModels);
+        btnRadio = findViewById(R.id.btnRadio);
         btnPair = findViewById(R.id.btnPair);
         btnClear = findViewById(R.id.btnClear);
         input = findViewById(R.id.input);
@@ -211,6 +213,13 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 startActivity(new Intent(MainActivity.this, ModelActivity.class));
+            }
+        });
+
+        btnRadio.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                scanRadio();
             }
         });
 
@@ -713,6 +722,90 @@ public class MainActivity extends Activity {
 
     private int dp(int v) {
         return (int) (getResources().getDisplayMetrics().density * v);
+    }
+
+    /**
+     * 扫频：把手机当频谱仪。
+     *
+     * 为什么这件事非手机不可：电脑的无线网卡被它自己开的移动热点占满了，
+     * 系统就不再扫周边 AP —— 电脑侧永远只看得见「已经连上的那个网」。
+     * 手机连着热点还能同时扫，周边有多少热点、都在哪个频段，只有它看得见。
+     *
+     * 为什么不用服务端那张等宽表格：手机是比例字体，等宽表一贴就散架，
+     * 看着像乱码。这里重新排成「一行一个热点」，宁可信息少一点也要能读。
+     */
+    private void scanRadio() {
+        final String base = Prefs.baseUrl(this);
+        if (!Prefs.paired(this)) {
+            addHint("还没配对。先点「配对」换一张长期凭据，再扫。");
+            return;
+        }
+        final Net.Auth auth = Net.auth(this);
+        say2("扫频中，约 8 秒…");
+        final TextView bubble = appendMsg(false, "正在让手机扫周边频段…");
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                String text;
+                try {
+                    JSONObject r = Net.call(base, auth, "radio.wifi.survey",
+                            new JSONObject().put("rounds", 1));
+                    text = renderSurvey(r.optJSONObject("data"));
+                } catch (Exception e) {
+                    text = "扫频失败：" + e.getMessage();
+                }
+                final String out = text;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        bubble.setText(out);
+                        scrollToBottom();
+                        say2("扫完了");
+                    }
+                });
+            }
+        });
+    }
+
+    /** 把 radio.wifi.survey 的 data 排成人能读的几行。 */
+    private static String renderSurvey(JSONObject d) {
+        if (d == null) {
+            return "扫频没有返回数据。";
+        }
+        org.json.JSONArray aps = d.optJSONArray("aps");
+        if (aps == null || aps.length() == 0) {
+            return "没扫到热点（射频被占或扫描被系统限流，过几秒再试）。";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("周边 ").append(d.optInt("count")).append(" 个热点");
+        JSONObject bands = d.optJSONObject("bands");
+        if (bands != null && bands.length() > 0) {
+            sb.append("（");
+            java.util.Iterator<String> it = bands.keys();
+            boolean first = true;
+            while (it.hasNext()) {
+                String k = it.next();
+                if (!first) { sb.append(" / "); }
+                sb.append(k).append(" ").append(bands.optInt(k));
+                first = false;
+            }
+            sb.append("）");
+        }
+        int n = Math.min(aps.length(), 10);
+        for (int i = 0; i < n; i++) {
+            JSONObject a = aps.optJSONObject(i);
+            if (a == null) { continue; }
+            String ssid = a.optString("ssid", "");
+            if (ssid.length() == 0) { ssid = "(隐藏)"; }
+            sb.append("\n").append(a.optString("band", "?"))
+              .append(" ch").append(a.optInt("channel"))
+              .append("  ").append(a.optInt("rssi")).append("dBm  ")
+              .append(ssid);
+        }
+        if (aps.length() > n) {
+            sb.append("\n…还有 ").append(aps.length() - n).append(" 个");
+        }
+        return sb.toString();
     }
 
     /** 空对话时的一句提示。用暗色居中，不伪装成气泡——
