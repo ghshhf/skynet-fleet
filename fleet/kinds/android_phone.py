@@ -18,6 +18,7 @@ from .. import acquire
 from .. import creative
 from .. import hotspot_roam
 from .. import ir_trial
+from .. import privacy as PRIV
 from .. import proximity
 from .. import wallprobe
 from ..core import BaseDevice, DeviceResult as R
@@ -92,7 +93,12 @@ class AndroidPhone(BaseDevice):
                 # 只读且**故意不设闸门**：发的每个字节都等于合法播放器零凭据
                 # 第一步就会发的（OPTIONS/DESCRIBE 无凭据/GET 公开路径/ONVIF 组播）。
                 # 401/403 即停、不发 SETUP/PLAY、不带凭据——红线在 fleet/wallprobe.py。
-                "net.wallprobe")
+                "net.wallprobe",
+                # ---- 隐私屏 / 无痕接入（UU 功能盘点 P0-b）----
+                # shade：控制会话期间被控端黑屏+静音（省电+在场的人看不见）；
+                # restore：断开恢复原状（原音量没读到就只亮屏不动音量，不猜）。
+                # 标 side_effect：会真的熄屏/静音/亮屏。
+                "privacy.shade", "privacy.restore")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -489,5 +495,25 @@ class AndroidPhone(BaseDevice):
                                            "不发 SETUP/PLAY、不带任何凭据",
                                    "text": "\n".join(
                                        f"{x['ip']}：{x['verdict']}" for x in recs)})
+
+        # ---- 隐私屏 / 无痕接入（UU 功能盘点 P0-b）----
+        if cap == "privacy.shade":
+            r = PRIV.enter(s, shell_fn=A.shell)
+            if not r.get("ok"):
+                return R.error(cap, r.get("note") or "进入隐私模式失败",
+                               device=self.name, via=self.via)
+            return R.success(cap, self.name, side_effect=True, via=self.via,
+                             data={"cmds": r["cmds"], "prev_volume": r["prev_volume"],
+                                   "state_path": r["state_path"], "note": r["note"] or
+                                   "已黑屏+静音；控制结束后用 privacy.restore 恢复"})
+        if cap == "privacy.restore":
+            r = PRIV.leave(serial=s, shell_fn=A.shell)
+            if not r.get("ok"):
+                return R.error(cap, r.get("note") or "恢复失败",
+                               device=self.name, via=self.via)
+            return R.success(cap, self.name, side_effect=True, via=self.via,
+                             data={"cmds": r["cmds"], "note": r["note"] or
+                                   "已亮屏解锁" + ("，音量已按原值恢复"
+                                                  if not r.get("note") else "")})
 
         return super().invoke(cap, args)

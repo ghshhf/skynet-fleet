@@ -260,6 +260,16 @@ CAPABILITIES = [
                     "silent/partial；拿到视频元数据≠拿到视频（后者要凭据+刑法 285/286）。"
                     "结果追加 ~/.fleet/wallprobe_log.jsonl 时间线，report 按 IP 汇总。"
                     "端口枚举在 net.wallprobe，客户端名单在 hotspot.roam——两件事"),
+    # ---- 隐私屏 / 无痕接入（kind=android_phone；UU 功能盘点 P0-b）----
+    # 控制会话期间被控端黑屏+静音：在场的人看不见听不见、屏幕不解码省电。
+    # 断开 restore 恢复；**原音量没读到就只亮屏不动音量**——静默写默认值
+    # = 覆盖用户原本设置，比不恢复更坏。
+    Capability("privacy.shade", "隐私屏：被控手机黑屏 + 媒体静音（控制会话期间）",
+               note="动手：会真的熄屏+静音。原音量先读后存 ~/.fleet/privacy.json；"
+                    "读完原音量进 restore 时按原值恢复"),
+    Capability("privacy.restore", "恢复隐私屏前的状态：亮屏解锁 + 音量按原值写回",
+               note="动手：会真的亮屏。原音量当时没读到 ⇒ 只亮屏不动音量，"
+                    "返回里明说「音量未动」"),
     # ---- 外部情报（L4：OSINT，拆解公开面拿数据；仅查你拥有/授权的资产）----
     Capability("osint.crt", "证书透明度枚举子域（crt.sh，被动数据、免 key）",
                params=(Param("domain", "str", True, "域名，如 example.com")),
