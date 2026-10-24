@@ -980,6 +980,9 @@ class _Handler(BaseHTTPRequestHandler):
                         for b in (r.data.get("backends") or [])]
         else:
             be_reason = r.err
+        # 后台循环心跳：卡住的循环要**在健康页就看得见**，否则现象只是
+        # 「点了没反应」，而进程活得好好的（总纲 P0-2）。
+        from ..beat import snapshot as _beats
         return {
             "ok": True,
             "version": FLEET_VERSION,
@@ -991,6 +994,7 @@ class _Handler(BaseHTTPRequestHandler):
             "persona": f.persona.snapshot(),
             "uptime_s": round(time.time() - f.started_at, 1),
             "calls": len(f.calls),
+            "loops": _beats(),
         }
 
     def _caps(self):

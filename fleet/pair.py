@@ -148,13 +148,25 @@ class Beacon:
         self._stop.clear()
 
         def _loop():
+            try:
+                from .beat import register
+            except (ImportError, ValueError):
+                from beat import register
+            bt = register("pair.beacon", stale_after=max(90.0, self.interval * 6))
+            bt.beat()                       # 进场先记：免得头一个周期被判假 stale
             while not self._stop.wait(self.interval):
                 try:
                     self.beat()
-                except OSError:
+                except OSError as e:
                     # 网络抖动（网卡刚断开等）：不停机，下一轮再试。
-                    # 但也不是完全无声——sent 不涨，GUI 看得见。
-                    pass
+                    # 但**不许静默**——以前这里是 pass，结果广播悄悄停了几小时
+                    # 也没人知道。现在记进心跳账本，/api/health 里看得见失败原因。
+                    bt.allow("broadcast: %s" % e)
+                    continue
+                except Exception as e:      # 非网络异常更要留证据，但不打死循环
+                    bt.allow("%s: %s" % (type(e).__name__, e))
+                    continue
+                bt.beat()
 
         self._thread = threading.Thread(target=_loop, daemon=True)
         self._thread.start()
