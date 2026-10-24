@@ -51,7 +51,7 @@ class ApprovalRequest:
 
     __slots__ = ("request_id", "session", "cap", "title", "device", "level",
                  "args_preview", "tag", "created_at", "deadline", "event",
-                 "decision", "reason", "destructive")
+                 "decision", "reason", "destructive", "closed_at")
 
     def __init__(self, request_id, session, cap, title, device, level,
                  args_preview, tag, created_at, deadline, destructive=False):
@@ -69,6 +69,7 @@ class ApprovalRequest:
         self.event = threading.Event()
         self.decision = ""          # "approved" / "denied" / ""
         self.reason = ""
+        self.closed_at = 0.0       # 结束时间（落历史用；pending 时为 0）
 
     def as_dict(self, now=None):
         now = time.time() if now is None else now
@@ -84,6 +85,7 @@ class ApprovalRequest:
             "created_at": self.created_at,
             "expires_in": max(0.0, round(self.deadline - now, 1)),
             "state": self.decision or "pending",
+            "closed_at": self.closed_at,
         }
 
 
@@ -114,10 +116,13 @@ class ApprovalBroker:
         # 会话标识：审批记录属于创建它的会话，别的会话拿着同一个 request_id
         # 也回不来（不认）。
         self.session = session or uuid.uuid4().hex
-        self._lk = threading.Lock()
+        # RLock（可重入）：respond / _await 在持有 self._lk 时也会调 _close，
+        # 而 _close 内部同样加锁——Lock 不可重入会死锁，必须 RLock。
+        self._lk = threading.RLock()
         self._pending = {}            # request_id -> ApprovalRequest
         self._closed = {}             # request_id -> 结束原因（防重放）
         self._closed_order = []
+        self._history = {}            # request_id -> 结束快照（给 UI 看「批了/拒了什么」）
 
     # ---------------- 对注册表暴露的闸门 ----------------
 
@@ -167,26 +172,42 @@ class ApprovalBroker:
             if req.decision:
                 ok = (req.decision == "approved")
                 reason = req.reason or ("" if ok else "主人拒绝了这次操作")
-                self._close(req.request_id, req.decision)
+                self._close(req)
                 return ok, reason
             # 没人表态 = 没人授权 = 拒绝（fail-closed）。
             if req.request_id in self._pending:
                 del self._pending[req.request_id]
             reason = req.reason or (
                 "审批超时未确认（等了 %.0f 秒没有人点确认，这次就不做）" % self.timeout)
-            self._close(req.request_id, "timeout")
+            self._close(req)
             return False, reason
 
-    def _close(self, request_id, how):
-        """记一笔「这条已经结束了」，用于拒绝重放。"""
-        if request_id in self._closed:
-            self._closed[request_id] = how
-            return
-        self._closed[request_id] = how
-        self._closed_order.append(request_id)
-        while len(self._closed_order) > CLOSED_LEDGER_MAX:
-            old = self._closed_order.pop(0)
-            self._closed.pop(old, None)
+    def _close(self, req, how=None):
+        """记一笔「这条已经结束了」：既写防重放账本，也写可读历史。
+
+        W2 已知限制 #8 收口——审批不再是「进程一关就没、也不给 UI 看」的黑箱：
+        已结束的审批（批准 / 拒绝 / 超时）留一份快照给 UI 看「刚才到底批了什么」。
+        """
+        with self._lk:
+            if req.request_id in self._history:
+                return
+            rec = req.as_dict()
+            rec["decision"] = req.decision or how or "timeout"
+            if req.decision == "approved":
+                rec["closed_reason"] = req.reason or "主人确认执行"
+            elif req.decision == "denied":
+                rec["closed_reason"] = req.reason or "主人拒绝了这次操作"
+            else:  # timeout
+                rec["closed_reason"] = req.reason or (
+                    "审批超时未确认（等了 %.0f 秒没有人点确认，这次就不做）" % self.timeout)
+            rec["closed_at"] = time.time()
+            self._history[req.request_id] = rec
+            self._closed[req.request_id] = rec["decision"]
+            self._closed_order.append(req.request_id)
+            while len(self._closed_order) > CLOSED_LEDGER_MAX:
+                old = self._closed_order.pop(0)
+                self._closed.pop(old, None)
+                self._history.pop(old, None)
 
     # ---------------- UI 侧接口 ----------------
 
@@ -199,12 +220,23 @@ class ApprovalBroker:
         rows.sort(key=lambda r: r["created_at"])
         return rows
 
+    def history(self, limit=200):
+        """已结束的审批清单（给 UI 显示「刚才批了/拒了什么」）。
+
+        按结束时间倒序；pending 不在这里。最多留 CLOSED_LEDGER_MAX 条。
+        """
+        with self._lk:
+            rows = sorted(self._history.values(),
+                          key=lambda r: r.get("closed_at", 0), reverse=True)
+        return rows[:limit]
+
     def get(self, request_id):
         """取一条待审批记录（响应后立刻就没了——那是一次性的）。"""
         with self._lk:
             return self._pending.get(request_id)
 
-    def respond(self, request_id, approve, reason="", session=None, double=False):
+    def respond(self, request_id, approve, reason="", session=None, double=False,
+                takeover=False):
         """主人点了确认/拒绝。
 
         `session` 是**回应方声称自己所属的会话**。不给时按本中枢的会话算
@@ -226,7 +258,10 @@ class ApprovalBroker:
                 if how:
                     return False, "这条审批已经结束了，不能重复回应"
                 return False, "没有这条审批请求（编号不认识）"
-            if claim != req.session:
+            # takeover=True 时允许同 token 下别的会话（同一主人的另一个窗口/页面）
+            # 接管这条审批——收口 W2 已知限制 #2（跨页面接不过来）。跨 broker 重放仍靠
+            # 下面的「已结束」账本挡住，安全性不降（外部无 token 连 401 都过不了）。
+            if claim != req.session and not takeover:
                 return False, "这条审批不属于当前会话"
             if req.decision:
                 return False, "这条审批已经结束了，不能重复回应"
@@ -240,5 +275,5 @@ class ApprovalBroker:
             req.event.set()
             # 从 pending 摘掉：它已经不会再被第二次回应了。
             del self._pending[request_id]
-            self._close(request_id, req.decision)
+            self._close(req)
         return True, ""

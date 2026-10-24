@@ -1598,8 +1598,9 @@ class _Handler(BaseHTTPRequestHandler):
                     "reason": "这个服务没开审批中枢（没注入 approval），"
                               "有副作用的能力一律被注册表拒成 denied"}
         rows = f.approval.pending()
+        hist = f.approval.history()
         return {"ok": True, "enabled": True, "count": len(rows), "pending": rows,
-                "reason": ""}
+                "history": hist, "reason": ""}
 
     # ---------------- W3 设备页（主机可视化）----------------
 
@@ -1704,12 +1705,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(approve, bool):
             return self._err(400, "approve 必须是布尔值（true/false）")
         double = bool(body.get("double"))
+        takeover = bool(body.get("takeover"))
         reason = (body.get("reason") or "").strip()
         session = body.get("session")
         if session is not None and not isinstance(session, str):
             return self._err(400, "session 必须是字符串")
         ok, why = f.approval.respond(rid, approve, reason=reason,
-                                      session=session, double=double)
+                                      session=session, double=double,
+                                      takeover=takeover)
         if not ok:
             # 409 = 「这条已经结束了/不属于你」；不是 500，也不是假装成功。
             return self._err(409, why)
