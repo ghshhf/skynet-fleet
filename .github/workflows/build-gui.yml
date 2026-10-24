@@ -31,18 +31,34 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: 装依赖
         run: |
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
           python -m pip install -r requirements.txt
 
+      # 两条活线门禁（eval_t31 对比度 / eval_t32 死链）要有真浏览器才跑得起来。
+      # 不装的话它们会 skip —— skip 不算通过，等于这两条在 CI 上是空的。
+      # Windows runner 不支持 --with-deps（那是 Linux 装系统库用的），直接装 chromium。
+      - name: 装 UI 审计依赖（playwright + chromium）
+        run: |
+          npm ci
+          npx playwright install chromium
+        working-directory: tools/uicheck
+
       - name: 冒烟（先证明后端自己能起，再谈打包）
         # 控制台的 cp1252 中文打印会 UnicodeEncodeError，必须挡构建；
         # --smoke 只起服务探 /api/health，不开窗、不依赖 webview，无显示器也能跑。
         run: python fleet_gui.py --smoke
 
-      - name: 自测（门禁 67 项）
+      - name: 自测（全量门禁，数字见 docs/_stats.json）
+        # 不写具体条数：手填必然过期（历史上出现过 52/58/67/74 四个版本并存）。
+        env:
+          FLEET_PY: python
         run: python run_selftests.py
 
       - name: 打包 fleet-gui.exe
