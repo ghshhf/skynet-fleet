@@ -250,6 +250,12 @@ CASES = [
     # 「页面指纹没变 且 没发出任何请求」才算死链；遮罩/disabled/当前选中记跳过。
     # 同时卡覆盖率 ≥90%——覆盖率太低时「死链 0」不可信。
     ("eval_t32_deadlink", ["evals/t32_deadlink.py"], HERE, 920),
+    # T33：后台循环心跳（P0-2）。静默卡住是最坏的失败形态：进程还在、端口还开、
+    # 日志不刷，用户只觉得「点了没反应」。这条钉子三件事：
+    # ① 账本语义（从没 beat = stale / 超时 = stale / 失败原因必留 / 空原因显式标出）；
+    # ② 四个常驻循环真接了心跳（名字与清单一致，防「改了名清单没跟着动」）；
+    # ③ 端到端：/api/health 里 loops 必须存在，且人为塞的卡住循环被标 stale。
+    ("eval_t33_loops_beat", ["evals/t33_loops_beat.py"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

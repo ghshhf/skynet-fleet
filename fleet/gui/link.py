@@ -130,19 +130,52 @@ def selfheal_loop(port, interval=15, stop=None):
 
     stop 是可调用（返回 True 即退出）；不传则跑到进程结束。日志每轮可见，
     正好也是 A4「后台循环心跳」的一份——「adb reverse 还活着吗、几台」。
+
+    同时记心跳（`fleet.beat`）：日志会滚动、会被重定向，而心跳账本能回答
+    「这个循环最后一次成功是几秒前」——卡住时 `/api/health` 直接标 stale。
     """
     import time
+    try:
+        from ..beat import register          # 正常：作为 fleet.gui.link 包内导入
+    except (ImportError, ValueError):
+        try:
+            from beat import register        # fleet/ 在 sys.path 里
+        except ImportError:
+            # 门禁 t28 把 fleet/gui 单独塞进 sys.path 再 import link ——
+            # 两种包内导入都不可用。**不能因此让自愈循环失去心跳**，
+            # 按文件路径直接加载 beat.py（只读依赖，无副作用）。
+            import importlib.util as _iu
+            import os as _os
+            _p = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "beat.py")
+            _spec = _iu.spec_from_file_location("_fleet_beat", _p)
+            _m = _iu.module_from_spec(_spec)
+            _spec.loader.exec_module(_m)
+            register = _m.register
+    bt = register("link.selfheal", stale_after=max(90.0, interval * 6))
+    # 进场先记一次：否则「刚起、正等第一个 interval」这段会被判成 stale 的假警。
+    bt.beat()
     while True:
         if stop is not None and stop():
             return
-        time.sleep(interval)
-        s = selfheal_once(port)
+        try:
+            time.sleep(interval)
+            s = selfheal_once(port)
+        except Exception as e:                  # 循环不许因为一次异常整条死掉
+            bt.allow("%s: %s" % (type(e).__name__, e))
+            print("[fleet-link] 自愈循环异常：%s: %s" % (type(e).__name__, e), flush=True)
+            continue
         if s.get("error"):
+            bt.allow(s["error"])
             print("[fleet-link] 自愈异常：%s" % s["error"], flush=True)
         elif s.get("empty"):
+            bt.beat()
             print("[fleet-link] 自愈：无在线设备", flush=True)
         elif s["fail"]:
+            # 有失败但也没全挂：算「跑过了」，把失败原因带上，两种事实都留
+            bt.beat(ok=False, error="reverse %d 失败 / %d 成功" % (s["fail"], s["ok"]))
             print("[fleet-link] 自愈：reverse %d 成功 / %d 失败"
                   % (s["ok"], s["fail"]), flush=True)
         else:
+            bt.beat()
             print("[fleet-link] 自愈：%d 台 reverse 存活" % s["ok"], flush=True)

@@ -326,15 +326,24 @@ class PhoneClient:
 
     def run(self):
         """后台常驻（断线自动重连）。要前台阻塞用 run()。"""
+        try:
+            from .beat import register
+        except (ImportError, ValueError):
+            from beat import register
+        # 心跳账本：日志会被重定向/滚动，账本能回答「最后一次连上是几秒前」。
+        bt = register("remote_link.reconnect", stale_after=90.0)
+        bt.beat()                 # 进场先记：否则头一轮连不上之前一直是假 stale
         fails = 0
         while not self._stop.is_set():
             try:
                 self._connect_once()
                 fails = 0  # 走到这里说明连接曾被建立并随后断开，重置计数
+                bt.beat()
             except Exception as e:
                 if self._stop.is_set():
                     break
                 fails += 1
+                bt.allow("第 %d 次失败：%s: %s" % (fails, type(e).__name__, e))
                 print(f"[remote-link] 反连 {self.host}:{self.port} 第 {fails} 次失败："
                       f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
             if self._stop.is_set():

@@ -123,6 +123,8 @@ class SkyNetRelay:
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind((self.host, self.port))
         self._srv.listen(64)
+        # 监听套超时：让 accept 循环能定期醒一次记心跳（没连接时也算活着）。
+        self._srv.settimeout(30.0)
         self.port = self._srv.getsockname()[1]
         self._stop.clear()
         self._thread = threading.Thread(target=self._accept_loop, args=(N,), daemon=True)
@@ -144,11 +146,30 @@ class SkyNetRelay:
             pass
 
     def _accept_loop(self, N):
+        try:
+            from .beat import register
+        except (ImportError, ValueError):
+            from beat import register
+        # relay 是事件驱动（没连接就一直阻塞在 accept），所以心跳记在
+        # 「还在等」这件事上：stale 说明 accept 线程真的死了，而不是「没流量」。
+        bt = register("relay.accept", stale_after=90.0)
+        bt.beat()
         while not self._stop.is_set():
             try:
                 conn, peer = self._srv.accept()
-            except OSError:
+            except socket.timeout:
+                # 监听套设有超时（见 start）：没连接也应定期记一次心跳，
+                # 否则「静悄悄没流量」会被判成「线程死了」——两件事不能混。
+                bt.beat()
+                continue
+            except OSError as e:
+                # stop() 关掉监听会让 accept 抛 OSError —— 那是正常收尾，
+                # 不算失败；只有「还在跑却 accept 失败」才是异常。
+                if self._stop.is_set():
+                    break
+                bt.allow("accept: %s" % e)
                 break
+            bt.beat()
             threading.Thread(target=self._handle, args=(conn, N, peer[0] if peer else ""),
                              daemon=True).start()
 

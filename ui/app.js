@@ -1631,6 +1631,11 @@
 
     api("/api/health").then(function (h) {
       $("regStat").textContent = "registry: " + h.devices + " devices / " + h.caps_count + " caps";
+      // 后台循环心跳：卡住要说出来，否则现象只是「点了没反应」。
+      var lp = h.loops || {};
+      if (lp.stale && lp.stale.length) {
+        toast("后台循环卡住：" + lp.stale.join("、"), true);
+      }
       if (h.backend) {
         $("modelName").textContent = h.backend.title || h.backend.id || "(未命名后端)";
         $("modelId").textContent = h.backend.model || h.backend.protocol || "";
