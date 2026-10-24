@@ -77,6 +77,10 @@ CASES = [
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
     ("fleet_hotspot_roam", ["-m", "fleet.hotspot_roam"], HERE, 30),
+    # 设备暴露面探测下放（2026-10-24 P3）：全离线——传输层(PCSender/BridgeSender)
+    # 全打桩，四态判定/SDP 解析(帧率·分辨率)/ONVIF 组播/时间线落盘/report_only
+    # 不发包/编排层参数切分都覆盖，自测自清理不碰真网。
+    ("fleet_wallprobe", ["-m", "fleet.wallprobe"], HERE, 30),
     ("fleet_list", ["-m", "fleet", "list"], HERE, 120),
     # ---- Android 静态门禁：XML 标签 vs Java 强转类型 ----
     # 一次真事故一条：activity_device.xml 里 btnDevBack 是 <TextView>，

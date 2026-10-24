@@ -162,6 +162,10 @@ public class BridgeService extends AccessibilityService {
                     return btState();
                 case "BLE":
                     return ble(rest);
+                case "PROBE":
+                    return probeTcp(rest);
+                case "PROBE_UDP":
+                    return probeUdp(rest);
                 default:
                     return "ERR unknown " + op;
             }
@@ -868,6 +872,185 @@ public class BridgeService extends AccessibilityService {
         if ((freq < 25000) || (freq > 60000)) return "ERR ir-freq 25k-60k";
         m.transmit(freq, pattern);
         return "OK ir " + pattern.length;
+    }
+
+    // ------------------------------------------------------------ 网络探测（P3）
+    //
+    // 把「手机当前所在网络里某设备的暴露面」读回来，让探测跟着人走
+    // （电脑侧只能扫电脑所在的网段，手机连到哪个网就能探哪个网）。
+    //
+    // 纪律（与电脑侧 tools/wall_probe.py 同一条红线，写在两边互相盯着）：
+    //   · 只做任何合法播放器/扫描器零凭据第一步就会做的事——TCP 连上、
+    //     发一个请求、读响应。RTSP DESCRIBE 返回 401/403 就是终点头：
+    //     **不携带任何凭据、不发 SETUP/PLAY、不做任何口令尝试**。
+    //     刑法 285/286 管未授权访问本身，与目标是否违法无关。
+    //   · 单连接、单请求、限长限时，不做并发轰炸。
+    //   · 回复 base64 单行/多行带回，解析全在电脑侧（fleet/wallprobe.py），
+    //     这里只保证「连得上、发得出、读得回」。
+    private static final int PROBE_CONNECT_MS = 2000;
+    private static final int PROBE_MAX_BYTES = 65536;
+
+    /** PROBE <ip> <port> <payload-b64> [read_ms] → "OK probe <字节数> <base64>"。 */
+    private static String probeTcp(String rest) {
+        String[] p = rest.trim().split("\\s+", 4);
+        if (p.length < 3) {
+            return "ERR probe-need ip+port+payload(b64)";
+        }
+        String ip = p[0];
+        int port;
+        try {
+            port = Integer.parseInt(p[1]);
+        } catch (NumberFormatException e) {
+            return "ERR probe-port " + p[1];
+        }
+        int readMs = 2000;
+        if (p.length >= 4) {
+            try {
+                readMs = Integer.parseInt(p[3]);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        readMs = Math.max(200, Math.min(10000, readMs));
+        byte[] payload;
+        try {
+            payload = android.util.Base64.decode(p[2], android.util.Base64.DEFAULT);
+        } catch (IllegalArgumentException e) {
+            return "ERR probe-b64";
+        }
+        try (Socket s = new Socket()) {
+            s.connect(new java.net.InetSocketAddress(ip, port), PROBE_CONNECT_MS);
+            s.getOutputStream().write(payload);
+            s.getOutputStream().flush();
+            byte[] all = readResponse(s, readMs);
+            return "OK probe " + all.length + " "
+                    + android.util.Base64.encodeToString(all, android.util.Base64.NO_WRAP);
+        } catch (Exception e) {
+            return "ERR probe " + e.getClass().getSimpleName() + " "
+                    + String.valueOf(e.getMessage());
+        }
+    }
+
+    /**
+     * 读到「响应完整」或超时为止。
+     * 完整 = 头结束（\r\n\r\n）且 Content-Length 满足；没有 Content-Length 的
+     * （HTTP 连接即关 / RTSP 例外）到头结束就停——**RTSP 是长连接，
+     * 服务器发完不关，无脑死等会每次探测都白等一个满Timeout**。
+     */
+    private static byte[] readResponse(Socket s, int readMs) throws java.io.IOException {
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        byte[] tmp = new byte[4096];
+        long deadline = System.currentTimeMillis() + readMs;
+        while (buf.size() < PROBE_MAX_BYTES) {
+            int left = (int) (deadline - System.currentTimeMillis());
+            if (left <= 0) {
+                break;
+            }
+            s.setSoTimeout(left);
+            int n;
+            try {
+                n = s.getInputStream().read(tmp);
+            } catch (java.net.SocketTimeoutException e) {
+                break;
+            }
+            if (n < 0) {
+                break;
+            }
+            buf.write(tmp, 0, n);
+            byte[] all = buf.toByteArray();
+            int headEnd = indexOf(all, "\r\n\r\n");
+            if (headEnd >= 0) {
+                String head = new String(all, 0, headEnd, "ISO-8859-1");
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("(?i)content-length:\\s*(\\d+)").matcher(head);
+                if (!m.find()) {
+                    break;                      // 无 Content-Length：头完即完整
+                }
+                if (all.length >= headEnd + 4 + Integer.parseInt(m.group(1))) {
+                    break;                      // body 收全
+                }
+            }
+        }
+        return buf.toByteArray();
+    }
+
+    private static int indexOf(byte[] hay, String needle) {
+        byte[] n = new byte[0];
+        try {
+            n = needle.getBytes("ISO-8859-1");
+        } catch (java.io.UnsupportedEncodingException ignored) {
+        }
+        outer:
+        for (int i = 0; i <= hay.length - n.length; i++) {
+            for (int j = 0; j < n.length; j++) {
+                if (hay[i + j] != n[j]) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    /**
+     * PROBE_UDP <port> <payload-b64> [wait_ms] → 多行："OK mcount" / 每来源一行
+     * "<ip> <base64>" / 末行 "END"（配 bridge_bulk 的多行读法）。
+     * 用途：ONVIF WS-Discovery 组播 Probe——标准匿名设备发现机制，
+     * 设计给匿名客户端，不携带任何凭据。
+     */
+    private static String probeUdp(String rest) {
+        String[] p = rest.trim().split("\\s+", 3);
+        if (p.length < 2) {
+            return "ERR probe-udp-need port+payload(b64)";
+        }
+        int port;
+        try {
+            port = Integer.parseInt(p[0]);
+        } catch (NumberFormatException e) {
+            return "ERR probe-udp-port " + p[0];
+        }
+        int waitMs = 2000;
+        if (p.length >= 3) {
+            try {
+                waitMs = Integer.parseInt(p[2]);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        waitMs = Math.max(500, Math.min(8000, waitMs));
+        byte[] payload;
+        try {
+            payload = android.util.Base64.decode(p[1], android.util.Base64.DEFAULT);
+        } catch (IllegalArgumentException e) {
+            return "ERR probe-udp-b64";
+        }
+        StringBuilder sb = new StringBuilder("OK mcast");
+        int n = 0;
+        try (java.net.DatagramSocket ds = new java.net.DatagramSocket()) {
+            ds.send(new java.net.DatagramPacket(payload, payload.length,
+                    java.net.InetAddress.getByName("239.255.255.250"), port));
+            long deadline = System.currentTimeMillis() + waitMs;
+            while (n < 16 && System.currentTimeMillis() < deadline) {
+                int left = (int) (deadline - System.currentTimeMillis());
+                ds.setSoTimeout(Math.max(50, Math.min(left, 300)));
+                byte[] buf = new byte[65535];
+                java.net.DatagramPacket rp = new java.net.DatagramPacket(buf, buf.length);
+                try {
+                    ds.receive(rp);
+                    byte[] data = java.util.Arrays.copyOf(rp.getData(), rp.getLength());
+                    sb.append('\n').append(rp.getAddress().getHostAddress())
+                      .append(' ')
+                      .append(android.util.Base64.encodeToString(data,
+                              android.util.Base64.NO_WRAP));
+                    n++;
+                } catch (java.net.SocketTimeoutException e) {
+                    // 没到截止时间就继续等
+                }
+            }
+        } catch (Exception e) {
+            return "ERR probe-udp " + e.getClass().getSimpleName() + " "
+                    + String.valueOf(e.getMessage());
+        }
+        sb.append("\nEND");
+        return sb.toString();
     }
 
     // ------------------------------------------------------------ 蓝牙

@@ -835,6 +835,28 @@ def _render_net_survey(r, arg):
     return f"bettercap 跑通：回传事件流 {d.get('raw_len')} 字节"
 
 
+def _render_wallprobe(r, arg):
+    if not r.get("ok"):
+        return f"暴露面探测失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    probed = d.get("probed", 0)
+    src = d.get("source")
+    head = f"设备暴露面探测：{probed} 个目标"
+    if src:
+        head += f"（来源 {src}）"
+    stats = d.get("stats") or {}
+    if stats:
+        head += " → " + "，".join(f"{k} {v}" for k, v in stats.items())
+    parts = [head]
+    text = d.get("text")
+    if text:
+        parts.append(text)
+    note = d.get("note")
+    if note:
+        parts.append(note)
+    return "\n".join(parts)
+
+
 def _render_osint(r, arg):
     if not r.get("ok"):
         return f"情报查询失败：{r.get('err') or '未知'}"
@@ -1130,6 +1152,15 @@ TOOLS = (
          "距离校准：拿已知距离（如贴着路由器 1 米）记样本，回归出本机 A/n 参数。"
          "之后估距更准。问「校准一下距离」选这个。只读+落 ~/.fleet/。",
          render=_render_prox_calib),
+
+    # ---- P3 设备暴露面探测下放（手机连哪个网就探哪个网）----
+    Tool("wallprobe", "net.wallprobe",
+         "设备暴露面探测：扫网里开了 RTSP/HTTP/ONVIF 等端口的设备，只读元数据/"
+         "墙形态——拿到 SDP ≠ 拿到视频（后者要凭据），401/403 即停、绝不发 SETUP/"
+         "PLAY、不带任何凭据。两种跑法：电脑侧扫本机 ARP 邻居；手机侧让桥 App 去"
+         "探电脑到不了的网段（商场 WiFi/办公室/楼道）。问「这网里有什么摄像/摄像头」"
+         "「帮我探一下设备暴露面」选这个。只读，红线在 fleet/wallprobe.py。",
+         render=_render_wallprobe),
 
     Tool("net_dissect", "net.dissect",
          "流量解剖：抓一段本机流量，抽对话对/协议占比/明文凭据告警。"

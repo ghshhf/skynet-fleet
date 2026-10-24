@@ -19,6 +19,7 @@ from .. import creative
 from .. import hotspot_roam
 from .. import ir_trial
 from .. import proximity
+from .. import wallprobe
 from ..core import BaseDevice, DeviceResult as R
 
 KEYMAP = {"back": 4, "home": 3, "enter": 66, "menu": 82, "power": 26,
@@ -86,7 +87,12 @@ class AndroidPhone(BaseDevice):
                 # ---- 距离感知（P0；手机能力升级计划书 2026-10-24）----
                 # proximity.* 把「只能报方向」升级成「米数 + 靠近/远离 + 轨迹」。
                 # 纯读：扫描/传感采集，落校准文件在 ~/.fleet/，不改设备状态。
-                "proximity.estimate", "proximity.track", "proximity.calibrate")
+                "proximity.estimate", "proximity.track", "proximity.calibrate",
+                # ---- P3 设备暴露面探测（手机连哪个网就探哪个网）----
+                # 只读且**故意不设闸门**：发的每个字节都等于合法播放器零凭据
+                # 第一步就会发的（OPTIONS/DESCRIBE 无凭据/GET 公开路径/ONVIF 组播）。
+                # 401/403 即停、不发 SETUP/PLAY、不带凭据——红线在 fleet/wallprobe.py。
+                "net.wallprobe")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -442,5 +448,46 @@ class AndroidPhone(BaseDevice):
                 "note": "5G 的 A 按比 2.4G 低 7dBm 折算（未分频段校准时先这么用）"
                         if c.get("r2", 0) >= 0.8 else
                         "R²<0.8：拟合差，先查样本（距离记错/中途换位置）再谈标定"})
+
+        # ---- P3 设备暴露面探测：手机连哪个网就探哪个网 ----
+        # via=phone 时探测由桥 App 执行（需要装带 PROBE/PROBE_UDP 的版本，
+        # 2026-10-24 起）；桥不支持该命令时 probe 返回 None → 记「无响应」，
+        # 不炸、不假装探过。
+        if cap == "net.wallprobe":
+            via = (args.get("via") or "phone").strip().lower()
+            onvif = bool(args.get("onvif", True))
+            note = (args.get("note") or "").strip()
+            targets = args.get("targets") or None
+            ports = args.get("ports") or None
+            try:
+                if via == "pc":
+                    r = wallprobe.run_pc(targets=targets, ports=ports,
+                                         onvif=onvif, note=note)
+                else:
+                    r = wallprobe.run_phone(s, targets=targets, ports=ports,
+                                            onvif=onvif, note=note)
+            except Exception as e:
+                return R.error(cap, f"{type(e).__name__}: {e}",
+                               device=self.name, via=self.via)
+            if not r.get("ok"):
+                return R.error(cap, r.get("err") or "探测失败",
+                               device=self.name, via=self.via)
+            recs = r.get("records") or []
+            stat = {}
+            for rec in recs:
+                key = rec["verdict"].split("：")[0]
+                stat[key] = stat.get(key, 0) + 1
+            exposed = [x for x in recs if x["verdict"].startswith("exposed")]
+            return R.success(cap, self.name, side_effect=False, via=self.via,
+                             data={"probed": r.get("probed", len(recs)),
+                                   "source": r.get("source", ""),
+                                   "stats": stat,
+                                   "exposed": [x["ip"] for x in exposed],
+                                   "records": recs,
+                                   "note": "探测只到「元数据/墙形态」为止：拿到 SDP "
+                                           "≠拿到视频（后者要凭据）。401/403 即停，"
+                                           "不发 SETUP/PLAY、不带任何凭据",
+                                   "text": "\n".join(
+                                       f"{x['ip']}：{x['verdict']}" for x in recs)})
 
         return super().invoke(cap, args)

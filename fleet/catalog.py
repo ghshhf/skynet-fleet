@@ -242,6 +242,24 @@ CAPABILITIES = [
                        Param("iface", "str", doc="网卡名，不给了本机默认")),
                note="只读：需 bettercap（PC: go install；手机 Termux: pkg install bettercap）。"
                     "PC 需 monitor 模式网卡才有完整 WiFi 能力"),
+    # ---- P3 设备暴露面探测（回答「能扫到监控，为什么拿不到数据」）----
+    # 只读，但故意**不做闸门**：它发的每一个字节都等于合法播放器/扫描器
+    # 零凭据第一步就会发的（RTSP OPTIONS / DESCRIBE 无凭据 / HTTP GET 公开路径 /
+    # ONVIF WS-Discovery 组播）。红线在 fleet/wallprobe.py 模块 docstring：
+    # **401/403 即停，不发 SETUP/PLAY，不带任何凭据，不做口令尝试。**
+    # 「401 本身就是数据」——墙的形态是可报告的事实，不是失败。
+    Capability("net.wallprobe", "设备暴露面探测：RTSP/HTTP/ONVIF 三问，判定每台设备"
+                                "「暴露 / 有认证墙 / 静默 / 形态未知」",
+               params=(Param("targets", "str", doc="逗号分隔 IP；不给=用 arp 表当前在线设备"),
+                       Param("ports", "str", doc="只探这些端口，逗号分隔；"
+                                                "不给=554/80/8000/8080/443/8554"),
+                       Param("via", "str", doc="pc=本机网段（默认）｜phone=经桥 App 探手机所在网"),
+                       Param("onvif", "bool", doc="是否顺带发 ONVIF 组播发现，默认 true"),
+                       Param("note", "str", doc="这次探测的备注，进时间线")),
+               note="只读：单连接单请求限长限时，不并发轰炸。判定四态 exposed/walled/"
+                    "silent/partial；拿到视频元数据≠拿到视频（后者要凭据+刑法 285/286）。"
+                    "结果追加 ~/.fleet/wallprobe_log.jsonl 时间线，report 按 IP 汇总。"
+                    "端口枚举在 net.wallprobe，客户端名单在 hotspot.roam——两件事"),
     # ---- 外部情报（L4：OSINT，拆解公开面拿数据；仅查你拥有/授权的资产）----
     Capability("osint.crt", "证书透明度枚举子域（crt.sh，被动数据、免 key）",
                params=(Param("domain", "str", True, "域名，如 example.com")),
