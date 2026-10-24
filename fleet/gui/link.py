@@ -109,3 +109,40 @@ def report(port, token, result):
     print("[fleet-link] 手机端「连接设置」填：", flush=True)
     print("[fleet-link]   地址 http://127.0.0.1:%d" % port, flush=True)
     print("[fleet-link]   令牌 %s" % token, flush=True)
+
+
+def selfheal_once(port):
+    """一次自愈检查：对所有在线设备重建 reverse（幂等，重复建无害）。
+
+    返回 {"ok", "fail", "empty", "error"} 汇总，供 selfheal_loop 打日志、
+    也供门禁断言。异常被兜住——自愈本身不能因为一次 adb 抖动而崩。
+    """
+    try:
+        r = ensure_reverse(port)
+    except RuntimeError as e:
+        return {"ok": 0, "fail": 0, "empty": False, "error": str(e)}
+    return {"ok": len(r.get("ok") or []), "fail": len(r.get("fail") or []),
+            "empty": bool(r.get("empty")), "error": None}
+
+
+def selfheal_loop(port, interval=15, stop=None):
+    """连接自愈主循环：每 interval 秒重建一次 reverse，掉了自动恢复。
+
+    stop 是可调用（返回 True 即退出）；不传则跑到进程结束。日志每轮可见，
+    正好也是 A4「后台循环心跳」的一份——「adb reverse 还活着吗、几台」。
+    """
+    import time
+    while True:
+        if stop is not None and stop():
+            return
+        time.sleep(interval)
+        s = selfheal_once(port)
+        if s.get("error"):
+            print("[fleet-link] 自愈异常：%s" % s["error"], flush=True)
+        elif s.get("empty"):
+            print("[fleet-link] 自愈：无在线设备", flush=True)
+        elif s["fail"]:
+            print("[fleet-link] 自愈：reverse %d 成功 / %d 失败"
+                  % (s["ok"], s["fail"]), flush=True)
+        else:
+            print("[fleet-link] 自愈：%d 台 reverse 存活" % s["ok"], flush=True)
