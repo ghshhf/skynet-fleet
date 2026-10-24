@@ -67,6 +67,9 @@ CASES = [
     # 站点逆向层（自建引擎，2026-10-24 P0）：re_site 的 21 项全是离线断言
     # （真机采集的 GBK 负载/JSON 当向量）。--live 才联网，按门禁纪律不进门禁。
     ("fleet_re_site", ["-m", "fleet.re_site"], HERE, 30),
+    # 距离感知引擎（2026-10-24 P0）：48 项全离线（合成 RSSI 序列当向量），
+    # 模型单调性/校准回归/热冷判定/三角定位收敛/航向/PDR 都覆盖。
+    ("fleet_proximity", ["-m", "fleet.proximity"], HERE, 30),
     ("fleet_list", ["-m", "fleet", "list"], HERE, 120),
     # ---- Android 静态门禁：XML 标签 vs Java 强转类型 ----
     # 一次真事故一条：activity_device.xml 里 btnDevBack 是 <TextView>，

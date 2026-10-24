@@ -175,6 +175,27 @@ CAPABILITIES = [
     Capability("life.sentinel", "生活哨兵：对比基线报告显著偏离（如「今晚房间持续很暗」）",
                params=(Param("baseline_frames", "int", doc="基线用最近几帧，默认 20")),
                note="只读：只看可观测偏离，不做因果/健康结论"),
+    # ---- 距离感知（P0：手机能力升级计划书 2026-10-24）----
+    # 把「只能报方向」升级成「米数 + 靠近/远离」。诚实边界写进 note：
+    # 区间不报单点（多径 ±6dBm → 误差可达一倍，物理限制不是没优化）。
+    Capability("proximity.estimate", "一按估距：周边每个 AP 的距离区间（近的在前）",
+               params=(Param("rounds", "int", doc="扫描轮数，默认 1")),
+               note="只读：RSSI→对数距离路径损耗模型。报区间不报单点；"
+                    "默认参数是经验值，用 proximity.calibrate 拿已知距离样本标定更准"),
+    Capability("proximity.track", "热冷跟踪：边走边采，报「正在靠近/远离」+ 当前距离区间",
+               params=(Param("seconds", "float", doc="跟踪几秒，默认 30"),
+                       Param("interval", "float", doc="采样间隔秒，默认 1.5（别低于 1s）"),
+                       Param("targets", "str", doc="只跟这几个 BSSID，逗号分隔；不给=全跟")),
+               note="只读：整段净变化 ≥2dBm 才判趋势，防抖。WiFi 扫描本身 4-6 秒一回合，"
+                    "采再密也是重复值"),
+    Capability("proximity.calibrate", "距离校准：记录已知距离样本 → 回归出本机 A/n 参数",
+               params=(Param("mode", "str", doc="add=记一条样本(要 dist_m/rssi)｜run=跑回归并存参数，默认 run"),
+                       Param("dist_m", "float", doc="add 模式：已知距离，米"),
+                       Param("rssi", "int", doc="add 模式：此刻该 AP 的信号"),
+                       Param("band", "str", doc="频段 2.4G/5G，默认 2.4G"),
+                       Param("bssid", "str", doc="add 模式：AP 的 BSSID，留痕用")),
+               note="只读+落 ~/.fleet/：R²<0.8 说明样本有问题（距离记错/中途换位），"
+                    "会如实报而不是硬给参数"),
     Capability("net.dissect", "流量解剖：抓一段本机流量，抽对话对/协议占比/明文凭据告警",
                params=(Param("duration", "int", doc="抓几秒，默认 5"),
                        Param("iface", "str", doc="网卡名，不给了本机默认"),
