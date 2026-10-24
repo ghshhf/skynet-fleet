@@ -337,6 +337,14 @@ CAPABILITIES = [
     Capability("re.ask", "逆向问答：把拆解事实交给 LLM 出人话假设（带「假设」标注）",
                params=(Param("question", "str", True, "问题")),
                note="LLM 回答一律标「模型回答」——可能错，关键结论要交叉验证"),
+    Capability("re.proto", "未知协议拆解：多帧样本→帧头/字段边界（常量/计数/步长/枚举/长度）"
+                           "→校验算法定位（crc8/crc16*/sum/xor）+字节序",
+               params=(Param("samples", "any", True,
+                             "多帧样本：hex 字符串列表；给一段长流则自动切帧"),
+                       Param("llm", "bool", doc="是否要 LLM 假设层，默认要")),
+               note="只做字节对齐分析（位域不拆）；校验只报**全帧吻合**的算法，"
+                    "1 字节校验单帧蒙对率 1/256 所以至少 2 帧；"
+                    "字段语义仍需人确认，输出里 caveats 写明没说到什么"),
     # ---- 这张网 ----
     Capability("relay.status", "中继状态：家里常开节点现在连着几台手机、各上报了什么能力",
                params=(), note="远程可触达层（L6）的门面；FLEET_RELAY_ENABLED=1 才在线"),

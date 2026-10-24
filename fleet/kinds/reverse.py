@@ -5,6 +5,7 @@
 Reverse 拆的是**不拆就没有**的数据（脉冲编码、广播结构、固件里的硬编码）。
 一个读表面，一个拆里面——都是只读，都不发攻击性报文。
 """
+from .. import proto_reverse as PR
 from .. import reverse as RV
 from .. import re_llm
 from ..core import BaseDevice, DeviceResult as R
@@ -26,7 +27,7 @@ class Reverse(BaseDevice):
         return True, ""
 
     def caps(self):
-        return ("re.ir", "re.ble", "re.binary", "re.ask")
+        return ("re.ir", "re.ble", "re.binary", "re.proto", "re.ask")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -50,6 +51,14 @@ class Reverse(BaseDevice):
             m = RV.binary_report(path)
             if m.get("ok") and args.get("llm", True):
                 m["hypothesis"] = RV.llm_hypothesize("binary", m)
+        elif cap == "re.proto":
+            samples = args.get("samples")
+            if not samples:
+                return R.error(cap, "缺参数 samples（多帧 hex 列表；一段长流也行）",
+                               device=self.name, via=self.via)
+            m = PR.proto_report(samples)
+            if m.get("ok") and args.get("llm", True):
+                m["hypothesis"] = RV.llm_hypothesize("proto", m)
         elif cap == "re.ask":
             q = (args.get("question") or "").strip()
             if not q:

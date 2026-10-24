@@ -267,6 +267,10 @@ CASES = [
     # 密码错 ⇒ denied 且说清「有服务不让你进」。SSH 侧：假 sshd 吐真版本行、
     # 普通 TCP 服务必须判 is_ssh=False（不冒充）、给密码 ⇒ denied（argv 里的密码等于公开）。
     ("eval_t35_channels", ["evals/t35_channels.py"], HERE, 180),
+    # 逆向深化第一层：未知二进制协议拆解。用**已知真值的假协议**验，
+    # 不拿真设备碰运气；96 帧纯随机必须 0 校验命中（假阳性钉子）；
+    # 增量校验状态机必须与独立写的暴力版逐位等价（性能优化不许改结果）。
+    ("eval_t36_proto_reverse", ["evals/t36_proto_reverse.py"], HERE, 180),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
