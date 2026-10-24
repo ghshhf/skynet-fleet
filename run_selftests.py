@@ -286,6 +286,11 @@ CASES = [
     # 两种信封 + 回环解析（模型吐回来的 tool_call 要还原成能力真名）。
     # 全离线：不连任何网关，验的是「投影与解析」，不是「模型今天调得对」。
     ("eval_t39_toolschema", ["-m", "fleet.toolschema", "--selftest"], HERE, 120),
+    # ---- T40：云端 agent loop（P4 的「跑」那一半）
+    # toolschema 只管信封，这一层才是「真执行并把结果喂回模型」。
+    # 全离线：chat 用假的、执行层用假的，验的是串得对不对 + 三条缰绳 +
+    # **工具表即权限边界**（模型叫了没给它的 pc.shell ⇒ 不许执行）。
+    ("eval_t40_agentloop", ["-m", "fleet.agentloop", "--selftest"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

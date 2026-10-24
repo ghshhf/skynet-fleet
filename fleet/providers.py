@@ -461,17 +461,21 @@ def route(provs=None, need=None, exclude=(), model=None):
         len(provs), "、".join(seen) or "全被排除")
 
 
-def pick_model(p, need=None, skip=()):
+def pick_model(p, need=None, skip=(), blocked=()):
     """从一个 provider 的模型表里挑一个能用的。挑不出来返回 None（不许瞎编模型名）。
 
     `skip` 是这家已经试过且失败的模型——2026-10-25 实测出来的：
     一家网关的 23 个模型走的是**不同上游车道**，其中一条报
     `FreeUsageLimitError`（429）不代表整家废了，换同一个网关的下一个模型就能成。
     只会换 provider 不会换模型，等于把 23 条车道当 1 条用。
+
+    `blocked` 是**跨调用**记住的坏车道（Quota.blocked_models）。
+    skip 只活在一次 chat() 里，blocked 活 6 小时——不加它，下一轮对话会
+    把刚才打过的 429 再撞一遍。
     """
     if not p.models:
         return None
-    skip = set(skip)
+    skip = set(skip) | set(blocked)
     pat = _NEED_PAT.get(need) if need else None
     pool = [m for m in p.models if m not in skip]
     if pat:
@@ -520,6 +524,63 @@ class Quota:
             (day, vendor, account or "")).fetchone()
         return (row[0], row[1]) if row else (0, 0)
 
+    # ---------------- 车道记忆（2026-10-25 补：P2 只记不看，等于白记） ----------------
+    #
+    # 教训来自真跑：zen-gate 23 个模型走的是不同上游车道，`flint-40b-free`、
+    # `mimo-v2.6-flash-free` 相继 429（FreeUsageLimitError）。当时 `chat()` 里有
+    # tried_models，但**只在单次调用内有效**——下一次调用（下一轮对话、重启进程）
+    # 又从头撞一遍同样的两条车道。撞一次 429 就是一趟完整 HTTP + 一次失败降级。
+    #
+    # 所以要把「这条车道刚才打过我」记下来，跨调用生效。
+    # 记的是**事件**不是额度上限：各家免费车道的真实上限谁也不知道，
+    # 编一个数字当上限就是拿估算当事实（红线）。能确定的只有「它刚拒绝过我」。
+
+    #: 429 记多久（默认 6 小时）。免费车道的额度多是按天/按滚动窗口给的，
+    #: 6 小时是个不装懂的折中：够避开这一波，又不至于把车道永久拉黑。
+    BLOCK_TTL_S = 6 * 3600
+
+    def mark_lane(self, model, provider="", status="429", note=""):
+        """记一次车道拒绝（429 = 这条车道没钱了 / 403 = 整家风控）。"""
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS lane_events ("
+            " ts REAL NOT NULL, provider TEXT, model TEXT, status TEXT, note TEXT)")
+        self._db.execute(
+            "INSERT INTO lane_events (ts, provider, model, status, note) "
+            "VALUES (?,?,?,?,?)", (time.time(), provider or "", model or "",
+                                   status, (note or "")[:200]))
+        self._db.commit()
+
+    def blocked_models(self, within_s=None):
+        """最近被 429 过的模型（车道）集合。"""
+        ttl = self.BLOCK_TTL_S if within_s is None else within_s
+        try:
+            rows = self._db.execute(
+                "SELECT model FROM lane_events WHERE status='429' AND ts>=?",
+                (time.time() - ttl,)).fetchall()
+        except Exception:
+            return set()                       # 表还没建 / 第一次跑
+        return {r[0] for r in rows if r[0]}
+
+    def blocked_providers(self, within_s=None):
+        """最近被 403（风控）整家停用的 provider 集合。"""
+        ttl = self.BLOCK_TTL_S if within_s is None else within_s
+        try:
+            rows = self._db.execute(
+                "SELECT provider FROM lane_events WHERE status='403' AND ts>=?",
+                (time.time() - ttl,)).fetchall()
+        except Exception:
+            return set()
+        return {r[0] for r in rows if r[0]}
+
+    def lane_events(self, limit=20):
+        """给人看：最近发生了哪些拒绝。"""
+        try:
+            return self._db.execute(
+                "SELECT ts, provider, model, status, note FROM lane_events "
+                "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        except Exception:
+            return []
+
     def report(self, day=None):
         """按天出一张表：每行一个「厂商/账号」。"""
         if day:
@@ -540,7 +601,7 @@ class Quota:
 
 
 def chat(messages, provs=None, need=None, model=None, timeout=90,
-         max_try=8, quota=None, account=""):
+         max_try=8, quota=None, account="", tools=None, tool_choice=None):
     """真发一轮，失败自动换下一个。
 
     返回 dict，成功时带：
@@ -559,14 +620,23 @@ def chat(messages, provs=None, need=None, model=None, timeout=90,
     tried, why = [], []
     tried_models = {}                 # provider_id -> 已失败的模型
     quota = quota if quota is not None else Quota()
+    dead_provs = quota.blocked_providers()      # 跨调用记住的 403（风控）
+    dead_models = quota.blocked_models()        # 跨调用记住的 429（车道打满）
 
     for _ in range(max_try):
         p, reason = route(provs, need=need, exclude=tried, model=model)
         if not p:
             return {"ok": False, "err": reason, "tried": tried, "why": why}
-        m = model or pick_model(p, need, skip=tried_models.get(p.id, ()))
+        if p.id in dead_provs:
+            why.append("%s：上次 403 风控，整家停用（%.0f 小时内不碰）"
+                       % (p.id, Quota.BLOCK_TTL_S / 3600.0))
+            tried.append(p.id)
+            continue
+        m = model or pick_model(p, need, skip=tried_models.get(p.id, ()),
+                                blocked=dead_models)
         if not m:
-            why.append("%s：模型都试过了（%d 个）" % (p.id, len(p.models or [])))
+            why.append("%s：模型都试过了（%d 个，其中 %d 条车道刚被 429）"
+                       % (p.id, len(p.models or []), len(dead_models)))
             tried.append(p.id)
             continue
 
@@ -575,17 +645,29 @@ def chat(messages, provs=None, need=None, model=None, timeout=90,
         k = p.real_key
         if k:
             headers["Authorization"] = "Bearer " + k
+        body = {"model": m, "messages": messages, "stream": False}
+        if tools:                       # 给云端模型的工具表（P4，见 toolschema.py）
+            body["tools"] = tools
+            if tool_choice:
+                body["tool_choice"] = tool_choice
         try:
-            r = _rq.post(url, headers=headers,
-                         json={"model": m, "messages": messages, "stream": False},
-                         timeout=timeout)
+            r = _rq.post(url, headers=headers, json=body, timeout=timeout)
         except Exception as e:
             why.append("%s/%s：%s" % (p.id, m, type(e).__name__))
             tried_models.setdefault(p.id, []).append(m)
             continue
         if r.status_code == 403:
             why.append("%s：HTTP 403 风控，整家停用" % p.id)
+            quota.mark_lane("", p.id, "403", (r.text or "")[:80])
+            dead_provs.add(p.id)
             tried.append(p.id)
+            continue
+        if r.status_code == 429:
+            # 这条上游车道额度打满，不是网关挂了 ⇒ 只记这一条车道，别家车道照用
+            why.append("%s/%s：HTTP 429 这条车道打满" % (p.id, m))
+            quota.mark_lane(m, p.id, "429", (r.text or "")[:80])
+            dead_models.add(m)
+            tried_models.setdefault(p.id, []).append(m)
             continue
         if r.status_code >= 400:
             why.append("%s/%s：HTTP %d %s" % (p.id, m, r.status_code,
@@ -612,6 +694,7 @@ def chat(messages, provs=None, need=None, model=None, timeout=90,
             "used_vendor": vendor_of(m),
             "content": content,
             "tokens": tokens,
+            "raw": data,              # 工具调用要从这里读 tool_calls，不能只留 content
             "tried": tried + [p.id],
             "why": why,
         }
@@ -797,6 +880,62 @@ def _selftest():
     ck(pick_model(multi, skip=["lane-a", "lane-b"]) == "lane-c", "应继续往后找")
     ck(pick_model(multi, skip=["lane-a", "lane-b", "lane-c"]) is None,
        "全试过必须返回 None（好让上层换 provider），不许回头重复试")
+
+    # 15) 车道记忆（跨调用）：429 记的是车道，403 记的是整家，两者别混。
+    #     没有这一层，下一次 chat() 会把刚才打过的 429 原样再撞一遍。
+    with tempfile.TemporaryDirectory() as td:
+        q2 = Quota(os.path.join(td, "q2.sqlite"))
+        q2.mark_lane("lane-a", "zen-gate", "429", "FreeUsageLimitError")
+        q2.mark_lane("", "dsh", "403", "风控")
+        ck("lane-a" in q2.blocked_models(), "429 过的车道要记住")
+        ck("lane-b" not in q2.blocked_models(), "没被拒的车道不许连坐")
+        ck("dsh" in q2.blocked_providers(), "403 要整家停用")
+        ck("zen-gate" not in q2.blocked_providers(),
+           "429 只是一条车道没钱，不许把整家拉黑")
+        ck(q2.blocked_models(within_s=-1) == set(), "过期窗口内不该有（TTL 要生效）")
+        ck(len(q2.lane_events()) == 2, "事件表应有 2 条")
+        # 记了就得用：pick_model 必须绕开
+        ck(pick_model(multi, blocked=q2.blocked_models()) == "lane-b",
+           "记住的坏车道必须被绕开，实得 %r" % pick_model(
+               multi, blocked=q2.blocked_models()))
+        # 记账与车道记忆是两张表，别互相污染
+        ck(q2.used("nvidia") == (0, 0), "记账表不该被车道事件污染")
+        q2.close()
+
+    # 16) tools 透传（P4 云侧）：给了 tools 就必须进请求体，没给就不许出现。
+    #     形状由 toolschema 保证，这里只钉「透传没丢」。
+    body_probe = {}
+    import requests as _rq                 # chat() 内部也是这么拿的
+    orig_post = _rq.post
+
+    class _R:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"choices": [{"message": {"content": "收到"}}], "usage": {}}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        body_probe.update(json or {})
+        return _R()
+
+    _rq.post = fake_post
+    try:
+        r1 = chat([{"role": "user", "content": "hi"}], provs=ch,
+                  quota=Quota(os.path.join(tempfile.mkdtemp(), "q3.sqlite")))
+        ck(r1.get("ok") is True, "假 HTTP 下 chat 应成功")
+        ck("tools" not in body_probe, "没给 tools 时不许出现在请求体里")
+        r2 = chat([{"role": "user", "content": "hi"}], provs=ch,
+                  tools=[{"type": "function",
+                          "function": {"name": "pc_state", "parameters": {}}}],
+                  tool_choice="auto",
+                  quota=Quota(os.path.join(tempfile.mkdtemp(), "q4.sqlite")))
+        ck(body_probe.get("tools") and body_probe["tools"][0]["function"]["name"]
+           == "pc_state", "tools 必须原样透传")
+        ck(body_probe.get("tool_choice") == "auto", "tool_choice 要透传")
+        ck("raw" in r2, "响应必须带 raw —— 工具调用要从 raw 里读 tool_calls")
+    finally:
+        _rq.post = orig_post
 
     if fails:
         print("providers selftest: FAIL")
