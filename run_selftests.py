@@ -92,6 +92,12 @@ CASES = [
     # 代码用 Manifest.permission.X 但清单没声明 ⇒ 运行时 SecurityException，
     # 编译期查不出、栈里也看不出跟权限有关（详见 tools/check_permissions.py 头部）。
     ("android_permissions", ["tools/check_permissions.py"], HERE, 30),
+    # ---- 桌面静态门禁 ③（总纲 §四/P2-14）：Tab 数量徽标不许硬编码 ----
+    # 「技能 18」这种手写数量不会报错，只会一直停在旧值。查五件事：
+    # 每个 tab 有带 id 的 .tn 徽标 / 标签里没数字 / paintTabCounts 从缓存取数 /
+    # 赋值语句无数字字面量 / 启动就拉一次。纯离线、秒级。
+    # 另一半靠 live 门禁（clickaudit 渲染后真点、a11y 真算对比度）。
+    ("ui_tab_counts", ["tools/check_ui_tabs.py"], HERE, 30),
     # ---- evals：一次真事故一个脚本 ----
     ("eval_d0_bridge_offline", ["evals/d0_bridge_offline.py"], HERE, 90),
     ("eval_t0_input", ["evals/t0_input_not_clobbered.py"], HERE, 90),
@@ -234,6 +240,16 @@ CASES = [
     ("eval_t28_link_selfheal", ["evals/t28_link_selfheal.py"], HERE, 90),
     ("eval_t29_approval_loop", ["evals/t29_approval_loop.py"], HERE, 120),
     ("eval_t30_heartbeat", ["evals/t30_heartbeat.py"], HERE, 90),
+    # T31：桌面两套主题的无障碍 + 对比度（P2-13，WCAG AA）
+    # 两层判据：① axe 真实引擎，serious/critical 必须为 0；
+    # ② 自算对比度，**含图标字形**（axe 对单字符直接判 incomplete，是盲区）
+    #    与渐变背景的每个色标取最差；文字 ≥4.5、图标 ≥3.0。
+    # 缺 node/playwright 时 skip 并说明，不假装绿。
+    ("eval_t31_a11y_contrast", ["evals/t31_a11y_contrast.py"], HERE, 420),
+    # T32：桌面界面死链（P2-12，X0）。真浏览器点一遍，判据是
+    # 「页面指纹没变 且 没发出任何请求」才算死链；遮罩/disabled/当前选中记跳过。
+    # 同时卡覆盖率 ≥90%——覆盖率太低时「死链 0」不可信。
+    ("eval_t32_deadlink", ["evals/t32_deadlink.py"], HERE, 920),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
