@@ -133,12 +133,12 @@ class Histogram(_Base):
             base = _label_str(self.labelnames, labels)
             for b in self.buckets:
                 cnt = self._buckets.get((k, b), 0.0)
-                out.append("%s_bucket%s  %s" % (
+                out.append("%s_bucket%s %s" % (
                     self.name, _join_le(base, b), _fmt(cnt)))
             s, c = self._agg.get(k, [0.0, 0.0])
-            out.append("%s_bucket%s  %s" % (self.name, _join_le(base, "+Inf"), _fmt(c)))
-            out.append("%s_sum%s  %s" % (self.name, base, _fmt(s)))
-            out.append("%s_count%s  %s" % (self.name, base, _fmt(c)))
+            out.append("%s_bucket%s %s" % (self.name, _join_le(base, "+Inf"), _fmt(c)))
+            out.append("%s_sum%s %s" % (self.name, base, _fmt(s)))
+            out.append("%s_count%s %s" % (self.name, base, _fmt(c)))
         # 兜底：observe 先于任何 _order 进来的情况（理论上 _order 已覆盖）
         for k in list(self._agg):
             if k not in seen:
@@ -146,9 +146,14 @@ class Histogram(_Base):
 
 
 def _join_le(base, le):
+    # base 形如 {backend="x"}；Prometheus 要求 le 作为标签塞进同一对花括号里。
+    # 拼到 } 外面（{backend="x"},le="5"）是非法格式，抓取端会整条丢指标。
+    # 无标签时也不能漏花括号（le="5" 同样是非法行）。
     if base:
+        if base.endswith("}"):
+            return "%s,%s}" % (base[:-1], _le(le))
         return "%s,%s" % (base, _le(le))
-    return _le(le)
+    return "{%s}" % _le(le)
 
 
 def _le(le):

@@ -60,7 +60,7 @@ check(MC.by_kind(MC.CUSTOM) == {}, "自定义不在内置目录里")
 
 print("⑥ 已知体积写实填")
 check(MC.get("sd15-q8_0.gguf")["size_bytes"] == 1_763_578_176, "SD1.5 体积写实")
-check(MC.get("beijixing-v7-q8_0.gguf")["size_bytes"] == 639_000_000, "北极星-V7 体积写实")
+check(MC.get("beijixing-v7-q8_0.gguf")["size_bytes"] == 639_446_720, "北极星-V7 体积写实")
 
 
 print("model_catalog: ", "PASS" if not FAIL else "FAIL (%d 项)" % len(FAIL))
