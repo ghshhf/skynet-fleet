@@ -134,6 +134,14 @@ class ControlClient:
     def nodes(self):
         return self.request(common.OP_NODES).get("nodes") or []
 
+    def nodes_detail(self):
+        """名字 → {platform, peer, caps}。
+
+        `peer` 是**真实来源地址**：跨网段排查第一问就是「它从哪连来的」，
+        只有名字时无法区分「它连了我」和「它自己连自己」。
+        """
+        return self.request(common.OP_NODES).get("detail") or {}
+
     def exec(self, node, cmd, timeout=None):
         """在节点上执行命令（白名单由节点侧把关）。返回 {rc, out, err}。"""
         return self.request(common.OP_EXEC, node=node, cmd=cmd, timeout=timeout)

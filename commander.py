@@ -639,15 +639,25 @@ def _handle_node(conn, password):
         #   临时节点「下机即清」在最常见的场景（断线重连）下失效 ⇒ 钥匙留在门上。
         #   现在给每次注册发一个世代号 GEN，连接断开时只认「自己是当前世代」。
         _gen = _next_gen()
+        # 🔴 来源地址必须记：多网段环境下「谁连上来的」是排查第一问。
+        #   2026-10-25 真事：另一台机器报 192.168.0.103 已接入，而这侧在线表里
+        #   只有本地自测节点 —— 没有 peer 时无法从日志区分「它连了我」还是「它自己连自己」。
+        try:
+            _ph, _pp = conn.getpeername()[:2]
+            _peer = f"{_ph}:{_pp}"
+        except OSError:
+            _peer = "?"
         REGISTRY.with_lock(lambda d: d.__setitem__(name, {
             "sock": conn, "token": token, "gen": _gen,
             "platform": reg.get("platform", "?"),
             "info": reg.get("info", {}),
             "capabilities": reg.get("capabilities", []),
+            "peer": _peer,
             "last_hb": time.time(),
         }))
-        print(f"[+] 节点上线: {name} ({reg.get('platform')}) caps={reg.get('capabilities')}", flush=True)
-        audit.log("node.up", node=name, platform=reg.get("platform"),
+        print(f"[+] 节点上线: {name} ({reg.get('platform')}) from {_peer} "
+              f"caps={reg.get('capabilities')}", flush=True)
+        audit.log("node.up", node=name, platform=reg.get("platform"), peer=_peer,
                   caps=reg.get("capabilities"))
         # 记进「来过」的历史（凭据字段由 registry 白名单剔掉，密码不会落盘）
         REGISTRY.observe(name, reg, force=True)
@@ -740,8 +750,17 @@ def _handle_client(conn, name="?"):
             node = m.get("node") or ""
             t0 = time.time()
             if op == common.OP_NODES:
-                rows = REGISTRY.with_lock(lambda d: sorted(d.keys()))
-                res = {"ok": True, "data": {"nodes": rows}}
+                # `nodes` 保留纯名字列表（老客户端照旧能读）；
+                # `detail` 补上来源/平台/能力 —— 光有名字判不出「它从哪来」。
+                def _snap(d):
+                    names = sorted(d.keys())
+                    detail = {k: {"platform": v.get("platform"),
+                                  "peer": v.get("peer"),
+                                  "caps": v.get("capabilities")}
+                              for k, v in d.items()}
+                    return names, detail
+                rows, detail = REGISTRY.with_lock(_snap)
+                res = {"ok": True, "data": {"nodes": rows, "detail": detail}}
             elif op == common.OP_EXEC:
                 if not node or not (m.get("cmd") or "").strip():
                     res = {"ok": False, "err": "exec 需要 node 和 cmd"}
