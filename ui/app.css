@@ -386,6 +386,14 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   border-radius:6px 6px 0 0}
 .tab:hover{color:var(--fg);background:var(--panel-2)}
 .tab.on{color:var(--accent-text);border-bottom-color:var(--accent);font-weight:500}
+/* Tab 末尾的数量徽标：值全部来自接口（见 app.js paintTabCounts），
+   前端一个数都不写死。空值时不占位（hidden），避免出现「技能 」这种空钩子。 */
+.tab .tn{display:inline-block;margin-left:5px;padding:0 5px;min-width:16px;
+  border-radius:8px;background:var(--panel-2);color:var(--fg-3);
+  font-size:10.5px;font-variant-numeric:tabular-nums;line-height:15px;
+  text-align:center;vertical-align:1px}
+.tab.on .tn{background:var(--accent-solid);color:#fff}
+.tab .tn[hidden]{display:none}
 .tab:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 
 /* ---------- Tab 内容区 ---------- */

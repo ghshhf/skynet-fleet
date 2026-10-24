@@ -245,6 +245,66 @@
   var ASSET_TAB = "fleet";
   var ASSET_CACHE = { fleet: null, cards: null, skills: null, conns: null, caps: null, audio: null };
 
+  /* ------------------------------------------------------------------ Tab 数量徽标
+     🔴 铁律：**前端不写死任何数量**。
+     曾经出现的形态是「技能 18」「连接器 12」这种手填字符串 —— 后端加一个能力，
+     界面上的数就永远停在旧值，而且没有任何东西会报错（总账 X1 就是这一条）。
+     现在每个徽标的唯一来源是它自己那个接口：
+       编队 = /api/fleet.devices.total   （后端算好的 total，不在前端重算）
+       专家 = /api/cardstore.cards       （本地卡库张数）
+       技能 = /api/skills.skills         （vendored + 用户级）
+       连接器 = /api/connectors.connectors
+       声音 = /api/audio/presets.presets
+     拿不到就显示「·」而不是 0：0 会读成「一个都没有」，· 才读得懂「还没读到」。 */
+  function _setTn(id, n) {
+    var e = $(id);
+    if (!e) { return; }
+    if (n === null || n === undefined || (typeof n === "number" && isNaN(n))) {
+      e.textContent = "";
+      e.hidden = true;
+    } else {
+      e.textContent = String(n);
+      e.hidden = false;
+    }
+  }
+
+  function paintTabCounts() {
+    var dev = ASSET_CACHE.fleet && ASSET_CACHE.fleet.devices;
+    _setTn("tnFleet", dev ? (dev.total !== undefined ? dev.total : (dev.rows || []).length) : null);
+    _setTn("tnCards", ASSET_CACHE.cards ? (ASSET_CACHE.cards.cards || []).length : null);
+    _setTn("tnSkills", ASSET_CACHE.skills ? (ASSET_CACHE.skills.skills || []).length : null);
+    _setTn("tnConns", ASSET_CACHE.conns ? (ASSET_CACHE.conns.connectors || []).length : null);
+    _setTn("tnAudio", ASSET_CACHE.audio ? (ASSET_CACHE.audio.presets || []).length : null);
+  }
+
+  // 启动时把五个来源各拉一次，只为把徽标点亮（不点 Tab 也看得到规模）。
+  // 只填空值，不覆盖已加载的缓存——避免把用户刚刷新的结果又盖回旧数据。
+  function refreshTabCounts() {
+    var jobs = [];
+    if (!ASSET_CACHE.fleet) {
+      jobs.push(api("/api/fleet").then(function (d) { ASSET_CACHE.fleet = d; })
+        .catch(function () { /* 单源失败不连坐：其余徽标照常亮 */ }));
+    }
+    if (!ASSET_CACHE.cards) {
+      jobs.push(api("/api/cardstore").then(function (d) { ASSET_CACHE.cards = d; })
+        .catch(function () {}));
+    }
+    if (!ASSET_CACHE.skills) {
+      jobs.push(api("/api/skills").then(function (d) { ASSET_CACHE.skills = d; })
+        .catch(function () {}));
+    }
+    if (!ASSET_CACHE.conns) {
+      jobs.push(api("/api/connectors").then(function (d) { ASSET_CACHE.conns = d; })
+        .catch(function () {}));
+    }
+    if (!ASSET_CACHE.audio) {
+      jobs.push(api("/api/audio/presets").then(function (d) { ASSET_CACHE.audio = d; })
+        .catch(function () {}));
+    }
+    if (!jobs.length) { paintTabCounts(); return Promise.resolve(); }
+    return Promise.all(jobs).then(paintTabCounts);
+  }
+
   function setAssetTab(tab) {
     ASSET_TAB = tab;
     Array.prototype.forEach.call(document.querySelectorAll("#tabBar .tab"), function (b) {
@@ -285,6 +345,7 @@
         ASSET_CACHE.pair = rs[1];
         renderFleetTab(rs[0]);
         renderPairBlock(rs[1]);
+        paintTabCounts();
       }).catch(function (e) {
         if (stale()) { return; }
         renderTabErr(body, "读不到编队总览：" + e.message);
@@ -296,6 +357,7 @@
         if (stale()) { return; }
         ASSET_CACHE.cards = d;
         renderCardsTab(d);
+        paintTabCounts();
       }).catch(function (e) {
         if (stale()) { return; }
         renderTabErr(body, "读不到角色卡：" + e.message);
@@ -315,6 +377,7 @@
         ASSET_CACHE.skills = rs[0];
         ASSET_CACHE.evolved = rs[1];
         renderSkillsTab(rs[0], rs[1]);
+        paintTabCounts();
       }).catch(function (e) {
         if (stale()) { return; }
         renderTabErr(body, "读不到技能清单：" + e.message);
@@ -326,6 +389,7 @@
         if (stale()) { return; }
         ASSET_CACHE.audio = d;
         renderAudioTab(d);
+        paintTabCounts();
       }).catch(function (e) {
         if (stale()) { return; }
         renderTabErr(body, "读不到音频预设：" + e.message);
@@ -336,6 +400,7 @@
       if (stale()) { return; }
       ASSET_CACHE.conns = d;
       renderConnsTab(d);
+      paintTabCounts();
     }).catch(function (e) {
       if (stale()) { return; }
       renderTabErr(body, "读不到连接器清单：" + e.message);
@@ -1596,6 +1661,9 @@
     api("/api/caps").then(renderCaps).catch(function (e) {
       toast("读取能力清单失败：" + e.message, true);
     });
+
+    // Tab 徽标不点也要亮：五个只读端点各拉一次，数全部来自后端。
+    refreshTabCounts();
 
     // W3 设备页
     loadHost();
