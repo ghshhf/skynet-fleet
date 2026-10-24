@@ -1,0 +1,298 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0E1116"><title>天网融合计划书 · 两个手机端 + 三个网络层</title><style>
+:root{
+  --ink:#0E1116; --panel:#161B22; --panel2:#1E252E; --line:#2A323C;
+  --cyan:#4DD0E1; --amber:#E8B44A; --red:#E05A5A; --green:#57C08A;
+  --text:#E6EDF3; --dim:#8B98A5;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; padding:0 0 60px; background:var(--ink); color:var(--text);
+  font:16px/1.72 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC",
+       "Microsoft YaHei",sans-serif;
+  word-break:break-word; overflow-wrap:anywhere;
+}
+.wrap{max-width:760px;margin:0 auto;padding:0 16px}
+header{
+  position:sticky;top:0;z-index:9;background:rgba(14,17,22,.94);
+  backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
+  padding:10px 16px;
+}
+header .t{font-size:14px;font-weight:600;color:var(--cyan);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+header .s{font-size:11px;color:var(--dim);margin-top:2px}
+h1{font-size:23px;line-height:1.35;margin:26px 0 12px;font-weight:700;
+   border-left:3px solid var(--cyan);padding-left:11px}
+h2{font-size:19px;margin:32px 0 12px;font-weight:650;color:#fff;
+   border-bottom:1px solid var(--line);padding-bottom:8px}
+h3{font-size:16px;margin:22px 0 9px;color:var(--cyan);font-weight:600}
+h4{font-size:14.5px;margin:16px 0 7px;color:var(--amber)}
+p{margin:11px 0;color:var(--text)}
+a{color:var(--cyan);text-decoration:none;border-bottom:1px dotted rgba(77,208,225,.5)}
+strong{color:#fff;font-weight:650}
+em{color:var(--amber);font-style:normal}
+code{
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:.875em;background:rgba(255,255,255,.08);color:#A8E7F0;
+  padding:1.5px 5px;border-radius:4px;
+}
+pre{
+  background:#0A0D11;border:1px solid var(--line);border-radius:10px;
+  padding:12px 13px;overflow-x:auto;margin:14px 0;
+  -webkit-overflow-scrolling:touch;
+}
+pre code{background:none;color:#C9D6E0;font-size:12.5px;line-height:1.62;padding:0}
+blockquote{
+  margin:14px 0;padding:9px 13px;background:var(--panel);
+  border-left:3px solid var(--amber);border-radius:0 8px 8px 0;color:var(--dim);
+}
+blockquote p{margin:4px 0;color:var(--dim)}
+hr{border:0;border-top:1px solid var(--line);margin:26px 0}
+ul,ol{margin:11px 0;padding-left:22px}
+li{margin:5px 0}
+li::marker{color:var(--cyan)}
+
+/* 表格：手机上不硬塞，改成横向可滑 + 首列吸住 */
+.tablewrap{overflow-x:auto;margin:14px 0;border:1px solid var(--line);
+  border-radius:10px;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;font-size:13px;min-width:480px}
+th{background:var(--panel2);color:var(--cyan);font-weight:600;
+   padding:9px 11px;text-align:left;white-space:nowrap;
+   position:sticky;top:0;border-bottom:1px solid var(--line)}
+td{padding:9px 11px;border-bottom:1px solid rgba(42,50,60,.65);vertical-align:top}
+tr:last-child td{border-bottom:0}
+tbody tr:nth-child(even){background:rgba(255,255,255,.017)}
+td:first-child{white-space:nowrap;color:#C9D6E0}
+
+/* 内嵌 SVG 图：宽度自适应，不裁切 */
+.svgbox{margin:16px 0;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:10px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.svgbox svg{display:block;width:100%;height:auto;min-width:320px}
+
+details{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:10px 13px;margin:12px 0}
+summary{cursor:pointer;font-weight:600;color:var(--cyan);font-size:14px}
+details[open] summary{margin-bottom:8px}
+
+.tag{display:inline-block;font-size:11px;font-family:ui-monospace,monospace;
+  padding:1px 6px;border-radius:4px;background:var(--panel2);color:var(--dim)}
+footer{margin-top:44px;padding-top:14px;border-top:1px solid var(--line);
+  font-size:11.5px;color:var(--dim);text-align:center}
+@media (prefers-color-scheme:light){
+  /* 保持深色：这是给夜里看的，浅色下反而刺眼 */
+}
+</style></head><body><header><div class="t">天网融合计划书 · 两个手机端 + 三个网络层</div><div class="s">天网 · 融合计划书</div></header><div class="wrap"><h1>天网融合计划书 · 两个手机端 + 三个网络层</h1>
+<blockquote><p>写于 2026-10-25 06:00。依据：当日实测（真机 Redmi K60 已装 <code>tianwang-next</code> v0.1-proto）</p><p>+ 三个上游仓库当天 HEAD 的 README/源码。</p><p>一句话：<strong>手机端管"看得见"，网络层管"用得起"，天网管"谁来做"。三者不是并列，是三层。</strong></p></blockquote>
+<h2>一、先把话说清：现在手里到底有什么</h2>
+<h3>1.1 两个手机端（产品形态的参照）</h3>
+<div class="tablewrap"><table><thead><tr><th></th><th>Operit</th><th>pocketpal-ai</th><th>天网 Next</th></tr></thead><tbody><tr><td>语言</td><td>Kotlin + Compose</td><td>React Native + TS</td><td>Kotlin + Compose</td></tr><tr><td>星数</td><td>8952</td><td>8795</td><td>—</td></tr><tr><td>本地模型</td><td>❌（塞在工具里的旁枝）</td><td>✅ GGUF/llama.cpp</td><td>✅ 已定接口，待接 JNI</td></tr><tr><td>云端模型</td><td>✅ 主路</td><td>❌ 完全没有</td><td>✅ 已定接口，待接 SSE</td></tr><tr><td>编队/多机</td><td>❌</td><td>❌</td><td>✅ 独有</td></tr><tr><td>界面厚度</td><td>21 个 feature 模块</td><td>9 个 screen</td><td>4 个页面（原型）</td></tr></tbody></table></div>
+<p><strong>结论</strong>：它们各自瘸一条腿，这是主人当场的原话，不是我的判断。 天网 Next 的取舍点是 <strong><code>Model.kt</code> 里那个 <code>ModelBackend</code> 接口</strong>——只要那个 <code>if (是不是本地)</code> 永远只出现在 <code>backendFor()</code> 一处，加第三个、第四个引擎都不用改 UI。</p>
+<h3>1.2 三个网络层（云端额度的来源）</h3>
+<div class="tablewrap"><table><thead><tr><th></th><th>freellmapi</th><th>zen-gate</th><th>dsh-our-free-model</th></tr></thead><tbody><tr><td>语言/形态</td><td>TS 服务 / Docker</td><td>Go 桌面托盘</td><td>JS 零依赖插件</td></tr><tr><td>星数</td><td>40910</td><td>227</td><td>41191</td></tr><tr><td>端点</td><td><code>:3001/v1</code> + 统一 Key</td><td>面板可配端口</td><td>本机 <code>8326</code>、独立服务 <code>18900</code></td></tr><tr><td>覆盖</td><td>34 家 635 个免费端点</td><td>OpenCode Zen 车道 + 14 家预设</td><td>10 个账号渠道 + Kilo + 匿名车道</td></tr><tr><td>局域网</td><td>需自行暴露</td><td>面板可配</td><td><strong>自带中继（0.0.0.0 + 独立 LAN Key）</strong></td></tr><tr><td>特点</td><td>额度跟踪、按 Key 计用量、自动 failover</td><td>自动注入 Agent 配置、单模型体检、模态路由</td><td>零依赖、免登录免 Key、说 Anthropic + OpenAI 双协议</td></tr><tr><td>协议</td><td>OpenAI</td><td>OpenAI + Anthropic</td><td>Chat/Responses + <strong><code>/v1/messages</code>（Anthropic 原生）</strong></td></tr></tbody></table></div>
+<p><strong>关键判断：这三个不是三个系统，是同一种资源的三个实例。</strong> 它们做的事完全一样——<strong>把上游的免费额度，翻译成一个 OpenAI 兼容端点</strong>。 差异只在「上游从哪来」「怎么轮换」「有没有局域网口」。</p>
+<p>⇒ 所以融合的正确姿势<strong>不是分别对接三次</strong>，而是抽一层：</p>
+<pre><code>        ┌──────────── Provider 注册表（一层）────────────┐
+        │  id / kind / baseUrl / key / 探测结果 / 模型表 │
+        └───────┬──────────┬──────────┬────────────────┘
+                │          │          │
+           freellmapi   zen-gate    dsh        自付 Key    本地 llama.cpp</code></pre>
+<h2>二、目标形态：三层，各管各的</h2>
+<div class="svgbox"><svg viewBox="0 0 680 452" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,-apple-system,'PingFang SC','Noto Sans CJK SC',sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4DD0E1"/>
+    </marker>
+  </defs>
+
+  <!-- 第三层：手机端 -->
+  <rect x="16" y="8" width="648" height="96" rx="12" fill="#161B22" stroke="#2A323C"/>
+  <text x="34" y="34" fill="#4DD0E1" font-size="14" font-weight="600">第三层 · 手机端（看得见）</text>
+  <text x="34" y="53" fill="#8B98A5" font-size="11">它不认 freellmapi / zen-gate / dsh，只认「云引擎」</text>
+  <g>
+    <rect x="34" y="64" width="146" height="28" rx="7" fill="#1E252E" stroke="#2A323C"/>
+    <text x="107" y="83" fill="#E6EDF3" font-size="12" text-anchor="middle">对话</text>
+    <rect x="190" y="64" width="146" height="28" rx="7" fill="#1E252E" stroke="#2A323C"/>
+    <text x="263" y="83" fill="#E6EDF3" font-size="12" text-anchor="middle">模型</text>
+    <rect x="346" y="64" width="146" height="28" rx="7" fill="#1E252E" stroke="#2A323C"/>
+    <text x="419" y="83" fill="#E6EDF3" font-size="12" text-anchor="middle">编队</text>
+    <rect x="502" y="64" width="146" height="28" rx="7" fill="#1E252E" stroke="#2A323C"/>
+    <text x="575" y="83" fill="#E6EDF3" font-size="12" text-anchor="middle">设置</text>
+  </g>
+
+  <!-- 链路 -->
+  <line x1="340" y1="104" x2="340" y2="130" stroke="#4DD0E1" stroke-width="1.6" marker-end="url(#ar)"/>
+  <text x="352" y="122" fill="#8B98A5" font-size="10.5">一条链路（局域网 / 隧道）</text>
+
+  <!-- 第二层：控制面 -->
+  <rect x="16" y="136" width="648" height="184" rx="12" fill="#161B22" stroke="#4DD0E1" stroke-width="1.4"/>
+  <text x="34" y="162" fill="#4DD0E1" font-size="14" font-weight="600">第二层 · 天网控制面（用得起）</text>
+  <text x="34" y="181" fill="#8B98A5" font-size="11">Provider 注册表 → 探测 → 路由 → 降级链 → 额度记账</text>
+
+  <rect x="34" y="194" width="118" height="46" rx="8" fill="#1B2A22" stroke="#57C08A"/>
+  <text x="93" y="213" fill="#57C08A" font-size="11.5" text-anchor="middle" font-weight="600">本地 llama.cpp</text>
+  <text x="93" y="230" fill="#8B98A5" font-size="10" text-anchor="middle">:8080 / :8090</text>
+
+  <rect x="160" y="194" width="118" height="46" rx="8" fill="#1E252E" stroke="#2A323C"/>
+  <text x="219" y="213" fill="#E6EDF3" font-size="11.5" text-anchor="middle" font-weight="600">dsh</text>
+  <text x="219" y="230" fill="#8B98A5" font-size="10" text-anchor="middle">:8326 / 中继 18899</text>
+
+  <rect x="286" y="194" width="118" height="46" rx="8" fill="#1E252E" stroke="#2A323C"/>
+  <text x="345" y="213" fill="#E6EDF3" font-size="11.5" text-anchor="middle" font-weight="600">zen-gate</text>
+  <text x="345" y="230" fill="#8B98A5" font-size="10" text-anchor="middle">实测 :8787</text>
+
+  <rect x="412" y="194" width="118" height="46" rx="8" fill="#1E252E" stroke="#2A323C"/>
+  <text x="471" y="213" fill="#E6EDF3" font-size="11.5" text-anchor="middle" font-weight="600">freellmapi</text>
+  <text x="471" y="230" fill="#8B98A5" font-size="10" text-anchor="middle">:3001</text>
+
+  <rect x="538" y="194" width="110" height="46" rx="8" fill="#2A2216" stroke="#E8B44A"/>
+  <text x="593" y="213" fill="#E8B44A" font-size="11.5" text-anchor="middle" font-weight="600">自付 Key</text>
+  <text x="593" y="230" fill="#8B98A5" font-size="10" text-anchor="middle">保底才动</text>
+
+  <rect x="34" y="252" width="614" height="52" rx="8" fill="#0F1419" stroke="#2A323C" stroke-dasharray="3 3"/>
+  <text x="46" y="271" fill="#8B98A5" font-size="10.5">密钥只留在这一层：手机丢了不泄露；换 WiFi 不用重配；三家共用同一批上游账号，才能统一记账</text>
+  <text x="46" y="290" fill="#E05A5A" font-size="10.5">风险：白嫖车道随时失效（zen-gate 自己写过 v1.8.0 因指纹拦截整条退役）⇒ 链尾必须有本地或自付</text>
+
+  <!-- 编队协议 -->
+  <line x1="340" y1="322" x2="340" y2="348" stroke="#4DD0E1" stroke-width="1.6" marker-end="url(#ar)"/>
+  <text x="352" y="340" fill="#8B98A5" font-size="10.5">编队协议 common.CLIENT*</text>
+
+  <!-- 第一层：编队 -->
+  <rect x="16" y="354" width="648" height="90" rx="12" fill="#161B22" stroke="#2A323C"/>
+  <text x="34" y="380" fill="#4DD0E1" font-size="14" font-weight="600">第一层 · 编队（谁来做）</text>
+  <g>
+    <rect x="34" y="394" width="190" height="32" rx="7" fill="#1E252E" stroke="#2A323C"/>
+    <text x="129" y="415" fill="#E6EDF3" font-size="11.5" text-anchor="middle">1号机 · 总控 + 存储</text>
+    <rect x="238" y="394" width="190" height="32" rx="7" fill="#1E252E" stroke="#2A323C"/>
+    <text x="333" y="415" fill="#E6EDF3" font-size="11.5" text-anchor="middle">2号机 · 游戏工具箱</text>
+    <rect x="442" y="394" width="206" height="32" rx="7" fill="#1B2A22" stroke="#57C08A"/>
+    <text x="545" y="415" fill="#57C08A" font-size="11.5" text-anchor="middle">手机 · 是节点也是控制台</text>
+  </g>
+</svg></div>
+<h3>2.1 三个设计决定，以及为什么</h3>
+<p><strong>(1) 手机不直连那三家，只连天网路由层。</strong> 理由不是"架构好看"，是三条硬理由：</p>
+<ul>
+<li>密钥全在 1 号机，<strong>手机丢了不泄露</strong>；</li>
+<li>手机换网/换 WiFi 不用重配（只记一个天网地址）；</li>
+<li>三家网关的额度是<strong>共享池</strong>，手机直连就无法统一记账，会互相抢额度。</li>
+</ul>
+<p>例外：dsh 自带 LAN 中继、且中继 Key 与本机 Key 互不通用——<strong>离线应急时手机可直连 dsh</strong>， 这是唯一允许的旁路，写进设置页当"应急通道"，默认关。</p>
+<p><strong>(2) 降级链顺序，按"失效概率"从低到高排。</strong></p>
+<div class="svgbox"><svg viewBox="0 0 680 360" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,-apple-system,'PingFang SC','Noto Sans CJK SC',sans-serif">
+  <defs>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8B98A5"/>
+    </marker>
+  </defs>
+
+  <text x="16" y="18" fill="#8B98A5" font-size="11">先试上面，挂了才往下走 —— 越往下越"依赖外部"</text>
+
+  <rect x="16" y="28" width="648" height="50" rx="9" fill="#1B2A22" stroke="#57C08A"/>
+  <circle cx="42" cy="53" r="11" fill="#57C08A"/>
+  <text x="42" y="57" fill="#0E1116" font-size="12" font-weight="700" text-anchor="middle">1</text>
+  <text x="64" y="50" fill="#57C08A" font-size="12.5" font-weight="600">本地 llama.cpp</text>
+  <text x="64" y="68" fill="#8B98A5" font-size="10.5">唯一不依赖上游政策的环节，只会因算力挂；同时是隐私闸门</text>
+
+  <line x1="340" y1="78" x2="340" y2="94" stroke="#8B98A5" stroke-width="1.3" marker-end="url(#a2)"/>
+
+  <rect x="16" y="96" width="648" height="50" rx="9" fill="#161B22" stroke="#2A323C"/>
+  <circle cx="42" cy="121" r="11" fill="#2A323C"/>
+  <text x="42" y="125" fill="#E6EDF3" font-size="12" font-weight="700" text-anchor="middle">2</text>
+  <text x="64" y="118" fill="#E6EDF3" font-size="12.5" font-weight="600">dsh-our-free-model</text>
+  <text x="64" y="136" fill="#8B98A5" font-size="10.5">零依赖、免登录免 Key，起得最快；自带局域网中继（应急直连就靠它）</text>
+
+  <line x1="340" y1="146" x2="340" y2="162" stroke="#8B98A5" stroke-width="1.3" marker-end="url(#a2)"/>
+
+  <rect x="16" y="164" width="648" height="50" rx="9" fill="#161B22" stroke="#2A323C"/>
+  <circle cx="42" cy="189" r="11" fill="#2A323C"/>
+  <text x="42" y="193" fill="#E6EDF3" font-size="12" font-weight="700" text-anchor="middle">3</text>
+  <text x="64" y="186" fill="#E6EDF3" font-size="12.5" font-weight="600">zen-gate</text>
+  <text x="64" y="204" fill="#8B98A5" font-size="10.5">渠道最多、有 failover 与单模型体检；但也最依赖"对齐官方指纹"这层伪装</text>
+
+  <line x1="340" y1="214" x2="340" y2="230" stroke="#8B98A5" stroke-width="1.3" marker-end="url(#a2)"/>
+
+  <rect x="16" y="232" width="648" height="50" rx="9" fill="#161B22" stroke="#2A323C"/>
+  <circle cx="42" cy="257" r="11" fill="#2A323C"/>
+  <text x="42" y="261" fill="#E6EDF3" font-size="12" font-weight="700" text-anchor="middle">4</text>
+  <text x="64" y="254" fill="#E6EDF3" font-size="12.5" font-weight="600">freellmapi</text>
+  <text x="64" y="272" fill="#8B98A5" font-size="10.5">635 个端点最全、按 Key 计用量；要 Docker/Node 起服务，最重</text>
+
+  <line x1="340" y1="282" x2="340" y2="298" stroke="#8B98A5" stroke-width="1.3" marker-end="url(#a2)"/>
+
+  <rect x="16" y="300" width="648" height="50" rx="9" fill="#2A2216" stroke="#E8B44A"/>
+  <circle cx="42" cy="325" r="11" fill="#E8B44A"/>
+  <text x="42" y="329" fill="#0E1116" font-size="12" font-weight="700" text-anchor="middle">5</text>
+  <text x="64" y="322" fill="#E8B44A" font-size="12.5" font-weight="600">自付 Key（保底）</text>
+  <text x="64" y="340" fill="#8B98A5" font-size="10.5">唯一会真花钱的一环 ⇒ 只在前面全挂才动，绝不默认走这里</text>
+</svg></div>
+<p><strong>为什么本地排第一</strong>：它不依赖任何上游政策，唯一会挂的原因是手机/机器性能。 <strong>为什么自付 Key 排最后</strong>：它是唯一会真花钱的，只在前面全挂时才动。</p>
+<p><strong>(3) 额度按"上游账号"记账，不按 provider 记账。</strong> freellmapi 的教训：它按 Key 跟踪用量才能不超额。我们三家混用时， <strong>同一个上游（比如智谱）可能被 dsh 和 zen-gate 同时消耗</strong>—— 所以记账的键必须是 <code>上游厂商 + 账号</code>，不是 <code>网关名</code>。 这一条不做，就会出现"以为还有额度、实际早打满"。</p>
+<h2>三、风险，写在最前面而不是最后面</h2>
+<p>这三条不是免责声明，是<strong>会让整个方案某天突然失效的现实</strong>：</p>
+<p><strong>R1 · 对抗性方案，随时失效。</strong> zen-gate 自己的 README 写着：v1.8.0 曾因上游按客户端指纹拦截（一律 403）<strong>退役整条车道</strong>， v1.9.0 靠对齐官方客户端指纹恢复。这句话的意思是——<strong>上游随时能再关一次</strong>。 ⇒ 应对：降级链必须至少有一环不依赖"伪装"，即本地模型或自付 Key。<strong>不能只有白嫖。</strong></p>
+<p><strong>R2 · 免费池可能记录提示词。</strong> zen-gate 明说「免费池提示词可能被上游记录，别交机密内容」。 ⇒ 应对：<code>SettingsScreen</code> 里那个「优先本地」开关不是装饰，是<strong>隐私闸门</strong>。 涉及本机路径、密钥、私人内容的对话，强制本地；网关层只许过"公开可查"的问题。</p>
+<p><strong>R3 · 账号风险。</strong> 这类方案本质是蹭免费车道，可能违反上游 ToS。 ⇒ 应对：<strong>只挂小号</strong>，不绑支付方式，不与主账号同设备指纹；一旦某渠道开始 403 就停用， 不反复重试（重试会把账号推到风控前面）。</p>
+<h2>四、分批路线（每批都有可验证的判据）</h2>
+<h3>P0 · Provider 注册表 + 探测（本机 CLI，先能看见）</h3>
+<ul>
+<li>新增 <code>fleet/providers.py</code>：<code>Provider</code> 数据类 + 注册表 + <code>discover()</code> + <code>probe()</code></li>
+<li><code>discover()</code> 三路并行：<strong>扫候选端口</strong>（3001/8326/18899/18900/8080/8090）、</li>
+</ul>
+<p><strong>读各自配置文件</strong>（<code>%APPDATA%\zen-gate\channels\</code>、<code>~/.our-free-model</code>）、<strong>手填</strong></p>
+<ul>
+<li><code>probe()</code> 打 <code>/v1/models</code>，记录：存活 / 首字延迟 / 模型数 / 是否需要 Key / 上次成功时间</li>
+<li>兼容 <code>re_llm.py</code> 已有的 <code>~/.workbuddy/models.json</code> 形状，产出同一份文件</li>
+</ul>
+<p><strong>判据</strong>：<code>python -m fleet.providers</code> 一条命令列出所有网关， 每行带 <code>[活/死] 延迟 ms 模型数</code>，缺哪个能说清缺的原因（不是"不可用"三个字）。</p>
+<h3>P1 · 手机端接进来（看得见）</h3>
+<ul>
+<li><code>ModelsScreen</code> 的"云端引擎"分组升级为<strong>网关分组</strong>：每个网关一张卡，</li>
+</ul>
+<p>显示 存活灯 / 延迟 / 模型数 / 额度剩余（能拿到的才显示，拿不到就写"未知"）</p>
+<ul>
+<li>加"应急直连"开关（连 dsh LAN 中继）</li>
+<li>设置页暴露降级链顺序，可拖动</li>
+</ul>
+<p><strong>判据</strong>：手机上能看见至少 2 个网关的真实状态，并能用其中一个跑通一轮完整对话 （不是假流式，是真 SSE）。</p>
+<h3>P2 · 路由与降级（用得起）</h3>
+<ul>
+<li><code>route(task)</code>：按 模态需求（图/音/长上下文）+ 降级链 + 当前额度，选一个 provider</li>
+<li>失败自动换下一个，<strong>响应里标注实际用了谁</strong>（学 zen-gate 的响应头做法）</li>
+<li>额度记账按 <code>上游+账号</code>，落 sqlite，按天聚合</li>
+</ul>
+<p><strong>判据</strong>：手动关掉降级链第一环，同一轮对话不中断，日志能指认"从 A 换到了 B"。 额外：连续 50 轮不同任务，额度记账与上游面板数字对不上时能报警。</p>
+<h3>P3 · 随时随地（隧道）</h3>
+<ul>
+<li>dsh 的 LAN 中继已有，先复用它验证"手机在外网也能用"</li>
+<li>再上 <code>trycloudflare</code> 隧道（已有 handoff 隧道经验）把天网控制面暴露给手机</li>
+<li>记住 1 号机是 <code>0.0.0.0</code> 还是仅 LAN 的取舍：<strong>默认只绑 LAN</strong>，隧道按需开、带独立 Key</li>
+</ul>
+<p><strong>判据</strong>：手机关掉 WiFi 走 4G，仍能对话；关隧道后 30 秒内手机侧显示"离线"而不是转圈。</p>
+<h3>P4 · 工具调用统一（真 Agent）</h3>
+<p>这一步才轮到"像 Operit"：</p>
+<ul>
+<li>把天网 149 项能力（<code>catalog.py</code> 那份唯一真相）投影成模型可调用的 tool schema</li>
+<li>工具调用走天网自己的闸门（<code>tg_mcp.py</code> + <code>policy.json</code> 那套代码级闸门，不靠提示词约束）</li>
+<li>手机端 <code>ToolCard</code> 显示的是真的执行过程，不是 Demo 数据</li>
+</ul>
+<p><strong>判据</strong>：手机上说一句"看下 2 号机的 model 目录"，卡片里出现真的 <code>node.exec</code> 与真的目录输出。</p>
+<h2>五、明确不做什么（防止范围失控）</h2>
+<ul>
+<li><strong>不 fork 那三个网络层仓库</strong>。它们是外部依赖，跟着上游走；</li>
+</ul>
+<p>我们只在 <code>providers.py</code> 里写适配器。一 fork 就要跟三家同步，是纯负债。</p>
+<ul>
+<li><strong>不把 Operit 的 21 个 feature 全抄</strong>。只抄三件：Agent 任务流、工具卡片、思维链折叠。</li>
+</ul>
+<p>其余（包市场、工作流编辑器、Ubuntu 用户空间）不在移动端做。</p>
+<ul>
+<li><strong>不追求"完全离线可用"</strong>。本地模型是隐私闸门和最后兜底，不是主力——</li>
+</ul>
+<p>手机算力摆在那，4B 在 8G 内存机上就是 6 tok/s 的水平，这一点不能自我欺骗。</p>
+<h2>六、眼下这一步（正在做）</h2>
+<ol>
+<li><code>fleet/providers.py</code> —— 注册表 + 端口发现 + 探测（P0）</li>
+<li>手机端 <code>ModelsScreen</code> 加网关分组（P1 的壳，先吃 <code>Demo</code> 数据，等 P0 出来换真数据）</li>
+<li>把三个上游的端口/Key 位置写进 <code>providers.py</code> 的注释，免得下次又要翻 README</li>
+</ol>
+<h2>附：三个上游的关键事实（免得再查一遍）</h2>
+<div class="tablewrap"><table><thead><tr><th>项</th><th>值</th></tr></thead><tbody><tr><td>freellmapi 服务端口</td><td><code>:3001</code>，OpenAI 兼容 <code>http://localhost:3001/v1</code>，仪表盘 <code>:5173</code>（dev）</td></tr><tr><td>freellmapi 鉴权</td><td>仪表盘「密钥」页顶部的统一 API Key</td></tr><tr><td>freellmapi 部署</td><td>Docker 镜像 <code>ghcr.io/freellmapi</code> 或 <code>npx freellmapi</code></td></tr><tr><td>zen-gate 形态</td><td>桌面托盘（Win10/11、macOS 13+、Linux），Go 1.26</td></tr><tr><td>zen-gate 配置</td><td><code>%APPDATA%\zen-gate\channels\&lt;渠道ID&gt;.json</code>（每渠道一份）</td></tr><tr><td>zen-gate 协议</td><td>OpenAI + Anthropic 双兼容，chat / responses / messages 三种线协议</td></tr><tr><td>dsh 本机网关</td><td><code>127.0.0.1:8326</code>（Chat Completions + Responses）</td></tr><tr><td>dsh 独立服务</td><td><code>~/.our-free-model</code>，端口 <code>18900</code>（请求 18899，占用则顺延并把实际端口落盘）</td></tr><tr><td>dsh 局域网中继</td><td>默认关，开启后绑 <code>0.0.0.0</code> + <strong>独立 LAN Key</strong>（与本机 Key 不通用）</td></tr><tr><td>dsh 协议</td><td><code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/v1/messages</code>、<code>/v1/messages/count_tokens</code>、<code>/v1/models</code></td></tr></tbody></table></div></div><footer>天网 · 手机版文档 · 由 md2mob 生成</footer></body></html>
