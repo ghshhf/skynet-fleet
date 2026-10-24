@@ -4,7 +4,10 @@
 以及 capabilities/catalog 登记、common 消息类型。
 """
 import os, sys, tempfile
-sys.path.insert(0, "D:/code/device-fleet")
+# 老写法钉死 `D:/code/device-fleet`（那台机器的旧仓库位置），换机即
+# ModuleNotFoundError——本文件要 import 的模块全在本仓，根目录按 __file__
+# 推，不写死任何路径（2026-10-24 与 netrunner 同一批修）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fleet.memory_store import MemoryStore
 from fleet import catalog
 import capabilities, common

@@ -1,10 +1,11 @@
 """语音链路的跨进程驱动：**跑在 polaris 的解释器里**，fleet 解释器不碰 torch。
 
-为什么要有这个文件：fleet 跑在 `/d/tools/python/python.exe`（3.12），实测
-**没有** torch / transformers / soundfile / scipy / numpy；只有 polaris 的
-venv（`D:/work/_local_ai/train_15b/venv/Scripts/python.exe`, 3.13）有。
-「在 fleet 解释器里 import polaris 的 listen」会在 `import torch` 处当场炸，
-所以只能跨进程：本文件由 polaris 的 python 执行，结果以 JSON 打到 stdout。
+为什么要有这个文件：跨进程隔离 torch 依赖。设计当初的前提是「fleet 自带
+解释器没有 torch」（在那台机器上成立）；实测 2026-10-24 本机
+G:/Python312 已自带 torch 2.14.1+cpu + transformers + soundfile，前提
+已不成立——但隔离仍然保留：fleet 主进程不碰 torch，语音链崩了不牵连界面。
+解释器由 `fleet/gui/voice.py` 按候选制挑（环境变量 → 历史 venv → 当前
+解释器）；本文件由被选中的那个执行，结果以 JSON 打到 stdout。
 
 两个 whisper 坑在这里被**真正执行**（不是注释）：
   1. 简体 prompt（`以下为普通话。`）→ 不给它中文默认吐繁体；
@@ -31,8 +32,11 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # 预算与 prompt 走 fleet/gui/voice.py（唯一真值）；环境变量可覆盖，但
-# 默认值就是那份真值——两处各写一份必然会走偏。
+# 默认值就是那份真值——两处各写一份必然会走偏。模块目录同理：原默认钉在
+# `D:/work/_local_ai/train_15b/...`（那台机器上写的，换机即失效），
+# 2026-10-24 改为与 voice.py 共用同一份候选制真值。
 from fleet.gui.voice import (MAX_TARGET_POSITIONS as _MAX_POS,  # noqa: E402
+                             POLARIS_DIR,
                              PROMPT_TOKEN_RESERVE as _RESERVE,
                              PROMPT_ZH as _PROMPT_ZH,
                              max_new_tokens)
@@ -40,10 +44,7 @@ PROMPT_ZH = os.environ.get("FLEET_STT_PROMPT") or _PROMPT_ZH
 MAX_TARGET_POSITIONS = int(os.environ.get("FLEET_STT_MAX_POS") or _MAX_POS)
 PROMPT_TOKEN_RESERVE = int(os.environ.get("FLEET_STT_RESERVE") or _RESERVE)
 
-POLARIS_DIR = os.environ.get(
-    "FLEET_POLARIS_DIR",
-    "D:/work/_local_ai/train_15b/modules/polaris-audio-io")
-if POLARIS_DIR not in sys.path:
+if POLARIS_DIR and POLARIS_DIR not in sys.path:
     sys.path.insert(0, POLARIS_DIR)
 
 
