@@ -448,17 +448,23 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 try {
-                    final String text = Net.recognize(base, auth, wav);
+                    // ① 先试手机本地 whisper：飞行模式 / 不在局域网也能出字（总纲 §四 第 6 条）。
+                    // ② 本地不可用（没 .so / 没装模型 / 没听出内容）才回退传回 PC。
+                    String text = localRecognize(wav);
+                    if (TextUtils.isEmpty(text)) {
+                        text = Net.recognize(base, auth, wav);
+                    }
+                    final String text0 = text;
                     ui.post(new Runnable() {
                         @Override
                         public void run() {
-                            if (TextUtils.isEmpty(text)) {
+                            if (TextUtils.isEmpty(text0)) {
                                 setBusy(false);
                                 orb.setState(OrbView.IDLE);
                                 say2("没听清，再说一次？");
                                 return;
                             }
-                            ask(text);
+                            ask(text0);
                         }
                     });
                 } catch (Exception e) {
@@ -474,6 +480,59 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    /**
+     * 手机本地 whisper 识别（总纲 §四 第 6 条）。不可用/失败返回 null。
+     *
+     * 本地优先是为了「飞行模式也能出字」；但没装模型时必须让调用方回退到 PC，
+     * 不能因为本地这条新路把原来能用的传回 PC 弄坏。
+     */
+    private String localRecognize(byte[] wav) {
+        try {
+            if (wav == null || wav.length < 45) { return null; }
+            java.io.File model = new java.io.File(Whisper.defaultModelPath(this));
+            if (!Whisper.looksLikeGgml(model)) {
+                android.util.Log.i("fleet-whisper", "本地模型未装（" + model + "），回退 PC 识别");
+                return null;
+            }
+            // 定位 WAV 的 data 块：不假设固定 44 字节头（有些录音器会多写 LIST/fact 段）
+            int off = 12, end = wav.length;
+            while (off + 8 <= end) {
+                String id = new String(wav, off, 4, "US-ASCII");
+                int sz = (wav[off + 4] & 0xff) | ((wav[off + 5] & 0xff) << 8)
+                        | ((wav[off + 6] & 0xff) << 16) | ((wav[off + 7] & 0xff) << 24);
+                if ("data".equals(id)) { off += 8; end = Math.min(end, off + sz); break; }
+                off += 8 + sz + (sz & 1);
+            }
+            if (off >= end) { return null; }
+            int n = (end - off) / 2;
+            short[] pcm = new short[n];
+            for (int i = 0; i < n; i++) {
+                int lo = wav[off + i * 2] & 0xff;
+                int hi = wav[off + i * 2 + 1];
+                pcm[i] = (short) ((hi << 8) | lo);
+            }
+            Whisper w = new Whisper();
+            try {
+                if (!w.load(model.getAbsolutePath())) {
+                    android.util.Log.i("fleet-whisper", "本地模型加载失败：" + w.lastError + "，回退 PC 识别");
+                    return null;
+                }
+                String t = w.transcribe(pcm, 16000, "zh");
+                if (t == null || t.isEmpty()) {
+                    android.util.Log.i("fleet-whisper", "本地没听出内容：" + w.lastError + "，回退 PC 识别");
+                    return null;
+                }
+                android.util.Log.i("fleet-whisper", "本地识别成功 " + w.lastMs + "ms");
+                return t;
+            } finally {
+                w.close();
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("fleet-whisper", "本地识别异常，回退 PC：" + t);
+            return null;
+        }
     }
 
     // ---------------- 打字那条路 ----------------
