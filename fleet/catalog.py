@@ -175,6 +175,26 @@ CAPABILITIES = [
     Capability("life.sentinel", "生活哨兵：对比基线报告显著偏离（如「今晚房间持续很暗」）",
                params=(Param("baseline_frames", "int", doc="基线用最近几帧，默认 20")),
                note="只读：只看可观测偏离，不做因果/健康结论"),
+    # ---- P1 交互式逐个试码（万能遥控同款：手机当试码器，人当 oracle）----
+    # start/next 会真的发射红外脉冲，故 side_effect=True + approval="ask"。
+    # 会话级授权：start 过闸门后，注册表对「会话有效（granted+未超 TTL）」的
+    # 后续 next/yes/no/stop 免重复闸门——对齐真·万能遥控（没有每发一码问一次）。
+    # 没有会话文件时每一次发射都过人闸（fail-closed）；stop/闲置 10 分钟即失效。
+    Capability("ir.trial", "交互式逐个试码：对没进码库的品牌，按协议常见参数一个个"
+                          "试，人看设备反应确认，试中的码自动入库",
+               params=(Param("action", "str", doc="start 开一轮｜next/no 没反应下一个｜"
+                                                 "yes 有反应记下｜stop 停｜status 看状态"),
+                       Param("brand", "str", doc="start 用：品牌，如 格力"),
+                       Param("device_type", "str", doc="start 用：类型，如 风扇/电视"),
+                       Param("key", "str", doc="yes 可选：这个码实际是什么键（默认 power）"),
+                       Param("protocols", "str", doc="start 可选：限定协议，逗号分隔，"
+                                                    "默认 nec,nec_ext,samsung,sony"),
+                       Param("phrase", "str", doc="一句话兜底：「start 格力 风扇」")),
+               side_effect=True, approval="ask",
+               note="只对在场设备发射；每次一个独立脉冲不发连发。候选=码组"
+                    "(协议,地址,cmd基准)，命中 power 即按偏移表派生整组键"
+                    "（启发式，带待验证标记）。空调整包快照是另一套候选模型，"
+                    "本版不做——诚实报「暂无」不假装"),
     # ---- 距离感知（P0：手机能力升级计划书 2026-10-24）----
     # 把「只能报方向」升级成「米数 + 靠近/远离」。诚实边界写进 note：
     # 区间不报单点（多径 ±6dBm → 误差可达一倍，物理限制不是没优化）。

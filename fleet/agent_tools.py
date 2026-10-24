@@ -736,6 +736,29 @@ def _render_life_sentinel(r, arg):
     return "生活哨兵告警：" + "；".join(flags)
 
 
+def _render_ir_trial(r, arg):
+    if not r.get("ok"):
+        return f"试码：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    if d.get("hit"):
+        return (f"✅ {d.get('brand')} {d.get('device_type')} 命中入库："
+                f"{d.get('protocol')} 地址={d.get('addr'):#04x} "
+                f"基准={d.get('cmd_base'):#04x}。派生了 "
+                f"{len(d.get('derived_keys') or [])} 个键（待逐个验证）。"
+                f"以后直接说「{d.get('brand')} {d.get('device_type')} 开机」")
+    if d.get("stopped"):
+        return (f"试码会话已停（试了 {d.get('tried')} 个）。"
+                f"未命中的码组已记档，下次同品牌自动跳过")
+    if d.get("active") is False:
+        return "当前没有进行中的试码会话（说「start 品牌 类型」开一轮）"
+    idx, total = d.get("index", 0), d.get("total", 0)
+    if idx and total:
+        return (f"试码 {d.get('brand')} {d.get('device_type')}："
+                f"第 {idx}/{total} 个（{d.get('current', '')}）。"
+                f"看设备反应：有 → 说「有」；没有 → 说「没有」")
+    return "试码：无有效输出"
+
+
 def _render_prox_estimate(r, arg):
     if not r.get("ok"):
         return f"估距失败：{r.get('err') or '未知'}"
@@ -1063,6 +1086,14 @@ TOOLS = (
          render=_render_life_sentinel),
 
     # ---- 距离感知（P0：从「只能报方向」到「米数 + 靠近/远离」）----
+    # ---- P1 交互式逐个试码（万能遥控同款 UX）----
+    Tool("ir_trial", "ir.trial",
+         "交互式逐个试码：对码库里没有的品牌/型号，系统按协议常见参数排好候选"
+         "一个个发射，你站在设备旁看反应——「有反应」就记下入库，「没有」就下一个。"
+         "试中的码以后直接说「格力 风扇 开机」就能用。问「帮我试试这个遥控器」"
+         "「码库里没有格力」选这个。开始试要确认，会话内不重复问。",
+         perm=PERM_ASK, side=True, argkey="phrase", render=_render_ir_trial),
+
     Tool("proximity_estimate", "proximity.estimate",
          "估距：扫周边 AP，报每个的距离区间（如「3~8 米」），近的在前。"
          "问「那个路由器离我多远」「这信号算近吗」选这个。只读。"
