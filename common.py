@@ -22,6 +22,22 @@ PUSH_RESULT = "push_result"   # node -> commander: {id, ok, err}
 PULL = "pull"                 # commander -> node: {id, path}
 PULL_RESULT = "pull_result"   # node -> commander: {id, ok, data(b64), err}
 
+# ---- D1 控制面对外协议（客户端侧，不是节点）----
+# 为什么要有：`shell.exec` / `file.push` / `file.pull` 这类「对别的机器动手」的
+# 能力，实现不在调用方进程里，而在**控制面持有的节点 socket** 上。没有这条协议，
+# 任何非 commander 进程（比如桌面 GUI）想说「让 N1 跑这条命令」时，
+# 唯一诚实的回答只能是「做不到」——所以要么补这条协议，要么别登记这些能力。
+#   客户端 = 和节点走同一道 AUTH（同一把密码），但**注册的是角色不是身份**：
+#   节点发 REGISTER 进编队，客户端发 CLIENT 只要一个请求通道。
+CLIENT = "client"             # 客户端 -> commander: {}（AUTH 之后发，声明「我是客户端」）
+CLIENT_REQ = "client_req"     # 客户端 -> commander: {id, op, node, ...}
+CLIENT_RES = "client_res"     # commander -> 客户端: {id, ok, data|err}
+# op 全集（少一个就必须报错，不能默默当成别的）
+OP_NODES = "nodes"            # 列出在线节点（只读）
+OP_EXEC = "exec"              # node + cmd
+OP_PUSH = "push"              # node + path + data(b64)
+OP_PULL = "pull"              # node + path
+
 # ---- L1 能力注册表 ----
 CAPABILITIES = "capabilities" # node -> commander: 上报/更新能力列表
 
