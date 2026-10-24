@@ -395,7 +395,7 @@ def run_phone(serial, targets=None, ports=None, onvif=True, note="",
     else:
         # 手机侧没有 discovery.read_neighbors（那是 PC 的），用邻居表
         import android_device as A
-        import hotspot_roam as H
+        from . import hotspot_roam as H
         rc, txt = A.shell(serial, "ip neigh show")
         ips = []
         for row in (H._parse_neigh(txt) if rc == 0 else []):
@@ -607,6 +607,30 @@ def _selftest():
         check("桥失败 → None（不炸）", bs.send("1.2.3.4", 554, b"x") is None)
     finally:
         A.bridge_cmd, A.bridge_bulk = orig_cmd, orig_bulk
+
+    # ⑥a run_phone 端到端（mock android_device，不碰真机）：ip-neigh 发现 + 探测判定。
+    # 这是 be8c324 里 run_phone 把「import hotspot_roam」写成顶层导入、在 fleet 包内必崩
+    # 的回归锁——自测必须走到这条导入路径（原门禁只 monkeypatch bridge_cmd，漏了这截）。
+    import android_device as A
+    _orig_shell, _orig_cmd = A.shell, A.bridge_cmd
+    A.shell = lambda serial, cmd: (0,
+        "192.168.137.1 dev wlan0 lladdr aa:bb:cc:dd:ee:ff STALE\n"
+        "192.168.137.20 dev wlan0 lladdr 11:22:33:44:55:66 REACHABLE\n")
+    def _fake_cmd(serial, cmd, timeout=8):
+        port = int(cmd.split()[2])
+        if port == 80:
+            return {"ok": True, "out": "OK probe 25 " +
+                    base64.b64encode(b"HTTP/1.0 200 OK\r\n").decode()}
+        return {"ok": True, "out": "OK probe 0 "}
+    A.bridge_cmd = _fake_cmd
+    try:
+        rp = run_phone("fake-phone", onvif=False)
+        check("run_phone 走通（ip-neigh 发现 2 邻居）",
+              rp.get("ok") and rp.get("source") == "ip-neigh"
+              and rp.get("probed") == 2)
+        check("run_phone 判定非空", bool(rp.get("lines")))
+    finally:
+        A.shell, A.bridge_cmd = _orig_shell, _orig_cmd
 
     # ⑥b 编排层：参数切分 + report_only 不发一个包
     check("端口默认集", _split_ports(None) == list(DEFAULT_PORTS)
