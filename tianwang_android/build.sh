@@ -6,7 +6,8 @@
 # 手搓五步，几十秒出包，产物一百多 KB。
 #
 # 同一份脚本在 Windows（Git Bash）和 GitHub Actions（ubuntu）上都能跑：
-#   SDK   ← $ANDROID_HOME / $ANDROID_SDK_ROOT，都没有就回落到本机 D:/DevTools/Android
+#   SDK   ← $ANDROID_HOME / $ANDROID_SDK_ROOT，都没有就回落到候选列表
+#           （/g/sdk → /d/DevTools/Android，后者是历史路径）
 #   工具  ← build-tools 里按版本号取最高的那套，自动补 .exe / .bat 后缀
 #
 # 用法：bash tianwang_android/build.sh
@@ -17,12 +18,17 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
 # ---------------- ① 定位 SDK ----------------
+# 候选制（2026-10-24 与 netrunner 同一批修）：原先回落写死 /d/DevTools/Android
+# （那台机器的 SDK），换机即失败。本机实测 SDK 在 /g/sdk（build-tools 34/35/37、
+# platforms、platform-tools 齐全）。环境变量仍是最高优先逃生口。
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then
-  SDK="/d/DevTools/Android"
+  for cand in /g/sdk /d/DevTools/Android; do
+    if [ -d "$cand" ]; then SDK="$cand"; break; fi
+  done
 fi
 if [ ! -d "$SDK" ]; then
-  echo "找不到 Android SDK：ANDROID_HOME 未设置，回落路径 $SDK 也不存在" >&2
+  echo "找不到 Android SDK：ANDROID_HOME 未设置，候选 /g/sdk、/d/DevTools/Android 也都不存在" >&2
   exit 1
 fi
 

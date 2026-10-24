@@ -31,8 +31,14 @@ import time
 import xml.etree.ElementTree as ET
 
 ANDROID_HOME = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+# 🔴 跨机死路径家族（2026-10-24 与 netrunner 同一批修）：原候选只有
+#    D:/DevTools/Android（那台机器的 SDK）和 C:/Users/admin——换机即失效。
+#    本机实测工具链在 G:/sdk（build-tools 34/35/37 + platforms + adb 齐全），
+#    补进来；FLEET_ADB 环境变量仍是最高优先逃生口（adb 不在 PATH 时用）。
 _ADB_CANDIDATES = [
+    os.environ.get("FLEET_ADB", "").strip(),
     (os.path.join(ANDROID_HOME, "platform-tools", "adb.exe") if ANDROID_HOME else ""),
+    "G:/sdk/platform-tools/adb.exe",
     r"D:/DevTools/Android/platform-tools/adb.exe",
     r"C:/Users/admin/AppData/Local/Android/Sdk/platform-tools/adb.exe",
     "/usr/bin/adb",

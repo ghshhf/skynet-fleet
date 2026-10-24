@@ -11,11 +11,14 @@
 # 这样时序和真实播放一致，但没有声卡也能跑完。
 import os
 import sys
+import tempfile
 import threading
 import time
 
-sys.path.insert(0, r"D:/code/device-fleet")
-os.environ.setdefault("FLEET_TTS_DIR", r"D:/tmp/tts")
+# 老写法钉死 `D:/code/device-fleet`（那台机器的旧仓库位置），换机即崩；
+# voice / voice_sherpa / voice_stream 都在本仓根目录，按 __file__ 推。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("FLEET_TTS_DIR", os.path.join(tempfile.gettempdir(), "tts"))
 
 import voice
 import voice_sherpa
