@@ -1448,6 +1448,9 @@
       if (r.level >= 2) { head.appendChild(el("span", "badge deny", "二级审批")); }
       if (r.destructive) { head.appendChild(el("span", "badge deny", "不可逆")); }
       if (r.device) { head.appendChild(el("span", "badge", r.device)); }
+      if (r.session && r.session !== SESSION) {
+        head.appendChild(el("span", "badge warn", "接管"));
+      }
       row.appendChild(head);
       if (r.args_preview) { row.appendChild(el("div", "ap", r.args_preview)); }
       row.appendChild(el("div", "ap",
@@ -1464,11 +1467,15 @@
       row.appendChild(acts);
       list.appendChild(row);
     });
+    renderApprovalHistory((payload && payload.history) || []);
   }
 
   function respondApproval(r, approve) {
     if (!requireToken()) { return; }
     var double = false;
+    // 这条审批不是本页面会话发起的（比如另一个窗口/页面发起的），
+    // 带 takeover=true 让后端允许同 token 下的接管——收口 W2 已知限制 #2。
+    var takeover = !!(r.session && r.session !== SESSION);
     if (approve && r.destructive) {
       if (!APPR_STEP[r.request_id]) {
         // 不可逆动作要点两次：第一次只是「我知道你要做什么」，
@@ -1484,6 +1491,7 @@
     api("/api/approval/respond", {
       method: "POST",
       body: { request_id: r.request_id, approve: approve, double: double,
+              takeover: takeover,
               session: SESSION, reason: approve ? "" : "主人拒绝了这次操作" }
     }).then(function () {
       delete APPR_STEP[r.request_id];
@@ -1492,6 +1500,29 @@
     }).catch(function (e) {
       toast("回应没送达：" + e.message, true);
       pollApprovals();
+    });
+  }
+
+  function renderApprovalHistory(hist) {
+    var box = $("apprHistList");
+    if (!box) { return; }
+    box.textContent = "";
+    if (!hist || !hist.length) {
+      box.appendChild(el("div", "apprnone", "（还没有审批记录）"));
+      return;
+    }
+    hist.forEach(function (h) {
+      var row = el("div", "ahrrow");
+      var dec = h.decision || "timeout";
+      var cls = dec === "approved" ? "yes" : (dec === "denied" ? "no" : "warn");
+      row.appendChild(el("span", "badge " + cls,
+        dec === "approved" ? "已批准" : (dec === "denied" ? "已拒绝" : "超时")));
+      row.appendChild(el("span", "nm", h.cap || "?"));
+      if (h.title) { row.appendChild(el("span", "tt", h.title)); }
+      if (h.device) { row.appendChild(el("span", "badge", h.device)); }
+      if (h.args_preview) { row.appendChild(el("div", "ap", h.args_preview)); }
+      if (h.closed_reason) { row.appendChild(el("div", "ap dim", h.closed_reason)); }
+      box.appendChild(row);
     });
   }
 

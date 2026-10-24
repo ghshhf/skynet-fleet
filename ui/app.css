@@ -293,6 +293,25 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   border:1px solid var(--line);color:var(--fg-2);margin-top:6px}
 .caprow .hbtn.go:hover{border-color:var(--accent);color:var(--accent-text)}
 
+/* 审批历史（W2 #8 收口）：已结束的审批给主人留痕，UI 看得见「刚才批了/拒了什么」。 */
+.apprhist{margin-top:10px;padding-top:9px;border-top:1px dashed var(--line);
+  display:flex;flex-direction:column;gap:6px}
+.apprhist .ah-title{font-size:11px;color:var(--fg-3);letter-spacing:.04em;
+  text-transform:uppercase;margin-bottom:2px}
+.apprhist-list{display:flex;flex-direction:column;gap:6px;
+  max-height:200px;overflow-y:auto}
+.ahrrow{border:1px solid var(--line-soft);border-radius:8px;padding:6px 9px;
+  background:var(--panel-2);display:flex;flex-direction:column;gap:3px}
+.ahrrow .ah{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.ahrrow .nm{font-family:var(--mono);font-size:11.5px;font-weight:600;color:var(--fg)}
+.ahrrow .tt{font-size:11px;color:var(--fg-2)}
+.ahrrow .ap{font-family:var(--mono);font-size:10.5px;color:var(--fg-3);
+  word-break:break-all}
+.ahrrow .ap.dim{opacity:.75}
+/* 历史徽标：复用既有着色（yes=绿 / no=红 / warn=琥珀），不引入新色值 */
+.badge.yes{background:var(--ok-solid);color:#fff}
+.badge.no{background:var(--danger-solid);color:#fff}
+
 /* ==========================================================================
    右栏：设备页（W3·主机可视化）
    规则同全篇：数据全部来自后端（/api/host），界面不许自己算一套；

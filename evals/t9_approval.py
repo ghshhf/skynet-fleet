@@ -396,6 +396,53 @@ try:
         check(st == 409, f"同一个 request_id 重复回应 → 409（实际 {st}）")
         check(bool(js and js.get("err")), "重复回应的 409 带原因")
 
+        # ⑦g 历史随 /api/approvals 返回（W2 #8）
+        st, js, _ = http_json(f"{BASE}/api/approvals", token=TOKEN)
+        hist = (js or {}).get("history") or []
+        check(isinstance(hist, list) and len(hist) >= 1,
+              "历史随待审批清单一并返回（%d 条）" % len(hist))
+        if hist:
+            hh = hist[0]
+            check(hh.get("decision") in ("approved", "denied", "timeout"),
+                  "历史条目有 decision（%s）" % hh.get("decision"))
+            check(hh.get("closed_at", 0) > 0, "历史条目带 closed_at")
+
+        # ⑦h 同 token 跨会话接管（W2 #2）走 HTTP
+        _ACTED.clear()
+        tk_res = {}
+
+        def _do_tk():
+            st, js, _ = http_json(f"{BASE}/api/call", token=TOKEN, method="POST",
+                                  body={"cap": "act.click", "args": {"x": 31},
+                                        "tag": "http-tk", "session": "会话甲"},
+                                  timeout=20)
+            tk_res["st"] = st
+            tk_res["js"] = js
+
+        thtk = threading.Thread(target=_do_tk)
+        thtk.daemon = True
+        thtk.start()
+        rid_tk = None
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            st, js, _ = http_json(f"{BASE}/api/approvals", token=TOKEN)
+            pend = (js or {}).get("pending") or []
+            if pend:
+                rid_tk = pend[0]["request_id"]
+                break
+            time.sleep(0.05)
+        if rid_tk:
+            st, js, _ = http_json(f"{BASE}/api/approval/respond", token=TOKEN,
+                                  method="POST",
+                                  body={"request_id": rid_tk, "approve": True,
+                                        "session": "会话乙", "takeover": True})
+            check(st == 200, f"HTTP 接管（takeover=True）→ 200（实际 {st}）")
+            thtk.join(timeout=10)
+            cjs = tk_res.get("js") or {}
+            check(cjs.get("ok") is True, "HTTP 接管后调用成功（%s）" % cjs.get("err"))
+        else:
+            check(False, "HTTP 接管：没等到待审批条目")
+
     # ⑦e 回应缺字段 → 400 带原因
     st, js, _ = http_json(f"{BASE}/api/approval/respond", token=TOKEN,
                           method="POST", body={"approve": True})
@@ -461,6 +508,83 @@ check("审批超时未确认" in _appr_src, "超时的理由写明「审批超�
 # 一次性
 check("_closed" in _appr_src and "不能重复回应" in _appr_src,
       "审批记录进「已结束」账本，重复回应被拒")
+
+# ------------------------------------------------------------------ ⑨ 历史留存（W2 #8）
+# 已结束的审批（批准/拒绝/超时）必须留快照给 UI 看「刚才批了/拒了什么」。
+# 这是收口 W2 已知限制 #8——之前审批进程一关就没、UI 也看不到。
+def _run_one(b, x, approve, reason=""):
+    _ACTED.clear()
+    th = threading.Thread(target=lambda: reg.call(
+        "act.click", device="act:local", args={"x": x}, gate=b.gate_for(tag="h%d" % x)))
+    th.daemon = True
+    th.start()
+    dl = time.time() + 3
+    while not b.pending() and time.time() < dl:
+        time.sleep(0.02)
+    p = b.pending()
+    if p:
+        b.respond(p[0]["request_id"], approve, reason=reason)
+        th.join(timeout=5)
+    return p
+
+# 拒绝 → 历史 denied
+b_deny = ApprovalBroker(timeout=5.0)
+_run_one(b_deny, 101, False, reason="历史留存测试：拒")
+hd = b_deny.history()
+check(len(hd) >= 1, "拒绝后历史至少留一条（实际 %d）" % len(hd))
+if hd:
+    check(hd[0].get("decision") == "denied", "历史 decision=denied（%s）" % hd[0].get("decision"))
+    check("历史留存" in (hd[0].get("closed_reason") or ""), "历史带 closed_reason（%s）" % hd[0].get("closed_reason"))
+    check(hd[0].get("closed_at", 0) > 0, "历史带 closed_at（%s）" % hd[0].get("closed_at"))
+
+# 确认 → 历史 approved，且确实执行了
+b_ok = ApprovalBroker(timeout=5.0)
+_run_one(b_ok, 102, True)
+hk = b_ok.history()
+check(hk and hk[0].get("decision") == "approved", "确认后历史 decision=approved")
+check(len(_ACTED) == 1 and _ACTED[0][0] == "act.click", "历史与实际一致：确认的那条真执行了")
+
+# 超时 → 历史 timeout
+b_to = ApprovalBroker(timeout=0.5)
+_ACTED.clear()
+reg.call("act.click", device="act:local", args={"x": 103}, gate=b_to.gate_for(tag="h103"))
+ht = b_to.history()
+check(ht and ht[0].get("decision") == "timeout", "超时也进历史（decision=timeout）")
+check(ht and "审批超时未确认" in (ht[0].get("closed_reason") or ""), "超时历史理由写清「审批超时未确认」")
+
+# ------------------------------------------------------------------ ⑩ 同 token 跨会话接管（W2 #2）
+# 收口点：同一个 broker、同一个 token，但 session 不同的另一个窗口/页面
+# （同一主人的另一个界面）应该能接管这条审批——之前跨页面接不过来。
+# 安全基线不变：不带 takeover 仍被拒；跨 broker 重放仍被 _closed 账本挡死。
+b_tk = ApprovalBroker(timeout=8.0, session="会话甲")
+_ACTED.clear()
+th_tk0 = threading.Thread(target=lambda: reg.call(
+    "act.click", device="act:local", args={"x": 201},
+    gate=b_tk.gate_for(tag="tk", session="会话甲")))
+th_tk0.daemon = True
+th_tk0.start()
+dl = time.time() + 3
+while not b_tk.pending() and time.time() < dl:
+    time.sleep(0.02)
+ptk = b_tk.pending()
+if ptk:
+    ok, why = b_tk.respond(ptk[0]["request_id"], True, session="会话乙")
+    check(not ok, "接管前：别的会话仍被拒（%s）" % why)
+    check(len(b_tk.pending()) == 1, "被拒的回应没吃掉这条审批")
+    ok, why = b_tk.respond(ptk[0]["request_id"], True, session="会话乙", takeover=True)
+    check(ok, "同 token 别的会话带 takeover=True 可接管（%s）" % why)
+    th_tk0.join(timeout=5)
+    check(len(_ACTED) == 1, "接管后这次调用执行了一次")
+
+# ------------------------------------------------------------------ #2/#8 代码层钉死
+check("def history(" in _appr_src, "审批中枢提供 history()（UI 拉历史）")
+check("_history" in _appr_src, "已结束审批进 _history 快照账本")
+check('"history": hist' in _srv_src or "history\": hist" in _srv_src,
+      "服务端把历史随 /api/approvals 一并返回")
+check("renderApprovalHistory" in _ui_src, "前端渲染审批历史面板")
+check("takeover" in _appr_src and "takeover" in _srv_src,
+      "接管开关在审批中枢 + 服务端打通")
+check('"接管"' in _ui_src, "前端对「非本会话发起」的审批打「接管」标")
 
 print("t9 approval:", "PASS" if not FAIL else "FAIL (%d 项)" % len(FAIL), flush=True)
 sys.exit(1 if FAIL else 0)
