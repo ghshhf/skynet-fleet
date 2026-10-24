@@ -950,6 +950,43 @@ def _render_re_ble(r, arg):
     return "；".join(parts) or "拆出来了但没识别出有名有姓的字段"
 
 
+def _render_re_bits(r, arg):
+    if not r.get("ok"):
+        return "位层拆解失败：%s" % (r.get("err") or "样本没解析出来")
+    d = r.get("data") or {}
+    lines = ["%d 帧 / 每帧 %d 位；位序 %s；常量位 %d（%.0f%%）%s"
+             % (d.get("frames") or 0, d.get("total_bits") or 0,
+                d.get("bit_order") or "?", d.get("const_bits") or 0,
+                100.0 * (d.get("const_ratio") or 0),
+                "" if d.get("byte_aligned") else "；**字节层拆不出，位层能**")]
+    if not d.get("found"):
+        lines.append("  没找到强的位域结构（退回按常量/变化分段）")
+    for f in (d.get("fields") or [])[:10]:
+        detail = f.get("bits") or ("值域 %d 种" % f.get("uniq", 0))
+        lines.append("  bit %d +%d = %s（%s）"
+                     % (f.get("bit_offset", 0), f.get("bit_len", 0),
+                        f.get("label") or f.get("kind"), detail))
+    for n in (d.get("notes") or [])[:2]:
+        lines.append("  注意：" + n[:100])
+    return "\n".join(lines)
+
+
+def _render_re_bits_extract(r, arg):
+    if not r.get("ok"):
+        return "位段取值失败：%s" % (r.get("err") or "参数不对")
+    d = r.get("data") or {}
+    lines = ["位段 bit %d +%d（%s）：%d 帧里出现 %d 种值"
+             % (d.get("bit_offset", 0), d.get("bit_len", 0), d.get("order"),
+                d.get("frames") or 0, d.get("distinct") or 0)]
+    vs = d.get("value_set") or []
+    if vs:
+        lines.append("  值域：%s%s" % (vs[:16], " …" if len(vs) > 16 else ""))
+    rows = d.get("rows") or []
+    if rows:
+        lines.append("  前几帧：%s" % [[x["hex"], x["value"]] for x in rows[:8]])
+    return "\n".join(lines)
+
+
 def _render_re_proto(r, arg):
     if not r.get("ok"):
         return "协议拆解失败：%s" % (r.get("err") or "样本没解析出来")
@@ -1275,6 +1312,17 @@ TOOLS = (
          "问「这段数据什么结构」「校验怎么算」选这个。只读；只做字节对齐，"
          "校验只报全帧吻合的算法；字段语义仍要人确认。",
          argkey="samples", render=_render_re_proto),
+    Tool("re_bits", "re.bits",
+         "拆**位打包**协议：字段不落在字节边界时用（传感器报文、SPI/I2C、无线遥控 "
+         "常见 4 位版本+6 位长度+2 位命令塞一个字节）。给多帧 hex，"
+         "按常量位切段再对变化段递归细分，出「位偏移+位宽+语义」的字段表。"
+         "问「这段数据位层面什么结构」选这个。只读；没找到强证据时会明说「用字节层就够」。",
+         argkey="samples", render=_render_re_bits),
+    Tool("re_bits_extract", "re.bits_extract",
+         "按给定位段抽出每帧的值并列值域。已知某几位是命令码/状态码时，"
+         "用这个把它出现过的所有取值列出来 —— 这是「照着重写协议」的必备一步。"
+         "需要 samples + bit_offset + bit_len。只读。",
+         argkey="samples", render=_render_re_bits_extract),
     Tool("re_ask", "re.ask",
          "逆向问答：把拆解得到的事实交给 LLM 出人话假设。问「这说明什么」"
          "「帮我看看怎么解」选这个。回答一律标「模型回答」，可能错，"

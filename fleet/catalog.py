@@ -345,6 +345,18 @@ CAPABILITIES = [
                note="只做字节对齐分析（位域不拆）；校验只报**全帧吻合**的算法，"
                     "1 字节校验单帧蒙对率 1/256 所以至少 2 帧；"
                     "字段语义仍需人确认，输出里 caveats 写明没说到什么"),
+    Capability("re.bits", "位层协议拆解：字段**不落在字节边界**时（硬件位打包协议）"
+                          "按常量位切段 + 变化段递归细分，给出位偏移/位宽的字段表",
+               params=(Param("samples", "any", True, "多帧样本：hex 列表"),
+                       Param("order", "str", doc="位序 msb/lsb，不给则自动比较取解释更好的")),
+               note="只按「可解释性」启发式切分，不保证是真边界；"
+                    "没找到强证据时会明说「用字节层就够」或「没拆出结构」，不硬凑字段"),
+    Capability("re.bits_extract", "位段取值：按给定的位偏移/位宽把每帧的值抽出来（列值域）",
+               params=(Param("samples", "any", True, "多帧样本：hex 列表"),
+                       Param("bit_offset", "int", True, "起始位（0 = 首字节最高位）"),
+                       Param("bit_len", "int", True, "位宽"),
+                       Param("order", "str", doc="位序，默认 msb")),
+               note="这是「从读懂到可复现」那一步：拿到命令位段的值域才谈得上照着实现"),
     # ---- 这张网 ----
     Capability("relay.status", "中继状态：家里常开节点现在连着几台手机、各上报了什么能力",
                params=(), note="远程可触达层（L6）的门面；FLEET_RELAY_ENABLED=1 才在线"),

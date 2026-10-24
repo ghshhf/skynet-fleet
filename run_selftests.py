@@ -271,6 +271,10 @@ CASES = [
     # 不拿真设备碰运气；96 帧纯随机必须 0 校验命中（假阳性钉子）；
     # 增量校验状态机必须与独立写的暴力版逐位等价（性能优化不许改结果）。
     ("eval_t36_proto_reverse", ["evals/t36_proto_reverse.py"], HERE, 180),
+    # 逆向深化第二层：位打包协议（字段不落在字节边界上）。字节层对这类数据
+    # 必然看不出结构，位层是唯一路径；三种规模的随机数据必须 found=False
+    # （递归切分天然能切出碎片，把碎片当结构就是假绿）。
+    ("eval_t37_bit_reverse", ["evals/t37_bit_reverse.py"], HERE, 180),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
