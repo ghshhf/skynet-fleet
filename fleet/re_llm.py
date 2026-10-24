@@ -42,12 +42,24 @@ def _live_entries():
     """
     try:
         with open(MODELS_JSON, encoding="utf-8") as f:
-            rows = (json.load(f) or {}).get("models") or []
+            raw = json.load(f)
     except (OSError, ValueError):
+        return []
+    # models.json 有两种形状：网关池写的 {"models": [...]}，以及某些工具直接落的裸 list。
+    # 以前只认前者 —— 裸 list 会在 `.get` 上抛 AttributeError，而这个函数是**探活路径**，
+    # 探活自己炸掉会把整条逆向链判成不可用（2026-10-25 实测：re.* 四个能力全调不通，
+    # 报的是 unavailable，看不出根因在 models.json 的形状）。
+    if isinstance(raw, dict):
+        rows = raw.get("models") or []
+    elif isinstance(raw, list):
+        rows = raw
+    else:
         return []
     bad = ("待刷新", "已下线", "锁区", "待验")
     out = []
     for r in rows:
+        if not isinstance(r, dict):        # 裸 list 里也可能混字符串
+            continue
         name = r.get("name") or ""
         if any(b in name for b in bad):
             continue
@@ -61,8 +73,15 @@ def _live_entries():
 
 
 def available():
-    """现在有没有可用的 LLM。返回 (ok, 说明)。"""
-    es = _live_entries()
+    """现在有没有可用的 LLM。返回 (ok, 说明)。
+
+    **探活不许自己抛**：它给上层提供的只是「有没有额度」这个事实，
+    抛异常会连「确定性拆解可用、只是没有假设层」这个判断一起吞掉。
+    """
+    try:
+        es = _live_entries()
+    except Exception as e:                 # 防御：任何意外形状都降级成「不可用 + 原因」
+        return False, "读 models.json 出错：%s: %s" % (type(e).__name__, e)
     if es:
         return True, "%d 个端点可用（最快：%s）" % (len(es), es[0]["name"])
     if os.path.exists(MODELS_JSON):

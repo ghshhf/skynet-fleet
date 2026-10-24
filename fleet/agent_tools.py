@@ -950,6 +950,30 @@ def _render_re_ble(r, arg):
     return "；".join(parts) or "拆出来了但没识别出有名有姓的字段"
 
 
+def _render_re_proto(r, arg):
+    if not r.get("ok"):
+        return "协议拆解失败：%s" % (r.get("err") or "样本没解析出来")
+    d = r.get("data") or {}
+    head = d.get("head") or {}
+    lines = ["%d 帧 / %d 字节一帧；帧头 %s" %
+             (d.get("frames") or 0, d.get("analyzed_len") or 0,
+              head.get("hex") or "无（无公共前缀）")]
+    for f in (d.get("fields") or [])[:10]:
+        tag = f.get("checksum") or f.get("label") or f.get("kind")
+        lines.append("  +%d %d字节 %s" % (f.get("offset", 0), f.get("length", 0), tag))
+    for h in (d.get("checksum_hits") or [])[:3]:
+        lines.append("  校验：偏移 %d = %s（%d 字节 %s，%d 帧全中）"
+                     % (h["pos"], h["algo"], h["width"], h["endian"], h["frames_ok"]))
+    if not d.get("checksum_hits"):
+        lines.append("  校验：没找到全帧吻合的算法（可能无校验 / 带 key / 跨帧）")
+    for c in (d.get("caveats") or [])[:2]:
+        lines.append("  注意：" + c[:100])
+    hyp = d.get("hypothesis") or {}
+    if hyp.get("ok"):
+        lines.append("【假设】" + hyp.get("text", "")[:200])
+    return "\n".join(lines)
+
+
 def _render_re_binary(r, arg):
     if not r.get("ok"):
         return "二进制拆解失败：%s" % (r.get("err") or "文件读不了")
@@ -1244,6 +1268,13 @@ TOOLS = (
          "认 ELF/PE/zip/dex 魔数。问「这个固件里硬编码了什么」「APK 里有什么地址」"
          "选这个。只读且只在本机；文件内容不外传。",
          argkey="path", render=_render_re_binary),
+    Tool("re_proto", "re.proto",
+         "拆**未知二进制协议**：给多帧样本（hex 列表，或一段含重复帧头"
+         "的长流会自动切帧），推帧头、字段边界（常量/递增/步长/枚举/长度）、"
+         "校验算法与位置（crc8/crc16-ccitt/crc16-modbus/sum/xor）和字节序。"
+         "问「这段数据什么结构」「校验怎么算」选这个。只读；只做字节对齐，"
+         "校验只报全帧吻合的算法；字段语义仍要人确认。",
+         argkey="samples", render=_render_re_proto),
     Tool("re_ask", "re.ask",
          "逆向问答：把拆解得到的事实交给 LLM 出人话假设。问「这说明什么」"
          "「帮我看看怎么解」选这个。回答一律标「模型回答」，可能错，"

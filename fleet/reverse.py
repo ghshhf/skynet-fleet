@@ -518,7 +518,8 @@ def llm_hypothesize(kind, facts):
         return {"ok": False, "err": "LLM 不可用：%s" % why}
     prompt = ("下面是%s拆解得到的事实 JSON。请给出：①这是什么（协议/设备/内容）"
               "②依据（引用 JSON 里的哪些字段）③还缺什么数据才能进一步确认。\n%s"
-              % ({"ir": "红外脉冲", "ble": "BLE 广播", "binary": "二进制文件"
+              % ({"ir": "红外脉冲", "ble": "BLE 广播", "binary": "二进制文件",
+                  "proto": "未知二进制协议（多帧样本）"
                   }.get(kind, kind),
                  json.dumps(facts, ensure_ascii=False)[:2600]))
     try:
