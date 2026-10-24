@@ -1,9 +1,9 @@
 """联网作业执行器：把两个爬虫包成「能起、能看、能停、能收」的作业。
 
-联网层由两个别人的项目提供，本文件是它们与设备层之间唯一的桥：
+联网层由两个本地项目提供，本文件是它们与设备层之间唯一的桥：
 
-  netforce（D:/code/netforce，1959 行）—— 资源站发现 / 游戏 wiki 语料 / 站群扩散
-  ai_frontier_crawl（train_15b/tools，308 行）—— arXiv + HF + OpenAlex 中英论文
+  netforce（自建爬虫，天网的**搜索层**）—— 资源站发现 / 游戏 wiki 语料 / 站群扩散
+  ai_frontier_crawl（train_15b/tools）—— arXiv + HF + OpenAlex 中英论文
 
 为什么一律走子进程，不 import 进来当函数调用：
 
@@ -16,9 +16,9 @@
 代价是要靠解析 stdout 拿进度——所以它俩的输出格式被当成契约来解析
 （`_progress()` 认 `(4/5)` 这种），解析不出来就退化成"只知道还活着"。
 
-不改动对方仓库一个字：路径全部走环境变量。
+不改动对方仓库一个字：路径全部走环境变量与候选推断。
 
-  NETFORCE_HOME   netforce 仓库位置（不设就认为没装）
+  NETFORCE_HOME   netforce 仓库位置（环境变量优先；不设则按候选目录自动找）
   PAPERS_HOME     论文爬虫所在的 train_15b 位置
   NETFORCE_DATA   两个爬虫的落盘目录（覆盖 netforce 默认的 G:/_train_corpus_raw）
 """
@@ -35,13 +35,73 @@ from pathlib import Path
 
 PY = sys.executable
 
-NETFORCE_HOME = os.environ.get("NETFORCE_HOME", r"D:\code\netforce")
-PAPERS_HOME = os.environ.get("PAPERS_HOME", r"D:\work\_local_ai\train_15b")
-NETFORCE_DATA = Path(os.environ.get("NETFORCE_DATA", r"D:\work\_netforce_data"))
-
 # netforce 的三模式在命令行上怎么叫；None 表示"没装这个活"
 NETFORCE_SCRIPT = "resource_finder.py"
 PAPERS_SCRIPT = os.path.join("tools", "ai_frontier_crawl.py")
+
+# ---------------------------------------------------------------------------
+# 源仓库定位：候选制 + marker 判定，**不写死盘符**。
+#
+# 🔴 历史教训（2026-10-24）：这三行原本是 `D:\code\netforce` 三个硬编码常量。
+#    那不是 bug——常量是在**另一台电脑**上写的，盘符对那台机器成立。但
+#    换机 = 换盘符 = 每换一次电脑就要手动指一次路径；指错或忘了指，
+#    12 个 web.* 能力静默降级成"没装"，而 README 仍写着「已接成远程设备」，
+#    代码看起来一切正常（实测 available() 返回 False 才发现）。
+#
+# ⇒ 改成「推出来的候选」：本仓与 netforce 摆在**同一个父目录**下就自动命中
+#    （当前布局 E:\xmanbian\{skynet-fleet,netforce}），换盘、换机、换 clone
+#    位置都不用改代码。环境变量仍是最优先——给人留一个显式逃生口。
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent   # fleet/ 的上一级 = 仓库根
+
+#: 判定「这就是那个仓库」的 marker。单文件不可靠（同名脚本到处都是），
+#: 要求关键文件**同时在**——netforce 的判据是入口脚本 + skynet 子包。
+NETFORCE_MARKERS = ("resource_finder.py", os.path.join("skynet", "__init__.py"))
+PAPERS_MARKERS = ("tools/ai_frontier_crawl.py",)
+
+#: 候选目录。**不含私人盘符**；历史路径只作兼容，找不到自然跳过。
+DEFAULT_NETFORCE_DIRS = [
+    str(_REPO_ROOT.parent / "netforce"),            # ① 与本仓并列（当前布局）
+    str(_REPO_ROOT / "vendor" / "netforce"),        # ② 想内嵌放置时的落点
+    str(_REPO_ROOT.parent / "code" / "netforce"),   # ③ 父目录下再套一层
+    r"D:\code\netforce",                            # ④ 历史布局（老机器）
+    str(Path.home() / "code" / "netforce"),         # ⑤ 用户目录习惯
+]
+DEFAULT_PAPERS_DIRS = [
+    str(_REPO_ROOT.parent / "train_15b"),
+    r"D:\work\_local_ai\train_15b",
+]
+
+#: 数据落盘目录。netforce 侧 `CORPUS_DIR.mkdir(parents=True, exist_ok=True)`
+#: 会自建，所以这里只给路径、不预先创建。同样从 D:\work 挪到与本仓并列。
+NETFORCE_DATA = Path(os.environ.get(
+    "NETFORCE_DATA", str(_REPO_ROOT.parent / "_netforce_data")))
+
+
+def _has_markers(base: str, markers) -> bool:
+    return all(os.path.isfile(os.path.join(base, m)) for m in markers)
+
+
+def discover_home(env_var: str, dirs, markers) -> str:
+    """定位一个外部源仓库。找不到返回 ""（调用方如实说没装，不静默降级）。
+
+    顺序：
+      ① 环境变量**设了** ⇒ 就认它。指错了也认——显式指定优先于自动推断，
+         悄悄换一个源比报错更坏。
+      ② 没设 ⇒ 按候选目录逐个验 marker，第一个命中的算数。
+    """
+    p = os.environ.get(env_var, "").strip()
+    if p:
+        return p
+    for d in dirs:
+        if d and _has_markers(d, markers):
+            return d
+    return ""
+
+
+NETFORCE_HOME = discover_home("NETFORCE_HOME", DEFAULT_NETFORCE_DIRS, NETFORCE_MARKERS)
+PAPERS_HOME = discover_home("PAPERS_HOME", DEFAULT_PAPERS_DIRS, PAPERS_MARKERS)
 
 # 时间戳 / 进度 的样式。netforce 每行形如：
 #   [02:22:15] (4/5) ✓ 18trip「18TRIPWIKI」51KB 目录页 15 个（角色6/剧情8/档案1）
