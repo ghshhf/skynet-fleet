@@ -64,6 +64,62 @@ _BLOCK_WORDS = (
 #: 已知的垃圾源。留空也不影响 —— 上面的长度/相关度/站群规则已经能挡住绝大多数。
 _BLOCK_HOSTS = ()
 
+# ── 违法广告的形状规则（2026-10-24 真机样本固化，见 docs/违法广告向量研究报告）━━
+# 为什么要单列一套：上面四条判据挡的是「形状垃圾」（口号库、堆问号、无字面
+# 重叠），而**违法广告是「形状正常 + 内容违法」**——它们的标题里真有查询词
+# （SEO 劫持的目的就是这个），字面重叠规则对它们完全失效。实测 112 条样本里
+# 12 条违法/垃圾全部穿过现有过滤，且全部长在同一形状上。
+
+#: 品类词。正常页也会提（电影/下载），所以**必须和入口词组合**才判导流——
+#: 单独命中不拦，那是误伤：「电影美剧搜索及在线观看离线下载软件」是真开源
+#: 项目（EvilCult/moviecatcher），通篇讲功能、没有一个入口词。
+_AD_KINDS = ("直播", "影视", "电影", "网盘", "资源站", "破解", "在线观看",
+             "纸飞机", "色情", "菠菜", "娱乐城", "赌场", "六合彩", "时时彩",
+             "首存")
+
+#: 入口词。正常标题几乎不堆这些——堆了就不是在介绍东西，是在给入口。
+_AD_ENTRY = ("官网", "官方入口", "入口网站", "网址", "最新网站", "欢迎光临",
+             "点击进入")
+
+#: 真交易所品牌。单独出现不拦（新闻天天提 OKX），和「官方 App 下载」话术
+#: 一起出现 = 假 App 导流，是资金诈骗的前置入口。
+#: 实测样本：「如何安全下载OKX官方APK文件？OKX安卓版本APK安装失败怎么办」
+#:            「欧易OKX怎么下载安装？OKX官方APP在哪里下载？」
+_AD_EXCHANGE = ("okx", "欧易", "币安", "binance", "火币", "htx", "bybit")
+_AD_APP_BAIT = ("apk", "下载安装", "怎么下载", "在哪里下载", "官方app",
+                "app下载")
+
+#: GitHub 寄生仓库名里的拼音品类词（电影/直播/网站/成人……）。
+_AD_REPO_PINYIN = ("dianying", "zhibo", "shipin", "wangzhan", "porn", "sex")
+
+#: 标题内嵌裸域名：`(lyiwush.com)`、`-xxx.com`。但**标题提自己的域名是
+#: 正常的**（「Welcome to Python.org」就在 python.org 上）——判据必须是
+#: 「标题里的域名 ≠ 命中页自己的域名」：想把你导去别处，才是导流页。
+#: 再加一层：**知名站点被正常页引用也常事**（中文镜像站标题写 Python.org）
+#: ——只有引用「来路不明的裸域名」才拦。GitHub 寄生那条由规则 5 单独管。
+_AD_TRUSTED_DOMAINS = ("github.com", "python.org", "gnu.org", "wikipedia.org",
+                       "stackoverflow.com", "pypi.org", "android.com",
+                       "sourceforge.net", "apache.org")
+_AD_DOMAIN_IN_TITLE = re.compile(
+    r"[（(\-—–\s]\s*(?:https?://)?(?:www\.)?((?:[a-z0-9][a-z0-9-]*\.)+"
+    r"(?:com|cn|net|org|top|xyz|icu|vip|cc|hk|io|me|info|biz))[)）]?", re.I)
+
+
+def _domain_mismatch(title, host):
+    """标题里有没有「不是本页的、且不是知名站点」的域名。有则返回它。"""
+    host = (host or "").lower()
+    for m in _AD_DOMAIN_IN_TITLE.finditer(title or ""):
+        d = m.group(1).lower()
+        if d == host or d.endswith("." + host) or host.endswith("." + d):
+            continue
+        if any(d == t or d.endswith("." + t) for t in _AD_TRUSTED_DOMAINS):
+            continue
+        return d
+    return ""
+
+#: GitHub 一次性小号仓库的随机后缀：`-91ok3gob`、`digg44`（数字字母混合）。
+_AD_REPO_RANDSUF = re.compile(r"-(?:[0-9a-z]{5,8})$|^(?=.*\d)(?=.*[a-z])[a-z0-9]{5,8}$")
+
 _cache = {}
 _cache_lock = threading.Lock()
 
@@ -328,6 +384,52 @@ def _junk_reason(hit, kws):
     # 正常标题极少超过 2 个问号（并列两问已是极限）。
     if title.count("?") + title.count("？") >= 3:
         return "标题堆满问号，疑似关键词堆砌"
+
+    # ── 违法广告的形状判据（样本见 docs/违法广告向量研究报告_2026-10-24.md）
+
+    # 1) 成人内容：字面出现即不进上下文。这类东西进了上下文，小模型会
+    #    当成「资料」去模仿，回答直接跑偏——和口号库一个道理，但没有
+    #    「批判地看」这个选项，根本不进。**标题和摘要都查**：摘要是话术
+    #    栖息地，而正常页的摘要几乎不可能出现这个词（误伤面约等于零）。
+    if "色情" in blob or "情色" in blob:
+        return "成人内容"
+
+    # 2) 真交易所品牌 + 官方 App 下载话术 = 假 App 导流（诈骗前置）。
+    #    只拦「品牌×下载」组合：新闻里提 OKX 是正常事，不误伤。
+    low_title = title.lower()
+    if (any(x in low_title for x in _AD_EXCHANGE)
+            and any(x in low_title for x in _AD_APP_BAIT)):
+        return "交易所品牌+官方下载话术，疑似假App导流"
+
+    # 3) 标题内嵌**外部**域名：正常标题提自己的站名，不会把你导向别处。
+    #    实测样本：「米兰app官方入口网站-(lyiwush.com)提供最新官方版本下载」
+    d = _domain_mismatch(title, host)
+    if d:
+        return f"标题内嵌外部域名 {d}，典型导流页"
+
+    # 4) 品类词 × 入口词：形状从「介绍软件」变成「给入口」。这条放过
+    #    正常技术页——moviecatcher 提「电影/资源站」但通篇讲功能。
+    if (any(k in title for k in _AD_KINDS)
+            and any(e in title for e in _AD_ENTRY)):
+        return "品类词+入口词组合，导流页形状"
+
+    # 5) GitHub 寄生仓库：一次性小号建仓，仓库名即导流词（拼音串/品类词/
+    #    随机后缀），描述堆品类词。实测一个账号连开 5 个 `-91ok3gob` 后缀仓。
+    if host == "github.com":
+        head = title.split(" ", 1)[0]
+        if "/" in head:
+            repo = head.split("/", 1)[1].lower()
+            rest = title[len(head):]
+            if (any(k in rest for k in _AD_KINDS)
+                    and (any(p in repo for p in _AD_REPO_PINYIN)
+                         or _AD_REPO_RANDSUF.search(repo))):
+                return "GitHub寄生仓库（仓库名即导流词）"
+
+    # 6) 同一品类词在标题堆 3 次以上：关键词堆砌的另一种形状。
+    #    实测：「足球直播_足球免费高清直播_足球直播在线观看-24直播网」直播×4。
+    for k in _AD_KINDS:
+        if title.count(k) >= 3:
+            return f"品类词「{k}」堆砌 {title.count(k)} 次"
 
     # 相关度兜底：标题里必须至少出现一个来自问题的词/二字组。
     # 只在「问题确实能被字面表达」时启用 —— 问「那它呢」这种指代句没有
@@ -721,6 +823,67 @@ def _selftest():
     # 指代句（没有可匹配的词）不能把所有结果都杀光
     eq(_junk_reason({"title": "随便什么标题", "host": "c.com", "snippet": ""},
                     _keywords("那它呢")), "", "词太少时不套重叠规则")
+
+    # --- 违法广告形状规则：2026-10-24 采集的真机样本（全部曾穿过旧规则）---
+    # 这 12 条来自 18 条正常查询的 112 个原始命中，LLM 定性全部是
+    # seo_spam / 违法，旧规则因为「标题含查询词」全部放行。
+    # 这里传**空 kws**：隔离相关度规则，单独验证新形状判据
+    # （它们当初就是靠「有字面重叠」漏过去的，新规则必须不依赖重叠也能拦）。
+    ad_samples = [
+        # (标题, 域名, 期望被拦的原因关键字；"退款" = 对照组，应放行)
+        ("peniteopat-crypto/nba 足球直播_足球免费高清直播_足球直播在线观看-24直播网",
+         "github.com", "堆砌"),
+        ("alhaikawa/20261618-tech-resources-91ok3gob 足球直播在线观看无插件",
+         "github.com", "GitHub寄生"),
+        ("alhaikawa/20261618-tech-resources-uv4c857r 足球直播高清在线观看",
+         "github.com", "GitHub寄生"),
+        ("thethetpvmy/digg44 006足球现场直播,006足球现场直播-免费在线看",
+         "github.com", "GitHub寄生"),
+        ("z-libraryttg/dianyingwangzhan 2026免费影视在线观看网站，电影动漫连续剧在线看（持续更新）",
+         "github.com", "GitHub寄生"),
+        ("yuliangmao99/555dianying 555电影官网 - 最新Netflix新剧、韩国电影免费在线观看|最新网站",
+         "github.com", "导流"),
+        ("chenguanyou/porn_movie 使用Python的web框架django开发的一个能在线搜索和观看色情小电影的Web程序",
+         "github.com", "成人"),
+        ("jv95697/cryptographic 最新OKX APK教程：如何安全下载OKX官方APK文件？OKX安卓版本APK安装失败怎么办",
+         "github.com", "假App"),
+        ("mv3978/payment 最新欧易下载教程：欧易OKX怎么下载安装？OKX官方APP在哪里下载？",
+         "github.com", "假App"),
+        ("adiaodiaopongping/mlmlmlmilan 米兰app官方入口网站-(lyiwush.com)提供最新官方版本下载",
+         "github.com", "外部域名"),
+        ("pctelegramorg/pctelegramorg 在这里下载Telegram官网最新版，适用于所有主流操作系统。纸飞机",
+         "github.com", "导流"),
+        ("sud64827/bandwagonhost-refund-guide 搬瓦工退款多久到账？退款条件、申请流程与到账时间完整指南：支付宝/PayPal",
+         "github.com", "退款"),
+    ]
+    # 最后一条是对照组：带问号的退款指南，问号只有 2 个、无品类词、无外部
+    # 域名——它该被放行（证明新规则不是「见 GitHub 就杀」）。
+    for i, (t, h, want) in enumerate(ad_samples):
+        why = _junk_reason({"title": t, "host": h, "snippet": ""}, set())
+        if want == "退款":
+            eq(why, "", "两问号的正常页要放行（不误伤）")
+        else:
+            eq(want in (why or ""), True, f"违法广告样本{i + 1}被拦（{why}）")
+
+    # --- 误伤对照：真开源项目/真站点必须放行 ---
+    # moviecatcher 提「电影/在线观看/资源站」但通篇讲功能，没有一个入口词；
+    # 它是本轮 LLM 判 normal 的真项目，形状规则必须放过它。
+    ok_pages = [
+        ("EvilCult/moviecatcher 电影美剧搜索及在线观看离线下载软件，集成热门资源站，"
+         "借助百度云实现离线下载以及在线播放功能。", "github.com"),
+        ("廖雪峰的官方网站 - Python教程", "liaoxuefeng.com"),
+        ("Welcome to Python.org", "python.org"),
+        ("kuaidi100-api/java-demo 快递100API-Java快递查询接口主要应用在电商商城",
+         "github.com"),
+        ("经常失眠怎么调理？从睡眠环境到睡前习惯的深度睡眠指南", "zhihu.com"),
+        ("guolindev/coolweather 酷欧天气是一款基于Android端开源的天气预报软件",
+         "github.com"),
+        ("Python 安装教程 - python.org", "python.org"),
+        ("欢迎来到 Python.org - Python 编程语言", "pythonlang.cn"),
+    ]
+    for i, (t, h) in enumerate(ok_pages):
+        eq(_junk_reason({"title": t, "host": h, "snippet": ""}, set()),
+           "", f"正常页{i + 1}要放行")
 
     kept, dropped = _search_filter("安卓版本", [
         {"url": "u1", "host": "same.com", "title": "安卓版本 A", "snippet": ""},

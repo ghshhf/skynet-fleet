@@ -58,6 +58,10 @@ DEFAULT_NETFORCE_DIRS = [
 #: 直接撑爆手机模型 4096 上下文（llama-server 400）。截断比报错重要，但必须标出来。
 TITLE_MAX = 300
 
+#: 摘要上限，与 skynet 的 DESC_MAX 同值。上游已截，这里是边界防御
+#: （同标题：谁也不能保证上游永远干净，而摘要最终也进模型上下文）。
+DESC_MAX = 240
+
 
 def netforce_home():
     """找 netforce 仓库。找不到返回 ""。
@@ -148,6 +152,10 @@ def search(query, wiki_tag=None, only=None, min_rel=None, limit=20,
             "url": h.url,
             "host": h.host,
             "title": title,
+            # desc 是搜索引擎给的摘要——广告话术（导流词、品类词、入口词）
+            # 最密集的一段。2026-10-24 之前这一层整个丢弃，下游只剩标题可看，
+            # 等于自废一半身份证据（见 docs/违法广告向量研究报告）。
+            "desc": (getattr(h, "desc", "") or "")[:DESC_MAX],
             "engines": list(h.engines),
             "cross": len(h.engines),
             "rel": round(float(h.rel), 4),
