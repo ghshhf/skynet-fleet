@@ -192,6 +192,11 @@ def _selftest():
     assert os.path.getmtime(slow.path) >= mt
 
     # ⑥ 排序：最近见过的在前
+    # 🔴 断言前必须 sleep >1s：mtime 是秒级精度，同秒写的两条排序不稳定
+    #    （实测连跑 5 次 4 绿 1 红，N1/N2 同秒时顺序随机）。这是测试的
+    #    时序问题，不是产品缺陷——「同秒谁在前」本身就是歧义，没有正确答案。
+    #    别用改排序加 tiebreaker 的方式「修」：那会把歧义藏进产品逻辑。
+    time.sleep(1.1)
     slow.observe("N2", {"platform": "linux"}, force=True)
     names = [r["name"] for r in slow.seen()]
     assert names[0] == "N2", names
