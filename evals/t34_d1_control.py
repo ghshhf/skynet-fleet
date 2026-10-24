@@ -142,6 +142,22 @@ def main():
         check("fleet-client" not in nodes,
               "客户端**没有**被写进编队（通道不等于节点身份）")
 
+        # `nodes` 必须仍是纯名字列表：老客户端（PS 版/手机端）只认这个形状，
+        # 加字段不能改形状，否则等于悄悄把旧客户端打死。
+        check(isinstance(nodes, list) and all(isinstance(x, str) for x in nodes),
+              "nodes 仍是纯字符串列表（加字段不改形状）")
+
+        # 来源地址：2026-10-25 真事 —— 另一台机器报「已接入」，这侧看不到来源，
+        # 于是「它连了我」和「它自己连自己」在日志上长得一模一样。判据钉在这。
+        det = cli.nodes_detail()
+        peer = (det.get("N1") or {}).get("peer") or ""
+        check(":" in peer and ("127.0.0.1" in peer or "::1" in peer),
+              "detail 记下真实来源地址（%r）" % (peer,))
+        check((det.get("N1") or {}).get("platform"),
+              "detail 带平台（%r）" % ((det.get("N1") or {}).get("platform"),))
+        check((det.get("N1") or {}).get("caps") is not None,
+              "detail 带能力列表")
+
         d = cli.exec("N1", "whoami")
         check(d.get("out") == "ran:whoami", "exec 拿到节点真实回执（%r）" % (d.get("out"),))
         check(d.get("rc") == 0, "exec 带回 rc")
