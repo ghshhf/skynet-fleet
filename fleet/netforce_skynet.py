@@ -47,10 +47,11 @@ from . import netrunner as NR
 #:    ⇒ 设了环境变量也指不到别处（实测：门禁因此连上了真网，跑了几分钟不返回）。
 NETFORCE_HOME_ENV = "NETFORCE_HOME"
 #: 备用位置：环境变量没设时，在这些目录下找带 `skynet/` 的那一个。
-DEFAULT_NETFORCE_DIRS = [
-    r"D:\code\netforce",
-    os.path.join(os.path.expanduser("~"), "code", "netforce"),
-]
+#: 🔴 **单一真源**：候选列表由 `netrunner` 维护，本模块直接复用。
+#:    2026-10-24 之前这里另写了一份 `[D:\code\netforce, ~/code/netforce]`，
+#:    与 netrunner 的常量各自为政 ⇒ 改一处另一处仍是死路径，`web.*` 照样降级。
+#:    候选里第一条是「与本仓并列」推断——换盘换机不用再手动指路径。
+DEFAULT_NETFORCE_DIRS = NR.DEFAULT_NETFORCE_DIRS
 
 #: 返回给调用方的标题硬上限。上游（skynet）已经修了刷屏仓库，这里是**边界防御**：
 #: 标题最终会被拼进模型上下文，谁也不能保证上游永远干净。
@@ -69,14 +70,13 @@ def netforce_home():
     判定顺序：
       ① 环境变量 NETFORCE_HOME **设了** ⇒ 就认它。指错了就是指错了
          （不 fallback 到别处——悄悄换一个源比报错更坏）。
-      ② 没设 ⇒ 看默认目录列表。
+      ② 没设 ⇒ 看默认目录列表（与 `netrunner` 共用同一份，单一真源）。
     两处都要真的有 `skynet/` 子目录才算数（老版本 netforce 没有这个包）。
     """
     p = os.environ.get(NETFORCE_HOME_ENV, "").strip()
     if p:
         return p if os.path.isdir(os.path.join(p, "skynet")) else ""
-    cands = [NR.NETFORCE_HOME] + DEFAULT_NETFORCE_DIRS
-    for d in cands:
+    for d in DEFAULT_NETFORCE_DIRS:
         if d and os.path.isdir(os.path.join(d, "skynet")):
             return d
     return ""
