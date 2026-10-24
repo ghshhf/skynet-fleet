@@ -37,7 +37,8 @@
   - **分权（`accounts.py`）**：账号是「人」，节点是「设备」，两维分开。**主号唯一**——能发令、能发码、能增删分号、能看全部；**分号只能被控**——没有发令权，只能看到自己名下节点（过滤在控制面做，不在客户端做，否则改个脚本就绕过了）。闸门顺序刻意是**先分权、再仲裁**：分号即使占了领袖位也拒，因为没有权限跟谁是领袖无关；两道闸失败语义也不同（分权是安全、拒绝即拒绝；仲裁是协同、状态文件坏了就放行）。令牌自带角色与过期时间，并带权限版本 `pv`——**吊销分号后旧令牌立刻作废**，不等自然过期。**授权码**（用户要的「密码生成器 / 扫码同步权限」）是**同一枚一次性码的两种呈现**：终端里念 6 位短码，手机上画二维码；6 位用去掉 0/O/1/I 的 32 字母表（≈10 亿组合）+ 5 分钟寿命 + 一次性；二维码载荷 `fleet://grant?p=…` 用账本自带密钥签 HMAC，**伪造载荷在查账本之前就被拒**。与入网码刻意分开：入网码离线验签（装设备时可能没网），授权码必须中心验（改权限不能交给客户端自己认）。**诚实边界**：没有找回密码——主号忘了只能删账本重建（会连带吊销所有分号），因为找回通道本身就是后门。
   - **主动发现（`discovery.py`）**：不问「你是谁」，自己看、自己猜、自己归类。三条路互补——**组播询问**（SSDP M-SEARCH + mDNS 手写 DNS 解析，设备自己举手报名，信息最准）、**邻居表 + OUI**（读 arp/ip neigh，零打扰，靠 MAC 前三字节查厂商）、**特征端口组合**（单端口只能投票，`9000+554+23+8080` 这种**招牌组合**才定案）。实测在真实局域网上认出了具体型号：`HIKVISION DS-2CD2T10FD-I3`（6 台，连序列号都有）、`TPOS/1.0.0 UPnP/1.0 YLWR1200G易展版`（TP-Link 路由）。三条铁律写在代码里：只在本网段活动（跨网段直接拒）、只对 ARP 表里已存在的 IP 敲端口（不做全网段暴力扫描）、**发现 != 入网**（结果只进发现账本，要成为节点仍需在设备上装 agent 并入网）。**踩过的坑**（都是真实误判，已修）：① 9000 端口曾被当成「编队节点」——它同时是 Portainer/海康 SDK 端口，等于把陌生人当自己人；② `192.168.0.255` 广播地址曾被列为设备；③ 一台开 554 的 Windows 电脑曾被判成摄像头，而它的 mDNS 明明写着 `Microsoft-Windows + iVCam`——**设备自报的身份永远压过端口投票**；④ 多网卡机器不显式绑网卡发组播，一个响应都收不到；⑤ 隐私随机 MAC（本地管理位=1）查 OUI 必然为空，不能当「厂商缺失」。
   - **扩散扫描（`sweep.py`）**：把「ARP 表里有的」扩成「整个网段在场的」。上一版只读 ARP，等于只看见**最近跟本机说过话**的设备——这才是「只扫到 30 台」的真因。四条补齐：**ICMP 全段 sweep**（并发 ping 整个 /24，活着的全部进 ARP 表）、**TCP connect 兜底**（IoT 常关 ICMP 却开着端口）、**NetBIOS(NBNS) 名字查询**（Windows 会把机器名报出来）、**mDNS 服务类型枚举**（`_services._dns-sd._udp.local` 让设备自报有哪些服务）。另加两层：**多网段**（本机每张网卡都扫，实测找回被漏掉的移动热点段 `192.168.137.0/24`——手机就在那里）与**环境画像**（摄像头密度、运营商 IPv6 前缀、OUI 批次）。实网 44 台 / 15 秒 / 两个网段。**踩过的坑**：① 本机 `192.168.0.103` 曾被判成「NAS/存储」（因为本机自己开着 139/445）——比漏发现更糟；② 广播地址 `.255` 曾被当成设备；③ 5555 端口曾被判成「手机」，实际那是安卓一体机/中控终端。**边界**：只发 ICMP/TCP/NBNS PTR，不发应用层指令、不试口令；跨网段「跳板扩散」不做——那需要别人机器上的执行权，现在没有也不该去拿。
-  - **一键自测门禁**：`run_selftests.py` 串起 **47 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / discovery / sweep / accounts / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups / t4 AI后端 / t6 无线ADB / t7 GUI后端 / t8 语音）。
+  - **一键自测门禁**：`run_selftests.py` 串起 **74 项**离线自测（commander / node_agent / install_windows / ui_automation / rules_relay / rule_engine / policies / arbiter / discovery / sweep / accounts / compute_runner / queue_store / persona / recall / enroll / enroll_install / journal / followups / t4 AI后端 / t6 无线ADB / t7 GUI后端 / t8 语音 / t16 skynet桥接 / t25 工具目录 等）。
+- **联网层接活 + 取文增强（2026-10-24）**：netforce 采集内核从「README 写着已接、实测全降级」修到真能用——**路径候选制 + marker 判定**（换盘换机不用再指路径，唯一约定 = 两个项目放同一个父目录，判据是 `resource_finder.py` + `skynet/` 子包同时在）；新增 `web.origin` 跳转链穿透与 `web.dns` DoH 污染判据。实测 httpbin 三跳穿透到终点、CDN 站不误报。自测 **73/74**，唯一红的 t8 是本机缺 `polaris-audio-io` 模块（train_15b 整个迁走）——代码现在如实报「缺模块」而不是误报「缺解释器」。计划书见 `docs/netforce联网层融合计划书_2026-10-24.md`。
 - **设备层三块新地基**（2026-10-21）：
   - **Windows 图形版（W1）**：`fleet/gui/server.py` + `fleet/gui/app.py`（pywebview 窗口壳）+ `ui/index.html|app.css|app.js`（纯原生三栏，无 CDN 外链）。三层安全：只绑 `127.0.0.1` + 随机端口（`port=0`）、一次性 token 走 **URL 片段**（片段不随 HTTP 发出 ⇒ 不进服务端日志、不进 Referer）+ `secrets.compare_digest`、一切能力调用走 `registry.call`（前端绕不过闸门）。T 版与命令行**保留**，但不当日常入口。
   - **无线 ADB（`kind=adb_wifi`，14 条能力）**：`fleet/kinds/adb_wifi.py`。只读 3 条 auto 档，动手 11 条全 `approval="ask"` + fail-closed。shell 只读白名单按「首词 + 参数形态」两级判定，**禁 shell 元字符**（管道符也拦）堵组合拳。发现方式默认 **mDNS + 经典 5555**（纯 stdlib），深度扫须显式 opt-in 且带**次数 + 墙钟双硬预算**，到点如实说扫了多少——**不许假装扫完了**。
@@ -112,10 +113,10 @@ L4  体验/离线队列   「她」人格层            → 主动性、连续�
 联网层把两个外部项目当成「远程设备」接进同一张注册表——它们在注册表里跟手机没有
 本质区别：都是「有的能力现在能用，有的现在不能用，问一句才知道」。
 
-| 源 | 位置（外部，不纳入本仓） | 提供 |
+| 源 | 位置（**自动发现**，不写死盘符） | 提供 |
 |---|---|---|
-| netforce | `D:/code/netforce` | 资源站发现 / 游戏 wiki 角色语料 / 站群扩散 |
-| ai_frontier_crawl | `train_15b/tools` | arXiv 12 类 + HF Papers + OpenAlex 中英论文 |
+| netforce | 与本仓并列的 `netforce/`（或 `NETFORCE_HOME` 指定） | 资源站发现 / 游戏 wiki 角色语料 / 站群扩散 / 采集内核 8 层 |
+| ai_frontier_crawl | `train_15b/tools`（本机未装，能力如实不可用） | arXiv 12 类 + HF Papers + OpenAlex 中英论文 |
 
 | 能力 | 干什么 | 性质 |
 |---|---|---|
@@ -126,14 +127,26 @@ L4  体验/离线队列   「她」人格层            → 主动性、连续�
 | `web.papers` | 前沿论文抓取 | 动手 |
 | `web.frontier` | 今天的论文清单 | 只读 |
 | `web.sites` | 站群活站清单 | 只读 |
+| `web.search` | 多引擎聚合搜索（意图校验 + 引擎健康度自动淘汰） | 只读 |
+| `web.fetch` | 取一个 URL 的正文（熔断 / 限速 / raw 镜像降级） | 只读 |
+| `web.probe` | 判一个页面值不值得抓（四级判定） | 只读 |
+| `web.structure` | 探站结构：robots / sitemap / feed | 只读 |
+| `web.download` | 下载到本地（真 Range 续传） | 动手 |
+| `web.origin` | 跳转链穿透：短链 / 跳板页走到终点（meta refresh / JS location 都算一跳） | 只读 |
+| `web.dns` | DNS 污染判据：系统解析 vs DoH 对比（无交集只报可疑，不下结论） | 只读 |
 
 三条不直观的地方：
 
-- **一律走子进程，不 import 进来当函数调用。** netforce 的发现模式一跑就是到次日 6 点，
-  import 进来等于把无限循环塞进我们进程。子进程崩了也只是这一条作业失败。
-- **路径全走环境变量，对方仓库一个字不改。** `NETFORCE_HOME` / `PAPERS_HOME` /
-  `NETFORCE_DATA`（覆盖 netforce 默认的 `G:/_train_corpus_raw`）。没装就自动降级：
-  只塌那一组能力，其余照常。
+- **长活走子进程，短活直接 import。** 发现模式一跑就是到次日 6 点 ⇒ 必须子进程
+  （import 等于把无限循环塞进我们进程，且没法中途叫停）；采集内核是短任务
+  （一次搜索几十秒）⇒ 直接 import 拿结构化结果，比解析 stdout 稳。两条路按性质选。
+- **路径候选制 + marker 判定，换机不用再指。** 环境变量仍是最优先逃生口；
+  不设则按候选目录找——第一条就是「**与本仓并列的 netforce/**」，
+  判据是 `resource_finder.py` + `skynet/` 子包**同时在**。⇒ 换盘、换机、
+  换 clone 位置都不用改代码，唯一约定是两个项目放同一个父目录。
+  （2026-10-24 修的：原先硬编码 `D:\code\netforce`，在另一台电脑上写的，
+  换机后 12 个能力全静默降级成「没装」，而 README 仍写着已接。）
+  没装就自动降级：只塌那一组能力，其余照常，且**如实说没装**、不编数据。
 - **域是 `web.*` 不是 `net.*`。** 局域网那台扫描器早就占了 `net.scan` / `net.nearby`，
   而能力名必须唯一——重名在注册表里会当场炸。
 
@@ -165,7 +178,9 @@ skynet-fleet/
 ├── audit.py             # 控制面审计：append-only JSONL，旁路留痕（node.up/down 等）
 ├── fleet/               # 设备层：契约 + 通道 + 设备种类 + 联网作业执行器 + 终端（两个显影面）
 │   ├── netrunner.py     #   联网作业执行器：把外部爬虫包成「能起/能看/能停/能收」的作业
-│   ├── kinds/           #   设备种类实现（adb_wifi.py 无线调试 等）
+│   │                    #     + 源仓库自动发现（候选制 + marker，换机不用再指路径）
+│   ├── netforce_skynet.py #  采集内核桥接层：只 import 不 vendoring，候选列表单一真源
+│   ├── kinds/           #   设备种类实现（adb_wifi.py 无线调试 / internet.py 联网层 等）
 │   ├── gui/             #   Windows 图形版：server.py(后端) app.py(窗口壳) voice.py(语音)
 ├── fleet_tui.py         # 全屏界面入口薄壳（PyInstaller 打包用；直接跑也行）
 ├── fleet-tui.bat        # Windows 双击进【全屏界面】
