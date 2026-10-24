@@ -159,12 +159,17 @@ def main(argv=None):
               flush=True)
 
     if args.link:
-        from .link import ensure_reverse, report
+        from .link import ensure_reverse, report, selfheal_loop
         try:
             report(port, srv.token, ensure_reverse(port))
         except RuntimeError as e:
             # 没设备/没授权不是启动失败：服务已经起来了，打印原因后照常跑窗口。
             print("[fleet-link] 接线失败：%s" % e, flush=True)
+        # A1 连接自愈：周期重建 reverse，掉了自动恢复，日志可见。
+        import threading
+        threading.Thread(target=selfheal_loop, args=(port,),
+                        kwargs={"interval": 15}, daemon=True).start()
+        print("[fleet-link] 已启动连接自愈（每 15s 检查 adb reverse）", flush=True)
 
     if args.no_window:
         print("[fleet-gui] --no-window：不开窗口，服务继续跑。Ctrl+C 结束。", flush=True)
