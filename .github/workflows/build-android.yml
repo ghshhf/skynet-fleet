@@ -33,6 +33,16 @@ jobs:
           ls "$ANDROID_HOME/platforms" || true
           java -version 2>&1 | head -3
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 离线门禁（契约层 + Android 静态检查）
+        # 总纲 §四 第 5 条：三条流水线都跑测试。
+        # Android 流水线只装 JDK，不装 Python 全量依赖（ubuntu 上 pyaudio 装不上），
+        # 所以只跑纯标准库的契约层 + 本流水线最相关的 XML/Java 强转静态检查。
+        run: python run_selftests.py fleet_result fleet_registry android_viewcast
+
       - name: 构建 APK
         env:
           # 签名密钥用 secret 注入；没配就退回临时密钥（能装，但重装会因签名不同失败）

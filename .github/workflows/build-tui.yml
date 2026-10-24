@@ -18,6 +18,10 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      # Windows 控制台默认 charmap，中文打印会 UnicodeEncodeError——全局锁 UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 
@@ -29,11 +33,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pyinstaller textual rich prompt_toolkit
+          python -m pip install -r requirements.txt
 
       - name: 冒烟（先证明界面自己能起来，再谈打包）
         # CI 的控制台是 cp1252，中文 print 会当场 UnicodeEncodeError：
         # 这是推上来才暴露的坑，本地 UTF-8 永远绿，所以它必须挡构建
         run: python -m fleet.tui --smoke
+
+      - name: 自测（门禁全量）
+        # 总纲 §四 第 5 条：三条流水线都跑测试，否则「门禁接全」白做。
+        # TUI 吃 Python 侧代码，和 build-gui 跑同一套用例。
+        run: python run_selftests.py
 
       - name: 打包 fleet-tui.exe
         run: >
