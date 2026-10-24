@@ -63,6 +63,11 @@ def req(base, path, method="GET", body=None, headers=None):
             return e.code, json.loads(raw)
         except ValueError:
             return e.code, {"err": raw}
+    except (ConnectionError, OSError) as e:
+        # 🔴 连接被重置时**必须说清是哪个请求**，否则只会看到一行
+        # ConnectionAbortedError，连发到哪一步都不知道（诊断成本极高）。
+        raise SystemExit("请求被重置：%s %s%s —— %s"
+                         % (method, path, "" if body is None else "（带 body）", e))
 
 
 def main():
