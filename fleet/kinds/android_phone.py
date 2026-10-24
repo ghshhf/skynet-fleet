@@ -16,6 +16,7 @@ import radio as RADIO
 import thermal as THERMAL
 from .. import acquire
 from .. import creative
+from .. import ir_trial
 from .. import proximity
 from ..core import BaseDevice, DeviceResult as R
 
@@ -68,6 +69,10 @@ class AndroidPhone(BaseDevice):
                 # ir.command / phone.hotspot 是「动手」级，标 side_effect，闸在 catalog 层。
                 "scene.scan", "ir.command", "phone.hotspot",
                 "sentinel.watch", "scene.run",
+                # ---- P1 交互式逐个试码（万能遥控同款 UX）----
+                # start/next/yes/no/stop 五动作；start/next 发射故标 side_effect，
+                # 闸在 catalog 层；start 过一次闸门后会话内免重复问（注册表豁免）。
+                "ir.trial",
                 # ---- 采集层（L2/L3/L5；信息获取层调研 2026-10-24）----
                 # phone.sense/phone.see 是「读 + 拍」，只读不改；life.* 是生活流聚合（本地簿记）。
                 # 都不标 side_effect：拍照/传感是采集不是动作；落本地日志不改设备状态。
@@ -275,6 +280,34 @@ class AndroidPhone(BaseDevice):
                 dry_run=bool(args.get("dry_run", True)),
                 phrase=(args.get("phrase") or None))
             return r
+
+        # ---- P1 交互式逐个试码：手机当试码器，人当 oracle ----
+        if cap == "ir.trial":
+            action = (args.get("action") or "").strip().lower()
+            brand = (args.get("brand") or "").strip()
+            device_type = (args.get("device_type") or "").strip()
+            if not action and (args.get("phrase") or "").strip():
+                action, brand, device_type = ir_trial.parse_phrase(args["phrase"])
+            if not action:
+                action = "status"
+            if action == "start":
+                r = ir_trial.start(s, brand, device_type,
+                                   protocols=args.get("protocols"))
+            elif action in ("next", "no", "没有", "下一个"):
+                r = ir_trial.next_candidate(s)
+            elif action in ("yes", "有", "有了", "命中"):
+                r = ir_trial.yes(s, key=(args.get("key") or None))
+            elif action == "stop":
+                r = ir_trial.stop()
+            else:
+                r = ir_trial.status()
+            if not r.get("ok"):
+                return R.error(cap, r.get("err") or "试码失败",
+                               device=self.name, via=self.via)
+            return R.success(cap, self.name,
+                             side_effect=action in ("start", "next", "no",
+                                                    "没有", "下一个"),
+                             via=self.via, data=r)
 
         if cap == "phone.hotspot":
             return creative.hotspot(

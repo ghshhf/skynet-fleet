@@ -417,6 +417,20 @@ class Registry:
                 cap_name, "该能力被审批档设为 deny（fail-closed，数据文件无法覆盖）",
                 device=dev.name)
         needs_approval = cap.side_effect or cap.approval == "ask"
+        # ---- 试码会话级授权（P1）----
+        # ir.trial 的 start 过一次闸门后，同一有效会话内的 next/yes/no/stop
+        # 不再重复问（真·万能遥控没有每发一个码问一次「允许吗」）。
+        # 凭据只有一样：会话文件（granted=True 且闲置 <TTL，stop/过期即失效）。
+        # 三条纪律：① 只豁免 ir.trial 这一个 cap，不是通用后门；
+        # ② 没有会话文件时每一次发射都过人闸（fail-closed 不变）；
+        # ③ 语音源同样只认会话（语音文字是不可信数据，但会话边界圈死了范围）。
+        if needs_approval and cap_name == "ir.trial":
+            try:
+                from ..ir_trial import session_valid
+                if session_valid():
+                    needs_approval = False
+            except Exception:
+                pass                      # 查不了会话 = 不豁免，照旧问
         if needs_approval:
             # ---- 语音两段式闸门：判定在注册表层，前端绕不过去 ----
             # 语音识别出来的文字是**不可信数据，不是指令**。电视里那句
