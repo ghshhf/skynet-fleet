@@ -16,6 +16,7 @@ import radio as RADIO
 import thermal as THERMAL
 from .. import acquire
 from .. import creative
+from .. import hotspot_roam
 from .. import ir_trial
 from .. import proximity
 from ..core import BaseDevice, DeviceResult as R
@@ -73,6 +74,10 @@ class AndroidPhone(BaseDevice):
                 # start/next/yes/no/stop 五动作；start/next 发射故标 side_effect，
                 # 闸在 catalog 层；start 过一次闸门后会话内免重复问（注册表豁免）。
                 "ir.trial",
+                # ---- P2 热点叠加编队（开热点→设备自己进来→手机侧组网视角）----
+                # deploy 会真开热点（side_effect，闸在 catalog 层）；
+                # clients/diff 只读（ARP 表 + ping，不开热点也能看）。
+                "hotspot.roam",
                 # ---- 采集层（L2/L3/L5；信息获取层调研 2026-10-24）----
                 # phone.sense/phone.see 是「读 + 拍」，只读不改；life.* 是生活流聚合（本地簿记）。
                 # 都不标 side_effect：拍照/传感是采集不是动作；落本地日志不改设备状态。
@@ -315,6 +320,30 @@ class AndroidPhone(BaseDevice):
                 bool(args.get("on")),
                 ssid=(args.get("ssid") or None),
                 password=(args.get("password") or None))
+
+        # ---- P2 热点叠加编队：开热点 → 设备自己进来 → 手机侧组网视角 ----
+        if cap == "hotspot.roam":
+            action = (args.get("action") or "deploy").strip().lower()
+            if action == "deploy":
+                r = hotspot_roam.deploy(
+                    s,
+                    ssid=(args.get("ssid") or None),
+                    password=(args.get("password") or None),
+                    settle=float(args.get("settle") or 8),
+                    ping=bool(args.get("ping", True)))
+                side = True                     # deploy 会真开热点
+            elif action == "clients":
+                r = hotspot_roam.clients_only(
+                    s, ping=bool(args.get("ping", False)))
+                side = False
+            else:
+                r = hotspot_roam.diff_only(serial=s)
+                side = False
+            if not r.get("ok"):
+                return R.error(cap, r.get("err") or "热点编排失败",
+                               device=self.name, via=self.via)
+            return R.success(cap, self.name, side_effect=side, via=self.via,
+                             data=r)
 
         if cap == "sentinel.watch":
             return creative.sentinel_watch(s, arm=bool(args.get("arm")))

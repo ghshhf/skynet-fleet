@@ -736,6 +736,19 @@ def _render_life_sentinel(r, arg):
     return "生活哨兵告警：" + "；".join(flags)
 
 
+def _render_hotspot_roam(r, arg):
+    if not r.get("ok"):
+        return f"热点编排失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    text = d.get("text") or ""
+    if d.get("deployed"):
+        head = f"热点 {d.get('ssid')} 已开，客户端 {len(d.get('clients') or [])} 台："
+        return head + ("\n" + text if text else "")
+    if d.get("new") is not None:
+        return "与基线差异：\n" + (text or "（无差异）")
+    return text or "客户端清单为空（没有设备连进来）"
+
+
 def _render_ir_trial(r, arg):
     if not r.get("ok"):
         return f"试码：{r.get('err') or '未知'}"
@@ -1087,6 +1100,13 @@ TOOLS = (
 
     # ---- 距离感知（P0：从「只能报方向」到「米数 + 靠近/远离」）----
     # ---- P1 交互式逐个试码（万能遥控同款 UX）----
+    # ---- P2 热点叠加编队（开热点 → 设备自己进来 → 手机侧组网视角）----
+    Tool("hotspot_roam", "hotspot.roam",
+         "热点叠加编队：开手机热点，等设备连进来，自动读客户端名单（IP/MAC/厂商）"
+         "并 ping 探活，与基线比对报「谁新入网/谁掉线」。问「开热点让设备连进来」"
+         "「现在谁连着我热点」选这个。开热点要确认；只读名单说「看客户端」即可。",
+         render=_render_hotspot_roam),
+
     Tool("ir_trial", "ir.trial",
          "交互式逐个试码：对码库里没有的品牌/型号，系统按协议常见参数排好候选"
          "一个个发射，你站在设备旁看反应——「有反应」就记下入库，「没有」就下一个。"
