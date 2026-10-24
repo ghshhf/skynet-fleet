@@ -1966,7 +1966,9 @@ public class MainActivity extends Activity {
         final String base = Prefs.baseUrl(this);
         final Net.Auth auth = Net.auth(this);
         say2("正在从电脑拉能力清单…");
-        worker.execute(new Runnable() {
+        // 关键修复：原来走单线程 worker，一旦被别的任务占住就「点了没反应」。
+        // 改成 urgent 池（2 线程，专给审批/拉清单这类不能等的活），不再被饿死。
+        urgent.execute(new Runnable() {
             @Override
             public void run() {
                 org.json.JSONArray rows = null;
@@ -1983,11 +1985,13 @@ public class MainActivity extends Activity {
                     @Override
                     public void run() {
                         if (e2 != null) {
-                            say2("拉清单失败：" + e2);
+                            // 连不上：弹常驻对话框说清原因+排查+重试，而不是一闪 Toast。
+                            // 这正是「点编队没反应」的根因——之前只 say2 一下就没了。
+                            showPcFail(base, e2);
                             return;
                         }
                         if (r == null || r.length() == 0) {
-                            say2("电脑那头没有注册任何能力");
+                            showPcFail(base, "电脑那头没有注册任何能力");
                             return;
                         }
                         renderPcPanel(r);
@@ -1995,6 +1999,34 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    /** 编队页连不上电脑时的常驻提示：说清原因 + 三步排查 + 重试。 */
+    private void showPcFail(final String base, final String err) {
+        final String e = (err == null) ? "" : err;
+        final String why;
+        if (e.contains("ConnectException") || e.contains("timed out")
+                || e.contains("TimeoutException") || e.contains("UnknownHost")
+                || e.contains("Failed to connect") || e.contains("ENETUNREACH")) {
+            why = "电脑那头连不上（" + base + "）。\n\n先排查三件事：\n"
+                    + "① 电脑端 fleet_gui 在跑吗？  python fleet_gui.py --link\n"
+                    + "② 做过  adb reverse tcp:8000 tcp:8000  吗？（App 靠它回连电脑）\n"
+                    + "③ 手机是不是开了全局 VPN？它会把局域网流量也劫走。";
+        } else if (e.contains("401") || e.contains("403") || e.contains("凭据")) {
+            why = "连上了，但凭据不对：" + e + "\n试试在设置里重新配对。";
+        } else {
+            why = "拉清单失败：" + e;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("编队 · 连不上电脑")
+                .setMessage(why)
+                .setPositiveButton("重试", new android.content.DialogInterface.OnClickListener() {
+                    @Override public void onClick(android.content.DialogInterface d, int w) {
+                        showPcPanel();
+                    }
+                })
+                .setNegativeButton("知道了", null)
+                .show();
     }
 
     private void renderPcPanel(final org.json.JSONArray rows) {
@@ -2063,7 +2095,7 @@ public class MainActivity extends Activity {
         final Net.Auth auth = Net.auth(this);
         setBusy(true);
         say2("让电脑做：" + cap + "\n（要审批的话在电脑上点确认…）");
-        worker.execute(new Runnable() {
+        urgent.execute(new Runnable() {
             @Override
             public void run() {
                 String text;
