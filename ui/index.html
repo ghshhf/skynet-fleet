@@ -166,15 +166,15 @@
               <!-- 编队总览排第一：这是「现在整个编队什么状态」的入口，
                    别的 tab 都是往里看某一类东西，只有它是先给你全貌。 -->
               <button class="tab on" data-tab="fleet" role="tab"
-                      aria-selected="true" aria-controls="tabBody">编队</button>
+                      aria-selected="true" aria-controls="tabBody">编队<span class="tn" id="tnFleet"></span></button>
               <button class="tab" data-tab="cards" role="tab"
-                      aria-selected="false" aria-controls="tabBody">专家</button>
+                      aria-selected="false" aria-controls="tabBody">专家<span class="tn" id="tnCards"></span></button>
               <button class="tab" data-tab="skills" role="tab"
-                      aria-selected="false" aria-controls="tabBody">技能</button>
+                      aria-selected="false" aria-controls="tabBody">技能<span class="tn" id="tnSkills"></span></button>
               <button class="tab" data-tab="conns" role="tab"
-                      aria-selected="false" aria-controls="tabBody">连接器</button>
+                      aria-selected="false" aria-controls="tabBody">连接器<span class="tn" id="tnConns"></span></button>
               <button class="tab" data-tab="audio" role="tab"
-                      aria-selected="false" aria-controls="tabBody">声音</button>
+                      aria-selected="false" aria-controls="tabBody">声音<span class="tn" id="tnAudio"></span></button>
             </div>
             <span class="grow"></span>
             <button class="hbtn" id="assetsRefresh" title="刷新">↻</button>
