@@ -1,0 +1,14 @@
+{
+  "brand": "海尔",
+  "device": "空调",
+  "protocol": "nec",
+  "keys": {
+    "power": {"addr": 2, "cmd": 8},
+    "temp_up": {"addr": 2, "cmd": 9},
+    "temp_down": {"addr": 2, "cmd": 10},
+    "mode": {"addr": 2, "cmd": 11},
+    "wind": {"addr": 2, "cmd": 12},
+    "timer_on": {"addr": 2, "cmd": 13},
+    "timer_off": {"addr": 2, "cmd": 14}
+  }
+}

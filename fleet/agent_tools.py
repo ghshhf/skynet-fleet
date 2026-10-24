@@ -600,6 +600,254 @@ class Tool:
         return f"- {self.name}：{self.desc}\n"
 
 
+# ------------------------------------------------- 创意能力渲染器
+
+def _render_scene(r, arg):
+    """天网之眼：scene.scan 全域快照。先给一句总结，再列最强的若干实体。"""
+    if not r.get("ok"):
+        return f"扫环境失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    out = []
+    if d.get("summary"):
+        out.append(d["summary"])
+    rows = d.get("rows") or []
+    if rows:
+        out.append(f"最强的 {min(len(rows), 12)} 个实体：")
+        for i, x in enumerate(rows[:12], 1):
+            name = x.get("name") or x.get("mac") or x.get("ip") or "?"
+            seg = f"[{i}] {name}"
+            if x.get("kind"):
+                seg += f"（{x['kind']}）"
+            if x.get("rssi") is not None:
+                seg += f" {x['rssi']}dBm"
+            if x.get("ip"):
+                seg += f" {x['ip']}"
+            out.append(seg)
+    if isinstance(d.get("note"), str) and d["note"]:
+        out.append(f"（注：{d['note']}）")
+    return "\n".join(out) or "扫描完成，但没有可报告的实体。"
+
+
+def _render_ir(r, arg):
+    """红外发射结果。dry_run 没真发要说清，别让人以为家电已经关了。"""
+    if not r.get("ok"):
+        return f"红外发射失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    if d.get("dry_run"):
+        return (f"已算好红外码（{d.get('protocol')}，freq={d.get('freq')}，"
+                f"{d.get('pairs')} 对）；dry_run 未发射")
+    return (f"已发射红外码（{d.get('protocol')}，freq={d.get('freq')}，"
+            f"addr={d.get('addr')}，cmd={d.get('cmd')}）")
+
+
+def _render_hotspot(r, arg):
+    """热点开/关结果。把「手机切蜂窝」这种副作用说清。"""
+    if not r.get("ok"):
+        return f"热点操作失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    state = "已开启" if d.get("on") else "已关闭"
+    seg = f"热点{state}"
+    if d.get("ssid"):
+        seg += f"，名称 {d['ssid']}"
+    if d.get("on") and d.get("clients") is not None:
+        seg += f"，已连 {d['clients']} 台"
+    if isinstance(d.get("note"), str) and d["note"]:
+        seg += f"（注：{d['note']}）"
+    return seg
+
+
+def _render_sentinel(r, arg):
+    """环境哨兵：arm 给标定信息，否则只报变化（无变化就明说静默）。"""
+    if not r.get("ok"):
+        return f"哨兵失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    if d.get("armed"):
+        return f"已标定基线，现在在场 {d.get('known')} 个设备；之后只在变化时报告。"
+    if not d.get("changed"):
+        return "哨兵：无变化（与基线一致）。"
+    lines = [f"哨兵报告变化（在场 {d.get('known')} 个）："]
+    for x in (d.get("new") or []):
+        lines.append(f"＋新设备：{x.get('name') or x.get('mac') or x.get('ip') or '?'}")
+    for x in (d.get("gone") or []):
+        lines.append(f"－消失：{x.get('name') or x.get('mac') or x.get('ip') or '?'}")
+    for x in (d.get("abnormal") or []):
+        lines.append(f"！信号异常：{x.get('name') or x.get('key')} "
+                     f"从 {x.get('was')} 掉到 {x.get('now')}dBm")
+    return "\n".join(lines)
+
+
+def _render_scene_run(r, arg):
+    """场景宏执行结果：哪几步过、哪步没过（fail_fast 会断在第一步失败处）。"""
+    if not r.get("ok"):
+        return f"场景执行失败：{r.get('err') or '未知原因'}"
+    d = _d(r)
+    lines = [f"场景「{d.get('name')}」：{d.get('ran')}/{d.get('total')} 步完成"]
+    if d.get("desc"):
+        lines.append(d["desc"])
+    for i, st in enumerate((d.get("steps") or []), 1):
+        mark = "✓" if st.get("ok") else "✗"
+        cap = st.get("cap") or st.get("step")
+        lines.append(f"  {i}. {mark} {cap}：{st.get('note', '')}")
+    return "\n".join(lines)
+
+
+def _render_sense(r, arg):
+    if not r.get("ok"):
+        return f"传感失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    parts = [f"环境光={d.get('lux')}（等级 {d.get('light_level')}），"
+             f"运动={d.get('motion_state')}，在场≈{d.get('occupancy_hint')}"]
+    if d.get("battery_pct") is not None:
+        parts.append(f"电量={d.get('battery_pct')}% 温度={d.get('battery_temp_c')}℃")
+    return "；".join(parts)
+
+
+def _render_see(r, arg):
+    if not r.get("ok"):
+        return f"视觉失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    if d.get("caption"):
+        return f"看到：{d['caption']}"
+    objs = d.get("objects") or []
+    return (f"场景={d.get('scene')}｜活动={d.get('activity')}｜"
+            f"物品={', '.join(objs[:6])}｜光线={d.get('light')}｜人={d.get('people')}")
+
+
+def _render_life_digest(r, arg):
+    if not r.get("ok"):
+        return f"聚合失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    if d.get("summary"):
+        return d["summary"]
+    lines = [f"生活流共 {d.get('frames_total')} 帧："]
+    for g in (d.get("groups") or []):
+        lines.append(f"  {g['period']}：{g['frames']}帧，场景={g.get('top_scenes')}，"
+                     f"活动={g.get('top_activities')}")
+    return "\n".join(lines)
+
+
+def _render_life_sentinel(r, arg):
+    if not r.get("ok"):
+        return f"生活哨兵失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    flags = d.get("flags") or []
+    if not flags:
+        return "生活哨兵：未检测到显著偏离"
+    return "生活哨兵告警：" + "；".join(flags)
+
+
+def _render_net_dissect(r, arg):
+    if not r.get("ok"):
+        return f"流量解剖失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    lines = [f"抓了 {d.get('captured')} 个包 / {d.get('seconds')}s"]
+    lines.append("协议：" + "，".join(f"{k}×{v}" for k, v in (d.get("protocols") or {}).items()))
+    tk = d.get("talkers") or []
+    if tk:
+        lines.append("对话对：" + "，".join(f"{t['src']}↔{t['dst']}({t['pkts']})" for t in tk[:5]))
+    ph = d.get("plaintext_hits") or []
+    if ph:
+        lines.append(f"⚠ 明文凭据疑似 {len(ph)} 处（仅自有设备排查用）")
+    return "\n".join(lines)
+
+
+def _render_net_survey(r, arg):
+    if not r.get("ok"):
+        return f"无线侦察失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    return f"bettercap 跑通：回传事件流 {d.get('raw_len')} 字节"
+
+
+def _render_osint(r, arg):
+    if not r.get("ok"):
+        return f"情报查询失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    if d.get("subdomains") is not None:
+        return f"crt.sh 子域（{d.get('count')}）：" + "，".join(d["subdomains"][:12])
+    if d.get("records") is not None:
+        return "DNS：" + "；".join(f"{k}={v}" for k, v in d["records"].items() if v)
+    if d.get("ldhName") is not None:
+        return (f"RDAP：{d.get('ldhName')} 状态={d.get('status')} "
+                f"NS={d.get('nameservers')} 事件={d.get('events')}")
+    if d.get("matches") is not None:
+        return (f"Shodan（共 {d.get('total')}）：" +
+                "，".join(f"{m.get('ip')}:{m.get('ports')}" for m in d["matches"][:8]))
+    return str(d)[:200]
+
+
+def _render_relay(r, arg):
+    if not r.get("ok"):
+        return "中继：%s" % (r.get("err") or "不可用")
+    d = r.get("data") or {}
+    devs = d.get("devices") or []
+    if not devs:
+        return "中继在线，但暂无手机拨入（让手机跑 phone_reverse_client.py 反连）"
+    lines = ["中继在线，%d 台手机拨入：" % len(devs)]
+    for dv in devs:
+        caps = dv.get("caps") or []
+        lines.append("· %s（%d 项能力）" % (dv.get("device_id"), len(caps)))
+    return "\n".join(lines)
+
+
+def _render_re_ir(r, arg):
+    if not r.get("ok"):
+        return "红外拆解失败：%s" % (r.get("err") or "拿不到脉冲")
+    d = r.get("data") or {}
+    head = "协议 %s（置信 %s）addr=%s cmd=%s" % (
+        d.get("protocol"), d.get("confidence"), d.get("addr"), d.get("cmd"))
+    cb = d.get("codebook") or {}
+    if cb.get("known"):
+        hits = "、".join("%s/%s/%s" % (h["brand"], h["device"], h["key"])
+                         for h in cb["hits"][:4])
+        head += "\n码库命中：" + hits
+    elif cb.get("proposal"):
+        head += "\n新码（人工确认后可入库）：%s" % cb["proposal"]
+    hyp = d.get("hypothesis") or {}
+    if hyp.get("ok"):
+        head += "\n【假设】" + hyp.get("text", "")[:220]
+    return head
+
+
+def _render_re_ble(r, arg):
+    if not r.get("ok"):
+        return "BLE 拆解失败：%s" % (r.get("err") or "不是广播原文")
+    d = r.get("data") or {}
+    parts = []
+    if d.get("name"):
+        parts.append("设备名 %s" % d["name"])
+    if d.get("flags"):
+        parts.append("flags %s" % d["flags"])
+    if d.get("uuids"):
+        parts.append("UUID " + "/".join(d["uuids"][:6]))
+    m = d.get("manufacturer") or {}
+    if m:
+        parts.append("厂商 %s（%s）" % (m.get("company"), m.get("company_id")))
+    ib = d.get("ibeacon") or {}
+    if ib:
+        parts.append("iBeacon major=%s minor=%s" % (ib.get("major"), ib.get("minor")))
+    hyp = d.get("hypothesis") or {}
+    if hyp.get("ok"):
+        parts.append("【假设】" + hyp.get("text", "")[:200])
+    return "；".join(parts) or "拆出来了但没识别出有名有姓的字段"
+
+
+def _render_re_binary(r, arg):
+    if not r.get("ok"):
+        return "二进制拆解失败：%s" % (r.get("err") or "文件读不了")
+    d = r.get("data") or {}
+    s = d.get("strings") or {}
+    lines = ["%s（%s，%d 字节）" % (d.get("path"), d.get("magic") or "未知格式",
+                                  d.get("size") or 0)]
+    for k, label in (("url", "URL"), ("ip", "IP"), ("email", "邮箱"),
+                     ("hex64", "64位hex"), ("version", "版本"), ("path", "路径")):
+        if s.get(k):
+            lines.append("  %s：%s" % (label, "，".join(s[k][:4])[:120]))
+    hyp = d.get("hypothesis") or {}
+    if hyp.get("ok"):
+        lines.append("【假设】" + hyp.get("text", "")[:200])
+    return "\n".join(lines)
+
+
 #: 描述是**给 1.7B 看的**，写得好不好直接决定选对选错。实测（tmp/probe_scale.py）：
 #: 枚举从 6 涨到 18 准确率没掉（94%→90~98%），失败**全部**是「两个工具边界重叠」
 #: 而非容量不够。所以每条描述都显式点名容易混的那个邻居（见 radio_cell /
@@ -708,6 +956,126 @@ TOOLS = (
          "在手机当前输入框里输入文字（会真的打字）。",
          perm=PERM_ASK, side=True, argkey="text",
          render=_mk_kv(("ok", "已输入"), ("len", "输入长度"), ("err", "错误"))),
+
+    # ---- 创意能力（天网之眼 + 信号外放；计划书 2026-10-24）----
+    # 决策模型只能给一个字符串参数，所以「动手+多参数」的能力拆成定向工具：
+    # 热点分 on/off、哨兵分 arm/check，红外用短语「品牌 设备 键」兜底。
+    Tool("scene_scan", "scene.scan",
+         "天网之眼：一键给身边拍全域快照（WiFi+蜂窝+蓝牙+局域网，合并成存在感表）。"
+         "问「周围有什么设备」「谁在家附近」「扫一下环境」选这个。只读，不改任何东西。",
+         render=_render_scene),
+
+    Tool("ir_command", "ir.command",
+         "用手机红外遥控家电（电视/空调，按 品牌 设备 按键，如「小米 电视 关」）。"
+         "会真发红外信号（动手级，要确认）。只看能不能发选这个，开空调/关电视才用。",
+         perm=PERM_ASK, side=True, argkey="phrase", render=_render_ir),
+
+    Tool("hotspot_on", "phone.hotspot",
+         "开手机热点（反向供网/断网自救：别的设备经手机入网，手机自己切蜂窝）。"
+         "动手级要确认；问「开热点」「手机当路由器」选这个。",
+         perm=PERM_ASK, side=True, args={"on": True}, render=_render_hotspot),
+
+    Tool("hotspot_off", "phone.hotspot",
+         "关手机热点（恢复手机 WiFi 客户端模式，不再当路由器）。动手级要确认；"
+         "问「关热点」「别共享网络了」选这个。",
+         perm=PERM_ASK, side=True, args={"on": False}, render=_render_hotspot),
+
+    Tool("sentinel_arm", "sentinel.watch",
+         "标定环境哨兵基线（把当前在场设备记成「已知」）。之后只在有进出/信号异常时报告。",
+         args={"arm": True}, render=_render_sentinel),
+
+    Tool("sentinel_check", "sentinel.watch",
+         "环境哨兵检查：对比基线，报告有没有新设备/设备消失/信号骤降。"
+         "只报变化，没变就静默。问「有陌生人进来吗」「环境变了吗」选这个。",
+         args={"arm": False}, render=_render_sentinel),
+
+    Tool("scene_run", "scene.run",
+         "执行一个场景宏（Jarvis 化一键，如「离家」「回家」，串起关电视/热点/哨兵等）。"
+         "动手级要确认；问「离家模式」「回家了」「执行 XX 场景」选这个。",
+         perm=PERM_ASK, side=True, argkey="name", render=_render_scene_run),
+
+    # ---- 采集层（L2/L3/L5：让编队真的去「获取」，不只是分析已有信息）----
+    Tool("phone_sense", "phone.sense",
+         "读手机传感：环境光/运动/电量温度 → 此刻房间明暗与是否在场。"
+         "问「房间亮不亮」「人在不在动」「手机热不热」选这个。只读，不改任何东西。",
+         render=_render_sense),
+
+    Tool("phone_see", "phone.see",
+         "用手机摄像头拍一张，本机视觉模型(Qwen3-VL) 描述画面：你在哪、周围有什么、"
+         "在做什么、光线如何。问「桌上有什么」「看看我现在在哪」「拍一张分析」选这个。"
+         "只读采集（拍照=采样），不上云。",
+         render=_render_see),
+
+    Tool("life_log", "life.log",
+         "拍一帧追加到「生活流」（照片事实的时序库），供之后聚合/告警。"
+         "问「记一笔此刻」「存一张生活流」选这个。只读采集+本地簿记。",
+         render=_render_see),
+
+    Tool("life_digest", "life.digest",
+         "聚合生活流：按日/周汇总场景/活动/光线/陪伴情况。"
+         "问「这周我都在干嘛」「生活流日报」选这个。只读聚合。",
+         render=_render_life_digest),
+
+    Tool("life_sentinel", "life.sentinel",
+         "生活哨兵：对比基线，报告显著偏离（如「今晚房间持续很暗」）。"
+         "问「生活流有异常吗」选这个。只读，只看可观测偏离。",
+         render=_render_life_sentinel),
+
+    Tool("net_dissect", "net.dissect",
+         "流量解剖：抓一段本机流量，抽对话对/协议占比/明文凭据告警。"
+         "问「这网络里在跑什么」「有没有明文口令」选这个。只读，需 scapy+Npcap。",
+         render=_render_net_dissect),
+
+    Tool("net_survey", "net.survey",
+         "无线侦察：用 bettercap 发现周边 BLE/WiFi 设备。"
+         "问「周围有什么无线设备」选这个。只读，需 bettercap。",
+         render=_render_net_survey),
+
+    # ---- 外部情报（L4：OSINT，拆解公开面拿数据）----
+    Tool("osint_crt", "osint.crt",
+         "证书透明度枚举子域（crt.sh，免 key）：拿一个域名暴露过的所有子域。"
+         "问「example.com 有哪些子域」选这个。只读，仅查自有/授权域名。",
+         argkey="domain", render=_render_osint),
+
+    Tool("osint_dns", "osint.dns",
+         "公共 DNS 解析（A/AAAA/MX/TXT/NS/CNAME）。问「example.com 解析到哪」选这个。只读。",
+         argkey="domain", render=_render_osint),
+
+    Tool("osint_rdap", "osint.rdap",
+         "RDAP 注册信息：注册局/注册商/创建时间/NS。问「这个域名谁注册的」选这个。只读。",
+         argkey="domain", render=_render_osint),
+
+    Tool("osint_shodan", "osint.shodan",
+         "Shodan 暴露面测绘（需 SHODAN_KEY，仅查自有资产）。"
+         "问「我的资产开了哪些端口」选这个。只读；无 key 时如实说不可用。",
+         argkey="query", render=_render_osint),
+    # ---- 远程可触达层（L6）----
+    Tool("relay_status", "relay.status",
+         "家里常开中继现在连着几台手机、各上报了什么能力。问「我的手机在线吗」"
+         "「现在能远程够到哪台」选这个。只读；中继未开时如实说不可用。",
+         render=_render_relay),
+    # ---- 逆向拆解层（不拆就没有的数据）----
+    Tool("re_ir", "re.ir",
+         "拆红外遥控脉冲：给一串微秒通断（或 Flipper 捕获文本），判定 NEC/三星/SIRC "
+         "协议并取出地址/命令码，再对照码库。问「这串脉冲是什么码」「这个遥控器是什么"
+         "协议」选这个。只读；像 scene_scan 但那是看空气，这是拆信号。",
+         argkey="capture", render=_render_re_ir),
+    Tool("re_ble", "re.ble",
+         "拆 BLE 广播原文 hex：AD 结构遍历出设备名/服务 UUID/厂商数据/iBeacon。"
+         "问「这个广播里有什么」「这是什么设备发的」选这个。只读；"
+         "与 radio.ble_scan 的分工：那个去扫，这个拆扫到的原文。",
+         argkey="hex", render=_render_re_ble),
+    Tool("re_binary", "re.binary",
+         "拆二进制/固件/APK：抽 strings 分类出 URL/IP/邮箱/疑似密钥/版本横幅/路径，"
+         "认 ELF/PE/zip/dex 魔数。问「这个固件里硬编码了什么」「APK 里有什么地址」"
+         "选这个。只读且只在本机；文件内容不外传。",
+         argkey="path", render=_render_re_binary),
+    Tool("re_ask", "re.ask",
+         "逆向问答：把拆解得到的事实交给 LLM 出人话假设。问「这说明什么」"
+         "「帮我看看怎么解」选这个。回答一律标「模型回答」，可能错，"
+         "关键结论要交叉验证；没额度时如实说不可用。",
+         argkey="question", render=lambda r, a: (
+             (r.get("data") or {}).get("answer", r.get("err") or "")[:300])),
 )
 
 

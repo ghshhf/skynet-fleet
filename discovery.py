@@ -124,6 +124,10 @@ OUI_VENDOR = {
     "00:1B:21": "Intel", "A0:36:9F": "Intel",
     "00:15:5D": "Hyper-V", "00:16:3E": "Xen", "52:54:00": "QEMU",
     "00:9A:CD": "Huawei", "9C:28:EF": "Huawei", "14:5F:94": "Huawei",
+    # 2026-10-24 实测：0C:38:3E 在线库注册为 Fanvil（深圳方位，VoIP 话机厂），
+    # 但实物 80 口 Server: RapidLogic/1.1 + 554 口 H264DVR 1.0 = 白牌 DVR。
+    # **OUI 只代表网卡/模组注册方，不等于整机品牌**——又一个铁律实例。
+    "0C:38:3E": "Fanvil(网络模组)",
     "00:8A:76": "Apple", "9C:20:7B": "Apple", "C8:B5:AD": "Apple",
 }
 
@@ -133,6 +137,11 @@ OUI_VENDOR = {
 CATEGORY_RULES = [
     # (类别, 正则/关键字, 权重, 作用域 all|ssdp|mdns|port|http|oui)
     # —— 设备自报身份（最硬）——
+    # 2026-10-24 实测新增：body 固件签名比端口投票硬得多。
+    # vlpr=车牌识别 / axvdc=ActiveX 视频控件 / PS5260=安防 SoC → 车牌抓拍相机；
+    # RapidLogic+H264DVR → 白牌 DVR（OUI 注册成 Fanvil 只是网络模组，整机不是话机）
+    ("dvr", r"RapidLogic|H264DVR", 9, "all"),
+    ("camera", r"vlpr|axvdc|VDCA|SVR_PRIME|PS5260|MT83001", 10, "all"),
     ("camera", r"_psia|_CGI|HIKVISION|DS-2CD|DS-2DE|onvif|dahua|ezviz|reolink", 9, "all"),
     ("router", r"TPOS|YLWR|易展|openwrt|asuswrt|miwifi|routerlogin", 8, "all"),
     ("pc", r"Microsoft-Windows|e2esoft|ivcam|_sftp-ssh|_smb|_rdp", 8, "all"),
@@ -669,8 +678,18 @@ def fetch_http_banner(ip, port, timeout=1.2):
             m = re.search(r"<title[^>]*>([^<]{1,80})</title>", body, re.I)
             if m:
                 title = m.group(1).strip()
+            # body 固件签名：title 常常是通用的「Welcome!」，真正的身份在 body 里
+            # （2026-10-24 实测：18:03:00 那批车牌相机的 vlpr/axvdc/固件串全在
+            # <label> 里，Server 头是空的、title 是人人都一样的 Welcome!）
+            sig = ""
+            m = re.search(r"(?i)(vlpr|axvdc|VDCA|SVR_PRIME|PS5260|MT83001|"
+                          r"RapidLogic|H264DVR|DS-2CD|DS-2DE|HIKVISION|"
+                          r"EZVIZ|dahua|uniview)", body)
+            if m:
+                sig = m.group(1)
             return {"server": hdr.get("server", ""), "title": title,
-                    "location": hdr.get("location", ""), "port": port}
+                    "location": hdr.get("location", ""), "port": port,
+                    "sig": sig}
         except OSError:
             return {}
         finally:

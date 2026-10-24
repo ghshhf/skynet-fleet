@@ -1,0 +1,11 @@
+{
+  "brand": "generic",
+  "device": "generic",
+  "protocol": "nec",
+  "keys": {
+    "power": {"addr": 4, "cmd": 8},
+    "vol_up": {"addr": 4, "cmd": 9},
+    "vol_down": {"addr": 4, "cmd": 10},
+    "ok": {"addr": 4, "cmd": 11}
+  }
+}

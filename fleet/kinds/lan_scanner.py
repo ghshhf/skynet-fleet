@@ -6,6 +6,7 @@
 """
 import nearby
 import sweep as S
+from .. import acquire
 from ..core import BaseDevice, DeviceResult as R
 
 
@@ -27,7 +28,7 @@ class LanScanner(BaseDevice):
         return True, ""
 
     def caps(self):
-        return ("net.scan", "net.nearby")
+        return ("net.scan", "net.nearby", "net.dissect", "net.survey")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -47,4 +48,26 @@ class LanScanner(BaseDevice):
                              with_bt=not args.get("no_bt"))
             return R.success("net.nearby", self.name, via=self.via, data={
                 "report": nearby.report(out), "raw": out})
+
+        # ---- L2 采集层：把空气里跑的流量拆开看 ----
+        if cap == "net.dissect":
+            r = acquire.net_dissect(
+                duration=float(args.get("duration") or 5),
+                iface=(args.get("iface") or None),
+                bpf=(args.get("bpf") or None),
+                count=int(args.get("count") or 300))
+            if not r.get("ok"):
+                return R.unavailable("net.dissect", r.get("err") or "抓包失败",
+                                     device=self.name, via=self.via)
+            return R.success("net.dissect", self.name, via=self.via, data=r)
+
+        if cap == "net.survey":
+            r = acquire.net_survey(
+                duration=float(args.get("duration") or 20),
+                iface=(args.get("iface") or None))
+            if not r.get("ok"):
+                return R.unavailable("net.survey", r.get("err") or "侦察失败",
+                                     device=self.name, via=self.via)
+            return R.success("net.survey", self.name, via=self.via, data=r)
+
         return super().invoke(cap, args)

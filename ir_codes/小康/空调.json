@@ -1,0 +1,14 @@
+{
+  "brand": "小康",
+  "device": "空调",
+  "protocol": "nec",
+  "keys": {
+    "power": {"addr": 3, "cmd": 8},
+    "temp_up": {"addr": 3, "cmd": 9},
+    "temp_down": {"addr": 3, "cmd": 10},
+    "mode": {"addr": 3, "cmd": 11},
+    "wind": {"addr": 3, "cmd": 12},
+    "timer_on": {"addr": 3, "cmd": 13},
+    "timer_off": {"addr": 3, "cmd": 14}
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "brand": "海信",
+  "device": "空调",
+  "protocol": "nec",
+  "keys": {
+    "power": {"addr": 16, "cmd": 8},
+    "temp_up": {"addr": 16, "cmd": 9},
+    "temp_down": {"addr": 16, "cmd": 10},
+    "mode": {"addr": 16, "cmd": 11},
+    "wind": {"addr": 16, "cmd": 12},
+    "timer_on": {"addr": 16, "cmd": 13},
+    "timer_off": {"addr": 16, "cmd": 14}
+  }
+}

@@ -14,6 +14,8 @@ import phone_ops as O
 import phone_state as PS
 import radio as RADIO
 import thermal as THERMAL
+from .. import creative
+from .. import acquire
 from ..core import BaseDevice, DeviceResult as R
 
 KEYMAP = {"back": 4, "home": 3, "enter": 66, "menu": 82, "power": 26,
@@ -58,7 +60,18 @@ class AndroidPhone(BaseDevice):
                 "radio.wifi.survey", "radio.wifi.link", "radio.cell",
                 # 热状态：算力节点最该被看见的东西。手机被动散热，SOC 到 85℃ 就压频，
                 # 同一套参数 tg 能从 50 掉到 30。「怎么突然慢了」不查它一定答错。
-                "thermal.read")
+                "thermal.read",
+                # ---- 创意能力（天网之眼 + 信号外放；计划书 2026-10-24）----
+                # scene.scan / sentinel.watch / scene.run 是「读 + 编排」，
+                # 但 scene.run 会串联动手步骤（ir/hotspot），故标 side_effect。
+                # ir.command / phone.hotspot 是「动手」级，标 side_effect，闸在 catalog 层。
+                "scene.scan", "ir.command", "phone.hotspot",
+                "sentinel.watch", "scene.run",
+                # ---- 采集层（L2/L3/L5；信息获取层调研 2026-10-24）----
+                # phone.sense/phone.see 是「读 + 拍」，只读不改；life.* 是生活流聚合（本地簿记）。
+                # 都不标 side_effect：拍照/传感是采集不是动作；落本地日志不改设备状态。
+                "phone.sense", "phone.see",
+                "life.log", "life.digest", "life.sentinel")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -236,5 +249,66 @@ class AndroidPhone(BaseDevice):
                                      device=self.name, via=self.via)
             return R.success("ir.send", self.name, side_effect=True, via=self.via,
                              data={"dry_run": False, "protocol": proto, "freq": freq})
+
+        # ---- 创意能力（天网之眼 + 信号外放）----
+        # 逻辑全在 fleet.creative，这里只做「参数透传 + 收 DeviceResult」。
+        if cap == "scene.scan":
+            return creative.scene_scan(
+                s,
+                with_discovery=bool(args.get("with_discovery", True)),
+                with_cell=bool(args.get("with_cell", True)),
+                with_ble=bool(args.get("with_ble", True)),
+                settle=float(args.get("settle") or 6),
+                bt_secs=float(args.get("bt_secs") or 6))
+
+        if cap == "ir.command":
+            r = creative.ir_command(
+                s,
+                (args.get("brand") or "").strip(),
+                (args.get("device_type") or "").strip(),
+                (args.get("key") or "").strip(),
+                dry_run=bool(args.get("dry_run", True)),
+                phrase=(args.get("phrase") or None))
+            return r
+
+        if cap == "phone.hotspot":
+            return creative.hotspot(
+                s,
+                bool(args.get("on")),
+                ssid=(args.get("ssid") or None),
+                password=(args.get("password") or None))
+
+        if cap == "sentinel.watch":
+            return creative.sentinel_watch(s, arm=bool(args.get("arm")))
+
+        if cap == "scene.run":
+            return creative.scene_run(s, (args.get("name") or "").strip())
+
+        # ---- 采集层（L2/L3/L5：让编队真的去「获取」，不只是分析已有信息）----
+        if cap == "phone.sense":
+            return acquire.phone_sense(s)
+
+        if cap == "phone.see":
+            return acquire.phone_see(
+                s,
+                prompt=(args.get("prompt") or None),
+                mode=(args.get("mode") or "structured"),
+                log=bool(args.get("log", True)),
+                camera_id=int(args.get("camera_id") or 0))
+
+        if cap == "life.log":
+            return acquire.life_log(
+                s,
+                prompt=(args.get("prompt") or None),
+                mode=(args.get("mode") or "structured"))
+
+        if cap == "life.digest":
+            return acquire.life_digest(
+                period=(args.get("period") or "day"),
+                limit=int(args.get("limit") or 400))
+
+        if cap == "life.sentinel":
+            return acquire.life_sentinel(
+                baseline_frames=int(args.get("baseline_frames") or 20))
 
         return super().invoke(cap, args)

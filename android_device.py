@@ -976,6 +976,82 @@ def wait_foreground(serial, want, timeout=10.0):
     return {"ok": False, "err": f"{timeout}s 内前台没切到 {want}"}
 
 
+# ---------------------------------------------------------------- 传感 / 相机（Termux:API）
+
+def camera_photo(serial, remote_path=None, camera_id=0, timeout=60):
+    """用 Termux:API 拍一张照（需手机装 Termux:API 插件）。
+
+    走 `termux-camera-photo -c {id} -f {path}`（adb shell）。文件留在手机上，
+    要再 pull 到本机（见 pull()）才能喂模型。返回 (ok, remote_path | err)。
+    """
+    rp = remote_path or f"/sdcard/DCIM/fleet_see_{int(time.time())}.jpg"
+    rc, txt = shell(serial, f"termux-camera-photo -c {int(camera_id)} -f {rp}")
+    if rc != 0:
+        return False, (txt.strip()[:200]
+                       or "termux-camera-photo 无输出（Termux:API 未装？）")
+    return True, rp
+
+
+def pull(serial, remote, local, timeout=90):
+    """从手机拉文件到本机（adb pull，只读传输，不过红线守卫）。返回 (ok, local | err)。"""
+    os.makedirs(os.path.dirname(os.path.abspath(local)), exist_ok=True)
+    rc, txt = _run(serial, ["pull", remote, local], timeout=timeout)
+    if rc != 0:
+        return False, f"pull 失败(rc={rc}): {txt.strip()[:200]}"
+    return True, local
+
+
+def sensor_read(serial, types="ambient_light,light,game_rotation_vector,step_counter,"
+                              "accelerometer,magnetic_field,proximity",
+                delay=1, timeout=60):
+    """读手机传感器（Termux:API termux-sensor）。返回 (ok, list_of_readings | err)。
+
+    termux-sensor 输出是 JSON 数组，逐元素形如
+    {"type":"...","values":[...],"accuracy":..}。-n 1 采一次即可；
+    delay 是采样前的稳定等待秒。
+    """
+    cmd = f"termux-sensor -s {types} -d {int(delay)} -n 1"
+    rc, txt = shell(serial, cmd, timeout=timeout)
+    if rc != 0:
+        return False, (txt.strip()[:200]
+                       or "termux-sensor 无输出（Termux:API 未装？）")
+    return True, _parse_sensor_json(txt)
+
+
+def _parse_sensor_json(txt):
+    """termux-sensor 会在 JSON 前后塞日志/stderr，这里尽力抽出第一个 JSON 数组。"""
+    txt = txt.replace("\r", "")
+    start = txt.find("[")
+    if start < 0:
+        return []
+    depth, end = 0, -1
+    for i in range(start, len(txt)):
+        if txt[i] == "[":
+            depth += 1
+        elif txt[i] == "]":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end < 0:
+        return []
+    try:
+        return json.loads(txt[start:end + 1])
+    except ValueError:
+        return []
+
+
+def battery_json(serial, timeout=30):
+    """读手机电池状态（Termux:API termux-battery-status）。返回 (ok, dict | err)。"""
+    rc, txt = shell(serial, "termux-battery-status", timeout=timeout)
+    if rc != 0:
+        return False, f"电池状态读取失败(rc={rc}): {txt.strip()[:200]}"
+    try:
+        return True, json.loads(txt)
+    except ValueError:
+        return False, f"电池状态非 JSON: {txt.strip()[:200]}"
+
+
 # ---------------------------------------------------------------- 离线自测
 
 _TREE_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>

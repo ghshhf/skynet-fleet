@@ -5,10 +5,20 @@ NEC 覆盖绝大多数国产电视、风扇、机顶盒；Samsung / Sony 各有�
 
 安全默认：不加 --send 只打印序列，不发射。真发射会把电器打开或关掉，
 这种动作不该在没确认对象的时候发生。
+
+码库路线（ir_codes.py / ir_codes/）：
+  infrared.command(serial, brand, device, key) → 查码库 → 编码 → 发射
+  infrared.codebook() → 列出有码的品牌
+  infrared.learn_info(serial) → 问硬件是否支持学习模式
+
+本机 25060RK16C 红外只有发射口，没有学习口——所以码库是唯一路线。
 """
+import json
+import os
 import sys
 
 import android_device as A
+import ir_codes as IC
 
 NEC_FREQ = 38000
 
@@ -65,6 +75,68 @@ def ir_info(serial):
     return A.bridge_cmd(serial, "IRINFO")
 
 
+def learn_info(serial):
+    """查红外收发器是否支持学习模式（仅部分机型支持）。
+
+    返回 dict：{"has_emitter": bool, "can_learn": bool, "bands": [...], "reason": str}
+    """
+    r = ir_info(serial)
+    out = (r.get("out") or "").strip()
+    if r.get("ok") and out.startswith("OK ir"):
+        bands = out[5:].strip()
+        band_list = []
+        for b in bands.split():
+            if "-" in b:
+                parts = b.split("-")
+                if len(parts) == 2 and all(p.isdigit() for p in parts):
+                    band_list.append({"min": int(parts[0]), "max": int(parts[1])})
+        return {"has_emitter": True, "can_learn": False, "bands": band_list,
+                "reason": "码库路线（本机红外只有发射口，没有学习口）"}
+    return {"has_emitter": False, "can_learn": False, "bands": [],
+            "reason": r.get("err") or r.get("out") or "红外收发器不可用"}
+
+
+def command(serial, brand, device_type, key, dry_run=True):
+    """经码库发射一条红外指令。
+
+    流程：查码库 → 编码 → (dry_run=False 时)经桥发射。
+    不发射时只返回编码信息，供审批/调试用。
+
+    返回 dict：{"ok": True/False, "err": str, "protocol": str, "freq": int,
+                "addr": int, "cmd": int, "dry_run": bool}
+    """
+    proto, addr, cmd = IC.lookup(brand, device_type, key)
+    if proto is None:
+        return {"ok": False, "err": f"码库里没有品牌={brand} 类型={device_type} 键={key}",
+                "protocol": None, "freq": 0, "addr": 0, "cmd": 0, "dry_run": True}
+
+    encoders = {
+        "nec": nec, "nec_ext": nec_ext, "samsung": samsung, "sony": sony,
+    }
+    enc = encoders.get(proto.lower())
+    if enc is None:
+        return {"ok": False, "err": f"不认识的协议 {proto}",
+                "protocol": proto, "freq": 0, "addr": addr, "cmd": cmd, "dry_run": True}
+
+    freq, pattern = enc(addr, cmd)
+    result = {"ok": True, "protocol": proto, "freq": freq,
+              "addr": addr, "cmd": cmd, "pairs": len(pattern) // 2,
+              "dry_run": dry_run, "codebook": True}
+    if not dry_run:
+        r = send(serial, freq, pattern)
+        if not r.get("ok"):
+            result["ok"] = False
+            result["err"] = r.get("err") or "桥拒绝发射"
+            return result
+        result["sent"] = True
+    return result
+
+
+def codebook():
+    """列出可用码库。"""
+    return IC.available_brands()
+
+
 def _pairs(pattern):
     """把微秒序列折成「通/断」两列，方便人眼核对。"""
     rows = []
@@ -113,7 +185,26 @@ def _selftest():
     _, ep = nec_ext(0x1234, 0x56)
     assert len(ep) == 67, len(ep)
 
-    print("infrared \u81ea\u6d4b\uff1a7 \u9879\u5168\u8fc7")
+    # ⑧ 码库查找
+    cb = IC.load_codebook("小米", "电视")
+    assert cb is not None and cb.get("brand") == "小米", cb
+    proto, addr, cmd = IC.lookup("小米", "电视", "power")
+    assert proto == "nec" and addr == 4 and cmd == 8, (proto, addr, cmd)
+    p2, a2, c2 = IC.lookup("海信", "空调", "temp_up")
+    assert p2 == "nec" and a2 == 16 and c2 == 9, (p2, a2, c2)
+    proto_none, _, _ = IC.lookup("nonexistent", "电视", "power")
+    assert proto_none is None, "不存在品牌返回 None"
+
+    # ⑨ 键名归一化
+    assert IC._normalize_key("电源") == "power", "键名归一化：电源->power"
+    proto, addr, cmd = IC.lookup("海信", "电视", "on")
+    assert addr == 8 and cmd == 8, "on -> power"
+
+    # ⑩ available_brands 非空（至少 generic）
+    brands = codebook()
+    assert len(brands) >= 1 and any(b["brand"] == "generic" for b in brands), brands
+
+    print("infrared 自测：10 项全过")
 
 
 def main(argv=None):
@@ -128,21 +219,53 @@ def main(argv=None):
         print(ir_info(serial))
         return 0
 
+    if argv[0] == "cb" or argv[0] == "codebook":
+        for c in codebook():
+            print(f"  {c['brand']} / {c['device']}  {c['keys']} 个键")
+        return 0
+
+    if argv[0] == "cmd":
+        # infrared.py cmd 小米 电视 power [--send]
+        if len(argv) < 4:
+            print("用法: infrared.py cmd <品牌> <类型> <键> [--send]")
+            return 1
+        brand, dev_type, key = argv[1], argv[2], argv[3]
+        send_it = "--send" in argv
+        r = command(serial, brand, dev_type, key, dry_run=not send_it)
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0 if r.get("ok") else 1
+
     proto = argv[0].lower()
     send_it = "--send" in argv
     argv = [a for a in argv if a != "--send"]
 
     if proto == "raw":
+        if len(argv) < 3:
+            print("用法: infrared.py raw <频> <通1> <断1> ...")
+            return 1
         freq = int(argv[1])
         pat = [int(x) for x in argv[2:]]
     elif proto == "nec":
+        if len(argv) < 3:
+            print("用法: infrared.py nec <addr> <cmd>")
+            return 1
         freq, pat = nec(int(argv[1], 0), int(argv[2], 0))
     elif proto == "necx":
+        if len(argv) < 3:
+            print("用法: infrared.py necx <addr16> <cmd>")
+            return 1
         freq, pat = nec_ext(int(argv[1], 0), int(argv[2], 0))
     elif proto == "samsung":
+        if len(argv) < 3:
+            print("用法: infrared.py samsung <addr> <cmd>")
+            return 1
         freq, pat = samsung(int(argv[1], 0), int(argv[2], 0))
     elif proto == "sony":
-        freq, pat = sony(int(argv[1], 0), int(argv[2], 0))
+        if len(argv) < 3:
+            print("用法: infrared.py sony <addr> <cmd> [bits]")
+            return 1
+        bits_n = int(argv[3]) if len(argv) > 3 else 12
+        freq, pat = sony(int(argv[1], 0), int(argv[2], 0), bits_n)
     else:
         print(__doc__)
         return 1

@@ -1,0 +1,27 @@
+{
+  "brand": "海信",
+  "device": "电视",
+  "protocol": "nec",
+  "keys": {
+    "power": {"addr": 8, "cmd": 8},
+    "vol_up": {"addr": 8, "cmd": 9},
+    "vol_down": {"addr": 8, "cmd": 10},
+    "ok": {"addr": 8, "cmd": 11},
+    "up": {"addr": 8, "cmd": 12},
+    "down": {"addr": 8, "cmd": 13},
+    "left": {"addr": 8, "cmd": 14},
+    "right": {"addr": 8, "cmd": 15},
+    "menu": {"addr": 8, "cmd": 16},
+    "home": {"addr": 8, "cmd": 17},
+    "1": {"addr": 8, "cmd": 18},
+    "2": {"addr": 8, "cmd": 19},
+    "3": {"addr": 8, "cmd": 20},
+    "4": {"addr": 8, "cmd": 21},
+    "5": {"addr": 8, "cmd": 22},
+    "6": {"addr": 8, "cmd": 23},
+    "7": {"addr": 8, "cmd": 24},
+    "8": {"addr": 8, "cmd": 25},
+    "9": {"addr": 8, "cmd": 26},
+    "0": {"addr": 8, "cmd": 27}
+  }
+}
