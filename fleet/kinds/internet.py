@@ -21,6 +21,7 @@ import time
 
 from .. import netrunner as NR
 from .. import netforce_skynet as NS
+from .. import re_site as RS
 from ..core import BaseDevice, DeviceResult as R
 
 
@@ -47,8 +48,8 @@ class Internet(BaseDevice):
     def caps(self):
         return ("web.status", "web.discover", "web.corpus", "web.diffuse",
                 "web.papers", "web.frontier", "web.sites",
-                "web.search", "web.fetch", "web.probe", "web.structure",
-                "web.download")
+                "web.search", "web.quote", "web.fetch", "web.probe",
+                "web.structure", "web.download")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -69,7 +70,35 @@ class Internet(BaseDevice):
         if cap in ("web.search", "web.fetch", "web.probe", "web.structure",
                    "web.download"):
             return self._skynet(cap, args)
+        if cap == "web.quote":
+            return self._quote(args)
         return super().invoke(cap, args)
+
+    # ---------------- 自建逆向引擎（re_site，见模块头部的纪律）----------------
+
+    def _quote(self, args):
+        """行情精确查询：走 re_site 的站点适配器（腾讯/东财，只读公开接口）。
+
+        和 web.search 的分工：search 答「网上怎么说」，quote 答「现在是多少」
+        ——自建引擎的命中是结构化事实，不是排名。适配器失败照常回信封，
+        不炸、不编（没查出来就说没查出来）。
+        """
+        q = (args.get("query") or "").strip()
+        if not q:
+            return R.unavailable("web.quote", "缺少 query（哪只股票/基金）",
+                                 device=self.name, via=self.via)
+        try:
+            d = RS.quote(q, kind=args.get("kind"))
+        except Exception as e:
+            return R.error("web.quote",
+                           f"re_site 适配器异常：{type(e).__name__}: {e}",
+                           device=self.name, via=self.via)
+        h = RS.hit_from(d) if d.get("ok") else None
+        return R.success("web.quote", self.name, via=self.via, data={
+            "query": q,
+            "quote": d,
+            "hits": [h] if h else [],
+        })
 
     # ---------------- 采集内核（skynet，短任务，直接 import 同步调）----------------
 
@@ -92,11 +121,28 @@ class Internet(BaseDevice):
                     only=only,
                     min_rel=(float(args["min_rel"]) if args.get("min_rel") is not None else None),
                     limit=int(args.get("limit") or 20))
+                # 自建逆向引擎前置注入（2026-10-24，路线 P0 第一枪）：
+                # 行情类查询先把精确答案顶到最前面——公网引擎答「哪篇资讯」，
+                # 适配器答「现在多少钱」，两者不冲突，一起给。
+                # 🔴 适配器任何异常都不许炸掉主搜索：降级成「这次没问出来」，
+                # 公网结果照常返回。quote 只发一次网络请求（hit_from 复用）。
+                qd = None
+                try:
+                    q = args.get("query") or ""
+                    if RS.is_quote_query(q):
+                        qd = RS.quote(q)
+                        if qd.get("ok"):
+                            h = RS.hit_from(qd)
+                            if h:
+                                hits = [h] + hits
+                except Exception:
+                    qd = None
                 return R.success(cap, self.name, via=self.via, data={
                     "query": args.get("query") or "",
                     "count": len(hits),
                     "hits": hits,
                     "engines": NS.engine_health(),
+                    "quote": qd,
                 })
             if cap == "web.fetch":
                 url = (args.get("url") or "").strip()

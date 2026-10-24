@@ -56,3 +56,11 @@ av==12.3.0
 rich>=13
 textual>=0.50
 prompt_toolkit>=3.0
+
+# —— 采集层（L2/L4；信息获取层 2026-10-24）——
+# L2 net.dissect 流量解剖；L4 osint.dns 公共解析；requests 为 Osint 探测依赖。
+scapy>=2.5
+requests>=2.31
+dnspython>=2.4
+# 注：bettercap（L2 net.survey）是 Go 二进制，不走 pip；PC: go install，
+#     手机 Termux: pkg install bettercap。缺失时 net.survey 如实报 unavailable。

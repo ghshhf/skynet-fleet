@@ -548,8 +548,22 @@ def sweep(subnets=None, do_icmp=True, do_tcp=True, do_nbns=True,
     for ip, d in per_ip.items():
         ssdp_txt = " ".join(str(v) for v in d["ssdp"].values())
         mdns_txt = " ".join(d["mdns"])
+        # HTTP banner（2026-10-24 补）：以前这里传空串，等于把最硬的
+        # 「设备自报身份」证据扔了——18:03:00 那批车牌相机靠 body 里的
+        # vlpr/axvdc 固件签名才认得出，只靠端口投票只能泛泛判个 camera。
+        http_txt = ""
+        for p in (80, 8080, 8000, 8008):
+            if p in d["ports"]:
+                try:
+                    b = D.fetch_http_banner(ip, p)
+                    if b:
+                        http_txt += " %s %s %s" % (b.get("server", ""),
+                                                    b.get("title", ""),
+                                                    b.get("sig", ""))
+                except Exception:
+                    pass
         ranked = D.score_categories({
-            "ssdp": ssdp_txt, "mdns": mdns_txt, "http": "",
+            "ssdp": ssdp_txt, "mdns": mdns_txt, "http": http_txt,
             "oui": d["vendor"], "ports": d["ports"],
         })
         combos = D.combo_hits(d["ports"])

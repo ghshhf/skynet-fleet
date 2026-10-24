@@ -59,6 +59,14 @@ CASES = [
     # ---- D0 契约层（结果信封 / 设备基类 / 注册表）----
     ("fleet_result", ["-m", "fleet.core.result"], HERE, 30),
     ("fleet_registry", ["-m", "fleet.core.registry"], HERE, 30),
+    # ---- 逆向拆解层（L7）：全部离线，不碰真网关不碰真机 ----
+    # re_llm 起一次性本地假端点；reverse 用红外编码器造往返向量。
+    # 门禁纪律：不许依赖外网/真机，所以这两个模块的 LLM 活体测试不进门禁。
+    ("fleet_re_llm", ["-m", "fleet.re_llm", "--selftest"], HERE, 60),
+    ("fleet_reverse", ["-m", "fleet.reverse", "--selftest"], HERE, 60),
+    # 站点逆向层（自建引擎，2026-10-24 P0）：re_site 的 21 项全是离线断言
+    # （真机采集的 GBK 负载/JSON 当向量）。--live 才联网，按门禁纪律不进门禁。
+    ("fleet_re_site", ["-m", "fleet.re_site"], HERE, 30),
     ("fleet_list", ["-m", "fleet", "list"], HERE, 120),
     # ---- Android 静态门禁：XML 标签 vs Java 强转类型 ----
     # 一次真事故一条：activity_device.xml 里 btnDevBack 是 <TextView>，

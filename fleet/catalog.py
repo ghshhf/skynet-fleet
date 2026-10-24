@@ -24,6 +24,9 @@ from .kinds.internet import Internet
 from .kinds.job_board import JobBoard
 from .kinds.phone_node import PhoneNode
 from .kinds.lan_scanner import LanScanner
+from .kinds.osint import Osint
+from .kinds.reverse import Reverse
+from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
 from .kinds.windows_pc import WindowsPC
@@ -114,7 +117,109 @@ CAPABILITIES = [
                        Param("dry_run", "bool", doc="默认 true")),
                side_effect=True, check=_bridge_reason,
                note="经编队桥发射；第一次用必须显式 dry_run=false"),
+    # ---- 创意能力（天网之眼 + 信号外放；计划书 2026-10-24）----
+    Capability("scene.scan", "一键全域快照（天网之眼）：融合 WiFi/蜂窝/蓝牙/局域网发现",
+               params=(Param("with_discovery", "bool", doc="局域网主动发现，默认 true"),
+                       Param("with_cell", "bool", doc="蜂窝驻留，默认 true"),
+                       Param("with_ble", "bool", doc="蓝牙扫描，默认 true"),
+                       Param("settle", "int", doc="WiFi 扫描后等几秒，默认 6"),
+                       Param("bt_secs", "int", doc="蓝牙扫几秒，默认 6")),
+               note="只读融合：把多源按 MAC 合并成「存在感表」。规则层（OUI/厂商/"
+                    "频段换算）已打底，模型只做身份归纳、不做能力断言，防编造"),
+    Capability("ir.command", "红外码库命名发射（手机万能遥控的编队版）",
+               params=(Param("brand", "str", True, "品牌，如 小米/海信"),
+                       Param("device_type", "str", True, "设备类型，如 电视/空调"),
+                       Param("key", "str", True, "按键，如 on/off/power"),
+                       Param("dry_run", "bool", doc="默认 true（只算不发射）")),
+               side_effect=True, approval="ask", check=_bridge_reason,
+               note="经编队桥发射；本机红外只有发射口无学习口，走码库查表路线。"
+                    "开空调/关电视是动手级，必须过闸门；第一次用显式 dry_run=false"),
+    Capability("phone.hotspot", "手机反向供网 / 断网自救（信号外放）",
+               params=(Param("on", "bool", True, "true=开软 AP，false=关"),
+                       Param("ssid", "str", doc="热点名，默认 Skynet"),
+                       Param("password", "str", doc="至少 8 位，默认 skynet2026")),
+               side_effect=True, approval="ask",
+               note="走 cmd wifi start-softap（不被红线守卫拦截）。开软 AP 会让手机"
+                    "自身 WiFi 客户端链路断开、切到蜂窝——这是宽带死时的 failover"
+                    "通道（控制面经手机存活），不是随便的开关"),
+    Capability("sentinel.watch", "环境哨兵：只在变化时报告（新设备/信号异常/消失）",
+               params=(Param("arm", "bool", doc="true=把当前在场设成基线，默认 false")),
+               note="只读：跑 nearby 三层指纹与基线做差。arm=true 只写本地基线文件"
+                    "（簿记，不改设备状态）；其余时间只在有进出/信号骤降>20dBm 时说话"),
+    Capability("scene.run", "场景宏（Jarvis 化一键）：把原子能力串成命名剧本",
+               params=(Param("name", "str", True, "宏名，如 离家/回家")),
+               side_effect=True, approval="ask",
+               note="剧本是人类审核过的 JSON（内置+~/.fleet/scene_macros.json）。"
+                    "执行前整体过一次闸门（fail-closed）；其中 ir.command/phone.hotspot"
+                    "等动手步骤在已批准的宏内执行。任一步失败默认中断并如实报告哪步没过"),
+    # ---- 采集层（L2/L3/L5：信息获取层，2026-10-24；让编队真的去「获取」）----
+    Capability("phone.sense", "读手机传感：环境光/运动/电量温度 → 房间明暗与在场",
+               note="只读：Termux:API 传感器+电池状态融合。lux 是环境光、occupancy 是"
+                    "启发式推断非直读。需装 Termux:API 插件"),
+    Capability("phone.see", "用手机摄像头拍一张，本机 VLM(Qwen3-VL) 出结构化观察",
+               params=(Param("prompt", "str", doc="想问的问题，如「桌上有什么」；不给=默认结构化描述"),
+                       Param("mode", "str", doc="structured(默认,JSON) | describe(纯文本)"),
+                       Param("log", "bool", doc="是否追加到生活流，默认 true"),
+                       Param("camera_id", "int", doc="摄像头编号，默认 0")),
+               note="只读采集（拍照=采样，不改设备）。视觉是「此刻此地」真实采样，"
+                    "模型只描述画面、不推断主观情绪/心理。本人自愿共享的自我数据，不出本地圈。"
+                    "需 Termux:API + 手机本机 Qwen3-VL(带 mmproj)"),
+    Capability("life.log", "拍一帧追加到生活流（life-stream：照片事实的时序库）",
+               params=(Param("prompt", "str", doc="想问的问题"),
+                       Param("mode", "str", doc="structured(默认) | describe")),
+               note="只读采集 + 本地簿记；落 ~/.fleet/life.jsonl。聚合/告警见 life.digest/life.sentinel"),
+    Capability("life.digest", "生活流聚合：按日/周汇总场景/活动/光线/陪伴情况",
+               params=(Param("period", "str", doc="day(默认) | week"),
+                       Param("limit", "int", doc="最多读几帧，默认 400")),
+               note="只读：只统计画面里「看得见」的事实，主观情绪/健康不推断"),
+    Capability("life.sentinel", "生活哨兵：对比基线报告显著偏离（如「今晚房间持续很暗」）",
+               params=(Param("baseline_frames", "int", doc="基线用最近几帧，默认 20")),
+               note="只读：只看可观测偏离，不做因果/健康结论"),
+    Capability("net.dissect", "流量解剖：抓一段本机流量，抽对话对/协议占比/明文凭据告警",
+               params=(Param("duration", "int", doc="抓几秒，默认 5"),
+                       Param("iface", "str", doc="网卡名，不给了本机默认"),
+                       Param("bpf", "str", doc="抓包过滤表达式，如 'tcp port 80'"),
+                       Param("count", "int", doc="最多抓几个包，默认 300")),
+               note="只读：需 scapy + Npcap(Windows)/root(Linux)。明文凭据告警用于自有设备排查，不对外"),
+    Capability("net.survey", "无线侦察：bettercap 发现周边 BLE/WiFi 设备",
+               params=(Param("duration", "int", doc="侦察几秒，默认 20"),
+                       Param("iface", "str", doc="网卡名，不给了本机默认")),
+               note="只读：需 bettercap（PC: go install；手机 Termux: pkg install bettercap）。"
+                    "PC 需 monitor 模式网卡才有完整 WiFi 能力"),
+    # ---- 外部情报（L4：OSINT，拆解公开面拿数据；仅查你拥有/授权的资产）----
+    Capability("osint.crt", "证书透明度枚举子域（crt.sh，被动数据、免 key）",
+               params=(Param("domain", "str", True, "域名，如 example.com")),
+               note="只读：拿你说的域名暴露过的子域——很多你从没猜过。仅查自有/授权域名"),
+    Capability("osint.dns", "公共 DNS 解析（A/AAAA/MX/TXT/NS/CNAME）",
+               params=(Param("domain", "str", True, "域名"),
+                       Param("types", "str", doc="逗号分隔类型，默认全要")),
+               note="只读：需 dnspython。公共解析结果可能因解析器/缓存而异"),
+    Capability("osint.rdap", "RDAP 注册信息（注册局/注册商/创建时间/NS，免 key）",
+               params=(Param("domain", "str", True, "域名")),
+               note="只读：个人注册人信息按 GDPR 多已脱敏"),
+    Capability("osint.shodan", "Shodan 暴露面测绘（需 SHODAN_KEY，仅查自有资产）",
+               params=(Param("query", "str", True, "查询串，如 hostname:example.com"),
+                       Param("limit", "int", doc="最多几条，默认 20")),
+               note="只读：无 key 时如实说 unavailable，不假装能查；不可用于未授权目标"),
+    # ---- 逆向拆解层（不拆就没有的数据）----
+    Capability("re.ir", "红外捕获拆解：脉冲序列→协议判定（NEC/Samsung/SIRC…）→addr/cmd→码库对照",
+               params=(Param("capture", "any", True, "微秒 list、Flipper .ir/.sub 文本"),
+                       Param("llm", "bool", doc="是否要 LLM 假设层，默认要")),
+               note="只读：只拆你自己捕获的信号；confidence=low 的意思是「像」不是「是」"),
+    Capability("re.ble", "BLE 广播拆解：原文 hex→AD 结构→设备名/UUID/厂商/iBeacon",
+               params=(Param("hex", "str", True, "广播原文 hex（hcidump/WireShark 抄的）"),
+                       Param("llm", "bool", doc="是否要 LLM 假设层，默认要")),
+               note="只读：厂商 ID 查蓝牙 SIG 常见表；未登记厂商如实报「未登记」"),
+    Capability("re.binary", "二进制拆解：固件/APK/可执行→strings 分类（URL/IP/密钥/版本横幅）+魔数",
+               params=(Param("path", "str", True, "文件路径"),
+                       Param("llm", "bool", doc="是否要 LLM 假设层，默认要")),
+               note="只读且只在本机：原文不外传；hex32/64 是「像」不「是」"),
+    Capability("re.ask", "逆向问答：把拆解事实交给 LLM 出人话假设（带「假设」标注）",
+               params=(Param("question", "str", True, "问题")),
+               note="LLM 回答一律标「模型回答」——可能错，关键结论要交叉验证"),
     # ---- 这张网 ----
+    Capability("relay.status", "中继状态：家里常开节点现在连着几台手机、各上报了什么能力",
+               params=(), note="远程可触达层（L6）的门面；FLEET_RELAY_ENABLED=1 才在线"),
     Capability("net.scan", "局域网端口指纹扫描",
                params=(Param("quick", "bool", doc="跳过 NBT/mDNS"),
                        Param("timeout_ms", "int"))),
@@ -562,6 +667,8 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(WindowsPC())
     reg.add(AndroidPhone())
     reg.add(LanScanner())
+    reg.add(Osint())
+    reg.add(Reverse())
     reg.add(Internet())
     reg.add(AI())
     reg.add(Host())
@@ -579,5 +686,17 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
                 reg.add(FleetNode(name, rec))
             except ValueError:
                 continue
+    # ---- 远程可触达层（L6）：手机反连家里后，自动成为编队设备 ----
+    # 默认关闭（FLEET_RELAY_ENABLED=1 才开），避免无谓监听端口。
+    if os.environ.get("FLEET_RELAY_ENABLED") == "1":
+        try:
+            from .remote_link import get_relay
+            relay = get_relay(enabled=True)
+            if relay is not None:
+                reg.add(RelayNode())
+                relay.set_on_change(lambda: sync_remote_devices(reg, relay))
+                sync_remote_devices(reg, relay)   # 启动瞬间同步一次
+        except Exception as e:                    # 中继起不来不该拖垮整条编队
+            print("[catalog] 中继启动失败（已跳过远程层）: %s" % e)
     reg.load()          # 历史只用于「谁来过」，不造在线设备
     return reg
