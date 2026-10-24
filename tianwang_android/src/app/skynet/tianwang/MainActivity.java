@@ -20,6 +20,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupMenu;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.util.Log;
@@ -512,14 +513,17 @@ public class MainActivity extends Activity {
         // 先把「我说的」钉到屏幕上，再看它怎么答。
         // 顺序反了会出现「它答完才看见我问了啥」，很像它答错人。
         appendMsg(true, prompt);
-        say2("在想…");
+        if (Prefs.localMode(this)) {
+            say2("本地模型思考中…（不连电脑）");
+        } else {
+            say2("在想…");
+        }
         final TextView bubble = appendMsg(false, "…");
         streaming = bubble;
 
-        worker.execute(new Runnable() {
-            @Override
-            public void run() {
-                Net.chat(base, auth, asked, backend, snapshotHistory(), new Net.SseCallback() {
+        // 同一个回调两种后端都能用：本地模式没有 web 进度帧，onWeb 自然不触发，
+        // onLine/onDone/onError 两路共用，不用写两份。
+        final Net.SseCallback cb = new Net.SseCallback() {
                     @Override
                     public void onWeb(final org.json.JSONObject data) {
                         // 联网/工具进度。搜索和手机工具都是几秒到十几秒的活，
@@ -624,7 +628,20 @@ public class MainActivity extends Activity {
                         });
                         speak(reply);
                     }
-                }, webMode);
+                };
+
+        // 本地模式：直接打手机自带的 llama-server，不碰电脑、不联网。
+        // 开着就彻底离线，断网也能聊——这是「手机下好模型却调不动」的修法。
+        final boolean local = Prefs.localMode(MainActivity.this);
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                if (local) {
+                    Net.chatLocal(Prefs.localBase(MainActivity.this), "local",
+                            asked, snapshotHistory(), cb);
+                } else {
+                    Net.chat(base, auth, asked, backend, snapshotHistory(), cb, webMode);
+                }
             }
         });
     }
@@ -1682,6 +1699,32 @@ public class MainActivity extends Activity {
         eBackend.setTextSize(13);
         box.addView(eBackend);
 
+        // ---- ③·b 本地模型（MCB）：手机自己跑，不连电脑、不联网 ----
+        // 开之前必须先在 Termux 里把 llama-server 起起来，否则对话会直接报错带「怎么救」。
+        final Switch swLocal = new Switch(this);
+        swLocal.setText("本地模型模式（不连电脑、不联网）");
+        swLocal.setTextSize(13);
+        swLocal.setChecked(Prefs.localMode(this));
+        swLocal.setPadding(0, dp(10), 0, dp(2));
+        box.addView(swLocal);
+
+        final EditText eLocalBase = new EditText(this);
+        eLocalBase.setHint("本地模型地址，默认 http://127.0.0.1:8080");
+        eLocalBase.setText(Prefs.localBase(this));
+        eLocalBase.setTextSize(13);
+        box.addView(eLocalBase);
+
+        final TextView localTip = new TextView(this);
+        localTip.setTextSize(11);
+        localTip.setPadding(0, dp(2), 0, 0);
+        localTip.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        localTip.setText("开之前：Termux 里先起 llama-server\n"
+                + "  llama-server -m /sdcard/Download/本地模型/\n"
+                + "    Qwen3VL-4B-Instruct-Q4_K_M.gguf \\\n"
+                + "    --host 127.0.0.1 --port 8080 --alias local\n"
+                + "然后打开上面开关即可。4B 模型纯 CPU 约 6~7 tok/s。");
+        box.addView(localTip);
+
         // ---- ④ 老令牌：只当兜底 ----
         final EditText eToken = new EditText(this);
         eToken.setHint("老令牌（一般留空，配对后不需要）");
@@ -1712,6 +1755,11 @@ public class MainActivity extends Activity {
                                 eBase.getText().toString(),
                                 eToken.getText().toString(),
                                 eBackend.getText().toString());
+                        Prefs.setLocalMode(MainActivity.this, swLocal.isChecked());
+                        Prefs.setLocalBase(MainActivity.this, eLocalBase.getText().toString());
+                        toast(swLocal.isChecked()
+                                ? "已切到本地模型（不连电脑）。开聊前确认 Termux 里 llama-server 已起。"
+                                : "已切回电脑模式。");
                         probeHealth();
                     }
                 })
@@ -1722,6 +1770,8 @@ public class MainActivity extends Activity {
                         Prefs.save(MainActivity.this, eBase.getText().toString(),
                                 eToken.getText().toString(),
                                 eBackend.getText().toString());
+                        Prefs.setLocalMode(MainActivity.this, swLocal.isChecked());
+                        Prefs.setLocalBase(MainActivity.this, eLocalBase.getText().toString());
                         showPairDialog();
                     }
                 })

@@ -78,6 +78,113 @@ public final class Net {
 
     private Net() { }
 
+    // ---------------- 本地模型（MCB）：手机自己跑，OpenAI 兼容 ----------------
+
+    /**
+     * 本地模型模式：直接打手机自带的 llama-server（Termux 里起的，
+     * OpenAI 兼容接口），不走电脑、不鉴权、不联网。
+     *
+     * 消息体就是 OpenAI 那套 {model, messages:[{role,content}], stream:true}；
+     * 收的是 SSE，每帧 choices[0].delta.content 是增量正文，
+     * 末帧 data:[DONE] 收尾。和 chat() 共用同一套 SseCallback：
+     * onLine 收正文、onDone 收尾、onError 兜底。本地模式没有 web 进度帧，
+     * onWeb 自然不会触发——界面上「在想…」会一直挂到出字，正常。
+     *
+     * 引擎没起 / 端口不对时的报错必须带「怎么救」：这是架构层面
+     * 「手机下好模型却调不动」的根因，把原因说清楚比重试按钮更有用。
+     */
+    public static void chatLocal(String base, String model, String prompt,
+                                 JSONArray history, SseCallback cb) {
+        HttpURLConnection c = null;
+        try {
+            JSONArray messages = new JSONArray();
+            if (history != null && history.length() > 0) {
+                for (int i = 0; i < history.length(); i++) {
+                    org.json.JSONObject o = history.optJSONObject(i);
+                    if (o == null) { continue; }
+                    String role = o.optString("role", "");
+                    String content = o.optString("content", "");
+                    if (role.isEmpty() || content.isEmpty()) { continue; }
+                    messages.put(new JSONObject().put("role", role).put("content", content));
+                }
+            }
+            messages.put(new JSONObject().put("role", "user").put("content", prompt));
+
+            JSONObject req = new JSONObject();
+            req.put("model", (model == null || model.isEmpty()) ? "local" : model);
+            req.put("messages", messages);
+            req.put("stream", true);
+
+            c = open(base + "/v1/chat/completions", "POST", new Auth("", "", ""),
+                     "application/json");
+            c.setReadTimeout(300000);          // 本地模型也照 PC 的耐心给 300s
+            writeBody(c, req.toString().getBytes(UTF8));
+
+            int code = c.getResponseCode();
+            if (code != 200) {
+                String err = readText(c);
+                String msg = "";
+                try {
+                    JSONObject eo = new JSONObject(err == null ? "{}" : err);
+                    msg = eo.optString("error",
+                            eo.optString("message", ""));
+                } catch (Exception ignored) { }
+                cb.onError("本地模型无响应（HTTP " + code
+                        + (msg.isEmpty() ? "" : "：" + msg)
+                        + "）。\n确认：Termux 里 llama-server 已起、"
+                        + "监听 " + base + "/v1/chat/completions。");
+                return;
+            }
+
+            InputStream in = new BufferedInputStream(c.getInputStream());
+            BufferedReader r = new BufferedReader(new InputStreamReader(in, UTF8));
+            String line;
+            boolean got = false;
+            String lastErr = null;
+            while ((line = r.readLine()) != null) {
+                if (!line.startsWith("data:")) { continue; }
+                String payload = line.substring(5).trim();
+                if (payload.isEmpty()) { continue; }
+                if ("[DONE]".equals(payload)) { break; }
+                JSONObject ev;
+                try {
+                    ev = new JSONObject(payload);
+                } catch (Exception e) {
+                    continue;                   // 单帧坏了不整体失败
+                }
+                if (ev.has("error")) {
+                    JSONObject eo = ev.optJSONObject("error");
+                    lastErr = (eo == null) ? ev.optString("error", "本地模型报错")
+                                           : eo.optString("message", "本地模型报错");
+                    continue;
+                }
+                org.json.JSONArray choices = ev.optJSONArray("choices");
+                if (choices == null || choices.length() == 0) { continue; }
+                JSONObject delta = choices.optJSONObject(0).optJSONObject("delta");
+                if (delta == null) { continue; }
+                String t = delta.optString("content", "");
+                if (!t.isEmpty()) {
+                    got = true;
+                    cb.onLine(t);
+                }
+            }
+            r.close();
+            if (lastErr != null && !got) {
+                cb.onError(lastErr);
+            } else {
+                cb.onDone();
+            }
+        } catch (IOException e) {
+            cb.onError("连不上本地模型：" + e.getMessage()
+                    + "。\n确认 Termux 里 llama-server 已起在 " + base
+                    + "（llama-server -m <模型> --host 127.0.0.1 --port 8080）");
+        } catch (Exception e) {
+            cb.onError(e.getClass().getSimpleName() + ": " + e.getMessage());
+        } finally {
+            if (c != null) { c.disconnect(); }
+        }
+    }
+
     // ---------------- 三趟：识别 / 对话 / 合成 ----------------
 
     /** 裸 wav 进 → {"ok":true,"text":"..."} 出 */
