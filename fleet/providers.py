@@ -56,6 +56,7 @@ class Provider:
     source: str = ""                # freellmapi | zen-gate | dsh | llama.cpp | self
     key_env: str = ""               # 密钥从哪个环境变量取（不落盘）
     key: str = ""                   # 显式给的密钥（只在内存，不写文件）
+    key_hint: str = ""              # 从网关自己的配置文件里读到的密钥（内存；不打印、不落盘）
     models: list = field(default_factory=list)
     alive: bool = False
     latency_ms: int = 0
@@ -65,9 +66,19 @@ class Provider:
 
     @property
     def real_key(self):
+        """优先级：显式给 > 环境变量 > 网关配置里自动读到的。
+
+        第三级是 2026-10-25 补的：端口都从人家的配置文件里读了，Key 就在同一个文件，
+        没道理再让人去配一遍环境变量——那样 `discover()` 会显示"活着但要 Key"，
+        模型数永远是 0，等于探测白做一半。
+        """
         if self.key:
             return self.key
-        return os.environ.get(self.key_env, "") if self.key_env else ""
+        if self.key_env:
+            got = os.environ.get(self.key_env, "")
+            if got:
+                return got
+        return self.key_hint
 
 
 # 内置候选：每个都带「为什么是这个端口」的出处，省得下次再翻 README。
@@ -140,6 +151,32 @@ def _iter_json(root, depth=2):
                 yield os.path.join(cur, fn)
 
 
+def _find_key_in(obj, keys=("mainkey", "lankey", "apikey", "api_key", "authkey",
+                            "access_key", "token", "secret", "key")):
+    """在网关自己的配置里找密钥。
+
+    和 `_find_port_in` 一个路子：都在任意嵌套 JSON 里找，找到第一个像的就返回。
+    只取看起来真像凭据的值（长度够、不是明显的占位符），免得把 `"key": ""`
+    或某个字段名本身当成密钥。
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in keys and isinstance(v, str):
+                s = v.strip()
+                # 太短的多半是开关/枚举，不是凭据
+                if len(s) >= 8 and not s.lower() in ("true", "false", "none", "null"):
+                    return s
+            got = _find_key_in(v, keys)
+            if got:
+                return got
+    elif isinstance(obj, list):
+        for v in obj:
+            got = _find_key_in(v, keys)
+            if got:
+                return got
+    return ""
+
+
 def _find_port_in(obj, keys=("port", "listen_port", "gateway_port", "http_port")):
     """在任意嵌套 JSON 里找端口。找到第一个像端口的就返回。"""
     if isinstance(obj, dict):
@@ -163,7 +200,11 @@ def _find_port_in(obj, keys=("port", "listen_port", "gateway_port", "http_port")
 
 
 def _zen_gate_ports():
-    """zen-gate 的端口在面板里配，落盘在 %APPDATA%\\zen-gate\\ 下的 json。"""
+    """zen-gate 的端口在面板里配，落盘在 %APPDATA%\\zen-gate\\ 下的 json。
+
+    顺手把 mainKey 一起读出来：端口都从这儿取了，Key 就在同一个文件里。
+    返回 (port, 文件, key)；key 只进内存，不打印、不落盘。
+    """
     roots = [
         os.path.join(os.environ.get("APPDATA", ""), "zen-gate"),
         os.path.expanduser("~/.config/zen-gate"),
@@ -173,20 +214,25 @@ def _zen_gate_ports():
         if not r or not os.path.isdir(r):
             continue
         for f in _iter_json(r):
-            p = _find_port_in(_read_json(f))
+            d = _read_json(f)
+            p = _find_port_in(d)
             if p:
-                return p, f
-    return None, ""
+                return p, f, _find_key_in(d)
+    return None, "", ""
 
 
 def _dsh_ports():
-    """dsh 独立服务默认 ~/.our-free-model，落盘的实际端口会覆盖默认值。"""
+    """dsh 独立服务默认 ~/.our-free-model，落盘的实际端口会覆盖默认值。
+
+    同样顺手读 key（dsh 免登录免 Key，但独立服务/中继可能配了 LAN Key）。
+    """
     root = os.path.expanduser("~/.our-free-model")
     for f in _iter_json(root):
-        p = _find_port_in(_read_json(f))
+        d = _read_json(f)
+        p = _find_port_in(d)
         if p:
-            return p, f
-    return None, ""
+            return p, f, _find_key_in(d)
+    return None, "", ""
 
 
 def discover():
@@ -195,16 +241,20 @@ def discover():
     notes = []
     by_id = {p.id: p for p in provs}
 
-    p, f = _zen_gate_ports()
+    p, f, k = _zen_gate_ports()
     if p and by_id.get("zen-gate"):
         by_id["zen-gate"].base = "http://127.0.0.1:%d/v1" % p
+        if k:
+            by_id["zen-gate"].key_hint = k
         notes.append("zen-gate 端口 %d 读自 %s" % (p, f))
 
-    p, f = _dsh_ports()
+    p, f, k = _dsh_ports()
     if p:
         for pid in ("dsh-local", "dsh-relay"):
             if by_id.get(pid) and pid == "dsh-local":
                 by_id[pid].base = "http://127.0.0.1:%d/v1" % p
+                if k:
+                    by_id[pid].key_hint = k
                 notes.append("dsh 端口 %d 读自 %s" % (p, f))
 
     # 用户手填的覆盖（"咱们的"配置，不进仓库）
@@ -317,6 +367,259 @@ def fallback_chain(provs):
 
 
 # ---------------------------------------------------------------------------
+# P2：路由（选谁做）+ 额度记账（按上游账号，不按网关）
+# ---------------------------------------------------------------------------
+
+# 模型 id → 上游厂商。记账的键必须是「厂商 + 账号」，不是网关名：
+# 同一个智谱账号可能同时被 dsh 和 zen-gate 消耗，按网关记账就会出现
+# 「以为还有额度、实际早打满」。这是 freellmapi 按 Key 跟踪用量那条教训的推广。
+VENDOR_HINTS = [
+    (r"^(glm|chatglm)", "zhipu"),
+    (r"^deepseek", "deepseek"),
+    (r"^(qwen|qwq)", "alibaba"),
+    (r"^(gpt|o[1-9]|text-davinci|chatgpt)", "openai"),
+    (r"^claude", "anthropic"),
+    (r"^(gemini|gemma)", "google"),
+    (r"^(kimi|moonshot)", "moonshot"),
+    (r"^(minimax|abab)", "minimax"),
+    (r"^step", "stepfun"),
+    (r"^nemotron", "nvidia"),
+    (r"^mimo", "xiaomi"),
+    (r"^llama", "meta"),
+    (r"^(mistral|mixtral)", "mistral"),
+    (r"^ernie", "baidu"),
+    (r"^hunyuan", "tencent"),
+    (r"^(doubao|seed)", "bytedance"),
+    (r"^(yi-|01-ai)", "01ai"),
+    (r"^(glm-4|internlm)", "internlm"),
+]
+
+
+def vendor_of(model_id):
+    """从模型 id 推上游厂商。推不出来就返回 unknown——**不许瞎猜成某一家**。
+
+    猜错比不猜更糟：把 A 厂的用量记到 B 厂头上，等于额度账本身就是错的。
+    """
+    m = (model_id or "").strip().lower()
+    if not m:
+        return "unknown"
+    # 带网关前缀的（如 "zen-gate/deepseek-v4"）先剥掉
+    if "/" in m:
+        m = m.split("/", 1)[1]
+    for pat, name in VENDOR_HINTS:
+        if re.match(pat, m):
+            return name
+    return "unknown"
+
+
+# 模态需求：只看 provider 自己报上来的模型表，不猜、不假设它"应该支持"。
+_NEED_PAT = {
+    "vision": re.compile(r"(vision|[-_]vl\b|4v|omni|image)", re.I),
+    "audio":  re.compile(r"(audio|voice|whisper|tts|speech|asr)", re.I),
+    "long":   re.compile(r"(128k|200k|256k|512k|1m|long)", re.I),
+    "embed":  re.compile(r"(embed|bge|gte)", re.I),
+}
+
+
+def supports(p, need):
+    """provider 能不能满足这个需求。
+
+    没探活或模型表为空的，一律 False——**模型表都拿不到就别谈支持什么**。
+    """
+    if not p.alive or not p.models:
+        return False
+    if not need:
+        return True
+    pat = _NEED_PAT.get(need)
+    if not pat:
+        return True
+    return any(pat.search(m) for m in p.models)
+
+
+def route(provs=None, need=None, exclude=(), model=None):
+    """按降级链 + 需求选一个 provider。返回 (provider, reason)。
+
+    选不出来时 provider 是 None，但 **reason 必须说清为什么**——
+    静默返回 None 会让调用方以为"没有可用后端"，实际可能只是需求太窄。
+    """
+    provs = provs if provs is not None else probe_all()
+    skip = set(exclude)
+    seen = []
+    for p in fallback_chain(provs):
+        if p.id in skip:
+            continue
+        if model and model not in (p.models or []):
+            seen.append("%s(无此模型)" % p.id)
+            continue
+        if not supports(p, need):
+            seen.append("%s(不满足 %s)" % (p.id, need or "-"))
+            continue
+        return p, "选 %s：链位 %d，%dms，%d 模型" % (
+            p.id, FALLBACK_ORDER.index(p.id) if p.id in FALLBACK_ORDER else 99,
+            p.latency_ms, len(p.models or []))
+    return None, "没有可用 provider（链上 %d 个；淘汰原因：%s）" % (
+        len(provs), "、".join(seen) or "全被排除")
+
+
+def pick_model(p, need=None, skip=()):
+    """从一个 provider 的模型表里挑一个能用的。挑不出来返回 None（不许瞎编模型名）。
+
+    `skip` 是这家已经试过且失败的模型——2026-10-25 实测出来的：
+    一家网关的 23 个模型走的是**不同上游车道**，其中一条报
+    `FreeUsageLimitError`（429）不代表整家废了，换同一个网关的下一个模型就能成。
+    只会换 provider 不会换模型，等于把 23 条车道当 1 条用。
+    """
+    if not p.models:
+        return None
+    skip = set(skip)
+    pat = _NEED_PAT.get(need) if need else None
+    pool = [m for m in p.models if m not in skip]
+    if pat:
+        hit = [m for m in pool if pat.search(m)]
+        return hit[0] if hit else None
+    return pool[0] if pool else None
+
+
+class Quota:
+    """额度记账：键是「上游厂商 + 账号」，按天聚合，落 sqlite。
+
+    为什么不按 provider 记：三家网关共享同一批上游账号，
+    按网关记就会各算各的，合起来早超了却看不出来。
+    """
+
+    def __init__(self, path=None):
+        self.path = path or os.path.expanduser("~/.fleet/quota.sqlite")
+        d = os.path.dirname(self.path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        import sqlite3
+        self._db = sqlite3.connect(self.path)
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS usage ("
+            " day TEXT NOT NULL, vendor TEXT NOT NULL, account TEXT NOT NULL,"
+            " calls INTEGER DEFAULT 0, tokens INTEGER DEFAULT 0,"
+            " PRIMARY KEY (day, vendor, account))")
+        self._db.commit()
+
+    def add(self, vendor, account="", calls=1, tokens=0, day=None):
+        import datetime
+        day = day or datetime.date.today().isoformat()
+        vendor = vendor or "unknown"
+        self._db.execute(
+            "INSERT INTO usage (day, vendor, account, calls, tokens) VALUES (?,?,?,?,?) "
+            "ON CONFLICT (day, vendor, account) DO UPDATE SET "
+            "calls = calls + excluded.calls, tokens = tokens + excluded.tokens",
+            (day, vendor, account, calls, tokens))
+        self._db.commit()
+
+    def used(self, vendor, account="", day=None):
+        import datetime
+        day = day or datetime.date.today().isoformat()
+        row = self._db.execute(
+            "SELECT calls, tokens FROM usage WHERE day=? AND vendor=? AND account=?",
+            (day, vendor, account or "")).fetchone()
+        return (row[0], row[1]) if row else (0, 0)
+
+    def report(self, day=None):
+        """按天出一张表：每行一个「厂商/账号」。"""
+        if day:
+            rows = self._db.execute(
+                "SELECT day, vendor, account, calls, tokens FROM usage WHERE day=? "
+                "ORDER BY calls DESC", (day,)).fetchall()
+        else:
+            rows = self._db.execute(
+                "SELECT day, vendor, account, calls, tokens FROM usage "
+                "ORDER BY day DESC, calls DESC").fetchall()
+        return rows
+
+    def close(self):
+        try:
+            self._db.close()
+        except Exception:
+            pass
+
+
+def chat(messages, provs=None, need=None, model=None, timeout=90,
+         max_try=8, quota=None, account=""):
+    """真发一轮，失败自动换下一个。
+
+    返回 dict，成功时带：
+      `ok` / `used`（实际用了谁的 id）/ `used_model` / `content` / `tried`（试过几个）
+    失败时带 `ok=False` + `err`，并且 **err 里列出每一步为什么淘汰**，
+    不许只回一句"全部失败"。
+
+    降级是**两级**的，这是 2026-10-25 实测出来的，不是设计癖：
+      一级 · 同一家内换模型（429 = 那条上游车道额度打满，别家车道可能还能用）
+      二级 · 换下一家 provider
+    另外 403 与 429 要分开对待（计划书 R3）：403 是风控，**整家停用不再碰**；
+    429 只是这条车道没钱了，只跳过这个模型。
+    """
+    import requests as _rq
+    provs = provs if provs is not None else probe_all()
+    tried, why = [], []
+    tried_models = {}                 # provider_id -> 已失败的模型
+    quota = quota if quota is not None else Quota()
+
+    for _ in range(max_try):
+        p, reason = route(provs, need=need, exclude=tried, model=model)
+        if not p:
+            return {"ok": False, "err": reason, "tried": tried, "why": why}
+        m = model or pick_model(p, need, skip=tried_models.get(p.id, ()))
+        if not m:
+            why.append("%s：模型都试过了（%d 个）" % (p.id, len(p.models or [])))
+            tried.append(p.id)
+            continue
+
+        url = p.base.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        k = p.real_key
+        if k:
+            headers["Authorization"] = "Bearer " + k
+        try:
+            r = _rq.post(url, headers=headers,
+                         json={"model": m, "messages": messages, "stream": False},
+                         timeout=timeout)
+        except Exception as e:
+            why.append("%s/%s：%s" % (p.id, m, type(e).__name__))
+            tried_models.setdefault(p.id, []).append(m)
+            continue
+        if r.status_code == 403:
+            why.append("%s：HTTP 403 风控，整家停用" % p.id)
+            tried.append(p.id)
+            continue
+        if r.status_code >= 400:
+            why.append("%s/%s：HTTP %d %s" % (p.id, m, r.status_code,
+                                              (r.text or "")[:60].replace("\n", " ")))
+            tried_models.setdefault(p.id, []).append(m)
+            continue
+
+        try:
+            data = r.json()
+            content = ((data.get("choices") or [{}])[0]
+                       .get("message", {}).get("content", ""))
+            usage = data.get("usage") or {}
+            tokens = int(usage.get("total_tokens") or 0)
+        except Exception as e:
+            why.append("%s/%s：响应解析失败 %s" % (p.id, m, type(e).__name__))
+            tried_models.setdefault(p.id, []).append(m)
+            continue
+
+        quota.add(vendor_of(m), account, calls=1, tokens=tokens)
+        return {
+            "ok": True,
+            "used": p.id,           # 计划书 P2：响应里标注实际用了谁
+            "used_model": m,
+            "used_vendor": vendor_of(m),
+            "content": content,
+            "tokens": tokens,
+            "tried": tried + [p.id],
+            "why": why,
+        }
+    return {"ok": False, "err": "试了 %d 次都失败" % len(tried),
+            "tried": tried, "why": why}
+
+
+# ---------------------------------------------------------------------------
 # 落盘 / 输出
 # ---------------------------------------------------------------------------
 
@@ -408,6 +711,92 @@ def _selftest():
     # 5) discover 不许因为文件不存在就炸
     provs, _notes = discover()
     ck(len(provs) >= 5, "内置 provider 少于 5 个")
+
+    # 6) 密钥三级优先：显式 > 环境变量 > 配置文件里读到的
+    #    这条守的是 2026-10-25 那个 bug——端口从人家配置里读了，Key 却没读，
+    #    结果探测显示"活着但要 Key"，模型数永远是 0，等于白探一半。
+    pf = Provider(id="k", label="k", kind="gateway", base="u",
+                  key_env="FLEET_TEST_KEY_X", key_hint="from-file")
+    ck(pf.real_key == "from-file", "无显式无 env 时应回落配置文件，实得 %r" % pf.real_key)
+    os.environ["FLEET_TEST_KEY_X"] = "from-env"
+    try:
+        ck(pf.real_key == "from-env", "env 应压过配置文件，实得 %r" % pf.real_key)
+        pf.key = "explicit"
+        ck(pf.real_key == "explicit", "显式应压过 env，实得 %r" % pf.real_key)
+    finally:
+        os.environ.pop("FLEET_TEST_KEY_X", None)
+
+    # 7) _find_key_in：能挖出嵌套 mainKey，但绝不把开关/空值当密钥
+    ck(_find_key_in({"a": {"b": {"mainKey": "sk-abcdefghij"}}}) == "sk-abcdefghij",
+       "_find_key_in 嵌套失败")
+    ck(_find_key_in({"key": ""}) == "", "空串不算密钥")
+    ck(_find_key_in({"key": "true"}) == "", "开关值 true 不算密钥")
+    ck(_find_key_in({"key": "abc"}) == "", "太短的不算密钥")
+
+    # 8) key_hint 不许出现在渲染输出里（发现归发现，不许打印出去）
+    leak = Provider(id="z", label="z", kind="gateway", base="http://127.0.0.1:1/v1",
+                    key_hint="SUPER-SECRET-DO-NOT-PRINT")
+    probe(leak, timeout=1.0)
+    out = render([leak])
+    ck("SUPER-SECRET" not in out, "渲染输出泄露了密钥")
+
+    # ---- P2：路由 ----
+    # 9) vendor_of：认得出的要说对，认不出的必须是 unknown（不许瞎猜成某一家）
+    ck(vendor_of("deepseek-v4.1-flash-free") == "deepseek", "deepseek 判错")
+    ck(vendor_of("glm-5.3-flash-free") == "zhipu", "glm 应判 zhipu")
+    ck(vendor_of("zen-gate/whatever-xyz-123") == "unknown", "认不出应 unknown")
+
+    # 10) 模型表为空就别谈支持什么
+    empty = Provider(id="e", label="e", kind="gateway", base="u", alive=True, models=[])
+    ck(not supports(empty, "vision"), "空模型表不能报支持")
+    vis = Provider(id="v", label="v", kind="gateway", base="u", alive=True,
+                   models=["qwen2-vl-7b", "deepseek-v3"])
+    ck(supports(vis, "vision"), "有 vl 模型应判支持")
+    ck(not supports(vis, "audio"), "没音频模型不该判支持")
+
+    # 11) route 选不出来必须说清原因，不许静默 None
+    p2, why2 = route([], need="vision")
+    ck(p2 is None and why2, "选不出也要给原因")
+    ck("淘汰原因" in why2 or "排除" in why2, "原因里要能看到淘汰过程：%r" % why2)
+
+    # 12) 判据「手动关掉降级链第一环，同一轮不中断」：exclude 掉活的那个，
+    #     必须自动落到下一个活的，而不是直接放弃
+    a = Provider(id="llama-8080", label="a", kind="local", base="u", alive=True,
+                 models=["qwen2-7b"])
+    b = Provider(id="zen-gate", label="b", kind="gateway", base="u", alive=True,
+                 models=["deepseek-v3"])
+    ch = [a, b]
+    pa, _ = route(ch)
+    ck(pa.id == "llama-8080", "默认应走链首，实得 %s" % pa.id)
+    pb, _ = route(ch, exclude=["llama-8080"])
+    ck(pb.id == "zen-gate", "关掉第一环应自动换下一个，实得 %s" % pb.id)
+
+    # ---- P2：额度记账 ----
+    # 13) 按「厂商+账号」记：同厂商不同账号必须分开，不许合成一笔
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        q = Quota(os.path.join(td, "q.sqlite"))
+        q.add("zhipu", "acct-A", tokens=100)
+        q.add("zhipu", "acct-A", tokens=50)
+        q.add("zhipu", "acct-B", tokens=7)
+        ck(q.used("zhipu", "acct-A") == (2, 150),
+           "同账号应累加，实得 %r" % (q.used("zhipu", "acct-A"),))
+        ck(q.used("zhipu", "acct-B") == (1, 7),
+           "不同账号必须分开，实得 %r" % (q.used("zhipu", "acct-B"),))
+        ck(q.used("deepseek") == (0, 0), "没记过的不该有数")
+        ck(len(q.report()) == 2, "报告应有 2 行，实得 %d" % len(q.report()))
+        q.close()
+
+    # 14) 判据「同一家内换模型」：这条是 2026-10-25 真跑出来的——
+    #     zen-gate 23 个模型走不同上游车道，前两个报 429（FreeUsageLimitError），
+    #     第三个 nemotron 直接成功。只会换 provider 的版本那一轮必失败。
+    multi = Provider(id="m", label="m", kind="gateway", base="u", alive=True,
+                     models=["lane-a", "lane-b", "lane-c"])
+    ck(pick_model(multi) == "lane-a", "默认取第一个")
+    ck(pick_model(multi, skip=["lane-a"]) == "lane-b", "跳过失败车道应取下一个")
+    ck(pick_model(multi, skip=["lane-a", "lane-b"]) == "lane-c", "应继续往后找")
+    ck(pick_model(multi, skip=["lane-a", "lane-b", "lane-c"]) is None,
+       "全试过必须返回 None（好让上层换 provider），不许回头重复试")
 
     if fails:
         print("providers selftest: FAIL")

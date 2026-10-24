@@ -275,6 +275,12 @@ CASES = [
     # 必然看不出结构，位层是唯一路径；三种规模的随机数据必须 found=False
     # （递归切分天然能切出碎片，把碎片当结构就是假绿）。
     ("eval_t37_bit_reverse", ["evals/t37_bit_reverse.py"], HERE, 180),
+    # ---- T38：Provider 注册表（融合计划书 P0）----
+    # 这一层是「两个手机端 + 三个网络层」的底座：三家免费网关（freellmapi /
+    # zen-gate / dsh）+ 本地 llama.cpp 抽象成同一种资源的多个实例。
+    # 门禁必须全离线——任何一家没起、没配 Key 都不能让它变红，
+    # 它验的是「注册表与探测逻辑」，不是「网关今天活着」。
+    ("eval_t38_providers", ["-m", "fleet.providers", "--selftest"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
