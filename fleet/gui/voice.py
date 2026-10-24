@@ -43,8 +43,27 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import wave
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent   # gui/ → fleet/ → 仓库根
+
+
+def _discover_dir(env_var: str, cands) -> str:
+    """按候选找一个**目录**；全不命中返回 ""（调用方如实报不在）。
+
+    与 `netrunner.discover_home` 同一条纪律（2026-10-24）：
+    环境变量最高优先，否则按候选逐个验存在性，**不写死盘符**。
+    """
+    p = os.environ.get(env_var, "").strip()
+    if p:
+        return p
+    for d in cands:
+        if d and os.path.isdir(str(d)):
+            return str(d)
+    return ""
 
 from ..core import BaseDevice, DeviceResult as R
 from ..core.registry import (CANCEL_WORDS, CONFIRM_WORDS, VOICE_CONFIRM_KEY,
@@ -54,13 +73,30 @@ from ..core.registry import (CANCEL_WORDS, CONFIRM_WORDS, VOICE_CONFIRM_KEY,
 # ---------------------------------------------------------------- 路径与常量
 
 #: polaris-audio-io 模块目录（听/说都在这）
-POLARIS_DIR = os.environ.get(
+#: 🔴 跨机死路径家族（2026-10-24 与 netrunner 同一批修）：原默认钉在
+#:    `D:/work/_local_ai/train_15b/...`——那台机器上写的，换机即失效。
+#:    改成候选制：环境变量 → 与本仓并列 → 历史路径。全不命中就留空，
+#:    由 `_run_polaris` 如实报「模块不在」，不静默降级成别的失败。
+POLARIS_DIR = _discover_dir(
     "FLEET_POLARIS_DIR",
-    "D:/work/_local_ai/train_15b/modules/polaris-audio-io")
+    [_REPO_ROOT.parent / "train_15b" / "modules" / "polaris-audio-io",
+     r"D:/work/_local_ai/train_15b/modules/polaris-audio-io"])
+
 #: polaris 的 venv 解释器（**有** torch/transformers/soundfile 的那个）
-POLARIS_PY = os.environ.get(
-    "FLEET_POLARIS_PY",
-    "D:/work/_local_ai/train_15b/venv/Scripts/python.exe")
+#: 🔴 前提已变（2026-10-24 实测）：这里原本假设「fleet 自带解释器没有 torch」，
+#:    所以必须跨进程去借 polaris venv。但本机跑 fleet 的 G:/Python312
+#:    已经有 torch 2.14.1+cpu + transformers + soundfile。
+#: ⇒ 候选顺序：环境变量 → 历史 venv（有就用）→ 当前解释器（自带 torch 时）。
+#:    这样只剩模块目录不在时才失败，而不是先卡在解释器上。
+def _discover_polaris_py() -> str:
+    for cand in (os.environ.get("FLEET_POLARIS_PY", "").strip(),
+                 r"D:/work/_local_ai/train_15b/venv/Scripts/python.exe"):
+        if cand and os.path.isfile(cand):
+            return cand
+    return sys.executable
+
+
+POLARIS_PY = _discover_polaris_py()
 #: 驱动脚本：跑在 polaris 解释器里，fleet 解释器不碰 torch
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_runner.py")
 
@@ -226,10 +262,17 @@ def _run_polaris(wav_path, mode, timeout=300, extra=None):
 
     失败一律抛 VoiceError 并带原因（解释器不在 / 权重缺失 / 加载失败 / 进程炸了）。
     """
-    if not os.path.isfile(POLARIS_PY):
+    if not POLARIS_PY or not os.path.isfile(POLARIS_PY):
         raise VoiceError(
-            "找不到 polaris 的解释器 %s（识别引擎只有它有 torch/transformers）："
-            "用环境变量 FLEET_POLARIS_PY 指到 polaris venv 的 python.exe" % POLARIS_PY)
+            "找不到可用的解释器 %s（语音引擎要 torch/transformers）："
+            "用环境变量 FLEET_POLARIS_PY 指到带 torch 的 python.exe" % POLARIS_PY)
+    if not POLARIS_DIR or not os.path.isdir(POLARIS_DIR):
+        # 🔴 模块目录不在时**必须说清缺的是模块**，不是解释器——
+        #    本机跑 fleet 的解释器自带 torch，卡点只剩这一个。
+        raise VoiceError(
+            "找不到 polaris-audio-io 模块目录（听/说引擎本体）："
+            "把 train_15b/modules/polaris-audio-io 拷到与本仓并列的位置，"
+            "或用环境变量 FLEET_POLARIS_DIR 指过去")
     if not os.path.isfile(RUNNER):
         raise VoiceError("语音驱动脚本丢了：%s" % RUNNER)
 
