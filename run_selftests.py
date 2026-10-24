@@ -256,6 +256,11 @@ CASES = [
     # ② 四个常驻循环真接了心跳（名字与清单一致，防「改了名清单没跟着动」）；
     # ③ 端到端：/api/health 里 loops 必须存在，且人为塞的卡住循环被标 stale。
     ("eval_t33_loops_beat", ["evals/t33_loops_beat.py"], HERE, 120),
+    # T34：D1 控制面对外协议（P1-9 真代发）。真端口真认证真转发：
+    # 假节点连上控制面注册，客户端走 AUTH+CLIENT 发 nodes/exec/push/pull 拿真回执；
+    # 同时钉三类失败可分辨（密码错/未知 op/节点离线）与「能力申报必须诚实」
+    # （缺 FLEET_PASS 就整条不申报，不长假按钮）。全离线，只在本机随机端口跑。
+    ("eval_t34_d1_control", ["evals/t34_d1_control.py"], HERE, 180),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

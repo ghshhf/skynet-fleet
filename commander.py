@@ -622,6 +622,13 @@ def _handle_node(conn, password):
         token = f"tok-{os.urandom(6).hex()}"
         common.send_msg(conn, {"t": common.AUTH_OK, "token": token})
         reg = common.recv_msg(conn)
+        # ---- D1：客户端角色（不是节点）----
+        # 同一道密码认证，但之后不发 REGISTER：它只要一个「替我对某个节点发令」
+        # 的通道。**不进编队**（不占节点名、不吃心跳、不参与路由），
+        # 所以节点的生命周期/清理逻辑完全不受影响。
+        if reg and reg.get("t") == common.CLIENT:
+            _handle_client(conn, name=auth.get("name"))
+            return
         if not reg or reg.get("t") != common.REGISTER:
             return
         name = reg.get("name")
@@ -706,6 +713,103 @@ def _handle_node(conn, password):
             _drop_node(nm, expect_gen=_gen)
             print(f"[-] 节点下线: {nm}", flush=True)
             audit.log("node.down", node=nm)
+
+
+def _handle_client(conn, name="?"):
+    """D1 客户端通道：把「对某个节点动手」的请求转给节点，回执照原样带回。
+
+    纪律（与节点侧一致）：
+      · 未知 op **必须报错**，不许当成已成功（静默失败是本项目头号病）；
+      · 节点不在线要说清「不在线」，而不是「命令执行失败」——两件事处置不同；
+      · 审计要留痕（谁让谁干了什么），失败也留；
+      · 这条通道**没有**任何写编队状态的能力：不进注册表、不改心跳、不动离线队列。
+    """
+    n = 0
+    try:
+        while True:
+            m = common.recv_msg(conn)
+            if m is None:
+                break
+            if m.get("t") != common.CLIENT_REQ:
+                common.send_msg(conn, {"t": common.CLIENT_RES, "id": m.get("id"),
+                                        "ok": False,
+                                        "err": "只接受 client_req，收到 %r" % m.get("t")})
+                continue
+            rid = m.get("id")
+            op = m.get("op")
+            node = m.get("node") or ""
+            t0 = time.time()
+            if op == common.OP_NODES:
+                rows = REGISTRY.with_lock(lambda d: sorted(d.keys()))
+                res = {"ok": True, "data": {"nodes": rows}}
+            elif op == common.OP_EXEC:
+                if not node or not (m.get("cmd") or "").strip():
+                    res = {"ok": False, "err": "exec 需要 node 和 cmd"}
+                else:
+                    r = send_to_node(node, {"t": common.EXEC, "cmd": m["cmd"]},
+                                     timeout=float(m.get("timeout") or 60))
+                    res = _client_shape(r, ("rc", "out", "err"))
+            elif op == common.OP_PUSH:
+                if not node or not m.get("path"):
+                    res = {"ok": False, "err": "push 需要 node 和 path"}
+                else:
+                    r = send_to_node(node, {"t": common.PUSH, "path": m["path"],
+                                            "data": m.get("data") or ""},
+                                     timeout=float(m.get("timeout") or 120))
+                    res = _client_shape(r, ("ok", "bytes"))
+            elif op == common.OP_PULL:
+                if not node or not m.get("path"):
+                    res = {"ok": False, "err": "pull 需要 node 和 path"}
+                else:
+                    r = send_to_node(node, {"t": common.PULL, "path": m["path"]},
+                                     timeout=float(m.get("timeout") or 120))
+                    res = _client_shape(r, ("data", "bytes"))
+            else:
+                res = {"ok": False, "err": "未知 op：%r（可用：%s）"
+                       % (op, ", ".join([common.OP_NODES, common.OP_EXEC,
+                                         common.OP_PUSH, common.OP_PULL]))}
+            n += 1
+            try:
+                audit.log("client.%s" % (op or "?"), client=name, node=node,
+                          ok=res.get("ok"), ms=round((time.time() - t0) * 1000))
+            except Exception:
+                pass
+            common.send_msg(conn, {"t": common.CLIENT_RES, "id": rid,
+                                   "ok": bool(res.get("ok")),
+                                   "data": res.get("data"),
+                                   # offline 必须回传：调用方据此分辨「去叫节点上线」
+                                   # 还是「重试命令」，糊成一句「失败」等于让人瞎猜。
+                                   "offline": bool(res.get("offline")),
+                                   "err": res.get("err") or ""})
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+        if DEBUG:
+            print(f"[dbg] 客户端 {name} 断开（处理 {n} 个请求）", flush=True)
+
+
+def _client_shape(r, fields):
+    """把 send_to_node 的答复折成给客户端的形状。
+
+    `send_to_node` 的两种失败要分开传：
+      · ok=False + offline=True ⇒ **节点不在线**（去叫它上线，而不是重试命令）；
+      · ok=False 其他 ⇒ 发送失败/超时，原因照带。
+    成功时把节点真实回执按字段摊平（rc/out/err 或 data/bytes）。
+    """
+    if not r.get("ok"):
+        return {"ok": False, "err": r.get("err") or "节点没回执",
+                "offline": bool(r.get("offline"))}
+    d = {}
+    for f in fields:
+        if f in r:
+            d[f] = r[f]
+    # 节点自己说的 ok 才算 ok（exec 的 rc≠0 也是「执行了但失败」，
+    # 所以这里不把 rc 当 ok —— ok 只表示通道通了、回执拿到了）
+    return {"ok": True, "data": d}
 
 
 def _route_capability_request(name, m, conn):

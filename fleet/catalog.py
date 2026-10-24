@@ -311,9 +311,26 @@ CAPABILITIES = [
                params=(Param("no_lan", "bool"), Param("no_wifi", "bool"),
                        Param("no_bt", "bool"))),
     # ---- 编队节点（远程机器）----
-    # 2026-10-25 摘除 shell.exec / file.push / file.pull 的空登记：
-    # 总纲 §四-3「或诚实摘掉登记，不留空壳」。此前它们只登记、invoke 必失败，
-    # 让界面长出点了没反应的假按钮。真代发要等控制面有对外协议（D1）再重新登记。
+    # D1 真代发（2026-10-25）：控制面已加对外协议（common.CLIENT*），
+    # 非 commander 进程可经 fleet.ctrl_client 让节点执行命令/推取文件。
+    # 三条能力**按节点设备逐条申报**（fleet_node.caps()），且只在
+    # 「控制面端口通 + FLEET_PASS 在环境里」时才申报——不满足就整条不出现，
+    # 免得界面长出点了没反应的假按钮（这正是当初摘掉它们的原因）。
+    Capability("shell.exec", "在编队节点上执行命令（节点侧白名单把关）",
+               params=(Param("node", "str", doc="节点名；留空 = 当前这台"),
+                       Param("cmd", "str", True), Param("timeout", "float")),
+               side_effect=True,
+               note="D1 真代发：经控制面客户端转发；节点侧白名单 + 授权门"),
+    Capability("file.push", "推文件到编队节点（内容走 base64）",
+               params=(Param("node", "str", doc="节点名；留空 = 当前这台"),
+                       Param("path", "str", True), Param("data", "str", True,
+                                                         doc="base64 内容"),
+                       Param("timeout", "float")),
+               side_effect=True, note="D1 真代发；不猜内容、不写空文件"),
+    Capability("file.pull", "从编队节点取文件（返回 base64）",
+               params=(Param("node", "str", doc="节点名；留空 = 当前这台"),
+                       Param("path", "str", True), Param("timeout", "float")),
+               side_effect=True, note="D1 真代发；读文件也算副作用，要过闸门"),
     # ---- 万维网（联网层）：外面的世界，经两个爬虫伸进去 ----
     Capability("web.status", "联网层现状（两个源在不在 / 各攒了多少）",
                note="只读：不联网也看得见本地已攒的"),
