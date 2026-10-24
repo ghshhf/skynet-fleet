@@ -361,6 +361,17 @@ CAPABILITIES = [
                params=(Param("url", "str", True), Param("dest", "str", True)),
                side_effect=True, check=_skynet_reason,
                note="写本地文件 ⇒ 要过审批闸门。断点续传、落盘按内容去重"),
+    Capability("web.origin", "跳转链穿透：短链/跳板页走到终点（skynet）",
+               params=(Param("url", "str", True),
+                       Param("max_hops", "int", doc="最多几跳，默认 10")),
+               check=_skynet_reason,
+               note="只读：meta refresh / JS location 都算一跳。"
+                    "不穿透就会把跳板页本身当成目标——它正文只有一行跳转脚本"),
+    Capability("web.dns", "DNS 污染判据：系统解析 vs DoH 对比（skynet）",
+               params=(Param("url", "str", True),),
+               check=_skynet_reason,
+               note="只读：verdict ∈ ok/suspicious/doh_failed/system_failed。"
+                    "无交集只报可疑不下结论——CDN 站本来就会给出不同 IP 子集"),
     # ---- 作业层：长任务（可排队/可查询/可取消/掉线可迁）----
     Capability("job.submit", "提交长任务（作业）",
                params=(Param("cap", "str", True, "要执行的能力名，如 image.gen"),
