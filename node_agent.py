@@ -86,13 +86,22 @@ def run_node(host, port, name, password, platform="windows",
     if relay_port:
         try:
             bind_host = "0.0.0.0" if relay_lan else "127.0.0.1"
+            # 🔴 --lan 没给 token 时**自动生成**一枚，而不是裸奔绑 0.0.0.0。
+            # relay 侧已 fail-closed（非回环 + 无 token 直接拒起），这里补上
+            # 「不用主人记参数也能安全开」的那一半：生成 → 落盘（save_relay_state
+            # 会写进 ~/.fleet/relay.json）→ 大声打出来，供他机 `--relay-token` 使用。
+            if relay_lan and not relay_token:
+                from fleet.skynet_relay import new_token
+                relay_token = new_token()
             relay = get_relay(host=bind_host, token=relay_token)
             relay.port = int(relay_port)
             actual = relay.start(host=bind_host, token=relay_token)
             if "skynet.relay" not in caps:
                 caps.append("skynet.relay")
             if relay_lan:
-                print(f"[{name}] SkyNet relay 已启动 {bind_host}:{actual}（--lan，需 token；skynet.relay 能力已上报）", flush=True)
+                print(f"[{name}] SkyNet relay 已启动 {bind_host}:{actual}（--lan，已强制 token 鉴权；skynet.relay 能力已上报）", flush=True)
+                print(f"[{name}] relay token（他机用 --relay-token 填这串）= {relay_token}", flush=True)
+                print(f"[{name}] token 已存 ~/.fleet/relay.json；换 token 就删掉它重开", flush=True)
             else:
                 print(f"[{name}] SkyNet relay 已启动 127.0.0.1:{actual}（skynet.relay 能力已上报）", flush=True)
         except Exception as e:
