@@ -175,6 +175,21 @@ CAPABILITIES = [
     Capability("life.sentinel", "生活哨兵：对比基线报告显著偏离（如「今晚房间持续很暗」）",
                params=(Param("baseline_frames", "int", doc="基线用最近几帧，默认 20")),
                note="只读：只看可观测偏离，不做因果/健康结论"),
+    # ---- P2 热点叠加编队（开热点 → 设备自己进来 → 手机侧组网视角）----
+    # deploy 会真开热点（side_effect + ask）；clients/diff 只读。
+    Capability("hotspot.roam", "热点叠加编队：开热点→等客户端→读 AP 侧 ARP 名单"
+                              "→ping 探活→与基线比对报新入网/掉线",
+               params=(Param("action", "str", doc="deploy 开热点建网（默认）｜"
+                                                 "clients 只读当前客户端｜diff 只读与基线差异"),
+                       Param("ssid", "str", doc="deploy 用：热点名，默认 Skynet"),
+                       Param("password", "str", doc="deploy 用：热点密码，默认 skynet2026"),
+                       Param("settle", "float", doc="deploy 用：开好后等几秒收客户端，默认 8"),
+                       Param("ping", "bool", doc="是否逐个 ping 探活，deploy 默认 true")),
+               side_effect=True, approval="ask",
+               note="客户端名单只有 AP 侧 ARP 表一个真源（ip neigh show）；"
+                    "dumpsys 只给计数不作名单。MAC 为主键（IP 会变），"
+                    "随机 MAC 如实标注。基线 ~/.fleet/hotspot_clients.json。"
+                    "端口级枚举不在这里——那是 net.wallprobe（P3）的活"),
     # ---- P1 交互式逐个试码（万能遥控同款：手机当试码器，人当 oracle）----
     # start/next 会真的发射红外脉冲，故 side_effect=True + approval="ask"。
     # 会话级授权：start 过闸门后，注册表对「会话有效（granted+未超 TTL）」的
