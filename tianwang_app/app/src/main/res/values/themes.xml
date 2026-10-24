@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 只负责「别给我加 ActionBar、别给我白底闪一下」。
+         真正的配色全在 Compose 的 MaterialTheme 里（见 Theme.kt），
+         这里多写一条颜色，就会在 Compose 首帧之前闪出来，反而难看。 -->
+    <style name="Theme.TianwangNext" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0E1116</item>
+        <item name="android:navigationBarColor">#0E1116</item>
+        <item name="android:statusBarColor">#0E1116</item>
+    </style>
+</resources>

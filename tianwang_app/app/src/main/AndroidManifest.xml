@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 界面原型只做本地演示，不联网、不申请敏感权限。
+         真接后端时按老工程那份清单逐条搬（INTERNET/RECORD_AUDIO/前台服务…），
+         不在这里先开一堆用不上的口子。 -->
+
+    <application
+        android:allowBackup="false"
+        android:label="天网 Next"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.TianwangNext">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

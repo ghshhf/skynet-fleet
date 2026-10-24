@@ -69,6 +69,18 @@ cards/compiled/
 tianwang_android/build/
 tianwang_android/keystore.jks
 tianwang_android/jni/build-sd/
+
+# 手机端 Next（Gradle 工程）：缓存与本机路径不入库
+tianwang_app/.gradle/
+tianwang_app/local.properties
+tianwang_app/app/build/
+tianwang_app/build/
+tianwang_app/.kotlin/
+tianwang_app/keystore.jks
+
+# APK 一律不入库（产物到处跑，靠 build.sh 重出）
+*.apk
+*.aab
 android_bridge/build/
 android_bridge/keystore.jks
 

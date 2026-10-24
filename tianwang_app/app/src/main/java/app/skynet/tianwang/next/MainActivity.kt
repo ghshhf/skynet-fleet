@@ -1,0 +1,285 @@
+package app.skynet.tianwang.next
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ChatBubbleOutline
+import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+/**
+ * 手机端第二代骨架。
+ *
+ * 结构上跟老工程最大的不同：**不是一个 Activity 手搓所有界面**。
+ * 老的那份 MainActivity 2200 行，加一个功能要在一个文件里翻十几个方法；
+ * 这里按屏切文件，一屏一件事，加功能是加文件而不是加分支。
+ */
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            TianwangTheme {
+                App()
+            }
+        }
+    }
+}
+
+private enum class Tab(val label: String) {
+    CHAT("对话"), MODELS("模型"), FLEET("编队"), SETTINGS("设置")
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun App() {
+    var tab by remember { mutableStateOf(Tab.CHAT) }
+    var current by remember { mutableStateOf(Demo.models.first()) }
+    var sheet by remember { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState()
+    val scope = rememberCoroutineScope()
+
+    val msgs = remember { mutableStateListOf<ChatMsg>().apply { addAll(Demo.seedMessages()) } }
+    val sessions = remember { mutableStateListOf<Session>().apply { addAll(Demo.sessions) } }
+    var busy by remember { mutableStateOf(false) }
+
+    fun send(text: String) {
+        if (busy) return
+        msgs.add(ChatMsg(role = ChatMsg.Role.USER, text = text))
+        // 原型：先用假流式把「输入 → 工具 → 回答」这条链路走通，
+        // 真链路（本地 llama.cpp / 云端 SSE）接进来时只换这一段的实现。
+        val replyId = java.util.UUID.randomUUID().toString()
+        msgs.add(ChatMsg(id = replyId, role = ChatMsg.Role.ASSISTANT, streaming = true))
+        busy = true
+        scope.launch {
+            val steps = listOf(
+                "fleet.nodes" to "{\"detail\":true}",
+                "model.route" to "{\"prefer\":\"${current.kind}\"}",
+            )
+            val done = mutableListOf<ToolCall>()
+            delay(280)
+            steps.forEachIndexed { i, (n, a) ->
+                val running = ToolCall(name = n, args = a, state = ToolCall.State.RUNNING)
+                done.add(running)
+                update(msgs, replyId) { it.copy(tools = done.toList()) }
+                delay(420 + i * 160L)
+                done[done.lastIndex] = running.copy(
+                    state = ToolCall.State.OK,
+                    result = if (n == "fleet.nodes")
+                        "2 台在线 / 共 ${Demo.nodes.size} 台"
+                    else "已选 ${current.label}",
+                    ms = 300 + i * 120L,
+                )
+                update(msgs, replyId) { it.copy(tools = done.toList()) }
+            }
+            val body = "收到。当前走 **${current.label}**" +
+                (if (current.kind == BackendKind.LOCAL) "（本地，不出手机）" else "（云端）") +
+                "。\n\n这条是原型的假流式回答——把模型层接上之后，" +
+                "上面这几张卡片会换成真的工具调用。"
+            body.split(" ").forEach { w ->
+                update(msgs, replyId) { it.copy(text = it.text + w + " ") }
+                delay(55)
+            }
+            update(msgs, replyId) { it.copy(streaming = false) }
+            busy = false
+        }
+    }
+
+    Scaffold(
+        modifier = Modifier.fillMaxSize().statusBarsPadding(),
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(
+                            "天网 Next",
+                            fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            when (tab) {
+                                Tab.CHAT -> msgs.lastOrNull { it.role == ChatMsg.Role.USER }?.text
+                                    ?.take(20) ?: "新对话"
+                                Tab.MODELS -> "本地 + 云端，一个列表"
+                                Tab.FLEET -> "我在编队里的位置"
+                                Tab.SETTINGS -> "会改变行为的开关"
+                            },
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    if (tab == Tab.CHAT) {
+                        IconButton(onClick = { sheet = true }) {
+                            Icon(Icons.Filled.Menu, "会话",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                },
+                actions = {
+                    if (tab == Tab.CHAT) {
+                        IconButton(onClick = {
+                            sessions.add(0, Session(title = "新会话"))
+                            msgs.clear()
+                        }) {
+                            Icon(Icons.Filled.Add, "新会话",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                ),
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+        },
+        bottomBar = {
+            Column(Modifier.navigationBarsPadding()) {
+                NavigationBar(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 0.dp,
+                ) {
+                    Tab.entries.forEach { t ->
+                        NavigationBarItem(
+                            selected = tab == t,
+                            onClick = { tab = t },
+                            icon = {
+                                Icon(
+                                    when (t) {
+                                        Tab.CHAT -> Icons.Filled.ChatBubbleOutline
+                                        Tab.MODELS -> Icons.Filled.Memory
+                                        Tab.FLEET -> Icons.Filled.Devices
+                                        Tab.SETTINGS -> Icons.Filled.Settings
+                                    },
+                                    t.label,
+                                )
+                            },
+                            label = { Text(t.label, fontSize = 10.5.sp) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = MaterialTheme.colorScheme.primary,
+                                selectedTextColor = MaterialTheme.colorScheme.primary,
+                                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                indicatorColor = MaterialTheme.colorScheme.surfaceVariant,
+                            ),
+                        )
+                    }
+                }
+            }
+        },
+    ) { pad ->
+        Box(Modifier.fillMaxSize().padding(pad)) {
+            when (tab) {
+                Tab.CHAT -> ChatScreen(
+                    msgs = msgs,
+                    model = current,
+                    onPickModel = { tab = Tab.MODELS },
+                    onSend = { send(it) },
+                )
+                Tab.MODELS -> ModelsScreen(Demo.models, current.id) { current = it }
+                Tab.FLEET -> FleetScreen(Demo.nodes)
+                Tab.SETTINGS -> SettingsScreen()
+            }
+        }
+    }
+
+    if (sheet) {
+        ModalBottomSheet(
+            onDismissRequest = { sheet = false },
+            sheetState = sheetState,
+            containerColor = MaterialTheme.colorScheme.surface,
+        ) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("会话", fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f))
+                    Text("${sessions.size} 个", fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.height(10.dp))
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                    items(sessions, key = { it.id }) { s ->
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .clickable { sheet = false }
+                                .padding(horizontal = 12.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(s.title, fontSize = 13.sp,
+                                    color = MaterialTheme.colorScheme.onSurface)
+                                Text("${s.tokens} tokens", fontSize = 10.5.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                        }
+                    }
+                }
+                Spacer(Modifier.height(24.dp))
+            }
+        }
+    }
+}
+
+/** 原地改列表里某条消息。原型用它模拟流式；真链路也走同一个入口。 */
+private fun update(list: MutableList<ChatMsg>, id: String, f: (ChatMsg) -> ChatMsg) {
+    val i = list.indexOfFirst { it.id == id }
+    if (i >= 0) list[i] = f(list[i])
+}
