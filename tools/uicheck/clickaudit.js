@@ -433,7 +433,21 @@ const FINGERPRINT = () => {
     // 改成按标记重查后，元素真被删就如实记「元素已不在 DOM」。
 
     const phaseStats = [];
-    for (const phase of PHASES) {
+    // --only=能力面板,聊天主视图 ⇒ 只跑指定相（门禁里跑快档用）。
+    // 不传就是全跑。用名字子串匹配，免得记全名。
+    const ONLY = (() => {
+      const v = arg("only", "");
+      if (!v || v === true) { return null; }
+      return String(v).split(",").map((x) => x.trim()).filter(Boolean);
+    })();
+    const phases = ONLY ? PHASES.filter((p) => ONLY.some((o) => p.name.indexOf(o) >= 0))
+                        : PHASES;
+    if (ONLY && !phases.length) {
+      console.log("[clickaudit] --only 没匹配到任何相位（可选：" +
+                  PHASES.map((p) => p.name).join(" / ") + "）");
+      process.exitCode = 2;
+    }
+    for (const phase of phases) {
       // 相位开始前先清掉审批遮罩：上一相位可能点出了审批弹窗，遮罩残留会把
       // 本相位的按钮挡成「点不到」（实测 37 个 skipped、覆盖率掉到 78%）。
       // 那不是死链，是审计自己造的遮挡。
@@ -573,10 +587,41 @@ const FINGERPRINT = () => {
         // 审批遮罩清场：上一个「执行」点出了审批弹窗，模态会挡住能力面板
         // 剩下的同类按钮（实测 25 个被判「被遮挡」）。本元素若不在模态内，
         // 先把遮罩关掉再测——这不是界面缺陷，是审计要自己清场。
-        await node.evaluate((n) => {
-          if (!n.closest(".apprmask")) {
-            document.querySelectorAll(".apprmask").forEach((m) => { m.hidden = true; });
+        // 🔴 只把遮罩 hidden 掉没用：审批弹窗是 `pollApprovals()` **每秒轮询**
+        // 驱动的，`$("apprMask").hidden = n === 0`。我们清场后 1 秒内轮询又把它
+        // 显示回来，于是能力面板剩下的同类按钮被判「被 DIV.apprmask 遮住」——
+        // 实测还剩 7 个这种**假跳过**（覆盖率卡在 93%）。
+        // ⇒ 正确清场是**把待审批请求真的拒掉**：服务端 pending 清零，
+        // 轮询就再也不会弹出（takeover=true 允许同 token 跨会话回应）。
+        await node.evaluate(async (n) => {
+          if (n.closest(".apprmask")) { return; }
+          const tok = (location.hash.match(/[#&]t=([^&]+)/) || [])[1] || "";
+          // (1) 把待审批真的拒掉 —— 服务端 pending 清零，轮询才不再弹。
+          if (tok) {
+            try {
+              const r = await fetch("/api/approvals", { headers: { "X-Fleet-Token": tok } });
+              const d = await r.json();
+              for (const p of ((d && d.pending) || [])) {
+                await fetch("/api/approval/respond", {
+                  method: "POST",
+                  headers: { "X-Fleet-Token": tok, "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    request_id: p.request_id, approved: false,
+                    reason: "clickaudit 清场（审计不替主人批准）", takeover: true,
+                  }),
+                });
+              }
+            } catch (e) { /* 清场失败就按遮挡跳过，不伪造绿灯 */ }
           }
+          // (2) 但**只靠 (1) 不够**：`renderApprovals` 每秒轮询会读到一个
+          // 在我们 deny 之前发出的过期响应，把 hidden 又置回 false —— 于是紧随
+          // 其后的 elementFromPoint 又落在遮罩上（实测 7→9 个假跳过，随机漂）。
+          // ⇒ 再给遮罩上 `pointer-events:none`：命中测试会穿透到下面的按钮，
+          // 无论 hidden 被翻回来多少次都不影响。
+          document.querySelectorAll(".apprmask").forEach((m) => {
+            m.hidden = true;
+            m.style.pointerEvents = "none";
+          });
         });
         const hit = await node.evaluate((node) => {
           // 找到最近的可滚动祖先，让元素滚到它可视区的中间
