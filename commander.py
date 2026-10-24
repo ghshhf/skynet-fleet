@@ -775,14 +775,14 @@ def _handle_client(conn, name="?"):
                     r = send_to_node(node, {"t": common.PUSH, "path": m["path"],
                                             "data": m.get("data") or ""},
                                      timeout=float(m.get("timeout") or 120))
-                    res = _client_shape(r, ("ok", "bytes"))
+                    res = _client_shape(r, ("ok", "bytes", "path"))
             elif op == common.OP_PULL:
                 if not node or not m.get("path"):
                     res = {"ok": False, "err": "pull 需要 node 和 path"}
                 else:
                     r = send_to_node(node, {"t": common.PULL, "path": m["path"]},
                                      timeout=float(m.get("timeout") or 120))
-                    res = _client_shape(r, ("data", "bytes"))
+                    res = _client_shape(r, ("data", "bytes", "path"))
             else:
                 res = {"ok": False, "err": "未知 op：%r（可用：%s）"
                        % (op, ", ".join([common.OP_NODES, common.OP_EXEC,

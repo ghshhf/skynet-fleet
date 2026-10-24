@@ -321,25 +321,43 @@ def _do_exec(s, m):
 
 
 def _do_push(s, m, sandbox):
+    """写文件：**只取 basename，一律落到沙箱里**。
+
+    沙箱是故意的（调用方给的目录不可信，不然就是任意路径写）。
+    但必须把**真实落盘路径**回给调用方 —— 2026-10-25 实测事故：
+    传 `D:\\...\\tmp\\a.txt`，回 ok=True，调用方去那儿看是空的（报「找不到文件」），
+    文件其实在 `sandbox_node\\a.txt`。**「成功了但找不到」比失败还难查。**
+    """
     mid = m.get("id")
     try:
         data = base64.b64decode(m.get("data", ""))
-        path = os.path.join(sandbox, os.path.basename(m.get("path", "file.bin")))
-        open(path, "wb").write(data)
-        common.send_msg(s, {"t": common.PUSH_RESULT, "id": mid, "ok": True, "err": ""})
+        path = os.path.join(sandbox, os.path.basename(m.get("path") or "file.bin"))
+        with open(path, "wb") as f:
+            f.write(data)
+        common.send_msg(s, {"t": common.PUSH_RESULT, "id": mid, "ok": True,
+                            "path": os.path.abspath(path), "bytes": len(data), "err": ""})
     except Exception as e:
         common.send_msg(s, {"t": common.PUSH_RESULT, "id": mid, "ok": False, "err": str(e)})
 
 
 def _do_pull(s, m, sandbox):
+    """读文件：同样只认沙箱里的 basename。
+
+    找不到时把沙箱绝对路径写进错误里 —— 否则调用方只会看到
+    「No such file」而不知道自己给的是沙箱外的路径。
+    """
     mid = m.get("id")
     try:
-        path = os.path.join(sandbox, os.path.basename(m.get("path", "")))
-        data = open(path, "rb").read()
+        path = os.path.join(sandbox, os.path.basename(m.get("path") or ""))
+        with open(path, "rb") as f:
+            data = f.read()
         common.send_msg(s, {"t": common.PULL_RESULT, "id": mid, "ok": True,
-                            "data": base64.b64encode(data).decode(), "err": ""})
+                            "data": base64.b64encode(data).decode(),
+                            "bytes": len(data), "path": os.path.abspath(path), "err": ""})
     except Exception as e:
-        common.send_msg(s, {"t": common.PULL_RESULT, "id": mid, "ok": False, "data": "", "err": str(e)})
+        common.send_msg(s, {"t": common.PULL_RESULT, "id": mid, "ok": False, "data": "",
+                            "err": "%s（节点只从沙箱 %s 取文件，传入的目录部分会被丢掉）"
+                                   % (e, os.path.abspath(sandbox))})
 
 
 def _do_compute(s, m):
