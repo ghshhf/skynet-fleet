@@ -311,15 +311,9 @@ CAPABILITIES = [
                params=(Param("no_lan", "bool"), Param("no_wifi", "bool"),
                        Param("no_bt", "bool"))),
     # ---- 编队节点（远程机器）----
-    Capability("shell.exec", "在编队节点上执行命令（白名单）",
-               params=(Param("node", "str"), Param("cmd", "str", True)),
-               side_effect=True, note="D0 只登记：控制面无对外代发口，D1 补"),
-    Capability("file.push", "推文件到编队节点",
-               params=(Param("node", "str"), Param("path", "str", True)),
-               side_effect=True, note="同上"),
-    Capability("file.pull", "从编队节点取文件",
-               params=(Param("node", "str"), Param("path", "str", True)),
-               side_effect=True, note="同上"),
+    # 2026-10-25 摘除 shell.exec / file.push / file.pull 的空登记：
+    # 总纲 §四-3「或诚实摘掉登记，不留空壳」。此前它们只登记、invoke 必失败，
+    # 让界面长出点了没反应的假按钮。真代发要等控制面有对外协议（D1）再重新登记。
     # ---- 万维网（联网层）：外面的世界，经两个爬虫伸进去 ----
     Capability("web.status", "联网层现状（两个源在不在 / 各攒了多少）",
                note="只读：不联网也看得见本地已攒的"),
