@@ -434,6 +434,12 @@ const FINGERPRINT = () => {
 
     const phaseStats = [];
     for (const phase of PHASES) {
+      // 相位开始前先清掉审批遮罩：上一相位可能点出了审批弹窗，遮罩残留会把
+      // 本相位的按钮挡成「点不到」（实测 37 个 skipped、覆盖率掉到 78%）。
+      // 那不是死链，是审计自己造的遮挡。
+      await page.evaluate(() => {
+        document.querySelectorAll(".apprmask").forEach((m) => { m.hidden = true; });
+      });
       // 打开这一层，再枚举。
       // 🔴 真实入口会**异步拉接口**渲染内容（Tab 卡片、名册、连接器墙），
       // 所以要多等一轮，等内容真的画出来再枚举——否则枚举到的是空壳。
@@ -564,6 +570,14 @@ const FINGERPRINT = () => {
         // 那个滚动容器里露出来，不保证露出来的那部分**没被别的层盖住**。
         // 能力面板的 68 个「执行」按钮就在这种容器里。
         // ⇒ 先把元素滚到**容器可视区的中间**，再判遮挡。
+        // 审批遮罩清场：上一个「执行」点出了审批弹窗，模态会挡住能力面板
+        // 剩下的同类按钮（实测 25 个被判「被遮挡」）。本元素若不在模态内，
+        // 先把遮罩关掉再测——这不是界面缺陷，是审计要自己清场。
+        await node.evaluate((n) => {
+          if (!n.closest(".apprmask")) {
+            document.querySelectorAll(".apprmask").forEach((m) => { m.hidden = true; });
+          }
+        });
         const hit = await node.evaluate((node) => {
           // 找到最近的可滚动祖先，让元素滚到它可视区的中间
           let sc = null, p = node.parentElement;
