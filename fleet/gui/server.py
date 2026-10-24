@@ -497,6 +497,11 @@ class FleetServer:
                             d2 = dict(data or {})
                             d2["phase"] = phase
                             d2["mode"] = "tool"
+                            if phase == "warn":
+                                # 工具面决策层不可用：落日志，界面/调试可见。
+                                sys.stderr.write(
+                                    f"[tool-warn] {d2.get('msg', '')}\n")
+                                sys.stderr.flush()
                             q.put({"type": "web", "data": d2})
 
                         results = AT.run_tools(raw_prompt, self.call,

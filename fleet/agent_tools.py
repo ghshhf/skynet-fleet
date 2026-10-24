@@ -24,7 +24,8 @@ import time
 import urllib.request
 
 #: 决策模型地址。默认手机 llama-server（adb forward tcp:18080 tcp:8080）。
-#: 可用环境变量覆盖；取不到时工具面整体静默跳过（对话照常答）。
+#: 运行时可用环境变量 AT_DECIDER_URL 覆盖（见 decide()）；连不上时工具面
+#: 会**如实告知**（fire("warn")），不再静默跳过。
 DECIDER_URL = "http://127.0.0.1:18080"
 
 #: 工具结果回填进 prompt 的上限（字符）。
@@ -94,7 +95,7 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
         "temperature": 0.1,
         "max_tokens": 160,
     }
-    base = (url or DECIDER_URL).rstrip("/")
+    base = (url or os.environ.get("AT_DECIDER_URL", DECIDER_URL)).rstrip("/")
     try:
         req = urllib.request.Request(
             base + "/v1/chat/completions",
@@ -1472,7 +1473,13 @@ def run_tools(question, caller, url=None, max_rounds=MAX_ROUNDS,
             break
         d = (decide(question, url=url) if rnd == 1
              else decide_followup(question, url=url))
-        if not d or d.get("tool") == "none":
+        if not d:
+            # 决策层不可用（连不上/超时/输出非法）：如实告知，不静默。
+            # 否则「决策模型消失」在界面上表现为「什么都没发生」，极难排查。
+            fire("warn", {"msg": "工具面决策模型连不上（AT_DECIDER_URL），"
+                                 "本次未调用手机工具"})
+            break
+        if d.get("tool") == "none":
             break
         tool = d["tool"]
         if tool in used:                       # 模型没听话 → 直接收手
