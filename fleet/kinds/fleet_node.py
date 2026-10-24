@@ -65,11 +65,22 @@ class FleetNode(BaseDevice):
                 caps.append("skynet.relay")
         except Exception:
             pass
-        if not caps:
-            return ("shell.exec", "file.push", "file.pull")
+        # 总纲 §四-3：不再硬编码申报 shell.exec/file.push/file.pull。
+        # 这三个能力此前只在 caps() 里"空登记"、invoke 必失败——声明了却调不通
+        # 比缺功能更糟（界面会长出点了没反应的假按钮）。rec 没上报就是空。
         return tuple(caps)
 
     def invoke(self, cap, args=None):
+        # 跨机真代发：原先在 caps() 空登记、此处必失败（总纲 C 档「调必失败」）。
+        # 按总纲 §四-3「或诚实摘掉登记，不留空壳」——明确说出未实现，
+        # 而不是让它看起来像"能力存在但这次没成"。
+        if cap in ("shell.exec", "file.push", "file.pull"):
+            return R.unsupported(
+                cap,
+                f"{cap} 暂不提供：跨机真代发未实现（控制面只有 REPL，"
+                f"没有对外代发口），登记已按总纲摘除，不留空壳",
+                device=self.name, via=self.via)
+
         # skynet.relay：返回本机 relay 运行状态（只读，不限网）
         if cap == "skynet.relay":
             try:
