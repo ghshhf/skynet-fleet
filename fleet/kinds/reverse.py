@@ -5,6 +5,7 @@
 Reverse 拆的是**不拆就没有**的数据（脉冲编码、广播结构、固件里的硬编码）。
 一个读表面，一个拆里面——都是只读，都不发攻击性报文。
 """
+from .. import bit_reverse as BR
 from .. import proto_reverse as PR
 from .. import reverse as RV
 from .. import re_llm
@@ -27,7 +28,8 @@ class Reverse(BaseDevice):
         return True, ""
 
     def caps(self):
-        return ("re.ir", "re.ble", "re.binary", "re.proto", "re.ask")
+        return ("re.ir", "re.ble", "re.binary", "re.proto",
+                "re.bits", "re.bits_extract", "re.ask")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -59,6 +61,23 @@ class Reverse(BaseDevice):
             m = PR.proto_report(samples)
             if m.get("ok") and args.get("llm", True):
                 m["hypothesis"] = RV.llm_hypothesize("proto", m)
+        elif cap == "re.bits":
+            samples = args.get("samples")
+            if not samples:
+                return R.error(cap, "缺参数 samples（多帧 hex 列表）",
+                               device=self.name, via=self.via)
+            m = BR.bit_report(samples, order=(args.get("order") or None))
+        elif cap == "re.bits_extract":
+            samples = args.get("samples")
+            if not samples:
+                return R.error(cap, "缺参数 samples（多帧 hex 列表）",
+                               device=self.name, via=self.via)
+            if args.get("bit_len") is None:
+                return R.error(cap, "缺参数 bit_len（位宽）",
+                               device=self.name, via=self.via)
+            m = BR.bit_extract(samples, int(args.get("bit_offset") or 0),
+                               int(args["bit_len"]),
+                               order=(args.get("order") or "msb"))
         elif cap == "re.ask":
             q = (args.get("question") or "").strip()
             if not q:
