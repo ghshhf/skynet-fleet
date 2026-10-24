@@ -30,6 +30,8 @@ import subprocess
 import sys
 import time
 
+from fleet import authority as AUTH
+
 # ---------------------------------------------------------------- 常量
 
 SSDP_ADDR = ("239.255.255.250", 1900)
@@ -830,10 +832,15 @@ def discover(local_ip=None, timeout=3.0, do_ports=True, max_hosts=24,
         for name, kv in (d["mdns"].get("txt") or {}).items():
             mdns_txt += " " + name + " " + " ".join(f"{k}={v}" for k, v in kv.items())
         http_txt = " ".join(str(v) for v in d["http"].values())
-        ranked = score_categories({
+        evidence = {
             "ssdp": ssdp_txt, "mdns": mdns_txt, "http": http_txt,
             "oui": d["vendor"], "ports": d["ports"],
-        })
+        }
+        ranked = score_categories(evidence)
+        # 证据分级：自报（mDNS/SSDP/HTTP 头）是实物，端口权重/组合特征是我们猜的。
+        # 554 的 Windows 被判摄像头、5555 被判手机——两个真实误判都因为
+        # 「端口投票赢过设备自报」，这里把 README 口头铁律变成数据结构
+        buckets = AUTH.score_by_source(evidence)
         port_set = set(d["ports"])
         # 组合特征加成：几个端口同时出现才有判别力（单端口只能投票）
         combos = combo_hits(d["ports"])
@@ -871,6 +878,10 @@ def discover(local_ip=None, timeout=3.0, do_ports=True, max_hosts=24,
             "possible_fleet": any(p in port_set for p in POSSIBLE_FLEET_PORTS) and not has_ipc,
             "found_via": sorted(d["via"]),
             "why": why,
+            # 证据分级：类别结论是读到的还是猜的。网关走路由表 ⇒ 实物；
+            # 其余按分桶判——自报出现即压过端口投票（README 铁律代码化）
+            "authority": "shipped-artifact" if is_gw else
+                         AUTH.category_authority(evidence, cat, scores=buckets),
             "open_ports": d["ports"],
             "ssdp": d["ssdp"],
             "mdns_services": d["mdns"].get("services", []),

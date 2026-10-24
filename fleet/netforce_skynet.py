@@ -39,6 +39,7 @@ from __future__ import annotations
 import os
 import sys
 
+from . import authority as AUTH
 from . import netrunner as NR
 
 #: 环境变量**名**。注意：这是名字，不是路径值。
@@ -164,6 +165,13 @@ def search(query, wiki_tag=None, only=None, min_rel=None, limit=20,
         if len(raw_title) > TITLE_MAX:
             # 不静默：调用方有权知道这条是被砍过的，砍过就说明上游出了问题
             rec["title_truncated"] = len(raw_title)
+        # 证据分级：引擎摘要与相关度都是外部生成的 ⇒ historical-reference。
+        # cross 引擎交叉只提高可信度，不改变来源（那是权重，不是 authority）
+        AUTH.attest(rec, "web.search",
+                    f"搜索引擎命中（{rec['cross']} 引擎交叉）",
+                    subject=query, authority=AUTH.authority_of_hit(rec),
+                    value=rec["url"],
+                    limitations=["摘要与相关度为搜索方生成，非目标站原文"])
         out.append(rec)
     return out
 
@@ -215,7 +223,7 @@ def fetch_text(url, timeout=15.0, budget=25.0, gap=0.8, force_channel=None,
     res = N.fetch_text(url, timeout=timeout, budget=budget, gap=gap,
                        force_channel=force_channel)
     text = getattr(res, "text", "") or ""
-    return {
+    out = {
         "url": getattr(res, "url", url),
         "final_url": getattr(res, "final_url", "") or "",
         "ok": bool(res.ok),
@@ -227,6 +235,12 @@ def fetch_text(url, timeout=15.0, budget=25.0, gap=0.8, force_channel=None,
         "hops": list(getattr(res, "hops", []) or []),
         "error": getattr(res, "error", "") or "",
     }
+    # 抓成功 ⇒ 页面字节是实物读到的；失败 ⇒ 失败是观察，「为什么失败」是推断
+    AUTH.attest(out, "web.fetch", "取正文结果", subject=url,
+                authority=AUTH.authority_of_fetch(out),
+                value=out["final_url"] or url,
+                limitations=(["失败原因（墙/超时/截断）为推断"] if not out["ok"] else []))
+    return out
 
 
 def download(url, dest, timeout=60.0, max_bytes=200 * 1024 * 1024, dedupe=True):
@@ -271,7 +285,7 @@ def probe(url, timeout=15.0, gap=0.6):
     from skynet import probe as P
     res = P.probe(url, timeout=timeout, gap=gap)
     c = getattr(res, "content", None)
-    return {
+    out = {
         "url": getattr(res, "url", url),
         "final_url": getattr(res, "final_url", "") or "",
         "alive": bool(getattr(res, "alive", False)),
@@ -289,6 +303,12 @@ def probe(url, timeout=15.0, gap=0.6):
         "audio_links": int(getattr(c, "audio_links", 0) or 0) if c else 0,
         "junk_hit": (getattr(c, "junk_hit", "") or "") if c else "",
     }
+    # probe 是我们主动跑一遍的探测 ⇒ controlled-replay；没探到东西时任何结论都是猜
+    AUTH.attest(out, "web.probe", "四级可用性判定", subject=url,
+                authority=AUTH.authority_of_probe(out),
+                value=f"{out['verdict']}（score={out['score']}）",
+                limitations=(["未探到实质内容"] if out["verdict"] == "unknown" else []))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -316,7 +336,7 @@ def structure(url, max_urls=1500):
     files = res.get("sitemap_files")
     sample = res.get("sample")
     feed = res.get("feed")
-    return {
+    out = {
         "root": res.get("root", "") or "",
         "robots": res.get("robots", "") or "",
         "crawl_delay": float(res.get("crawl_delay", 0) or 0),
@@ -327,6 +347,13 @@ def structure(url, max_urls=1500):
         "sample": list(sample) if isinstance(sample, (list, tuple)) else [],
         "feed": feed or "",
     }
+    # robots/sitemap 是站点主动发布的实物字节 ⇒ shipped-artifact。
+    # ⚠️ 站点声明 ≠ 真实存在（sitemap 里可以有死链）——那是引用时的事
+    AUTH.attest(out, "web.structure", "站结构（站点主动发布）", subject=url,
+                authority=AUTH.authority_of_structure(out),
+                value=f"sitemap_urls={out['sitemap_urls']}",
+                limitations=["站点声明不等于真实存在，sitemap 内可有死链"])
+    return out
 
 
 # --------------------------------------------------------------------------

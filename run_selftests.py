@@ -185,6 +185,14 @@ CASES = [
     # ⑥ audio.synth 写文件 ⇒ 副作用 ⇒ 没闸门时 fail-closed。
     # 全离线：合成全在内存与临时目录里完成。
     ("eval_t17_audio_synth", ["evals/t17_audio_synth.py"], HERE, 180),
+    # T26：证据分级 authority——「读到的」和「猜的」必须是数据结构。
+    # 钉三件事：① 同一结论同一证据 id（sha256 前 16 位，authority 参与哈希）；
+    # ② 每条 web.* 结果带 authority 且取值合法（非法值 mk_evidence 抛 ValueError）；
+    # ③ discovery 端口投票必须 analyst-inference、设备自报压过端口投票
+    #    （554 的 Windows 被判摄像头、5555 被判手机两个真实误判的根）。
+    # 全离线：全部假数据驱动判定助手。
+    # 🔴 编号 t25 已被另一台机器推的 t25_tool_catalog 占 ⇒ 本门禁用 t26
+    ("eval_t26_authority", ["evals/t26_authority.py"], HERE, 90),
     # ---- P4：vendored 技能完整性（第4层技能自进化地基）----
     # 仓库 skills/ 下每个 vendored 技能必须带 _audit.json 且结论 clean，
     # 且 MANIFEST.json 登记与实际目录一一对应。未审查进仓 = 红。
