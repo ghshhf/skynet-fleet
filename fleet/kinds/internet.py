@@ -49,7 +49,8 @@ class Internet(BaseDevice):
         return ("web.status", "web.discover", "web.corpus", "web.diffuse",
                 "web.papers", "web.frontier", "web.sites",
                 "web.search", "web.quote", "web.fetch", "web.probe",
-                "web.structure", "web.download")
+                "web.structure", "web.download",
+                "web.origin", "web.dns")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -68,7 +69,7 @@ class Internet(BaseDevice):
         if cap == "web.sites":
             return self._sites(args)
         if cap in ("web.search", "web.fetch", "web.probe", "web.structure",
-                   "web.download"):
+                   "web.download", "web.origin", "web.dns"):
             return self._skynet(cap, args)
         if cap == "web.quote":
             return self._quote(args)
@@ -168,11 +169,32 @@ class Internet(BaseDevice):
             if cap == "web.download":
                 url = (args.get("url") or "").strip()
                 dest = (args.get("dest") or "").strip()
-                if not url or not dest:
-                    return R.unavailable(cap, "缺少 url 或 dest",
+                if not url:
+                    return R.unavailable(cap, "缺少 url（要下哪个）",
+                                         device=self.name, via=self.via)
+                if not dest:
+                    return R.unavailable(cap, "缺少 dest（下到哪）",
                                          device=self.name, via=self.via)
                 d = NS.download(url, dest)
                 return R.success(cap, self.name, via=self.via, side_effect=True, data=d)
+            if cap == "web.origin":
+                url = (args.get("url") or "").strip()
+                if not url:
+                    return R.unavailable(cap, "缺少 url（要穿透哪个）",
+                                         device=self.name, via=self.via)
+                d = NS.origin(url, max_hops=int(args.get("max_hops") or 10))
+                return R.success(cap, self.name, via=self.via, data=d)
+            if cap == "web.dns":
+                url = (args.get("url") or "").strip()
+                if not url:
+                    return R.unavailable(cap, "缺少 url（要判哪个域名）",
+                                         device=self.name, via=self.via)
+                d = NS.dns_check(url)
+                return R.success(cap, self.name, via=self.via, data=d)
+            # 走到这里 = caps() 报了没实现的分支。如实报，不 fallback
+            # 到父类（父类不认识 skynet，只会给一句更含糊的失败）。
+            return R.error(cap, f"skynet 能力分支未实现：{cap}",
+                           device=self.name, via=self.via)
         except ImportError as e:
             return R.unavailable(cap, f"skynet 内核不在：{e}",
                                  device=self.name, via=self.via)

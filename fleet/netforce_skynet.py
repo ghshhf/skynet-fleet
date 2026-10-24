@@ -330,6 +330,93 @@ def structure(url, max_urls=1500):
 
 
 # --------------------------------------------------------------------------
+# 跳转穿透 + DNS 污染判据
+# --------------------------------------------------------------------------
+
+def origin(url, max_hops=10, timeout=10.0):
+    """逐跳穿透一个 URL，直到终点。返回 dict。
+
+    干什么用：短链 / 跳板页 / meta refresh / JS location 都算跳转。
+    只读原始 URL 会把跳板页本身当成目标——它的正文通常只有一行跳转脚本，
+    拿回来当内容是静默零产出（`probe()` 的 L4 解析校验防的正是这类）。
+
+    🔴 skynet 的 `route.trace()` 返回 `Trace`（dataclass），字段
+    `start/final/short/hops/error/cross_domain`；每跳是 `Hop`
+    （`n/url/status/location/kind/host/set_cookie`，kind ∈ http/meta/js/end）。
+    这里全部拍平，别让上层去猜属性名。
+    """
+    _ensure_path()
+    from skynet import route as R
+    t = R.trace(url, max_hops=max_hops, timeout=timeout)
+    hops = [{
+        "n": int(getattr(h, "n", 0) or 0),
+        "url": getattr(h, "url", "") or "",
+        "status": int(getattr(h, "status", 0) or 0),
+        "kind": getattr(h, "kind", "") or "",
+        "host": getattr(h, "host", "") or "",
+        "location": (getattr(h, "location", "") or "")[:500],
+        "set_cookie": int(getattr(h, "set_cookie", 0) or 0),
+    } for h in (getattr(t, "hops", None) or [])]
+    return {
+        "start": getattr(t, "start", url) or url,
+        "final": getattr(t, "final", "") or "",
+        "hops": hops,
+        "hop_count": len(hops),
+        "cross_domain": bool(getattr(t, "cross_domain", False)),
+        "short": bool(getattr(t, "short", False)),
+        "error": getattr(t, "error", "") or "",
+    }
+
+
+#: dns.check() 的全部 verdict（上游语义：无交集只报可疑，不下死结论）
+DNS_VERDICTS = ("ok", "suspicious", "doh_failed", "system_failed")
+
+
+def dns_check(url, timeout=6.0):
+    """对比系统解析与 DoH，判断是否疑似被污染。返回 dict。
+
+    干什么用：本机链路会把域名带到假 IP（连得上、返回错内容，或直接 reset）。
+    表现为 fetch 成功但内容不对——比报错更难发现。
+
+    🔴 **判据不能是「两边 IP 不同」**（上游 docstring 写明，实测踩过）：
+      CDN 站本来就有十几个 IP，按地域/线路给出不同子集完全正常，
+      那样判会把所有 CDN 站误报成投毒。真正的特征是**两边完全没有交集**，
+      所以无交集只报 `suspicious`，不下死结论。
+    """
+    _ensure_path()
+    from skynet import dns as D
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").strip()
+    if not host:
+        return {"host": "", "verdict": "system_failed", "error": "URL 里没有 host",
+                "system": [], "doh": [], "common": [], "only_system": []}
+    res = D.check(host, timeout=timeout) or {}
+    verdict = res.get("verdict", "")
+    return {
+        "host": res.get("host", host) or host,
+        "verdict": verdict if verdict in DNS_VERDICTS else "suspicious",
+        "system": list(res.get("system") or []),
+        "doh": list(res.get("doh") or []),
+        "common": list(res.get("common") or []),
+        "only_system": list(res.get("only_system") or []),
+    }
+
+
+def resolve_hint(url, timeout=6.0):
+    """给 curl 的 `--resolve` 拼参数：`host:port:ip`。拿不到返回 ""。
+
+    只读帮手：上层自己起 curl 时，用 DoH 结果绕开被污染的系统解析。
+    拿不到就返回空串，调用方照常用系统解析——不假装绕成功了。
+    """
+    _ensure_path()
+    from skynet import dns as D
+    try:
+        return D.resolve_for_curl(url, timeout=timeout) or ""
+    except Exception as e:                        # noqa: BLE001
+        return ""
+
+
+# --------------------------------------------------------------------------
 # 自测
 # --------------------------------------------------------------------------
 
