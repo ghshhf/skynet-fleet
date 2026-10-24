@@ -29,7 +29,9 @@ const { spawn } = require("child_process");
 const { chromium } = require("playwright");
 
 const ROOT = path.join(__dirname, "..", "..");
-const PY = "D:/tools/python/python.exe";
+// 换机即挂的硬编码（原为 D:/tools/python/python.exe）已去掉：
+// 优先 FLEET_PY 环境变量，否则用 PATH 里的 python —— 换机不再 ModuleNotFoundError。
+const PY = process.env.FLEET_PY || (process.platform === "win32" ? "python" : "python3");
 
 function arg(name, dflt) {
   const i = process.argv.indexOf("--" + name);

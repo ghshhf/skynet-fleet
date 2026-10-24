@@ -88,6 +88,10 @@ CASES = [
     # 这种错编译期查不出来（findViewById 按声明类型推导，不校验布局），
     # 只能在真机上点一下才知道，所以必须静态拦。纯离线、秒级。
     ("android_viewcast", ["tools/check_viewcast.py"], HERE, 30),
+    # ---- Android 静态门禁 ②（总纲 §四 第 7 条）：运行时权限 vs Manifest 声明 ----
+    # 代码用 Manifest.permission.X 但清单没声明 ⇒ 运行时 SecurityException，
+    # 编译期查不出、栈里也看不出跟权限有关（详见 tools/check_permissions.py 头部）。
+    ("android_permissions", ["tools/check_permissions.py"], HERE, 30),
     # ---- evals：一次真事故一个脚本 ----
     ("eval_d0_bridge_offline", ["evals/d0_bridge_offline.py"], HERE, 90),
     ("eval_t0_input", ["evals/t0_input_not_clobbered.py"], HERE, 90),
@@ -220,6 +224,28 @@ CASES = [
     # 全离线：registry 与决策模型都打桩。
     ("eval_t24_agent_tools_v2", ["evals/t24_agent_tools_v2.py"], HERE, 120),
     ("eval_t25_tool_catalog", ["evals/t25_tool_catalog.py"], HERE, 120),
+    # ---- 2026-10-25 门禁接全（总纲 §四 第 1 条）----
+    # 这 16 个 eval 一直躺在 evals/ 里但没进门禁 ⇒「写了不跑 = 没写」。
+    # 接进来当场就抓到两个真 bug：metrics 直方图 Prometheus 格式非法
+    # （{backend="x"},le="5" —— le 拼在花括号外，抓取端整条丢），
+    # 以及 video.gen 的「未配置」断言在装了 ffmpeg 的机器上必红（测试假设过时）。
+    # 全部离线：不连网、不碰真机。
+    ("eval_t27_decider_config", ["evals/t27_decider_config.py"], HERE, 90),
+    ("eval_t28_link_selfheal", ["evals/t28_link_selfheal.py"], HERE, 90),
+    ("eval_t29_approval_loop", ["evals/t29_approval_loop.py"], HERE, 120),
+    ("eval_t30_heartbeat", ["evals/t30_heartbeat.py"], HERE, 90),
+    ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
+    ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
+    ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
+    ("eval_t8_relay", ["evals/t8_relay.py"], HERE, 90),
+    ("eval_phone_pair", ["evals/test_device_pair.py"], HERE, 90),
+    ("eval_fleet_overview", ["evals/test_fleet_overview.py"], HERE, 90),
+    ("eval_jobs_artifacts", ["evals/test_jobs_artifacts.py"], HERE, 120),
+    ("eval_memory_pack", ["evals/test_memory_pack.py"], HERE, 90),
+    ("eval_memory_sync", ["evals/test_memory_sync.py"], HERE, 90),
+    ("eval_model_catalog", ["evals/test_model_catalog.py"], HERE, 60),
+    ("eval_phone_node", ["evals/test_phone_node.py"], HERE, 90),
+    ("eval_video_gen", ["evals/test_video_gen.py"], HERE, 90),
 ]
 
 

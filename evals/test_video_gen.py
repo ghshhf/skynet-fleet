@@ -23,10 +23,21 @@ def _ok_backend(prompt, duration, fps, size, seed, model):
 
 
 def test_unconfigured():
+    # 环境自适应：本机有 ffmpeg / FLEET_VIDEO_CLI 时 video.gen 是真可用的，
+    # 此时验「能出片」；两者都没有才验「如实报未配置」。
+    # （旧版固定断言 ok=False，在装了 ffmpeg 的机器上必红——那是测试假设，不是代码 bug。）
+    import os as _os, shutil as _sh
+    has_backend = bool(_os.environ.get("FLEET_VIDEO_CLI")
+                       or _os.environ.get("FLEET_FFMPEG")
+                       or _sh.which("ffmpeg"))
     r = video_gen_runner.run("海浪")
-    assert r["ok"] is False, r
-    assert "未配置" in r["err"], r
-    print("  [ok] 默认后端未配置 -> ok=False + 未配置原因")
+    if has_backend:
+        assert r["ok"] is True and r["path"], r
+        print("  [ok] 检测到视频后端 -> 真出片")
+    else:
+        assert r["ok"] is False, r
+        assert "未配置" in r["err"], r
+        print("  [ok] 默认后端未配置 -> ok=False + 未配置原因")
 
 
 def test_empty_prompt():
