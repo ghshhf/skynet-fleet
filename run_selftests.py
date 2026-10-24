@@ -281,6 +281,11 @@ CASES = [
     # 门禁必须全离线——任何一家没起、没配 Key 都不能让它变红，
     # 它验的是「注册表与探测逻辑」，不是「网关今天活着」。
     ("eval_t38_providers", ["-m", "fleet.providers", "--selftest"], HERE, 120),
+    # ---- T39：能力表 → 云端 function-calling 工具表（融合计划书 P4 的云侧那一步）
+    # 149 项能力已经有了 MCP 形状（t14 覆盖），这一层补的是 OpenAI / Anthropic
+    # 两种信封 + 回环解析（模型吐回来的 tool_call 要还原成能力真名）。
+    # 全离线：不连任何网关，验的是「投影与解析」，不是「模型今天调得对」。
+    ("eval_t39_toolschema", ["-m", "fleet.toolschema", "--selftest"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
