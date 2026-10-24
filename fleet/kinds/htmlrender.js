@@ -99,7 +99,13 @@ function lintDeterminism(src) {
   }
 
   fs.mkdirSync(FRAMES, { recursive: true });
-  const browser = await chromium.launch();
+  // 🔴 两个 flag 是确定性的一部分：transform 亚像素定位与字体子像素定位
+  // 会让同一份 HTML 两次渲出不同像素（实测 linear 动画 59/60 帧边缘差
+  // 2/255——逻辑完全确定，是光栅器的亚像素行为）。关掉子像素定位后
+  // 亚像素抖动消失，逐字节一致才真正成立。
+  const browser = await chromium.launch({
+    args: ["--disable-font-subpixel-positioning", "--disable-lcd-text"],
+  });
   const page = await browser.newPage({
     viewport: { width: W, height: H },
     deviceScaleFactor: 1,
@@ -124,8 +130,12 @@ function lintDeterminism(src) {
   const t0 = Date.now();
   for (let f = 0; f < total; f++) {
     const t = (f / FPS) * 1000;
-    await page.evaluate((tt) => {
+    await page.evaluate(async (tt) => {
       document.getAnimations().forEach((a) => { try { a.currentTime = tt; } catch (_) { } });
+      // 🔴 拨完时间必须等两帧再截图：currentTime 的设置要过渲染管线才落到
+      // 画面上，设完立刻 screenshot 是 race——偶发截到旧帧 ⇒ 同一份 HTML
+      // 两次渲染不一致（t23 实测红过一次）。两帧 = 设置生效 + 合成完成。
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     }, t);
     const name = "f" + String(f).padStart(4, "0") + ".png";
     await page.screenshot({ path: path.join(FRAMES, name) });
