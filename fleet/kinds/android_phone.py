@@ -53,7 +53,24 @@ class AndroidPhone(BaseDevice):
         if not A.alive(s, timeout=8):
             return False, f"{s} 在列表里但 adb shell 不通（授权弹窗没点 / 无线调试过期）"
         self.meta["addr"] = s
+        self.selfcheck()  # 首次接入即自检（结果按 serial 缓存，不重探）
         return True, ""
+
+    def selfcheck(self):
+        """接入即自检——仅首次（结果按 serial 缓存，之后直接复用，不重探）。
+
+        返回 device_probe 的能力档 dict（含每条结论的 authority + limitations），
+        或 {"error": ...}。失败不影响 probe 本身（自检是副产品，不算可达性故障）。
+        想显式刷新（如 root 后/ROM 升级后）调 device_probe.run_onboard(force=True)。
+        """
+        s = self.serial()
+        if not s:
+            return None
+        try:
+            from .. import device_probe as DP
+            return DP.probe_device(s)
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)}
 
     def caps(self):
         return ("screen.read", "tree.read", "apps.list", "app.foreground",
