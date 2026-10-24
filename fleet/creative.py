@@ -2,7 +2,7 @@
 """天网创意能力：把 radio / ble / discovery / infrared / nearby / hotspot 焊成
 「一眼、一手、一哨、一网、一幕」。
 
-计划书：docs/创意能力企划_天网之眼与信号外放_2026-10-24.md
+定位与边界见 docs/总纲_唯一推进依据_2026-10-25.md。
 
 五个能力：
   scene.scan     —— 一键全域快照（天网之眼）：融合 WiFi/蜂窝/蓝牙/主动发现

@@ -9,7 +9,7 @@
 为什么这次要**分档**（2026-10-22 实测）：
   实测 WorkBuddy 自身 38 条真实技能，旧规则只有 4 条判 clean、34 条判 needs_review（89% 误杀）；
   分档规则落地后 9 条 clean、28 条 needs_review —— 误杀降到 0，红线（恶意样本 0 漏、正常样本 clean、
-  带脚本技能 0 clean）守住（详见 docs/技能进化_可验证融合落地_计划书_2026-10-22.md §4.3）。
+  带脚本技能 0 clean）守住（详见 docs/总纲_唯一推进依据_2026-10-25.md）。
   误杀的三个典型形状：
     ① 教材里提到网址  —— 「从 CDN 引入 <script src="https://cdn.jsdelivr.net/...">」
        被 `http_request` 命中。教材提到 URL ≠ 代码去请求 URL。
