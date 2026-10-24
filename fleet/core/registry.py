@@ -170,6 +170,7 @@ class Registry:
         self._devices = {}
         self._seen = {}
         self._probe = {}
+        self._supports = {}                 # device.name -> (at, frozenset(caps))
         self._lk = threading.RLock()
 
     # ---------------- 登记 ----------------
@@ -235,9 +236,32 @@ class Registry:
         with self._lk:
             return [self._devices[k] for k in sorted(self._devices)]
 
+    def _caps_of(self, device, ttl=None):
+        """设备的能力集合（带缓存）。
+
+        为什么要缓存：`owners()` 会为「149 项能力 × 每台设备」各调一次
+        `supports()`，而 `supports()` 内部就是 `caps()`。有些设备的 `caps()` 里有
+        真 IO（FleetNode 探控制面可达性、安卓机问 adb），这层放大曾把
+        `python -m fleet list` 从几秒拖到 3 分钟。设备能力在 TTL 内视为不变。
+        """
+        ttl = self.ttl if ttl is None else ttl
+        now = time.time()
+        if ttl > 0:
+            with self._lk:
+                c = self._supports.get(device.name)
+                if c and (now - c[0]) < ttl:
+                    return c[1]
+        try:
+            caps = frozenset(device.caps())
+        except Exception:
+            caps = frozenset()
+        with self._lk:
+            self._supports[device.name] = (now, caps)
+        return caps
+
     def owners(self, cap):
         """声明支持这项能力的设备（不管现在可不可用）。"""
-        return [d for d in self.devices() if d.supports(cap)]
+        return [d for d in self.devices() if cap in self._caps_of(d)]
 
     # ---------------- 可用性 ----------------
 
@@ -262,8 +286,10 @@ class Registry:
         with self._lk:
             if name:
                 self._probe.pop(name, None)
+                self._supports.pop(name, None)
             else:
                 self._probe.clear()
+                self._supports.clear()
 
     def check(self, cap_name, device_name=""):
         """综合判定：能力存在 → 有设备声明它能做 → 设备可用 → check_fn 通过。"""

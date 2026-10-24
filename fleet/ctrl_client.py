@@ -25,6 +25,8 @@
 import os
 import socket
 import sys
+import threading
+import time
 import uuid
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -162,16 +164,48 @@ class ControlClient:
         return self.request(common.OP_PULL, node=node, path=path, timeout=timeout)
 
 
-def available(host=None, port=None):
-    """控制面是否可达（只探端口，不认证）—— 用于 probe 与「诚实报错」文案。"""
+_AVAIL_TTL = float(os.environ.get("FLEET_AVAIL_TTL") or 2.0)
+_avail_cache = {}          # (host, port) -> (at, ok)
+_avail_lk = threading.Lock()
+
+
+def invalidate_available(host=None, port=None):
+    """起停 commander 之后主动清缓存——否则「刚起来」会在 TTL 内仍显示不可达。"""
+    with _avail_lk:
+        if host is None and port is None:
+            _avail_cache.clear()
+        else:
+            _avail_cache.pop((host or default_host(), int(port or default_port())), None)
+
+
+def available(host=None, port=None, ttl=None):
+    """控制面是否可达（只探端口，不认证）—— 用于 probe 与「诚实报错」文案。
+
+    🔴 **必须带缓存**：这个函数被 `device.caps()` 调，而 `Registry.owners()` 会对
+    149 项能力 × 每台设备各调一次 `supports()`（内部即 `caps()`）。真去敲端口时，
+    三台残留节点的 0.4s 连接超时会被放大成 **149 × 1.2s ≈ 3 分钟** —— 实测
+    `python -m fleet list` 因此卡到 timeout 被杀（rc=124）。
+    连接成功与失败都缓存：失败路径最慢，恰恰最需要缓存。
+    """
+    ttl = _AVAIL_TTL if ttl is None else float(ttl)
     h = host or default_host()
     p = int(port or default_port())
+    key = (h, p)
+    now = time.time()
+    if ttl > 0:
+        with _avail_lk:
+            c = _avail_cache.get(key)
+            if c and (now - c[0]) < ttl:
+                return c[1]
     try:
         s = socket.create_connection((h, p), timeout=0.4)
+        s.close()
+        ok = True
     except OSError:
-        return False
-    s.close()
-    return True
+        ok = False
+    with _avail_lk:
+        _avail_cache[key] = (now, ok)
+    return ok
 
 
 if __name__ == "__main__":       # 手工探活用：python -m fleet.ctrl_client
