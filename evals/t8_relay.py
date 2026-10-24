@@ -8,6 +8,7 @@ FleetNode.invoke 当设备层入口。验三件事：
 """
 import os
 import sys
+import json
 import http.server as _hs
 import socketserver as _ss
 import threading as _th
@@ -66,6 +67,87 @@ def _selftest():
     assert not r3.get("ok"), "relay 停了 fetch 必须失败，不应谎报成功"
     assert r3.get("err"), "失败必须带原因，不应静默空"
     print("  [3] 一致性 OK（relay 停 → fetch 失败带原因：%s）" % r3.get("err"))
+
+    # ④ fail-closed：绑非回环却不给 token ⇒ 必须拒绝启动
+    #   （旧行为是照样绑 0.0.0.0 且不校验，等于把本机出口摆在局域网上任人借用）
+    import fleet.skynet_relay as SR
+    lan = SkyNetRelay(host="0.0.0.0", token="")
+    try:
+        lan.start()
+        lan.stop()
+        raise AssertionError("绑 0.0.0.0 且无 token 竟然起成功了（fail-open，应当拒绝）")
+    except ValueError as e:
+        assert "token" in str(e), "拒绝理由要说明是缺 token：%r" % str(e)
+        print("  [4] fail-closed OK（0.0.0.0 无 token 拒绝启动：%s）" % str(e)[:46])
+
+    # ⑤ 鉴权按**来源**判：局域网来源必须带 token，回环来源免 token
+    #   本机没有第二块网卡也能测：直接喂 _handle 一个假连接 + 伪造 peer。
+    class _FakeConn:
+        def __init__(self, payload):
+            self._in = payload
+            self.out = b""
+
+        def settimeout(self, *_a):
+            pass
+
+        def recv(self, _n):
+            d, self._in = self._in, b""
+            return d
+
+        def sendall(self, b):
+            self.out += b
+
+        def close(self):
+            pass
+
+    def _probe(peer, token):
+        req = json.dumps({"type": "task", "id": "z", "kind": "fetch",
+                          "url": target_url, "token": token}).encode("utf-8") + b"\n"
+        c = _FakeConn(req)
+        r2._handle(c, _N(), peer)
+        line = [x for x in c.out.split(b"\n") if x.strip()][0]
+        return json.loads(line.decode("utf-8", "ignore"))
+
+    def _N():
+        from skynet import net as N
+        return N
+
+    tok = SR.new_token()
+    r2 = SkyNetRelay(host="127.0.0.1", token=tok)
+    r2.start()
+    try:
+        a = _probe("192.168.1.50", "")             # LAN 来源 + 无 token → 拒
+        assert not a.get("ok") and "unauthorized" in (a.get("error") or ""), a
+        b = _probe("192.168.1.50", "wrong-token")  # LAN 来源 + 错 token → 拒
+        assert not b.get("ok") and "unauthorized" in (b.get("error") or ""), b
+        c1 = _probe("192.168.1.50", tok)           # LAN 来源 + 对 token → 放行
+        assert c1.get("ok"), "持正确 token 的局域网节点应能借出口：%r" % (c1,)
+        d1 = _probe("127.0.0.1", "")               # 回环来源免 token
+        assert d1.get("ok"), "回环来源（本机/adb reverse）应免 token：%r" % (d1,)
+        print("  [5] 按来源鉴权 OK（LAN 无/错 token 拒、对 token 放行、回环免 token）")
+    finally:
+        r2.stop()
+
+    # ⑥ 回归：盘里存过 host=0.0.0.0 时，随手 get_relay() **不许**静默绑 0.0.0.0
+    import tempfile
+    old_path, old_single = SR.RELAY_STATE_PATH, SR._relay
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"host": "0.0.0.0", "port": 45678, "token": "keep-me"}, f)
+        SR.RELAY_STATE_PATH = tmp
+        SR._relay = None
+        g = SR.get_relay()
+        assert g.host == "127.0.0.1", "get_relay 竟回填了盘里的 0.0.0.0（会静默对外开端口）"
+        assert g.token == "keep-me", "token 应可回填（只对非回环来源生效）"
+        print("  [6] 状态回填 OK（host 只认显式参数，绝不回填 0.0.0.0）")
+    finally:
+        SR.RELAY_STATE_PATH, SR._relay = old_path, old_single
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
     # 收尾：把 relay 重新停干净（已是 stopped）
     relay.stop()

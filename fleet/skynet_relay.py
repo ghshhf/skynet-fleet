@@ -16,8 +16,10 @@
   · 零第三方依赖（stdlib socket/threading/json/base64）。
 """
 import base64
+import hmac
 import json
 import os
+import secrets
 import socket
 import threading
 
@@ -27,6 +29,22 @@ from .netforce_skynet import _ensure_path  # 复用 netforce 定位逻辑
 # 端口与 token（避免端口漂移，且 relay_client/commander 能发现上次起的 relay）。
 RELAY_STATE_PATH = os.path.join(
     os.path.expanduser("~/.fleet"), "relay.json")
+
+# 回环地址：只有它能免 token（本机 / 经 adb reverse 进来的手机在本进程眼里就是回环）。
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def is_loopback(host):
+    """host 是否是回环（含 127.0.0.0/8）。"""
+    h = (host or "").strip().lower()
+    if h in _LOOPBACK:
+        return True
+    return h.startswith("127.")
+
+
+def new_token():
+    """生成一枚 LAN 共享 token（24 字节 ≈ 32 字符 urlsafe）。"""
+    return secrets.token_urlsafe(24)
 
 
 def load_relay_state():
@@ -55,6 +73,11 @@ def save_relay_state(host, port, token=""):
         with open(RELAY_STATE_PATH, "w", encoding="utf-8") as f:
             json.dump({"host": host, "port": port, "token": token or ""},
                       f, ensure_ascii=False)
+        # token 是凭据，别让同机其他用户读得到（Windows 上 chmod 语义有限，尽力而为）
+        try:
+            os.chmod(RELAY_STATE_PATH, 0o600)
+        except OSError:
+            pass
     except OSError:
         pass
 
@@ -86,6 +109,14 @@ class SkyNetRelay:
             self.port = port
         if token is not None:
             self.token = token or ""
+        # 🔴 fail-closed：绑非回环地址（--lan）而没 token ⇒ **不起**，直接抛。
+        # 旧行为是照样绑 0.0.0.0 且不校验 token —— 等于把「本机出口 + 取页能力」
+        # 摆在局域网上任人借用（总纲 P1-11 就是这一条）。宁可不启动，
+        # 也不给一个看起来能用、其实裸奔的端口。
+        if not is_loopback(self.host) and not self.token:
+            raise ValueError(
+                "relay 绑 %s（非回环）必须配 token；否则局域网内任何人都能借本机出口。"
+                "传 token=... 或先调 new_token() 生成一枚。" % (self.host,))
         _ensure_path()                       # 确认 netforce 在，再绑端口
         from skynet import net as N        # noqa: F401（运行期才需要 net 模块）
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -115,12 +146,13 @@ class SkyNetRelay:
     def _accept_loop(self, N):
         while not self._stop.is_set():
             try:
-                conn, _ = self._srv.accept()
+                conn, peer = self._srv.accept()
             except OSError:
                 break
-            threading.Thread(target=self._handle, args=(conn, N), daemon=True).start()
+            threading.Thread(target=self._handle, args=(conn, N, peer[0] if peer else ""),
+                             daemon=True).start()
 
-    def _handle(self, conn, N):
+    def _handle(self, conn, N, peer=""):
         buf = b""
         try:
             conn.settimeout(25.0)
@@ -142,13 +174,22 @@ class SkyNetRelay:
                         continue
                     rid = req.get("id")
                     kind = req.get("kind")
-                    # token 鉴权：仅当本 relay 设了 token（--lan 模式）才校验，
-                    # 没设 token（默认 127.0.0.1）则不拦，保持本机/adb 直连零摩擦。
-                    if self.token and req.get("token") != self.token:
-                        conn.sendall(json.dumps(
-                            {"type": "result", "id": rid, "ok": False,
-                             "error": "unauthorized: token 不匹配"}).encode("utf-8") + b"\n")
-                        continue
+                    # token 鉴权：**按来源判**，不按「设没设 token」判。
+                    #   回环来源（本机进程 / 经 adb reverse 进来的手机，在本进程眼里
+                    #   就是 127.0.0.1）⇒ 免 token，零摩擦；
+                    #   非回环来源（局域网他机）⇒ **一律要 token**。
+                    # 这样即使 relay 绑在 0.0.0.0，LAN 侧也过不了门；
+                    # 而绑回环时 LAN 侧根本连不上（双保险）。
+                    # 用 compare_digest 做常量时间比较，避免按字节猜 token。
+                    if not is_loopback(peer):
+                        got = req.get("token") or ""
+                        if not self.token or not hmac.compare_digest(str(got), str(self.token)):
+                            conn.sendall(json.dumps(
+                                {"type": "result", "id": rid, "ok": False,
+                                 "error": "unauthorized: 局域网来源必须带正确 token"
+                                          "（relay 只借给持 token 的节点）"}
+                            ).encode("utf-8") + b"\n")
+                            continue
                     if kind == "fetch":
                         url = req.get("url", "")
                         try:
@@ -185,13 +226,18 @@ def get_relay(host=None, token=None):
     """单例。host/token 仅在首次创建或显式传入时生效（node_agent --lan 用）。
 
     若首次创建且未显式给 host/token，尝试从持久化状态恢复，避免端口漂移。
+
+    🔴 **不回填 host**：盘里存过 `"host":"0.0.0.0"`（上次开过 --lan），
+    下一次随手 `get_relay()` 就会静默绑 0.0.0.0 —— 等于把对外端口重新打开，
+    而调用方根本没表达这个意图。绑哪个网卡只认**显式参数**，默认永远回环。
+    token 可以回填（只对非回环来源生效，不经 --lan 就等于没用）。
     """
     global _relay
     if _relay is None:
         saved = None
         if host is None and token is None:
             saved = load_relay_state()
-        _host = host or (saved.get("host") if saved else None) or "127.0.0.1"
+        _host = host or "127.0.0.1"
         _token = token if token is not None else ((saved.get("token") if saved else "") or "")
         _relay = SkyNetRelay(host=_host, token=_token)
         if saved and saved.get("port") and host is None:
