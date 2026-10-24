@@ -576,7 +576,32 @@ class _Handler(BaseHTTPRequestHandler):
         obj = {"ok": False, "err": err}
         if extra:
             obj.update(extra)
+        self._drain_body()
         self._json(obj, code)
+
+    def _drain_body(self):
+        """回错误之前先把请求体读掉（只对带 body 的方法，且没读过才读）。
+
+        🔴 为什么必须有它（2026-10-25 门禁偶发红查出来的）：
+        POST 的 401/403 若在**读完 body 之前**就回响应并关连接，客户端还在写，
+        Windows 会直接 RST ⇒ 客户端拿到的是 `ConnectionAbortedError`
+        而不是那条 403。于是「已配对设备被拒」这种断言偶发失败，
+        线上表现更糟：报错根本看不出来，只看到「连接被重置」。
+        """
+        if self.command not in ("POST", "PUT", "PATCH", "DELETE"):
+            return
+        if getattr(self, "_body_used", None) is not None:
+            return                      # 已经读过，再读会阻塞
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        self._body_used = n
+        if n > 0:
+            try:
+                self.rfile.read(n)
+            except OSError:
+                pass
 
     def _read_json(self):
         try:
@@ -584,6 +609,7 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             n = 0
         raw = self.rfile.read(n) if n > 0 else b""
+        self._body_used = n
         if not raw:
             return {}
         try:
@@ -654,9 +680,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path.startswith("/api/"):
-            return self._api_post(path)
-        self._err(404, f"没有这个路径: {path}")
+        try:
+            if path.startswith("/api/"):
+                return self._api_post(path)
+            self._err(404, f"没有这个路径: {path}")
+        finally:
+            # 🔴 兜底：任何没读 body 的 POST 都要在关连接前把 body 吃掉。
+            # 实测（2026-10-25 门禁 1/8 概率红）：`POST /api/pair/state` 直接回 200
+            # 却没读那 2 字节 body ⇒ Windows 直接 RST ⇒ 客户端读到的是
+            # 「连接被重置」，连状态行都没收到。这类假红最难查，因为服务端
+            # 一条日志都没有（响应确实发出去了，只是被 RST 吃掉）。
+            self._drain_body()
 
     def _api_get(self, path):
         # 配对/受控端点走自己的鉴权（会话令牌，不是 GUI 令牌）——

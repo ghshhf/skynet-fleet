@@ -419,6 +419,14 @@ try:
     check(bool(js) and TOKEN not in json.dumps(js, ensure_ascii=False),
           "token 不出现在任何 API 答复里")
 
+    # ---- 带 body 的 POST 到「不读 body 的端点」也必须拿到响应 ----
+    # 实测（2026-10-25，配对门禁 1/8 概率红）：服务端直接回 200 却没读那几字节
+    # body ⇒ Windows 直接 RST ⇒ 客户端连状态行都收不到。这类假红最难查，
+    # 因为服务端确实发了响应（只是被 RST 吃掉，一条日志都没有）。
+    st, js, err = http_json(f"{BASE}/api/pair/state", token=TOKEN,
+                            method="POST", body={"probe": 1})
+    check(st == 200, f"POST 带 body 到不读 body 的端点仍回 200（实际 {st} {err}）")
+
     # ================================================================ ③ 契约
     st, h, err = http_json(f"{BASE}/api/health", token=TOKEN)
     check(st == 200, f"GET /api/health 200（实际 {st} {err}）")
