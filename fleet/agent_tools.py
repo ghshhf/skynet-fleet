@@ -875,6 +875,25 @@ def _render_osint(r, arg):
     return str(d)[:200]
 
 
+def _render_ssh_banner(r, arg):
+    if not r.get("ok"):
+        return "SSH 探测失败：%s" % (r.get("err") or "未知")
+    d = r.get("data") or {}
+    if not d.get("is_ssh"):
+        first = d.get("first_line") or "（没吐任何东西）"
+        return "那个端口开着，但不是 SSH：%s" % first
+    return "确认是 sshd：SSH-%s-%s" % (d.get("proto"), d.get("software"))
+
+
+def _render_mqtt_probe(r, arg):
+    if not r.get("ok"):
+        return "MQTT：%s" % (r.get("err") or "不可用")
+    d = r.get("data") or {}
+    return "MQTT 握手通过（%s:%s，会话=%s）" % (
+        d.get("broker"), d.get("port"),
+        "有" if d.get("session_present") else "新建")
+
+
 def _render_relay(r, arg):
     if not r.get("ok"):
         return "中继：%s" % (r.get("err") or "不可用")
@@ -1191,6 +1210,19 @@ TOOLS = (
          "Shodan 暴露面测绘（需 SHODAN_KEY，仅查自有资产）。"
          "问「我的资产开了哪些端口」选这个。只读；无 key 时如实说不可用。",
          argkey="query", render=_render_osint),
+    # ---- 远程 shell / 物联网总线两条通道（只读那一半才下放；执行/发布留给人叫）----
+    Tool("ssh_banner", "ssh.banner",
+         "SSH 版本探测：连上去读 `SSH-2.0-xxx` 版本行，确认那个端口上跑的是不是 sshd。"
+         "问「这台机器是 SSH 吗」「22 端口开的是不是 ssh」选这个。只读："
+         "端口开着但不吐版本行会如实说「不是 sshd」，不冒充。只连自有/授权机器。",
+         argkey="host", render=_render_ssh_banner),
+
+    Tool("mqtt_probe", "mqtt.probe",
+         "MQTT 真握手：把 CONNACK 返回码翻成人话（通过 / 未授权 / 密码错 / client id 被拒）。"
+         "问「这个 broker 通不通」「IoT 总线能不能进」选这个。只读；"
+         "「有服务但不让你进」和「连不上」会分开说。",
+         argkey="broker", render=_render_mqtt_probe),
+
     # ---- 远程可触达层（L6）----
     Tool("relay_status", "relay.status",
          "家里常开中继现在连着几台手机、各上报了什么能力。问「我的手机在线吗」"

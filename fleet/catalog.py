@@ -24,11 +24,13 @@ from .kinds.internet import Internet
 from .kinds.job_board import JobBoard
 from .kinds.phone_node import PhoneNode
 from .kinds.lan_scanner import LanScanner
+from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.reverse import Reverse
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
+from .kinds.ssh_shell import SshShell
 from .kinds.windows_pc import WindowsPC
 from .transports import get as get_transport
 
@@ -285,6 +287,40 @@ CAPABILITIES = [
                params=(Param("query", "str", True, "查询串，如 hostname:example.com"),
                        Param("limit", "int", doc="最多几条，默认 20")),
                note="只读：无 key 时如实说 unavailable，不假装能查；不可用于未授权目标"),
+    # ---- 远程 shell 通道（D4：把别人的机器当设备管；只连你拥有/获授权的机器）----
+    Capability("ssh.banner", "SSH 版本探测：真读 SSH-2.0 版本行，确认 22 端口上跑的是 sshd",
+               params=(Param("host", "str", True, "主机/IP"),
+                       Param("port", "int", doc="默认 22"),
+                       Param("timeout_ms", "int", doc="默认 1500")),
+               note="只读：端口开着但没吐版本行会如实判 is_ssh=False（不是 sshd），"
+                    "比「连不上」更值钱"),
+    Capability("ssh.exec", "在远程机器上执行命令（系统 ssh 客户端，BatchMode + ConnectTimeout）",
+               params=(Param("host", "str", True, "主机/IP"),
+                       Param("cmd", "str", True, "命令，经 stdin 交给远端 sh -s"),
+                       Param("user", "str"), Param("port", "int"),
+                       Param("timeout", "int", doc="总超时秒，默认 20")),
+               note="动手：不回显 stdout 之外的任何凭据；**不收密码**（argv 里的密码等于公开），"
+                    "只支持密钥/agent。255 = 连不上或认证失败，与「远端命令返回非 0」分开"),
+    # ---- MQTT 通道（D4：物联网总线；broker 地址是参数不是设备属性）----
+    Capability("mqtt.probe", "MQTT 真握手：CONNACK 返回码翻成人话（通过/未授权/密码错…）",
+               params=(Param("broker", "str", True, "broker 地址"),
+                       Param("port", "int", doc="默认 1883"),
+                       Param("user", "str"), Param("pw", "str"),
+                       Param("timeout", "int", doc="默认 5")),
+               note="只读：rc≠0 时判 denied 并说明是「有服务但不让你进」，与「连不上」分开"),
+    Capability("mqtt.pub", "往 MQTT 主题发一条（QoS 0/1；QoS1 必须等到 PUBACK 才算送达）",
+               params=(Param("broker", "str", True), Param("topic", "str", True),
+                       Param("payload", "str"), Param("qos", "int", doc="0 或 1"),
+                       Param("retain", "bool"), Param("port", "int"),
+                       Param("user", "str"), Param("pw", "str")),
+               note="动手：会真的发到 broker。等不到 PUBACK 就报 timeout，绝不说成功"),
+    Capability("mqtt.sub", "订阅 MQTT 主题并收若干条（带回总超时）",
+               params=(Param("broker", "str", True), Param("topic", "str", doc="默认 #"),
+                       Param("count", "int", doc="收几条，默认 1"),
+                       Param("timeout", "int", doc="总超时秒，默认 5"),
+                       Param("port", "int"), Param("user", "str"), Param("pw", "str")),
+               note="只读网络（不改外部）：收不满不算失败，如实回 got/complete；"
+                    "SUBACK=0x80 判 denied"),
     # ---- 逆向拆解层（不拆就没有的数据）----
     Capability("re.ir", "红外捕获拆解：脉冲序列→协议判定（NEC/Samsung/SIRC…）→addr/cmd→码库对照",
                params=(Param("capture", "any", True, "微秒 list、Flipper .ir/.sub 文本"),
@@ -796,6 +832,9 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(AudioSynth())
     reg.add(JobBoard())
     reg.add(PhoneNode())
+    # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
+    reg.add(SshShell())
+    reg.add(MqttBus())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:

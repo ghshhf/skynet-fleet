@@ -261,6 +261,12 @@ CASES = [
     # 同时钉三类失败可分辨（密码错/未知 op/节点离线）与「能力申报必须诚实」
     # （缺 FLEET_PASS 就整条不申报，不长假按钮）。全离线，只在本机随机端口跑。
     ("eval_t34_d1_control", ["evals/t34_d1_control.py"], HERE, 180),
+    # T35：两条通道真伪（ssh / mqtt，总纲「C 档 5 条通道」收口）。不 mock 协议：
+    # 门禁里现起一个真 MQTT broker（独立实现，不复用被测模块的编解码），
+    # 真投递 pub→sub 且 payload 原样到；QoS1 等不到 PUBACK 必须报 timeout；
+    # 密码错 ⇒ denied 且说清「有服务不让你进」。SSH 侧：假 sshd 吐真版本行、
+    # 普通 TCP 服务必须判 is_ssh=False（不冒充）、给密码 ⇒ denied（argv 里的密码等于公开）。
+    ("eval_t35_channels", ["evals/t35_channels.py"], HERE, 180),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
