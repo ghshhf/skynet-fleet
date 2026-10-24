@@ -147,12 +147,18 @@ class ControlClient:
         return self.request(common.OP_EXEC, node=node, cmd=cmd, timeout=timeout)
 
     def push(self, node, path, data_b64, timeout=None):
-        """把 base64 内容写到节点上的 path。"""
+        """把 base64 内容写到节点上的 path。
+
+        ⚠️ 节点侧会**沙箱化**：只取你给的 basename，落到它的沙箱目录里，
+        目录部分被丢弃。所以返回的 `path` 才是**真实落盘路径**，
+        别拿你自己传的路径去找文件（2026-10-25 实测踩过：传 tmp\\a.txt，
+        回 ok，去 tmp 看是空的，文件在 sandbox_node\\a.txt）。
+        """
         return self.request(common.OP_PUSH, node=node, path=path,
                             data=data_b64, timeout=timeout)
 
     def pull(self, node, path, timeout=None):
-        """从节点上读 path 的 base64 内容。"""
+        """从节点上读 path 的 base64 内容（同样只认沙箱里的 basename）。"""
         return self.request(common.OP_PULL, node=node, path=path, timeout=timeout)
 
 

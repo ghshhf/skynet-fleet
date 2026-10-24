@@ -23,8 +23,10 @@
 全离线：只在本机 127.0.0.1 随机端口跑；不碰真编队、不连外网。
 """
 import base64
+import json
 import os
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -169,6 +171,60 @@ def main():
         f = cli.pull("N1", "/tmp/x.bin")
         check(base64.b64decode(f.get("data") or "") == b"hello-from-node",
               "pull 拿回节点真实内容")
+
+        # -------- ①b 沙箱写读：直接打真函数，不经模拟节点
+        # 2026-10-25 真实事故：传 D:\...\tmp\a.txt，push 回 ok=True，
+        # 去 tmp 看是空的 —— 文件其实在 sandbox_node\a.txt，但没人告诉调用方。
+        # 「成功了但找不到」比失败更难查，所以钉死：push 必须回真实落盘路径。
+        import node_agent as NA
+
+        class _FakeSock(object):
+            """只收 sendall：_do_push/_do_pull 只发一帧就结束。"""
+            def __init__(self):
+                self.frames = []
+
+            def sendall(self, b):
+                self.frames.append(b)
+
+        def _last(sock):
+            frame = sock.frames[-1]
+            n = struct.unpack(">I", frame[:4])[0]
+            return json.loads(frame[4:4 + n].decode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as sbx:
+            fake = _FakeSock()
+            # 故意给一个「目录很明确」的路径：看它会不会静默改写
+            want = os.path.join(sbx, "不该出现的目录", "a.txt")
+            NA._do_push(fake, {"id": "p1", "path": want,
+                               "data": base64.b64encode(b"hello").decode()}, sbx)
+            got = _last(fake)
+            rp = got.get("path") or ""
+            check(got.get("ok") is True, "push 报成功")
+            check(got.get("bytes") == 5,
+                  "push 回真实字节数（实得 %r）" % (got.get("bytes"),))
+            check(bool(rp) and os.path.isabs(rp),
+                  "push 必须回**绝对**落盘路径（实得 %r）" % (rp,))
+            check(os.path.basename(rp) == "a.txt",
+                  "文件名保留（实得 %r）" % (os.path.basename(rp),))
+            check(os.path.dirname(os.path.abspath(rp)) == os.path.abspath(sbx),
+                  "目录被沙箱化（实际父目录 %r）" % (os.path.dirname(os.path.abspath(rp)),))
+            check(os.path.exists(rp), "它回的那个路径**真的存在**（不是编个字符串交差）")
+
+            fake2 = _FakeSock()
+            NA._do_pull(fake2, {"id": "p2", "path": want}, sbx)
+            g2 = _last(fake2)
+            check(g2.get("ok") is True, "pull 能从沙箱取回（同一个 basename）")
+            check(base64.b64decode(g2.get("data") or "") == b"hello",
+                  "pull 内容与 push 进去的一致")
+            check(g2.get("bytes") == 5,
+                  "pull 回字节数（实得 %r）" % (g2.get("bytes"),))
+
+            fake3 = _FakeSock()
+            NA._do_pull(fake3, {"id": "p3", "path": os.path.join(sbx, "nope.txt")}, sbx)
+            g3 = _last(fake3)
+            check(g3.get("ok") is False, "沙箱里没有的文件 ⇒ 失败，不许返回空当成功")
+            check("沙箱" in (g3.get("err") or ""),
+                  "失败原因里说清沙箱在哪（实得 %r）" % (g3.get("err"),))
 
         # -------- ② 失败要能分辨
         bad = CC.ControlClient(host="127.0.0.1", port=port, password="wrong")
