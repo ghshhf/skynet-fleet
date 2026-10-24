@@ -109,6 +109,9 @@ public class MainActivity extends Activity {
     private final ExecutorService urgent = Executors.newFixedThreadPool(2);
 
     private MediaPlayer player;
+    // 本地推理引擎（内嵌 libfleet_llm.so）。懒加载：第一次本地对话才 new，
+    // 避免 .so 缺失的旧包在类加载期就崩。
+    private LlmEngine llm;
     // 系统语音（本地合成）。null = 还没起或起不来；起不来时 speakerWhy 里有原因。
     private Speaker speaker;
     private String speakerWhy = "";
@@ -689,21 +692,87 @@ public class MainActivity extends Activity {
                     }
                 };
 
-        // 本地模式：直接打手机自带的 llama-server，不碰电脑、不联网。
-        // 开着就彻底离线，断网也能聊——这是「手机下好模型却调不动」的修法。
+        // 本地模式：手机内嵌引擎（libfleet_llm.so）直接跑，模型来自 App 自己的
+        // 模型目录（ModelManager 管，App 内下载），不碰电脑、不联网、不依赖 Termux。
+        // 这是「手机下好模型却调不动」的真正修法——引擎和模型都在 App 里。
         final boolean local = Prefs.localMode(MainActivity.this);
         worker.execute(new Runnable() {
             @Override
             public void run() {
                 if (local) {
-                    Net.chatLocal(Prefs.localBase(MainActivity.this), "local",
-                            asked, snapshotHistory(), cb);
+                    runLocal(cb, asked);
                 } else {
                     Net.chat(base, auth, asked, backend, snapshotHistory(), cb, webMode);
                 }
             }
         });
     }
+
+    /**
+     * 本地推理：在 worker 线程里装载（按需）+ 生成。
+     *
+     * 失败一律在 UI 上说人话并通过 cb.onError 回主链路，不吞不谎报：
+     *   · 没下模型 → 指向「模型库」App 内下载；
+     *   · 装模型失败 → 给底层原因；
+     *   · 生成报错 → 透传。
+     */
+    private void runLocal(final Net.SseCallback cb, final String asked) {
+        // 选一个能聊的模型（KIND_LLM / KIND_VL）；没有就请人去模型库下。
+        final ModelManager.Spec m = ModelManager.currentLlm(MainActivity.this);
+        if (m == null) {
+            ui.post(new Runnable() {
+                @Override
+                public void run() {
+                    setBusy(false);
+                    streaming = null;
+                    orb.setState(OrbView.IDLE);
+                    say2("没有本地模型：去「模型库」下一个（App 内下载，不靠电脑）");
+                    ModelManager.showMissingDialog(MainActivity.this);
+                }
+            });
+            return;
+        }
+        final String modelPath = ModelManager.fileOf(MainActivity.this, m).getAbsolutePath();
+        if (llm == null) { llm = new LlmEngine(); }
+        if (!llm.isReady()) {
+            final int threads = Math.max(1, Math.min(6,
+                    Runtime.getRuntime().availableProcessors() / 2));
+            if (!llm.load(modelPath, 4096, threads)) {
+                final String err = llm.lastError;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        streaming = null;
+                        orb.setState(OrbView.IDLE);
+                        say2("本地模型装不进：" + err);
+                    }
+                });
+                return;
+            }
+        }
+        // 把历史 + 本轮拼成 messages JSON，交给内嵌引擎（它按模型自带 chat 模板渲染）。
+        final org.json.JSONArray arr = snapshotHistory();
+        try {
+            arr.put(new org.json.JSONObject().put("role", "user").put("content", asked));
+        } catch (org.json.JSONException ignored) { }
+        llm.generate(arr.toString(), new LlmEngine.TokenListener() {
+            @Override
+            public void onToken(final String text) {
+                // 直接借 cb.onLine 走原流式逻辑（更新气泡、累加 acc）
+                cb.onLine(text);
+            }
+            @Override
+            public void onDone() {
+                cb.onDone();
+            }
+            @Override
+            public void onError(final String msg) {
+                cb.onError(msg);
+            }
+        });
+    }
+
 
     /** 在回答末尾附上这一轮参考过的网页。
      *
@@ -1758,30 +1827,33 @@ public class MainActivity extends Activity {
         eBackend.setTextSize(13);
         box.addView(eBackend);
 
-        // ---- ③·b 本地模型（MCB）：手机自己跑，不连电脑、不联网 ----
-        // 开之前必须先在 Termux 里把 llama-server 起起来，否则对话会直接报错带「怎么救」。
+        // ---- ③·b 本地模型（MCB）：手机内嵌引擎原地跑，不连电脑、不联网、不依赖 Termux ----
+        // 引擎（libfleet_llm.so）已打进 App；模型由 ModelManager 管（App 内下载，
+        // 放在 App 自己的私有目录）。打开开关即用，没有模型时 App 会领去「模型库」下载。
         final Switch swLocal = new Switch(this);
-        swLocal.setText("本地模型模式（不连电脑、不联网）");
+        swLocal.setText("本地模型模式（不连电脑、不联网、不依赖外部软件）");
         swLocal.setTextSize(13);
         swLocal.setChecked(Prefs.localMode(this));
         swLocal.setPadding(0, dp(10), 0, dp(2));
         box.addView(swLocal);
 
-        final EditText eLocalBase = new EditText(this);
-        eLocalBase.setHint("本地模型地址，默认 http://127.0.0.1:8080");
-        eLocalBase.setText(Prefs.localBase(this));
-        eLocalBase.setTextSize(13);
-        box.addView(eLocalBase);
+        final TextView localModelInfo = new TextView(this);
+        localModelInfo.setTextSize(12);
+        localModelInfo.setPadding(0, dp(2), 0, dp(2));
+        ModelManager.Spec lm = ModelManager.currentLlm(this);
+        localModelInfo.setText(lm == null
+                ? "当前没有本地聊天模型 → 打开开关后会让你去「模型库」下载（App 内，走手机代理直连 Hugging Face）"
+                : "将使用本地模型：" + lm.label + "\n（模型在 App 私有目录，引擎已内嵌，无需 Termux）");
+        localModelInfo.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
+        box.addView(localModelInfo);
 
         final TextView localTip = new TextView(this);
         localTip.setTextSize(11);
         localTip.setPadding(0, dp(2), 0, 0);
         localTip.setTextColor(getResources().getColor(R.color.text_dim, getTheme()));
-        localTip.setText("开之前：Termux 里先起 llama-server\n"
-                + "  llama-server -m /sdcard/Download/本地模型/\n"
-                + "    Qwen3VL-4B-Instruct-Q4_K_M.gguf \\\n"
-                + "    --host 127.0.0.1 --port 8080 --alias local\n"
-                + "然后打开上面开关即可。4B 模型纯 CPU 约 6~7 tok/s。");
+        localTip.setText("开之前只要确保「模型库」里下好一个 LLM/VL 模型\n"
+                + "（推荐 Qwen3-1.7B-Q8，约 30 tok/s；4B 纯 CPU 约 6~7 tok/s）。\n"
+                + "打开开关后断网也能聊。");
         box.addView(localTip);
 
         // ---- ④ 老令牌：只当兜底 ----
@@ -1815,7 +1887,6 @@ public class MainActivity extends Activity {
                                 eToken.getText().toString(),
                                 eBackend.getText().toString());
                         Prefs.setLocalMode(MainActivity.this, swLocal.isChecked());
-                        Prefs.setLocalBase(MainActivity.this, eLocalBase.getText().toString());
                         toast(swLocal.isChecked()
                                 ? "已切到本地模型（不连电脑）。开聊前确认 Termux 里 llama-server 已起。"
                                 : "已切回电脑模式。");
@@ -1830,7 +1901,6 @@ public class MainActivity extends Activity {
                                 eToken.getText().toString(),
                                 eBackend.getText().toString());
                         Prefs.setLocalMode(MainActivity.this, swLocal.isChecked());
-                        Prefs.setLocalBase(MainActivity.this, eLocalBase.getText().toString());
                         showPairDialog();
                     }
                 })

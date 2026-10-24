@@ -26,17 +26,10 @@ public final class Prefs {
     private static final String K_DEV_SEC = "device_secret";
     private static final String K_DEV_NAME = "device_name";
     private static final String K_LOCAL = "local_mode";
-    private static final String K_LOCAL_BASE = "local_base";
 
     public static final String DEFAULT_BASE = "http://127.0.0.1:8000";
     /** 已拍板的默认：pollinations（免 key、不挑机器）。 */
     public static final String DEFAULT_BACKEND = "pollinations";
-    /**
-     * 本地模型（MCB）默认打手机自己的 llama-server。Termux 里起一个
-     * `llama-server -m ... --host 127.0.0.1 --port 8080` 就能用，
-     * OpenAI 兼容，端口照这个走。
-     */
-    public static final String DEFAULT_LOCAL = "http://127.0.0.1:8080";
 
     private Prefs() { }
 
@@ -116,25 +109,13 @@ public final class Prefs {
 
     // ---------------- 本地模型（MCB）：手机自己跑，不连电脑 ----------------
 
-    /** 是否走本地模型：默认关，开着就完全不打电脑、不联网。 */
+    /** 是否走本地模型：默认关，开着就完全不打电脑、不联网。
+     *  引擎内嵌在 App（libfleet_llm.so），模型由 ModelManager 管（App 内下载）。 */
     public static boolean localMode(Context c) {
         return sp(c).getBoolean(K_LOCAL, false);
     }
 
-    /** 本地模型地址，默认 DEFAULT_LOCAL（手机自带 llama-server 的 8080）。 */
-    public static String localBase(Context c) {
-        String v = sp(c).getString(K_LOCAL_BASE, DEFAULT_LOCAL);
-        if (v == null || v.trim().isEmpty()) { return DEFAULT_LOCAL; }
-        v = v.trim();
-        while (v.endsWith("/")) { v = v.substring(0, v.length() - 1); }
-        return v;
-    }
-
     public static void setLocalMode(Context c, boolean on) {
         sp(c).edit().putBoolean(K_LOCAL, on).apply();
-    }
-
-    public static void setLocalBase(Context c, String base) {
-        sp(c).edit().putString(K_LOCAL_BASE, base == null ? "" : base.trim()).apply();
     }
 }

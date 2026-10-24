@@ -91,6 +91,15 @@ public final class ModelManager {
             SdBridge.SAMPLE_LCM, 1.0f, 1024, 1, 2, 4);
 
     // ---- 4B 级 LLM / VL：本轮回只管下载/摆放/登记，真跑 LLM 对话见下一轮 ----
+    /** 手机本地对话首选：1.7B-Q8 约 30 tok/s、读资料/决策准确率 6/6 零编造。
+     *  比 4B 快 4~5 倍，比 0.6B 准，团队已拍板为默认。 */
+    public static final Spec QWEN3_1_7B = new Spec(
+            "qwen3-1.7b-instruct-q8_0.gguf",
+            "Qwen3-1.7B-Instruct（1.7B，手机对话首选 ≈30 tok/s）",
+            "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF"
+                    + "/resolve/main/Qwen3-1.7B-Instruct-Q8_0.gguf",
+            KIND_LLM, 0L, -1, 0f, -1, 0, 0, 0);
+
     public static final Spec QWEN25_4B = new Spec(
             "qwen2.5-4b-instruct-q4_k_m.gguf",
             "Qwen2.5-4B-Instruct（4B LLM）",
@@ -127,7 +136,7 @@ public final class ModelManager {
             KIND_VL, 0L, -1, 0f, -1, 0, 0, 0);
 
     private static final Spec[] SPECS = { SD15, SD21_TURBO, SDXL_TURBO,
-            QWEN25_4B, GEMMA2_4B, BEIJIXING_V7, QWEN3VL_4B, MMPROJ_QWEN3VL };
+            QWEN3_1_7B, QWEN25_4B, GEMMA2_4B, BEIJIXING_V7, QWEN3VL_4B, MMPROJ_QWEN3VL };
 
     /** 全量模型档（出图 + LLM/VL），供「模型库」界面列出与下载。 */
     public static Spec[] allSpecs() { return SPECS; }
@@ -220,6 +229,31 @@ public final class ModelManager {
             if (s == SD21_TURBO) return s;
         }
         return av.get(0);
+    }
+
+    /** 已下完的 LLM / VL 模型（能拿来聊天的）。 */
+    public static List<Spec> availableLlmVl(Context ctx) {
+        List<Spec> out = new ArrayList<Spec>();
+        for (Spec s : SPECS) {
+            if (!KIND_LLM.equals(s.kind) && !KIND_VL.equals(s.kind)) continue;
+            File f = fileOf(ctx, s);
+            if (f.isFile() && f.length() >= MIN_BYTES) out.add(s);
+        }
+        Log.i(TAG, "可用聊天模型 " + out.size() + " 个");
+        return out;
+    }
+
+    /**
+     * 选一个能本地聊的模型：优先 1.7B（团队默认、最快最稳），否则任意 LLM/VL。
+     * 一个都没有返回 null —— 调用方据此把人领去「模型库」App 内下载。
+     */
+    public static Spec currentLlm(Context ctx) {
+        Spec fallback = null;
+        for (Spec s : availableLlmVl(ctx)) {
+            if (s == QWEN3_1_7B) return s;
+            if (fallback == null) fallback = s;
+        }
+        return fallback;
     }
 
     public static void choose(Context ctx, Spec s) {

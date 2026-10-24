@@ -149,7 +149,7 @@ echo "[4/5] classes.dex 已合入"
 # 不在这一步现场编（NDK 全套编一遍要几分钟，且大多数改动跟 native 无关），
 # 用 jni/build*/libfleet_*.so 这些已经 strip 过的产物。
 # 要重编：bash jni/build.sh（语音） / bash jni/build-sd.sh（出图）
-for SO in "$HERE/jni/build/libfleet_whisper.so" "$HERE/jni/build-sd/libfleet_sd.so"; do
+for SO in "$HERE/jni/build/libfleet_whisper.so" "$HERE/jni/build-sd/libfleet_sd.so" "$HERE/jni/build-llm/libfleet_llm.so"; do
   if [ -f "$SO" ]; then
     PY="${PY:-/d/tools/python/python.exe}"
     "$PY" - "$HERE/build/base.apk" "$SO" <<'PYEOF'

@@ -83,3 +83,30 @@ target_compile_options(fleet_sd PRIVATE -O3 -fvisibility=hidden -ffunction-secti
 target_link_options(fleet_sd PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL)
 
 endif()  # SD_DIR
+
+# ---------------------------------------------------------------- llama (本地 LLM 对话)
+# 和 whisper 同路：把 llama.cpp 全部源码静态链进单个 .so，Java 侧只有一行
+# loadLibrary，没有 .so 依赖顺序问题。
+# LLAMA_DIR 由 build-llm.sh 传入（llama.cpp 源码目录，含 build-static 产出的 .a）。
+
+if(DEFINED LLAMA_DIR)
+
+add_library(fleet_llm SHARED llm_jni.cpp)
+
+target_include_directories(fleet_llm PRIVATE
+    "${LLAMA_DIR}/include"
+    "${LLAMA_DIR}/ggml/include")
+
+# 链接顺序有讲究：被依赖的放后面（llama → ggml → ggml-cpu → ggml-base）
+target_link_libraries(fleet_llm PRIVATE
+    "${LLAMA_DIR}/build-static/src/libllama.a"
+    "${LLAMA_DIR}/build-static/ggml/src/libggml.a"
+    "${LLAMA_DIR}/build-static/ggml/src/libggml-cpu.a"
+    "${LLAMA_DIR}/build-static/ggml/src/libggml-base.a"
+    android
+    log)
+
+target_compile_options(fleet_llm PRIVATE -O3 -fvisibility=hidden -ffunction-sections -fdata-sections)
+target_link_options(fleet_llm PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL)
+
+endif()  # LLAMA_DIR
