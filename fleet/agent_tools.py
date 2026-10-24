@@ -736,6 +736,47 @@ def _render_life_sentinel(r, arg):
     return "生活哨兵告警：" + "；".join(flags)
 
 
+def _render_prox_estimate(r, arg):
+    if not r.get("ok"):
+        return f"估距失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    targets = d.get("targets") or []
+    if not targets:
+        return "周边没扫到 AP"
+    lines = ["周边 AP 距离（区间，近的在前）："]
+    for t in targets[:10]:
+        name = t.get("ssid") or "(隐藏)"
+        lines.append(f"  {name} {t.get('rssi')}dBm → {t.get('text')}")
+    if not d.get("calibrated"):
+        lines.append("（未校准：默认经验参数。拿已知距离样本跑 proximity.calibrate 可更准）")
+    return "\n".join(lines)
+
+
+def _render_prox_track(r, arg):
+    if not r.get("ok"):
+        return f"跟踪失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    lines_ = d.get("lines") or []
+    if not lines_:
+        return "跟踪期内没采到 AP"
+    head = f"热冷跟踪 {d.get('seconds')}s / {d.get('target_count')} 个目标："
+    return head + "\n" + "\n".join("  " + ln for ln in lines_[:8])
+
+
+def _render_prox_calib(r, arg):
+    if not r.get("ok"):
+        return f"校准失败：{r.get('err') or '未知'}"
+    d = r.get("data") or {}
+    if d.get("added"):
+        return (f"已记录一条样本（{d.get('samples_total')} 条）。"
+                f"再记几条不同距离的，然后 calibrate run 出参数")
+    if "a" in d:
+        warn = "" if d.get("r2", 0) >= 0.8 else "（R²<0.8：样本可能有问题，参数仅供参考）"
+        return (f"校准完成：A={d['a']}dBm n={d['n']}（R²={d['r2']}，"
+                f"{d.get('samples')} 条样本）{warn}")
+    return "校准：无有效输出"
+
+
 def _render_net_dissect(r, arg):
     if not r.get("ok"):
         return f"流量解剖失败：{r.get('err') or '未知'}"
@@ -1020,6 +1061,24 @@ TOOLS = (
          "生活哨兵：对比基线，报告显著偏离（如「今晚房间持续很暗」）。"
          "问「生活流有异常吗」选这个。只读，只看可观测偏离。",
          render=_render_life_sentinel),
+
+    # ---- 距离感知（P0：从「只能报方向」到「米数 + 靠近/远离」）----
+    Tool("proximity_estimate", "proximity.estimate",
+         "估距：扫周边 AP，报每个的距离区间（如「3~8 米」），近的在前。"
+         "问「那个路由器离我多远」「这信号算近吗」选这个。只读。"
+         "报的是区间不是精确米数——室内多径让单点误差可达一倍，这是物理限制。",
+         render=_render_prox_estimate),
+
+    Tool("proximity_track", "proximity.track",
+         "热冷跟踪：拿着手机边走边采几十秒，报「正在靠近/正在远离」+ 当前距离区间。"
+         "问「我是在走近还是走远」「帮我找信号最强的方向」选这个。只读。"
+         "整段净变化 ≥2dBm 才判趋势，防抖。",
+         render=_render_prox_track),
+
+    Tool("proximity_calibrate", "proximity.calibrate",
+         "距离校准：拿已知距离（如贴着路由器 1 米）记样本，回归出本机 A/n 参数。"
+         "之后估距更准。问「校准一下距离」选这个。只读+落 ~/.fleet/。",
+         render=_render_prox_calib),
 
     Tool("net_dissect", "net.dissect",
          "流量解剖：抓一段本机流量，抽对话对/协议占比/明文凭据告警。"

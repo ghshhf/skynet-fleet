@@ -14,8 +14,9 @@ import phone_ops as O
 import phone_state as PS
 import radio as RADIO
 import thermal as THERMAL
-from .. import creative
 from .. import acquire
+from .. import creative
+from .. import proximity
 from ..core import BaseDevice, DeviceResult as R
 
 KEYMAP = {"back": 4, "home": 3, "enter": 66, "menu": 82, "power": 26,
@@ -71,7 +72,11 @@ class AndroidPhone(BaseDevice):
                 # phone.sense/phone.see 是「读 + 拍」，只读不改；life.* 是生活流聚合（本地簿记）。
                 # 都不标 side_effect：拍照/传感是采集不是动作；落本地日志不改设备状态。
                 "phone.sense", "phone.see",
-                "life.log", "life.digest", "life.sentinel")
+                "life.log", "life.digest", "life.sentinel",
+                # ---- 距离感知（P0；手机能力升级计划书 2026-10-24）----
+                # proximity.* 把「只能报方向」升级成「米数 + 靠近/远离 + 轨迹」。
+                # 纯读：扫描/传感采集，落校准文件在 ~/.fleet/，不改设备状态。
+                "proximity.estimate", "proximity.track", "proximity.calibrate")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -310,5 +315,70 @@ class AndroidPhone(BaseDevice):
         if cap == "life.sentinel":
             return acquire.life_sentinel(
                 baseline_frames=int(args.get("baseline_frames") or 20))
+
+        # ---- 距离感知（P0）----
+        if cap == "proximity.estimate":
+            r = RADIO.wifi_survey(s, rounds=int(args.get("rounds") or 1))
+            if not r.get("ok"):
+                return R.unavailable(cap, r.get("err") or "WiFi 扫描失败",
+                                     device=self.name, via=self.via)
+            est = proximity.estimate_aps(r["aps"])
+            return R.success(cap, self.name, via=self.via, data={
+                "count": len(est), "targets": est,
+                "calibrated": bool(proximity.load_calib()),
+                "note": "距离是区间不是单点（多径 ±6dBm → 误差可达一倍，物理限制）"
+                         if proximity.load_calib() else
+                         "距离是区间不是单点；未校准（默认参数），拿已知距离样本跑 "
+                         "proximity.calibrate 可标定",
+                "text": "\n".join(
+                    f"{t['ssid'] or t['bssid']}（{t['bssid']}）{t['rssi']}dBm "
+                    f"→ {t['text']}" for t in est[:12])})
+
+        if cap == "proximity.track":
+            seconds = float(args.get("seconds") or 30)
+            interval = float(args.get("interval") or 1.5)
+            targets = args.get("targets") or None
+            res = proximity.track(proximity.ap_sampler(s), seconds=seconds,
+                                  interval=interval, targets=targets)
+            if not res:
+                return R.unavailable(cap, "跟踪期内没采到任何 AP",
+                                     device=self.name, via=self.via)
+            lines = proximity.track_report(res)
+            return R.success(cap, self.name, via=self.via, data={
+                "seconds": seconds, "target_count": len(res),
+                "lines": lines,
+                "note": "趋势看整段净变化；采样间隔别低于 1s（WiFi 扫描本身 4-6 秒一回合）",
+                "text": "\n".join(lines)})
+
+        if cap == "proximity.calibrate":
+            mode = (args.get("mode") or "run").strip()
+            if mode == "add":
+                dist = args.get("dist_m")
+                rssi = args.get("rssi")
+                if dist is None or rssi is None:
+                    return R.error(cap, "缺参数：add 模式要 dist_m（已知距离，米）",
+                                   device=self.name, via=self.via)
+                band = (args.get("band") or "2.4G").strip()
+                proximity.add_calib_sample(float(dist), int(rssi), band=band,
+                                           bssid=(args.get("bssid") or ""))
+                n = len(proximity.read_calib_samples())
+                return R.success(cap, self.name, via=self.via, data={
+                    "added": True, "samples_total": n,
+                    "note": f"已记录（{band} {rssi}dBm @ {dist}m）；"
+                            f"样本共 {n} 条，够 2 个不同距离就能 calibrate"})
+            # 默认 run：从样本文件跑回归
+            band = (args.get("band") or "2.4G").strip()
+            c = proximity.calibrate_from_file(band=band)
+            if not c.get("ok"):
+                return R.unavailable(cap, c.get("err") or "校准失败",
+                                     device=self.name, via=self.via)
+            saved = proximity.save_calib({"a_24": c["a"], "a_5": c["a"] - 7.0,
+                                          "n": c["n"], "band": band,
+                                          "r2": c["r2"], "samples": c["samples"]})
+            return R.success(cap, self.name, via=self.via, data={
+                **c, "saved": saved,
+                "note": "5G 的 A 按比 2.4G 低 7dBm 折算（未分频段校准时先这么用）"
+                        if c.get("r2", 0) >= 0.8 else
+                        "R²<0.8：拟合差，先查样本（距离记错/中途换位置）再谈标定"})
 
         return super().invoke(cap, args)
