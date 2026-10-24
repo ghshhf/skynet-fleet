@@ -68,6 +68,10 @@ def candidates(ctx, now=None, window=DEFAULT_WINDOW, k=3,
         row["age"] = now - it["ts"]
         row["when"] = human_age(it["ts"], now)
         row["score"] = -abs(row["age"] - prefer_age)
+        # 证据分级：账本里的原文 ⇒ historical-reference（外部已知，需复核）。
+        # 模型照抄就是原文；它要是自己发挥了，那句话就是 analyst-inference——
+        # 这个标让「哪句是库里的、哪句是它编的」在数据结构上可分
+        row["authority"] = "historical-reference"
         out.append(row)
     out.sort(key=lambda r: (r["score"], r["ts"]), reverse=True)
     return out[:k]
@@ -110,12 +114,19 @@ def mark_recalled(st, ctx, items, now=None, dedupe_days=DEFAULT_DEDUPE_DAYS):
 
 
 def prompt_hint(items):
-    """给模型的提示片段：原文照抄，不许它自己编往事。"""
+    """给模型的提示片段：原文照抄，不许它自己编往事。
+
+    2026-10-24 起每条往事带 authority 标（historical-reference = 账本原文）。
+    模板句里写明这条规矩：模型**照抄** ⇒ 仍是原文标；它**润色/发挥** ⇒
+    那句话就变成了 analyst-inference（我们猜的），引用前先想清楚。
+    """
     if not items:
         return ""
     lines = ["你记得的往事（来自共享记忆，只能引用，不要编造）："]
     for it in items:
         lines.append(f"- {it['when']}：{it['val']}")
+    lines.append("（以上为账本原文[historical-reference]；你的转述若偏离原文，"
+                 "即降级为推断[analyst-inference]，不要当成事实说）")
     return "\n".join(lines)
 
 
