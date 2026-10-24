@@ -29,11 +29,9 @@
         "tool_filter": [
           "ai.chat",
           "ai.complete",
-          "shell.exec",
           "host.apps",
           "pcctl.text",
           "pcctl.proc.list",
-          "file.pull",
           "state.read",
           "tree.read"
         ],

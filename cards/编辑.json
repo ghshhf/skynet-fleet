@@ -29,7 +29,6 @@
         "tool_filter": [
           "ai.chat",
           "ai.complete",
-          "file.pull",
           "host.apps",
           "state.read",
           "tree.read"
