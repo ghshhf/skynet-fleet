@@ -196,8 +196,9 @@ class RelayServer:
                     with self._lk:
                         if did in self._sessions:
                             self._sessions[did]["last_seen"] = time.time()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[remote-link] 会话主循环异常：{type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
         finally:
             try:
                 conn.close()
@@ -324,14 +325,21 @@ class PhoneClient:
         return self
 
     def run(self):
+        """后台常驻（断线自动重连）。要前台阻塞用 run()。"""
+        fails = 0
         while not self._stop.is_set():
             try:
                 self._connect_once()
-            except Exception:
-                pass
+                fails = 0  # 走到这里说明连接曾被建立并随后断开，重置计数
+            except Exception as e:
+                if self._stop.is_set():
+                    break
+                fails += 1
+                print(f"[remote-link] 反连 {self.host}:{self.port} 第 {fails} 次失败："
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
             if self._stop.is_set():
                 break
-            time.sleep(3)          # 重连退避
+            self._stop.wait(3)     # 重连退避；stop 时立即唤醒（不再死等 3 秒）
 
     def stop(self):
         self._stop.set()
