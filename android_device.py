@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 
 ANDROID_HOME = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
 # 🔴 跨机死路径家族（2026-10-24 与 netrunner 同一批修）：原候选只有
@@ -588,6 +589,103 @@ def bridge_token():
     return ""
 
 
+_TOKEN_CACHE = {}
+
+
+def bridge_token_candidates(serial):
+    """按可信度排好序的候选令牌：文件里的在前，从**已安装 APK** 里捞的在后。
+
+    🔴 为什么要有这道兜底（2026-10-25 真踩）
+      `android_bridge/build/` 被清掉、`android_bridge/.token` 也没了之后，
+      `bridge_token()` 返回空串，所有动作当场报「无障碍桥不可用」——
+      **桥明明活着，只是我们手里没钥匙**，可错误信息把责任全推给了设备。
+      更阴的是接着跑 `build.sh` 会**新生成**一枚令牌，装上去就是「同一台手机
+      两把钥匙」，线上那台再也连不上。
+
+      已安装的 APK 才是唯一权威：它认哪枚，我们就用哪枚。所以令牌丢了就回到
+      APK 里捞——dex 里那串 24 位十六进制原文就在那儿，不需要重编、不需要重装。
+    """
+    out = []
+    t = bridge_token()
+    if t:
+        out.append(t)
+    pkg = BRIDGE_SVC.split("/")[0]
+    key = (serial or "", pkg)
+    if key in _TOKEN_CACHE:
+        out.extend(x for x in _TOKEN_CACHE[key] if x not in out)
+        return out
+    cands = bridge_tokens_in_apk(serial)
+    _TOKEN_CACHE[key] = cands
+    out.extend(x for x in cands if x not in out)
+    return out
+
+
+def bridge_tokens_in_apk(serial):
+    """从**已安装**的 APK 里把 24 位令牌候选捞出来（dex 里的原文）。
+
+    两处坑，都踩过：
+      ① 不能 `exec-out cat` 到管道里再读——Windows 上 20 KB 的包会被截到
+         20120 字节，dex 尾部的字符串直接丢，扫出来是空的（静默假失败）。
+         所以先落到临时文件，再在本地解，字节数才对得上。
+      ② APK 里的 dex 是**压缩**存放的，直接在包字节里搜是搜不到的，
+         必须先 `zipfile` 解出 `classes*.dex` 再扫。
+    """
+    pkg = BRIDGE_SVC.split("/")[0]
+    rc, txt = shell(serial, f"pm path {pkg}", timeout=10)
+    path = ""
+    for line in (txt or "").splitlines():
+        if line.startswith("package:"):
+            path = line[8:].strip()
+            break
+    if rc != 0 or not path:
+        return []
+    exe = adb_path()
+    if not exe:
+        return []
+    tmp = os.path.join(tempfile.gettempdir(),
+                       "fleet_bridge_%s.apk" % re.sub(r"\W", "", serial or "x")[:12])
+    try:
+        cmd = [exe] + (["-s", serial] if serial else []) + ["exec-out", "cat", path]
+        with open(tmp, "wb") as fh:
+            subprocess.run(cmd, stdout=fh, stderr=subprocess.DEVNULL, timeout=30)
+        hits = []
+        with zipfile.ZipFile(tmp) as z:
+            for n in z.namelist():
+                if not n.endswith(".dex"):
+                    continue
+                for m in re.finditer(rb"\b[0-9a-f]{24}\b", z.read(n)):
+                    t = m.group(0).decode("ascii")
+                    if t not in hits:
+                        hits.append(t)
+        return hits
+    except (OSError, zipfile.BadZipFile, subprocess.SubprocessError):
+        return []
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def bridge_token_heal(serial, tok):
+    """把验过能用的令牌写回 .token 与 build/token.txt（下次就不用再捞）。
+
+    只写不删；写不进去也只是下次再捞一次，不影响本次动作。
+    """
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "android_bridge")
+    ok = []
+    for rel in ((".token",), ("build", "token.txt")):
+        p = os.path.join(root, *rel)
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(tok)
+            ok.append(p)
+        except OSError:
+            pass
+    return ok
+
+
 def bridge_health(serial):
     """无障碍服务在没在系统里登记着（不是问它活没活，是问系统认不认它）。
 
@@ -596,26 +694,78 @@ def bridge_health(serial):
     表现就是「桥连上了、鉴权回空」。这不是坏了，是被关掉了，写回去就能好。
     """
     rc, txt = shell(serial, "settings get secure enabled_accessibility_services")
-    on = BRIDGE_SVC in (txt or "")
+    on = svc_listed(txt)
     return {"ok": rc == 0, "enabled": on, "raw": (txt or "").strip()}
+
+
+def svc_listed(txt, svc=BRIDGE_SVC):
+    """设置里那串服务清单里有没有我们这一条。
+
+    🔴 为什么不能直接 `svc in txt`（2026-10-25 修）
+      HyperOS 回的是**缩写**写法 `app.fleet.bridge/.BridgeService`，
+      我们写的是全名 `app.fleet.bridge/app.fleet.bridge.BridgeService`。
+      直接比字符串永远不相等 ⇒ `enabled` 永远 False ⇒ 每次动作都被判定
+      「无障碍没开」，然后：
+        · 白跑一次 `settings put`（其实本来就在）；
+        · 真出错的时候，错误信息把责任推给无障碍——把人往错误方向带。
+      一份清单里可以有多个服务，按逗号/冒号切开逐条比，两种写法都认。
+    """
+    pkg, _, klass = (svc or "").partition("/")
+    klass_full = klass or ""
+    klass_short = klass_full.rsplit(".", 1)[-1] if klass_full else ""
+    for item in re.split(r"[,:]", txt or ""):
+        item = item.strip()
+        if not item:
+            continue
+        if item == svc:
+            return True
+        ip, _, ik = item.partition("/")
+        if ip != pkg:
+            continue
+        if ik == klass_full:
+            return True
+        if ik.startswith(".") and klass_full.endswith(ik):     # pkg/.Cls 缩写
+            return True
+        if klass_short and ik.endswith("." + klass_short):
+            return True
+    return False
 
 
 def bridge_ensure(serial, wait=1.6):
     """把无障碍服务写回系统设置（幂等）。返回是否「本来就在」。
 
-    只写设置、不弹 UI：shell 有 WRITE_SECURE_SETTINGS，一步到位，
-    不需要人去「设置 → 无障碍」里点。写不进去（ROM 限制）就返回 False，
-    由上层如实报「需要手动开一次」。
+    只写设置、不弹 UI：shell 有 WRITE_SECURE_SETTINGS 时一步到位，
+    不需要人去「设置 → 无障碍」里点。
+
+    🔴 但这**不是总能成**（2026-10-26 实测）：HyperOS 在「USB 调试（安全设置）」
+    没开时会直接拒 ——
+        SecurityException: Permission denial, must have one of:
+        [android.permission.WRITE_SECURE_SETTINGS]
+    连 `pm grant` 也被 `GRANT_RUNTIME_PERMISSIONS` 挡住。这时候**没有任何 adb 通路**，
+    只能人手在手机上开一次。
+
+    所以失败信息必须写成「人照着能做完的一句话」，而不是把 `raw` 里的
+    `null` 甩出去 —— 那既没说是权限、也没说该点哪儿，等于把问题丢回给用户。
     """
     h = bridge_health(serial)
     if h.get("enabled"):
         return {"ok": True, "healed": False, "why": "本来就在"}
-    shell(serial, f"settings put secure enabled_accessibility_services {BRIDGE_SVC}")
-    shell(serial, "settings put secure accessibility_enabled 1")
+    rc1, out1 = shell(serial, f"settings put secure enabled_accessibility_services {BRIDGE_SVC}")
+    rc2, out2 = shell(serial, "settings put secure accessibility_enabled 1")
     time.sleep(wait)
     h2 = bridge_health(serial)
-    return {"ok": bool(h2.get("enabled")), "healed": True,
-            "why": "已写回" if h2.get("enabled") else f"写不进去：{h2.get('raw','')[:60]}"}
+    if h2.get("enabled"):
+        return {"ok": True, "healed": True, "why": "已写回"}
+    denied = "WRITE_SECURE_SETTINGS" in (out1 or "") or "WRITE_SECURE_SETTINGS" in (out2 or "")
+    if denied:
+        why = ("这台 ROM 不让 adb 改无障碍设置（WRITE_SECURE_SETTINGS 被拒，"
+               "通常要开「开发者选项 → USB 调试（安全设置）」且要插卡）。"
+               "只能手开一次：设置 → 无障碍 → 已下载的服务 → 「编队桥」→ 打开。")
+    else:
+        why = ("写了但没生效（当前值 %r）。手开一次：设置 → 无障碍 → 已下载的服务 → "
+               "「编队桥」→ 打开。" % (h2.get("raw") or "空")[:40])
+    return {"ok": False, "healed": True, "why": why}
+
 
 
 def bridge_cmd(serial, cmd, timeout=8):
@@ -644,28 +794,55 @@ def bridge_cmd(serial, cmd, timeout=8):
     return r2
 
 
+def _bridge_open(serial, timeout=8):
+    """连上桥并完成 AUTH。成功返回 ({"s": socket, "f": file}, "")，失败返回 (None, err)。
+
+    令牌一枚一枚试：文件里的先试，不通再试从**已安装 APK** 捞回来的。
+    哪枚过了就写回文件——下次开门就不用再撬一次。
+    这是「令牌丢了也不至于整条控制链断掉」的唯一一处兜底，别的层别再加。
+    """
+    _run(serial, ["forward", f"tcp:{BRIDGE_LOCAL_PORT}", f"tcp:{BRIDGE_REMOTE_PORT}"])
+    cands = bridge_token_candidates(serial)
+    if not cands:
+        return None, "找不到编队桥令牌（先跑 android_bridge/build.sh）"
+    last = ""
+    for tok in cands:
+        try:
+            s = socket.create_connection(("127.0.0.1", BRIDGE_LOCAL_PORT),
+                                         timeout=timeout)
+        except OSError as e:
+            return None, f"桥隧道连不上：{e}"
+        try:
+            f = s.makefile("rwb")
+            f.write(("AUTH " + tok + "\n").encode("utf-8"))
+            f.flush()
+            auth = f.readline().decode("utf-8", "replace").strip()
+        except OSError as e:
+            s.close()
+            return None, f"桥通信失败：{e}"
+        if auth.startswith("OK"):
+            if tok != bridge_token():
+                bridge_token_heal(serial, tok)
+            return {"s": s, "f": f}, ""
+        s.close()
+        last = auth
+    return None, f"鉴权失败（试了 {len(cands)} 枚令牌）：{last}"
+
+
 def _bridge_once(serial, cmd, timeout=8):
     """单次尝试，不带任何自愈逻辑（自愈放在 bridge_cmd 里，避免递归爆炸）。"""
-    tok = bridge_token()
-    if not tok:
-        return {"ok": False, "err": "找不到编队桥令牌（先跑 android_bridge/build.sh）"}
-    _run(serial, ["forward", f"tcp:{BRIDGE_LOCAL_PORT}", f"tcp:{BRIDGE_REMOTE_PORT}"])
+    conn, err = _bridge_open(serial, timeout)
+    if conn is None:
+        return {"ok": False, "err": err}
     try:
-        s = socket.create_connection(("127.0.0.1", BRIDGE_LOCAL_PORT), timeout=timeout)
-    except OSError as e:
-        return {"ok": False, "err": f"桥隧道连不上：{e}"}
-    try:
-        with s:
-            f = s.makefile("rwb")
+        with conn["s"]:
+            f = conn["f"]
 
             def x(line):
                 f.write((line + "\n").encode("utf-8"))
                 f.flush()
                 return f.readline().decode("utf-8", "replace").strip()
 
-            auth = x("AUTH " + tok)
-            if not auth.startswith("OK"):
-                return {"ok": False, "err": f"鉴权失败：{auth}"}
             out = x(cmd)
             ok = out.startswith("OK") or out == "PONG"   # PING 的回执是 PONG
             return {"ok": ok, "out": out, "err": "" if ok else out}
@@ -679,17 +856,12 @@ def bridge_bulk(serial, cmd, timeout=25, max_bytes=1 << 20):
     和 bridge_cmd 的区别：那条一问一答只用 readline 取一行，而 UI 树是多行，
     必须按 END 哨兵收尾，否则后面的行会残留在 socket 里污染下一次读取。
     """
-    tok = bridge_token()
-    if not tok:
-        return {"ok": False, "err": "找不到编队桥令牌（先跑 android_bridge/build.sh）"}
-    _run(serial, ["forward", f"tcp:{BRIDGE_LOCAL_PORT}", f"tcp:{BRIDGE_REMOTE_PORT}"])
+    conn, oerr = _bridge_open(serial, timeout)
+    if conn is None:
+        return {"ok": False, "err": oerr}
     try:
-        s = socket.create_connection(("127.0.0.1", BRIDGE_LOCAL_PORT), timeout=timeout)
-    except OSError as e:
-        return {"ok": False, "err": f"桥隧道连不上：{e}"}
-    try:
-        with s:
-            f = s.makefile("rwb")
+        with conn["s"]:
+            f = conn["f"]
 
             def send(line):
                 f.write((line + "\n").encode("utf-8"))
@@ -700,13 +872,6 @@ def bridge_bulk(serial, cmd, timeout=25, max_bytes=1 << 20):
                 if not raw:
                     return None
                 return raw.decode("utf-8", "replace").rstrip("\r\n")
-
-            send("AUTH " + tok)
-            auth = read()
-            if auth is None:
-                return {"ok": False, "err": "桥无应答（服务可能刚被杀，重试一次）"}
-            if not auth.startswith("OK"):
-                return {"ok": False, "err": f"鉴权失败：{auth}"}
 
             send(cmd)
             head = read()
