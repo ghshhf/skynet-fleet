@@ -1,7 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// 版本号唯一真源 = version.properties（`bash release.sh` 会自动 +1 再构建安装）。
+// 不写死在 gradle 里，是为了「一条命令发一版」不用改代码。
+val verProps = Properties().apply {
+    val f = rootProject.file("version.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
@@ -14,8 +23,8 @@ android {
         // Android libc 到 API 28 才有）。将来合并 native 时这里不能降。
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1-proto"
+        versionCode = verProps.getProperty("VERSION_CODE", "1").trim().toInt()
+        versionName = verProps.getProperty("VERSION_NAME", "0.1-proto").trim()
     }
 
     buildFeatures {
@@ -31,9 +40,22 @@ android {
             keyAlias = "tianwang"
             keyPassword = "tianwang"
         }
+        // 迭代用的 debug 密钥也收进项目（原来靠 ~/.android/debug.keystore，
+        // 换机器/清目录就换签名 ⇒ 手机再也覆盖不上，只能卸载重装、连带删掉模型）。
+        // 这份就是本机那份的副本，证书 SHA-256 与手机上已装的包一致。
+        create("dbg") {
+            storeFile = file("../keystore-debug.jks")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
+        debug {
+            // 固定签名 ⇒ `adb install -r` 可长期迭代，升级不清数据、不丢模型。
+            signingConfig = signingConfigs.getByName("dbg")
+        }
         release {
             signingConfig = signingConfigs.getByName("rel")
             // 🔴 必须开：material-icons-extended 里有几千个图标，

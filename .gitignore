@@ -78,6 +78,23 @@ tianwang_app/build/
 tianwang_app/.kotlin/
 tianwang_app/keystore.jks
 
+# native 构建产物不入库（源码在 cpp/ + tools/，靠 build-llama.sh 重出）
+# 2026-10-25：cpp/ 里混进 213M 构建目录才想起来加这条
+tianwang_app/app/src/main/cpp/build-android-*/
+tianwang_app/app/src/main/cpp/build*/
+tianwang_app/app/src/main/jniLibs/
+# 电脑/手机侧的验证可执行（verify_host.cpp 才是源码）
+tianwang_app/verify_host_arm64
+tianwang_app/verify_host.exe
+
+# 截图/临时抓图（顺手截的，不是资产）
+_screen*.png
+_now.png
+_pick.png
+# uiautomator dump 的界面转储（调试用，随手生成）
+ui_chat*.xml
+window_dump*.xml
+
 # APK 一律不入库（产物到处跑，靠 build.sh 重出）
 *.apk
 *.aab
