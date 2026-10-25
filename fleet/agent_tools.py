@@ -23,16 +23,38 @@ import re
 import time
 import urllib.request
 
-#: 决策模型地址。默认手机 llama-server（adb forward tcp:18080 tcp:8080）。
-#: 运行时可用环境变量 AT_DECIDER_URL 覆盖（见 decide()）；连不上时工具面
-#: 会**如实告知**（fire("warn")），不再静默跳过。
+#: 决策模型地址（OpenAI 兼容 /v1/chat/completions）。运行时可用 AT_DECIDER_URL 覆盖。
+#:
+#: 🔴 2026-10-26：默认回到本地 llama-server（18080）。
+#: 中途试过把默认指向 pollinations 免费端点，**实测不可用**：5 次里 4 次失败
+#: ——402 Payment Required、读超时、以及空字符串（返回了 200 但 content 是空的），
+#: 匿名免费额度扛不住「每说一句话调一次」的频率。第二个理由更重要：决策输入
+#: 是用户原话，走云端等于把这句话发给第三方，与项目「数据不出本机」相悖。
+#: 现在默认本地（免费、稳定、不外传）；要换就设 AT_DECIDER_URL。
+#: 服务没起时 decide() 返回 None，调用方 fire("warn") 如实告知，绝不静默跳过。
 DECIDER_URL = "http://127.0.0.1:18080"
 
 #: 工具结果回填进 prompt 的上限（字符）。
 MAX_RESULT_CHARS = 1200
 
 #: 决策调用超时（秒）。手机 1.7B 实测平均 5.1s，超了就当没有工具面。
-DECIDE_TIMEOUT = 10.0
+#: 🔴 2026-10-26：10 → 25。本地 Qwen3.5-4B 实测单次决策 4.2s～9.3s（schema 约束解码
+#: 比普通生成慢），10 秒会**误杀合法回答**——模型答对了，只是慢一点，decide() 却
+#: 返回 None，表现为工具面「时灵时不灵」，且极难查（日志里只剩一句超时，看不出
+#: 是模型答错还是没赶上）。25 秒的代价是真挂了要多等一会儿才降级，值。
+DECIDE_TIMEOUT = 25.0
+
+#: 🔴 2026-10-26：决策失败原因。用列表容器是故意的——函数内改字符串要 global 声明，
+#: 改容器元素不用。
+#:
+#: 背景：decide() 原来所有失败一律 `return None`，调用方只能发一句「连不上」。
+#: 排查时吃过大亏——模型其实答对了，只是慢了 0.3 秒被超时误杀，日志却说是连不上，
+#: 于是往「服务没起」「地址填错」的方向查了五六轮。失败原因不分类，等于让下一次
+#: 排查的人重新踩一遍。现在分：连不上 / 超时 / 非 JSON / 工具不在清单。
+LAST_FAIL = [""]
+
+def _fail(msg):
+    LAST_FAIL[0] = msg
 
 #: 权限三档。定义提前到文件顶部是因为 TOOLS 表要引用它们。
 #: auto = 直接跑；ask = 交给审批闸门（无闸门即 fail-closed 拒绝）；forbid = 永不跑。
@@ -101,15 +123,47 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
             base + "/v1/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode(),
             method="POST", headers={"Content-Type": "application/json"})
-        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
-        txt = (d["choices"][0]["message"].get("content") or "").strip()
-        o = json.loads(txt)
-        tool = o.get("tool")
-        if tool not in DECIDE_SCHEMA["properties"]["tool"]["enum"]:
+        try:
+            d = json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
+        except urllib.error.HTTPError as e:
+            _fail("HTTP %s（端点 %s）" % (e.code, base))
             return None
+        except urllib.error.URLError as e:
+            # socket 超时会被 urllib 包成 URLError(reason="timed out")，这时说
+            # 「连不上」是错的——服务活着，只是没赶上。分清楚，排查方向才对。
+            r = str(getattr(e, "reason", e))
+            if "timed out" in r or "timeout" in r.lower():
+                _fail("超时 %.0fs（%s）——服务活着但没答完，可加大 DECIDE_TIMEOUT"
+                      % (timeout, base))
+            else:
+                _fail("连不上 %s（%s）——服务起了吗" % (base, r))
+            return None
+        except TimeoutError:
+            _fail("超时 %.0fs（模型答得慢，不是答错）" % timeout)
+            return None
+        txt = (d["choices"][0]["message"].get("content") or "").strip()
+        try:
+            o = json.loads(txt)
+        except Exception:
+            _fail("返回的不是 JSON：%r" % txt[:80])
+            return None
+        if not isinstance(o, dict):
+            _fail("返回不是对象：%r" % txt[:80])
+            return None
+        # 🔴 2026-10-26：宽容收键名。schema 里明明写的是 `tool`，但免费/小模型
+        # 实测相当比例回成 `{"name": ...}`（意图是对的，键名不听话）。原来只认
+        # `tool` ⇒ 这些回答全被判成非法 ⇒ decide() 返回 None ⇒ 工具面时灵时不灵，
+        # 而且看不出是模型没听懂还是键名不对。键名不是重点，意图才是：
+        # 多收几个常见别名，但**值必须在 enum 里** —— 幻觉出来的工具名照样拒。
+        tool = str(o.get("tool") or o.get("name") or o.get("tool_name") or "").strip()
+        if tool not in DECIDE_SCHEMA["properties"]["tool"]["enum"]:
+            _fail("模型选的工具不在清单里：%r" % tool[:40])
+            return None
+        LAST_FAIL[0] = ""                   # 成功：把上一次的失败原因清掉
         return {"tool": tool, "arg": (o.get("arg") or "").strip()}
-    except Exception:
+    except Exception as e:
         # 决策层挂了不拖垮对话：这是「暂时状态」，调用方按无工具面继续。
+        _fail("%s: %s" % (type(e).__name__, str(e)[:80]))
         return None
 
 
@@ -1587,8 +1641,10 @@ def run_tools(question, caller, url=None, max_rounds=MAX_ROUNDS,
         if not d:
             # 决策层不可用（连不上/超时/输出非法）：如实告知，不静默。
             # 否则「决策模型消失」在界面上表现为「什么都没发生」，极难排查。
-            fire("warn", {"msg": "工具面决策模型连不上（AT_DECIDER_URL），"
-                                 "本次未调用手机工具"})
+            # 🔴 2026-10-26：带上具体原因（见 LAST_FAIL）。原来这里硬编码「连不上」，
+            # 但超时误杀、模型返回非 JSON 也走同一条分支 —— 日志骗人，排查方向全错。
+            fire("warn", {"msg": "工具面决策不成功，本次未调用手机工具",
+                                 "reason": LAST_FAIL[0] or "未知（decide 返回空）"})
             break
         if d.get("tool") == "none":
             break
