@@ -579,7 +579,8 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true", help="跑自测后退出")
     # ---- 审批闸门（有副作用的能力要不要放、放哪些）----
     ap.add_argument("--gate-file", default="",
-                    help="闸门策略文件（默认 fleet_gate.json；文件不存在 = 什么都问）")
+                    help="闸门策略文件（默认 fleet_gate.json；文件不存在 = 动手类能力逐条问，"
+                         "只读能力不受影响）")
     ap.add_argument("--gate-mode", default=None, choices=("ask", "allow", "deny"),
                     help="没写进 allow/deny 的能力怎么办（默认 ask = 逐次确认）")
     ap.add_argument("--allow", action="append", default=[], metavar="PATTERN",
@@ -603,7 +604,11 @@ def main(argv=None):
     print("[agent_server] 绑定 %s:%d" % (srv.host, args.port or 0))
     print("[agent_server] 闸门 mode=%s allow=%s deny=%s%s" % (
         snap["mode"], snap["allow"] or "-", snap["deny"] or "-",
-        "" if snap["file_present"] else "（无策略文件 ⇒ 什么都问）"))
+        # 🔴 文案改准：闸门只对「有副作用/破坏性」的能力生效，只读能力**根本不走闸门**。
+        # 早先这里写「无策略文件 ⇒ 什么都问」，会让人以为连查个 CPU 都要点允许——
+        # 真跑一次就知道 host.monitor 直接执行了。会让人误判的文案比没文案更糟。
+        "（无策略文件 ⇒ 动手类能力逐条问，只读不受影响）"
+        if not snap["file_present"] else ""))
     print("[agent_server] 手机地址（配合 adb reverse tcp:%d tcp:%d）：" %
           (args.port or 0, srv.bind_port))
     try:
