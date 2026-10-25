@@ -292,6 +292,10 @@ CASES = [
     # **工具表即权限边界**（模型叫了没给它的 pc.shell ⇒ 不许执行）。
     ("eval_t40_agentloop", ["-m", "fleet.agentloop", "--selftest"], HERE, 120),
     ("eval_t41_doctor", ["-m", "fleet.doctor", "--selftest"], HERE, 60),
+    # 人格注入：云侧 system 必须带人格且排在执行纪律之前。
+    # 这条断过一次（新链绕开老链的人格锚，同一台机器换链路换了个人），
+    # 断的时候代码不报错、只有真跑看得出，所以要用门禁钉死。
+    ("eval_t42_persona_wired", ["evals/t42_persona_wired.py"], HERE, 60),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

@@ -207,6 +207,26 @@ class FleetAgentServer:
             groups.setdefault(d["domain"], []).append(d["name"])
         return {"caps": flat, "groups": groups}
 
+    def _persona_system(self):
+        """人格层：从卡库取当前卡渲染成 system。取不到返回空串。
+
+        🔴 2026-10-26 核出来的断头：老的桌面链（dialogue.py）有完整人格锚
+        （`_card_anchor` + `_worldview` + 记忆块），但**新的 agent_server 完全
+        绕开了这一套**——system 只有执行层口径（"不许编造、查不到就说查不到"）。
+        结果：手机聊的是个冷冰冰的执行层，不是「她」。同一台机器，换条链路就换了个人。
+        人格不生效，等于主人调的那套卡只在桌面有用。
+
+        卡库坏了（缺文件/编译失败）不许把服务搞挂——人格是增强，不是启动依赖。
+        """
+        try:
+            import tianwang_cards
+            cid = tianwang_cards.current()
+            if not cid:
+                return ""
+            return (tianwang_cards.build_system(cid) or "").strip()
+        except Exception:
+            return ""
+
     def _env_facts(self):
         """把实时探测到的网关/后端状态压成一句事实，喂给模型当「当前环境」。
 
@@ -263,7 +283,21 @@ class FleetAgentServer:
         # 🔴 把实时探测到的网关/后端状态作为「环境实况」直接喂给模型：
         # 于是「有哪些网关」从「跑一堆慢扫描工具」变成「读这句直接答」，
         # 一轮出结果、不调工具，时延从几十秒压到几秒。
-        system = agentloop.SYSTEM + "\n\n" + self._env_facts() + "\n\n" + GATE_PROMPT
+        # 🔴 人格在前、纪律在后，中间加一句仲裁。
+        # 不写仲裁那半句，模型会把「不许推测」读成「不要有人格」，
+        # 回一堆没温度的条目——这正是「她」在云端消失的原因。
+        # 口径与 MEMORY 里的位阶同一套：身份层管「我是谁」，
+        # 纪律只约束「信息从哪来」，不覆盖自称与语气。
+        _segs = []
+        _persona = self._persona_system()
+        if _persona:
+            _segs.append(_persona)
+            _segs.append("【上面是你的身份与说话方式——自称、称呼、语气照它来。"
+                         "下面几条只约束「信息从哪来」，不改变你是谁。】")
+        _segs.append(agentloop.SYSTEM)
+        _segs.append(self._env_facts())
+        _segs.append(GATE_PROMPT)
+        system = "\n\n".join(s for s in _segs if s)
         # 语言约束：手机端设的「回复语言」优先。空/未传 = 不加任何约束（跟随提问）。
         _LANG = {
             "zh-CN": "始终使用简体中文回答。即使用户用其他语言提问，也用简体中文回复。",

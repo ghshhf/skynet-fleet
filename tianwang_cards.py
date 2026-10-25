@@ -46,15 +46,24 @@ def _card_path(cid):
 
 
 def list_cards():
-    """语音栈 UI 要的形状：[{"id", "name", "file"}]；坏卡跳过不拖垮列表。"""
+    """语音栈 UI 要的形状：[{"id", "name", "file"}]；坏卡跳过不拖垮列表。
+
+    🔴 2026-10-26 修：统一层的 list_cards 会把同一张卡的 .json 和 .md
+    **各算一遍**，于是 16 张卡列出 26 条——手机卡库页会看到每张卡两遍，
+    点哪一条都一样。这里按 id 去重，保留先出现的那条（.json 排在前面，
+    是权威数据；.md 是编译源）。
+    """
     if _pc is None:
         return []
-    out = []
+    out, seen = [], set()
     for c in _pc.list_cards():
         if not c.get("ok"):
             continue
         fn = c["file"]
         cid = os.path.splitext(fn)[0]
+        if cid in seen:
+            continue
+        seen.add(cid)
         out.append({"id": cid, "file": fn,
                     "name": (c.get("summary") or {}).get("name") or cid})
     return out
