@@ -92,6 +92,25 @@ def obvious_none(question):
     return bool(_RE_NONE.search(q))
 
 
+# ---- 决策缓存：同一句话第二次直接命中，省掉 4–9 秒的模型推理 ----
+# 为什么能缓存：决策只取决于「这句话 → 用哪个工具」，和当前时间/状态无关
+# （同一句话该调的工具不会变；变了是工具表变了，那得重启）。小模型决策实测
+# 4.2–9.3s，命中等于把整段省掉。**失败不缓存**——那是暂时状态（连不上/超时），
+# 下次该重试，缓存失败会把「服务重启就能好」变成「永远坏」。
+_DECIDE_CACHE = {}
+_DECIDE_CACHE_MAX = 128
+
+
+def _cache_get(key):
+    return _DECIDE_CACHE.get(key)
+
+
+def _cache_put(key, val):
+    if len(_DECIDE_CACHE) >= _DECIDE_CACHE_MAX:
+        _DECIDE_CACHE.pop(next(iter(_DECIDE_CACHE)))    # FIFO，最老的先走
+    _DECIDE_CACHE[key] = dict(val)
+
+
 def decide(question, url=None, timeout=DECIDE_TIMEOUT):
     """问决策模型：该用哪个工具。返回 {"tool": ..., "arg": ...}。
 
@@ -107,6 +126,12 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
     if obvious_none(q):
         return {"tool": "none", "arg": ""}
 
+    base = (url or os.environ.get("AT_DECIDER_URL", DECIDER_URL)).rstrip("/")
+    key = (base, q)
+    hit = _cache_get(key)
+    if hit is not None:
+        return dict(hit)            # 复制：别让调用方改坏缓存里那条
+
     payload = {
         "messages": [
             {"role": "system", "content": DECIDE_SYSTEM},
@@ -117,7 +142,6 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
         "temperature": 0.1,
         "max_tokens": 160,
     }
-    base = (url or os.environ.get("AT_DECIDER_URL", DECIDER_URL)).rstrip("/")
     try:
         req = urllib.request.Request(
             base + "/v1/chat/completions",
@@ -160,7 +184,9 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
             _fail("模型选的工具不在清单里：%r" % tool[:40])
             return None
         LAST_FAIL[0] = ""                   # 成功：把上一次的失败原因清掉
-        return {"tool": tool, "arg": (o.get("arg") or "").strip()}
+        out = {"tool": tool, "arg": (o.get("arg") or "").strip()}
+        _cache_put(key, out)
+        return dict(out)
     except Exception as e:
         # 决策层挂了不拖垮对话：这是「暂时状态」，调用方按无工具面继续。
         _fail("%s: %s" % (type(e).__name__, str(e)[:80]))
@@ -1739,6 +1765,32 @@ def _selftest():
         {"title": "t" * 2000, "text": "x" * 2000, "when": ""}]}}
     _, text, _ok = execute("notify_read", "", lambda cap, args: long_r)
     check("结果限长 ≤1200+尾注", len(text) <= MAX_RESULT_CHARS + 60)
+
+    # 5. 决策缓存：同句第二次不再打模型（省 4–9s）
+    import urllib.request as _ur
+    orig_open = _ur.urlopen
+    calls = []
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = body
+
+        def read(self):
+            return self._b
+
+    def fake_open(req, timeout=None):
+        calls.append(1)
+        return _Resp(json.dumps({"choices": [{"message": {"content": json.dumps(
+            {"tool": "device_status", "arg": ""})}}]}).encode())
+
+    _ur.urlopen = fake_open
+    try:
+        a = decide("手机烫不烫", url="http://fake:1")
+        b = decide("手机烫不烫", url="http://fake:1")
+    finally:
+        _ur.urlopen = orig_open
+    check("决策缓存命中", bool(a) and a == b and a.get("tool") == "device_status")
+    check("同句只打一次模型", len(calls) == 1)
 
     # 5. 资料块
     blk = render_tool_block("notify.read", "共 1 条通知：…")
