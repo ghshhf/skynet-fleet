@@ -51,7 +51,7 @@ def _match_deps(cap_name):
     return best[1] if best else ()
 
 
-def scan(caps=None, checker=None):
+def scan(caps=None, checker=None, deep=False):
     checker = checker or _default_checker
     if caps is None:
         from .catalog import CAPABILITIES
@@ -91,6 +91,7 @@ def scan(caps=None, checker=None):
         "miss_exes": sorted(miss_exes.values(), key=lambda x: x["name"]),
         "miss_repos": sorted(miss_repos.values(), key=lambda x: x["name"]),
         "summary": _summary(cap_rows, proj_rows, gui_rows),
+        "health": _health(cap_rows, deep),
     }
 
 
@@ -113,8 +114,54 @@ def _summary(caps, proj, gui):
     return {"caps": cnt(caps), "project": cnt(proj), "gui": cnt(gui)}
 
 
+def _health(cap_rows, deep=False):
+    """体检结论：能力可用率 +（可选）网关真实状态。
+
+    deep=False 只算本地能算的（毫秒级，纯内存）；deep=True 才去探网关
+    （1–2 秒，走网络）。为什么分开：GUI 每次打开都全扫会让界面卡在
+    「体检中」；网络探测应该由用户主动触发，不该在渲染路径上偷偷跑。
+
+    判据口径：`na`（无第三方依赖、纯逻辑能力）算「可用」——它本来就不需要环境。
+    一个网关都不活 = fail，比缺几个 pip 包严重：依赖缺了能力还在，网关死了
+    整个 agent 就只会回「请求失败」。
+    """
+    tot = len(cap_rows)
+    ok = sum(1 for r in cap_rows if r["status"] == "ok")
+    na = sum(1 for r in cap_rows if r["status"] == "na")
+    fail = sum(1 for r in cap_rows if r["status"] == "fail")
+    usable = ok + na
+    h = {"caps_total": tot, "caps_ok": ok, "caps_na": na, "caps_fail": fail,
+         "caps_usable_pct": int(round(usable * 100.0 / tot)) if tot else 0}
+    verdict = "ok" if fail == 0 else ("warn" if usable * 100 >= tot * 60 else "fail")
+    if deep:
+        try:
+            from . import providers as P
+            provs = P.probe_all()
+            alive = [p for p in provs if getattr(p, "alive", False)]
+            h["gateways"] = {
+                "alive": len(alive), "total": len(provs),
+                "models": sum(len(getattr(p, "models", None) or []) for p in alive),
+            }
+            if not alive:
+                verdict = "fail"
+        except Exception as e:
+            h["gateways"] = {"err": "%s: %s" % (type(e).__name__, e)}
+    h["verdict"] = verdict
+    return h
+
+
 def text_report(rep):
     lines = ["== 天网环境自检 =="]
+    h = rep.get("health") or {}
+    if h:
+        gw = h.get("gateways")
+        extra = ""
+        if gw and "alive" in gw:
+            extra = " · 网关 %d/%d 活（%d 模型）" % (
+                gw["alive"], gw["total"], gw.get("models", 0))
+        lines.append("体检：%s · 能力可用 %d%%（%d/%d）%s" % (
+            h.get("verdict", "?"), h.get("caps_usable_pct", 0),
+            h.get("caps_ok", 0) + h.get("caps_na", 0), h.get("caps_total", 0), extra))
     s = rep["summary"]
     lines.append("能力 %d（ok %d / warn %d / fail %d / 无依赖 %d）"
                  % (len(rep["caps"]), s["caps"]["ok"], s["caps"]["warn"],
@@ -167,7 +214,7 @@ def main(argv):
     if "--selftest" in argv:
         _selftest()
         return
-    rep = scan()
+    rep = scan(deep="--deep" in argv)
     if "--json" in argv:
         print(json.dumps(rep, ensure_ascii=False, indent=1))
     elif "--fix" in argv:
@@ -223,8 +270,18 @@ def _selftest():
     assert all(r["status"] in ("ok", "na") for r in rep2["caps"]), \
         "全有依赖不应有 fail/warn"
 
+    # ---- 体检：deep=False 绝不碰网络（门禁必须全离线）----
+    h = rep["health"]
+    assert h["caps_total"] == len(caps), "体检要数到全部能力"
+    assert h["verdict"] in ("ok", "warn", "fail"), "体检结论必须是三档之一"
+    assert h["caps_fail"] >= 1, "全缺失时应有 fail"
+    assert "gateways" not in h, "deep=False 不许去探网关（门禁全离线）"
+    h2 = rep2["health"]
+    assert h2["verdict"] == "ok", "全有依赖时体检应为 ok，实得 %r" % h2["verdict"]
+
     txt = text_report(rep)
     assert "host.monitor" in txt and "psutil" in txt, "报告应含能力名与包名"
+    assert "体检：" in txt, "文本报告要有体检行"
     print("fleet.doctor selftest ok")
 
 

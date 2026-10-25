@@ -396,6 +396,10 @@
       });
       return;
     }
+    if (tab === "doctor") {
+      loadDoctorTab(false);
+      return;
+    }
     api("/api/connectors").then(function (d) {
       if (stale()) { return; }
       ASSET_CACHE.conns = d;
@@ -643,6 +647,111 @@
       });
     }
     body.appendChild(jb);
+  }
+
+  // ---- 体检面板（doctor）：依赖 / 网关 / 能力可用率，缺什么直接给按钮 ----
+  // 浅扫（本地毫秒级）与深扫（探网关，1-2s）分开：打开面板不该卡在「体检中」。
+  var DOC_SEQ = 0;
+  function loadDoctorTab(deep) {
+    var body = $("tabBody");
+    var my = ++DOC_SEQ;
+    body.textContent = "";
+    body.appendChild(el("div", "empty",
+      deep ? "深度体检中（探网关，约 1-2 秒）…" : "体检中…"));
+    api("/api/doctor" + (deep ? "?deep=1" : "")).then(function (rep) {
+      if (my !== DOC_SEQ) { return; }
+      renderDoctor(body, rep, deep);
+    }).catch(function (e) {
+      if (my !== DOC_SEQ) { return; }
+      renderTabErr(body, "体检失败：" + e.message);
+    });
+  }
+
+  function renderDoctor(body, rep, deep) {
+    var h = rep.health || {};
+    var pips = rep.miss_pips || [];
+    var exes = rep.miss_exes || [];
+    var repos = rep.miss_repos || [];
+    var fails = (rep.caps || []).filter(function (r) { return r.status === "fail"; });
+    body.textContent = "";
+
+    // 结论条：红黄绿 + 可用率 +（深扫时）网关
+    var head = el("div", "doc-head");
+    var v = h.verdict || "warn";
+    head.appendChild(el("span", "badge " + (v === "ok" ? "ok" : (v === "fail" ? "deny" : "se")),
+      v === "ok" ? "健康" : (v === "fail" ? "有问题" : "注意")));
+    head.appendChild(el("span", "doc-line",
+      "能力可用 " + (h.caps_usable_pct || 0) + "%（" + ((h.caps_ok || 0) + (h.caps_na || 0))
+      + "/" + (h.caps_total || 0) + "）"));
+    if (h.gateways && h.gateways.alive !== undefined) {
+      head.appendChild(el("span", "doc-line",
+        "网关 " + h.gateways.alive + "/" + h.gateways.total + " 活 · "
+        + (h.gateways.models || 0) + " 模型"));
+    }
+    var bDeep = el("button", "hbtn", deep ? "重新浅扫" : "深度体检");
+    bDeep.onclick = function () { loadDoctorTab(!deep); };
+    head.appendChild(bDeep);
+    body.appendChild(head);
+
+    // 缺的 pip：一键装（后端只装白名单 pip，绝不碰 exe/repo）
+    if (pips.length) {
+      var sec = el("div", "doc-sec");
+      sec.appendChild(el("div", "doc-sec-t", "缺的 pip 包（可一键装）"));
+      var row = el("div", "doc-pips");
+      pips.forEach(function (c) { row.appendChild(el("span", "badge se", c)); });
+      var bFix = el("button", "hbtn", "一键装");
+      bFix.onclick = function () {
+        bFix.disabled = true;
+        bFix.textContent = "安装中…";
+        api("/api/doctor/fix", { method: "POST" }).then(function (d) {
+          var ok = d.returncode === 0;
+          toast(ok ? "装好了，重新体检" : ("安装返回码 " + d.returncode), !ok);
+          loadDoctorTab(deep);
+        }).catch(function (e) {
+          toast("安装失败：" + e.message, true);
+          bFix.disabled = false;
+          bFix.textContent = "一键装";
+        });
+      };
+      row.appendChild(bFix);
+      sec.appendChild(row);
+      body.appendChild(sec);
+    }
+
+    // 缺的 exe / repo：只给命令，不自动下（不乱下二进制）
+    function cmdSec(title, items) {
+      if (!items.length) { return; }
+      var s = el("div", "doc-sec");
+      s.appendChild(el("div", "doc-sec-t", title));
+      items.forEach(function (d) {
+        var r = el("div", "doc-row");
+        r.appendChild(el("span", "doc-name", d.name));
+        r.appendChild(el("span", "doc-fix", d.fix || ""));
+        s.appendChild(r);
+      });
+      body.appendChild(s);
+    }
+    cmdSec("缺的外部程序（手动装，不自动下）", exes);
+    cmdSec("缺的仓库（设环境变量 / 克隆）", repos);
+
+    // 不可用的能力：名字 + 缺什么
+    if (fails.length) {
+      var s2 = el("div", "doc-sec");
+      s2.appendChild(el("div", "doc-sec-t", "不可用的能力（" + fails.length + " 项）"));
+      fails.forEach(function (r) {
+        var line = el("div", "doc-row");
+        line.appendChild(el("span", "badge deny", "✗"));
+        line.appendChild(el("span", "doc-name", r.name));
+        line.appendChild(el("span", "doc-fix",
+          (r.missing || []).map(function (m) { return m.name; }).join("、")));
+        s2.appendChild(line);
+      });
+      body.appendChild(s2);
+    }
+
+    if (!pips.length && !exes.length && !repos.length && !fails.length) {
+      body.appendChild(el("div", "empty", "环境齐全，没有要装的。"));
+    }
   }
 
   function renderTabErr(body, why) {    body.textContent = "";

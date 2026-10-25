@@ -743,7 +743,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/shot":
             return self._shot_png()
         if path == "/api/doctor":
-            return self._json(DOCTOR.scan())
+            # ?deep=1 才探网关（1–2s 走网络），默认只做本地毫秒级体检 ——
+            # 每次打开界面都全扫会让面板卡在「体检中」，网络探测该由用户主动触发。
+            q = parse_qs(urlparse(self.path).query)
+            deep = q.get("deep", ["0"])[0] in ("1", "true", "yes")
+            return self._json(DOCTOR.scan(deep=deep))
         self._err(404, f"没有这个接口: {path}")
 
     def _api_post(self, path):
