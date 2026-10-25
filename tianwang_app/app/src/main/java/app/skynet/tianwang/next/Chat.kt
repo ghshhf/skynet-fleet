@@ -53,18 +53,44 @@ data class NodeInfo(
 )
 
 object Demo {
-    val models = listOf(
+    /**
+     * 模型落点 = **app 私有外置目录**，由 MainActivity 在 onCreate 里用
+     * `getExternalFilesDir(null)` 注入真实绝对路径。
+     *
+     * 🔴 **不能硬编码 `/sdcard/...`**（2026-10-25 实测踩到）：
+     * targetSdk 35 下 app 进程按 `/sdcard` 这个 FUSE 视图访问自己的
+     * `Android/data/<pkg>/files` 会被拒，`File.exists()` 直接返回 false，
+     * 表现就是「模型明明推上去了，UI 却说还没下载完」。
+     * 只有系统给的 `/storage/emulated/0/Android/data/<pkg>/files` 才稳。
+     *
+     * 推送：`adb push xxx.gguf /sdcard/Android/data/app.skynet.tianwang.next/files/models/`
+     */
+    @Volatile
+    var modelDir: String = "/sdcard/Android/data/app.skynet.tianwang.next/files/models"
+
+    /** 文件真在才敢说就绪——不拿常量骗 UI（加载失败会白等一轮）。 */
+    private fun exists(name: String): Boolean = java.io.File("$modelDir/$name").exists()
+
+    /** 每次取都重新探盘：模型推到手机后不用重启 app 就能亮起来。 */
+    val models: List<ModelProfile>
+        get() = listOf(
         ModelProfile(
             label = "Qwen3-4B-Instruct (本地)", kind = BackendKind.LOCAL,
-            target = "/sdcard/tianwang/models/qwen3-4b-q4.gguf", ctx = 8192,
-            nGpuLayers = 0, down = true, sizeMb = 2480,
-            note = "断网可用 · 4B 在 8G 内存机上约 6 tok/s",
+            target = "$modelDir/qwen3-4b-q4.gguf", ctx = 8192,
+            nGpuLayers = 0, down = exists("qwen3-4b-q4.gguf"), sizeMb = 2500,
+            note = "断网可用 · 4B Q4_K_M · 手机上约 6~10 tok/s",
         ),
         ModelProfile(
             label = "SmolLM2-360M (本地)", kind = BackendKind.LOCAL,
-            target = "/sdcard/tianwang/models/smollm2-360m-q8.gguf", ctx = 4096,
-            down = false, sizeMb = 386,
+            target = "$modelDir/smollm2-360m-q8.gguf", ctx = 4096,
+            down = exists("smollm2-360m-q8.gguf"), sizeMb = 386,
             note = "极速兜底 · 适合摘取/分类这种短任务",
+        ),
+        ModelProfile(
+            label = "Qwen3-1.7B (本地)", kind = BackendKind.LOCAL,
+            target = "$modelDir/qwen3-1.7b-q4.gguf", ctx = 8192,
+            down = exists("qwen3-1.7b-q4.gguf"), sizeMb = 1107,
+            note = "轻量主力 · 比 4B 快一倍，中文够用",
         ),
         ModelProfile(
             label = "deepseek-chat (云)", kind = BackendKind.CLOUD,

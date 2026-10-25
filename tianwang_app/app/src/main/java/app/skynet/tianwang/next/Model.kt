@@ -1,6 +1,8 @@
 package app.skynet.tianwang.next
 
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 双后端模型层。
@@ -50,29 +52,74 @@ interface ModelBackend {
 }
 
 /**
- * 本地（llama.cpp / GGUF）。
+ * 本地（llama.cpp / GGUF）——真实现，JNI 静态链进 app 的单 .so（libfleet_llama.so）。
  *
- * 原型阶段先落成可编译的桩：真实现要接 llama.cpp 的 JNI——
- * 老工程 `tianwang_android/jni/` 已经有 whisper_jni / sd_jni 的构建经验，
- * 下一个 JNI 模块按同一套 CMake 加，不另起炉灶。
+ * 🔴 「一个 APP 解决所有」的本地那一半：模型文件在 /sdcard/tianwang/models/，
+ * 加载/推理/模板全在 app 进程内完成，不借外部 app、不连外部 server。
+ *
+ * 句柄按 profile.id 缓存：同一模型连问多轮不重复 mmap 2.5GB 权重；
+ * 每轮 native 侧会清 KV 重放全量历史（KV 复用留给下一版）。
  */
 class LocalBackend : ModelBackend {
     override val kind = BackendKind.LOCAL
+
+    /** profile.id → native 会话句柄。切模型/换文件先 free 旧的。 */
+    private val handles = HashMap<String, Long>()
+
+    private fun sessionFor(profile: ModelProfile): Result<Long> {
+        if (!profile.down) return Result.failure(IllegalStateException("这个模型还没下载完"))
+        synchronized(handles) { handles[profile.id] }?.let { return Result.success(it) }
+        if (!LlamaNative.ensureLoaded())
+            return Result.failure(IllegalStateException("native 库没加载上（缺 libfleet_llama.so？）"))
+        val threads = (Runtime.getRuntime().availableProcessors()).coerceAtMost(6)
+        val h = LlamaNative.nativeLoadModel(profile.target, profile.ctx, threads)
+        if (h == 0L) return Result.failure(IllegalStateException("模型加载失败：${profile.target}"))
+        synchronized(handles) {
+            handles.remove(profile.id)?.let { LlamaNative.nativeFreeModel(it) }
+            handles[profile.id] = h
+        }
+        return Result.success(h)
+    }
+
     override suspend fun chat(
         profile: ModelProfile,
         messages: List<ChatMsg>,
         onDelta: (String) -> Unit,
         onTool: (ToolCall) -> Unit,
-    ): Result<String> {
-        if (!profile.down) return Result.failure(IllegalStateException("这个模型还没下载完"))
-        // TODO(jni): llama_model_load + llama_decode 流式回调 onDelta
-        onDelta("（本地引擎待接 JNI：${profile.label}）")
-        return Result.success("")
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val h = sessionFor(profile).getOrElse { return@withContext Result.failure(it) }
+        val roles = ArrayList<String>(messages.size)
+        val contents = ArrayList<String>(messages.size)
+        for (m in messages) {
+            if (m.text.isBlank()) continue
+            roles.add(
+                when (m.role) {
+                    ChatMsg.Role.USER -> "user"
+                    ChatMsg.Role.ASSISTANT -> "assistant"
+                    ChatMsg.Role.SYSTEM -> "system"
+                }
+            )
+            contents.add(m.text)
+        }
+        if (roles.isEmpty()) return@withContext Result.failure(IllegalStateException("没有可发送的内容"))
+        try {
+            val full = LlamaNative.nativeChatMessages(
+                h,
+                roles.toTypedArray(),
+                contents.toTypedArray(),
+                profile.maxTokens,
+                LlamaNative.TokenCallback { onDelta(it) },
+            )
+            Result.success(full)
+        } catch (e: Throwable) {
+            Result.failure(e)
+        }
     }
 
-    override suspend fun probe(profile: ModelProfile): Result<String> =
-        if (profile.down) Result.success("GGUF 就绪：${profile.target}")
-        else Result.failure(IllegalStateException("文件不在：${profile.target}"))
+    override suspend fun probe(profile: ModelProfile): Result<String> = withContext(Dispatchers.IO) {
+        val h = sessionFor(profile).getOrElse { return@withContext Result.failure(it) }
+        Result.success("GGUF 就绪：${profile.target}（句柄 $h）")
+    }
 }
 
 /** 云端（OpenAI 兼容 /v1/chat/completions，SSE 流式）。 */

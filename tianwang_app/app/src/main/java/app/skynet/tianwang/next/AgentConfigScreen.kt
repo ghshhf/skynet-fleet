@@ -54,10 +54,14 @@ fun AgentConfigScreen() {
             Spacer(Modifier.width(8.dp))
             Button(onClick = {
                 scope.launch {
+                    // 🔴 先落盘再测：getProviders 读的是已保存配置，
+                    // 不先 save 就点测试 = 拿旧地址测，必错
+                    Net.saveConfig(url, token)
                     msg = "测试中…"
                     runCatching {
                         val ps = Net.getProviders()
-                        "连接成功 · 网关 ${ps.size} 个"
+                        if (ps.isEmpty()) "连接成功但没拉到网关 —— 检查云侧是否启动"
+                        else "连接成功 · 网关 ${ps.size} 个（活 ${ps.count { it.status == "活" }}）"
                     }.onSuccess { msg = it }.onFailure { msg = "连接失败：${it.message}" }
                 }
             }) { Text("测试连接") }

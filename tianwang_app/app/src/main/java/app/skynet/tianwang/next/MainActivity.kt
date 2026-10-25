@@ -1,6 +1,7 @@
 package app.skynet.tianwang.next
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -71,12 +72,77 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Net.init(applicationContext)
+        // 模型目录必须由系统给：`/sdcard/...` 硬编码在 targetSdk 35 下读不到
+        // 自己的 Android/data（File.exists() 恒 false ⇒ UI 谎报「没下载完」）。
+        Demo.modelDir = java.io.File(getExternalFilesDir(null), "models").absolutePath
+        Log.i("TianwangModels", "dir=${Demo.modelDir}")
+        Demo.models.forEach { m ->
+            Log.i("TianwangModels", "${m.label} down=${m.down} exists=${java.io.File(m.target).exists()} ${m.target}")
+        }
         enableEdgeToEdge()
         setContent {
             TianwangTheme {
                 App()
             }
         }
+        if (intent?.getBooleanExtra("selftest", false) == true) {
+            runSelfTest(intent?.getStringExtra("stmodel") ?: "1.7b")
+        }
+    }
+
+    /**
+     * 本地推理自检：`adb shell am start -n app.skynet.tianwang.next/.MainActivity --ez selftest true`
+     * （换 4B：再加 `--es stmodel 4b`）。结果全进 logcat，TAG = `Selftest`。
+     *
+     * 为什么要这个入口：HyperOS 把 `adb shell input` 封了（`INJECT_EVENTS` 权限），
+     * 没法从外面点界面。「装了能启动」也不等于「推理真通」，所以必须让 App
+     * 自己走一遍加载 + 生成，把首字延迟、耗时、输出都写出来。
+     */
+    private fun runSelfTest(which: String) {
+        Thread {
+            val tag = "Selftest"
+            try {
+                if (!LlamaNative.ensureLoaded()) {
+                    Log.e(tag, "FAIL native 库没加载上（libfleet_llama.so 缺或 ABI 不符）")
+                    return@Thread
+                }
+                val want = if (which.contains("4b", true)) "4B" else "1.7B"
+                val m = Demo.models.firstOrNull {
+                    it.kind == BackendKind.LOCAL && it.down && it.label.contains(want, true)
+                }
+                if (m == null) {
+                    Log.e(tag, "FAIL 没有已就绪的 $want（dir=${Demo.modelDir}）")
+                    return@Thread
+                }
+                Log.i(tag, "START ${m.label} ctx=${m.ctx} path=${m.target}")
+
+                val t0 = System.currentTimeMillis()
+                val h = LlamaNative.nativeLoadModel(m.target, m.ctx, 6)
+                val loadMs = System.currentTimeMillis() - t0
+                Log.i(tag, "LOAD handle=$h 耗时=${loadMs}ms")
+                if (h == 0L) {
+                    Log.e(tag, "FAIL 加载返回 0（模型损坏 / 内存不足 / 格式不认）")
+                    return@Thread
+                }
+
+                val prompt = "你好，用一句话介绍你自己。"
+                var firstMs = -1L
+                var chars = 0
+                val tGen = System.currentTimeMillis()
+                val out = LlamaNative.nativeChatMessages(h, arrayOf("user"), arrayOf(prompt), 96) { s ->
+                    if (firstMs < 0) firstMs = System.currentTimeMillis() - tGen
+                    chars += s.length
+                }
+                val genMs = System.currentTimeMillis() - tGen
+                Log.i(tag, "PROMPT=$prompt")
+                Log.i(tag, "OUT=[$out]")
+                Log.i(tag, "STAT first=${firstMs}ms total=${genMs}ms chars=$chars")
+                Log.i(tag, if (out.isNotBlank()) "PASS 本地推理真出字" else "FAIL 输出为空")
+                LlamaNative.nativeFreeModel(h)
+            } catch (e: Throwable) {
+                Log.e(tag, "FAIL 异常 ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
     }
 }
 
@@ -88,7 +154,17 @@ private enum class Tab(val label: String) {
 @Composable
 private fun App() {
     var tab by remember { mutableStateOf(Tab.CHAT) }
-    var current by remember { mutableStateOf(Demo.models.first()) }
+    // 默认选「这台手机真跑得动」的那个：1.7B 是普适甜点——本机（K70E/天玑8300）
+    // 实测 9.8 tok/s，4B 只有 2.9 tok/s（首字 4.2s），明显卡手。
+    // 强机（另一台能跑 4B 的）在模型页手动切，不靠这里猜。
+    // 顺序：1.7B → 任一就绪 → 第一个占位。
+    var current by remember {
+        mutableStateOf(
+            Demo.models.firstOrNull { it.down && it.label.contains("1.7B") }
+                ?: Demo.models.firstOrNull { it.down }
+                ?: Demo.models.first()
+        )
+    }
     var sheet by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState()
     val scope = rememberCoroutineScope()
@@ -103,7 +179,28 @@ private fun App() {
         val replyId = java.util.UUID.randomUUID().toString()
         msgs.add(ChatMsg(id = replyId, role = ChatMsg.Role.ASSISTANT, streaming = true))
         busy = true
-        if (Net.hasConfig()) {
+        if (current.kind == BackendKind.LOCAL) {
+            // 真本地链路：llama.cpp 已编进 app（libfleet_llama.so），
+            // 模型在 /sdcard/tianwang/models/，推理全程不出手机。
+            scope.launch {
+                val backend = LocalBackend()
+                val history = msgs.filter { it.id != replyId }   // 含刚发的 user 消息
+                backend.chat(current, history, onDelta = { d ->
+                    update(msgs, replyId) { it.copy(text = it.text + d) }
+                }).onSuccess { full ->
+                    update(msgs, replyId) {
+                        it.copy(text = full.ifEmpty { it.text }, streaming = false)
+                    }
+                    busy = false
+                }.onFailure { e ->
+                    update(msgs, replyId) {
+                        it.copy(failed = e.message ?: "本地推理失败", streaming = false)
+                    }
+                    busy = false
+                }
+            }
+    }
+        else if (Net.hasConfig()) {
             // 真链路：手机 → 云侧 SSE → 电脑侧 agentloop 真跑（工具 + 回答都是真的）
             val steps = androidx.compose.runtime.mutableStateListOf<ToolCall>()
             scope.launch {
@@ -122,8 +219,9 @@ private fun App() {
                         busy = false
                     })
             }
-        } else {
-            // 未连云侧：用假流式把「输入 → 工具 → 回答」这条链路走通
+        }
+        else {
+                // 未连云侧：用假流式把「输入 → 工具 → 回答」这条链路走通
             scope.launch {
                 val steps = listOf(
                     "fleet.nodes" to "{\"detail\":true}",
