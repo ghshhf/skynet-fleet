@@ -83,6 +83,61 @@ object Net {
             } finally { c.disconnect() }
         }
 
+    /**
+     * 编队节点快照。数据全部来自云侧 /api/nodes —— 本机信息、注册表成员、
+     * 控制面是否可用。拉不到就返回空并带上原因，绝不塞占位节点糊弄界面。
+     */
+    suspend fun getNodes(): FleetSnapshot = withContext(Dispatchers.IO) {
+        val c = auth("${loadConfig().url}/api/nodes")
+        try {
+            if (c.responseCode != 200) {
+                return@withContext FleetSnapshot(err = "HTTP ${c.responseCode}")
+            }
+            val root = JSONObject(c.readBody())
+            val selfJ = root.optJSONObject("self")
+            val self = selfJ?.let {
+                NodeInfo(
+                    name = it.optString("name", "本机"),
+                    host = run {
+                        val a = it.optJSONArray("ips")
+                        if (a == null || a.length() == 0) "127.0.0.1"
+                        else (0 until a.length()).joinToString(", ") { i -> a.optString(i) }
+                    },
+                    online = true,
+                    caps = it.optInt("caps", 0),
+                    note = "${it.optString("platform", "")} · ${it.optString("role", "")}",
+                )
+            }
+            val list = mutableListOf<NodeInfo>()
+            root.optJSONArray("nodes")?.let { a ->
+                for (i in 0 until a.length()) {
+                    val o = a.optJSONObject(i) ?: continue
+                    list.add(
+                        NodeInfo(
+                            name = o.optString("name"),
+                            host = o.optString("host", "-"),
+                            online = o.optBoolean("online", true),
+                            caps = o.optInt("caps", 0),
+                            note = o.optString("note", ""),
+                        )
+                    )
+                }
+            }
+            val cp = root.optJSONObject("controlplane")
+            FleetSnapshot(
+                self = self,
+                nodes = list,
+                cpAvailable = cp?.optBoolean("available", false) ?: false,
+                cpErr = cp?.optString("err", "") ?: "",
+                err = "",
+            )
+        } catch (e: Exception) {
+            FleetSnapshot(err = e.message ?: e.javaClass.simpleName)
+        } finally {
+            c.disconnect()
+        }
+    }
+
     suspend fun getTasks(): TaskBoard = withContext(Dispatchers.IO) {
         val c = auth("${loadConfig().url}/api/tasks")
         try {
@@ -114,7 +169,12 @@ object Net {
         c.requestMethod = "POST"
         c.setRequestProperty("Content-Type", "application/json")
         c.doOutput = true
-        c.outputStream.write(JSONObject().put("question", question).toString().encodeToByteArray())
+        // 语言偏好跟着请求走：同一台云侧可能连好几台设备，各人语言不同
+        c.outputStream.write(
+            JSONObject().put("question", question)
+                .put("lang", Prefs.replyLang.key)
+                .toString().encodeToByteArray()
+        )
         val steps = mutableListOf<ToolCall>()
         try {
             if (c.responseCode != 200) {
