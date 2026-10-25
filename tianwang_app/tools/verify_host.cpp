@@ -48,26 +48,43 @@ int main(int argc, char** argv) {
         return 2;
     }
     const char* path = argv[1];
-    std::string userStr = (argc > 2 && argv[2][0] == '@') ? read_file(argv[2] + 1)
-                        : std::string((argc > 2) ? argv[2] : "你好，用一句话介绍你自己。");
+    std::string userStr = (argc > 2 && argv[2][0] != '-') ? ((argv[2][0] == '@') ? read_file(argv[2] + 1) : std::string(argv[2]))
+                                                          : std::string("你好，用一句话介绍你自己。");
     if (userStr.empty()) userStr = "你好，用一句话介绍你自己。";
-    int maxTokens = (argc > 3) ? atoi(argv[3]) : 96;
+    int maxTokens = (argc > 3 && argv[3][0] != '-') ? atoi(argv[3]) : 96;
+
+    // 具名参数：--threads N / --gpu N / --ctx N / --clear-kv
+    // 手机和电脑的核数、GPU 完全不同，写死会把「机器差异」误读成「程序差异」。
+    int nThreads = 6;     // 默认沿用手机端配置，电脑请显式 --threads 16
+    int nGpuLayers = 0;   // 0 = 纯 CPU；-1 = 全部层 offload
+    int nCtx = 8192;
+    bool clearKv = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--threads" && i + 1 < argc)      nThreads = atoi(argv[++i]);
+        else if (a == "--gpu" && i + 1 < argc)     nGpuLayers = atoi(argv[++i]);
+        else if (a == "--ctx" && i + 1 < argc)     nCtx = atoi(argv[++i]);
+        else if (a == "--clear-kv")                clearKv = true;
+    }
 
     llama_backend_init();
 
     long long t0 = now_ms();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = nGpuLayers;
     llama_model* model = llama_model_load_from_file(path, mp);
     if (!model) { fprintf(stderr, "[FAIL] 模型加载失败: %s\n", path); return 1; }
     printf("[load] %lld ms\n", now_ms() - t0);
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 8192;
-    cp.n_threads = 6;
-    cp.n_threads_batch = 6;
+    cp.n_ctx = nCtx;
+    cp.n_threads = nThreads;
+    cp.n_threads_batch = nThreads;
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "[FAIL] ctx 创建失败\n"); return 1; }
+    printf("[cfg] threads=%d gpu_layers=%d ctx=%d gpu_offload_support=%s\n",
+           nThreads, nGpuLayers, (int) llama_n_ctx(ctx),
+           llama_supports_gpu_offload() ? "YES" : "NO(本次构建无 GPU 后端)");
 
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
@@ -108,7 +125,7 @@ int main(int argc, char** argv) {
     // ↓↓↓ 以下与 llama_jni.cpp 修复后的循环逐行对应 ↓↓↓
     // 可选：模拟 JNI 里的「每轮前清 KV」。用 --clear-kv 打开，
     // 用来验证这句是不是卡死的元凶。
-    if (argc > 4 && std::string(argv[4]) == "--clear-kv") {
+    if (clearKv) {
         printf("[kv] clearing...\n"); fflush(stdout);
         llama_memory_clear(llama_get_memory(ctx), true);
         printf("[kv] cleared\n"); fflush(stdout);
