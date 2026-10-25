@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -76,9 +77,12 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun ChatScreen(
     msgs: List<ChatMsg>,
-    model: ModelProfile,
+    model: ModelProfile?,
+    busy: Boolean,
     onPickModel: () -> Unit,
     onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var draft by remember { mutableStateOf("") }
@@ -92,35 +96,63 @@ fun ChatScreen(
     Column(modifier.fillMaxSize()) {
         ModelBar(model, onPickModel)
 
-        LazyColumn(
-            state = list,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                start = 14.dp, end = 14.dp, top = 10.dp, bottom = 14.dp,
-            ),
-            verticalArrangement = Arrangement.spacedBy(18.dp),
-        ) {
-            items(msgs, key = { it.id }) { m ->
-                when (m.role) {
-                    ChatMsg.Role.USER -> UserBubble(m.text)
-                    ChatMsg.Role.ASSISTANT -> AssistantBlock(m)
-                    ChatMsg.Role.SYSTEM -> SystemNote(m.text)
+        if (msgs.isEmpty()) {
+            // 🔴 空态就是空态。旧版这里塞了两条假对话（含假的工具调用和假结果），
+            // 让人以为「刚才真跑过 fleet.nodes」—— 那是整个 app 最像空壳的地方。
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Column(
+                    Modifier.padding(horizontal = 32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text("还没有对话", fontSize = 15.sp, fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        if (model == null) "先在「模型」页挑一个模型：本地 GGUF 或者云侧网关。"
+                        else "当前用 ${model.label}。本地模型断网也能答，不出手机。",
+                        fontSize = 12.sp, lineHeight = 19.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                }
+            }
+        } else {
+            LazyColumn(
+                state = list,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                    start = 14.dp, end = 14.dp, top = 10.dp, bottom = 14.dp,
+                ),
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                items(msgs, key = { it.id }) { m ->
+                    when (m.role) {
+                        ChatMsg.Role.USER -> UserBubble(m.text)
+                        ChatMsg.Role.ASSISTANT -> AssistantBlock(m)
+                        ChatMsg.Role.SYSTEM -> SystemNote(m.text)
+                    }
                 }
             }
         }
 
-        Composer(draft, { draft = it }, onSend = {
-            val t = draft.trim()
-            if (t.isNotEmpty()) { onSend(t); draft = "" }
-        })
+        Composer(
+            draft, { draft = it },
+            busy = busy,
+            canSend = model != null,
+            onSend = {
+                val t = draft.trim()
+                if (t.isNotEmpty()) { onSend(t); draft = "" }
+            },
+            onStop = onStop,
+        )
     }
 }
 
 /* ---------------------------------- 顶栏 ---------------------------------- */
 
 @Composable
-private fun ModelBar(model: ModelProfile, onPick: () -> Unit) {
-    val isLocal = model.kind == BackendKind.LOCAL
+private fun ModelBar(model: ModelProfile?, onPick: () -> Unit) {
+    val isLocal = model?.kind == BackendKind.LOCAL
     Row(
         Modifier.fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface)
@@ -131,19 +163,24 @@ private fun ModelBar(model: ModelProfile, onPick: () -> Unit) {
         Icon(
             if (isLocal) Icons.Filled.Memory else Icons.Filled.Cloud,
             contentDescription = null,
-            tint = if (isLocal) StatusColors.ok else MaterialTheme.colorScheme.primary,
+            tint = if (model == null) StatusColors.idle
+                   else if (isLocal) StatusColors.ok else MaterialTheme.colorScheme.primary,
             modifier = Modifier.size(15.dp),
         )
         Spacer(Modifier.width(7.dp))
         Text(
-            model.label,
+            model?.label ?: "未选模型",
             fontSize = 12.5.sp,
             fontWeight = FontWeight.Medium,
             color = MaterialTheme.colorScheme.onSurface,
         )
         Spacer(Modifier.width(7.dp))
         Text(
-            if (isLocal) "本地 · 断网可用" else "云端 · 长上下文",
+            when {
+                model == null -> "点这里去挑一个"
+                isLocal -> "本地 · 断网可用"
+                else -> "云端 · 长上下文"
+            },
             fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -212,6 +249,20 @@ private fun AssistantBlock(m: ChatMsg) {
 
             if (m.text.isNotBlank()) {
                 MarkdownLite(m.text)
+            }
+            // 实测性能：不写「很快」「有点慢」这种词，直接把数字摆出来
+            m.stats?.let { st ->
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    buildString {
+                        if (st.firstMs >= 0) append("首字 ${st.firstMs}ms · ")
+                        append("${st.tokens} token")
+                        if (st.tokPerSec > 0) append(" · ${String.format("%.1f", st.tokPerSec)} tok/s")
+                    },
+                    fontSize = 10.sp,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (m.streaming) {
                 Spacer(Modifier.height(6.dp))
@@ -487,8 +538,15 @@ private fun TypingDots() {
 /* --------------------------------- 输入区 --------------------------------- */
 
 @Composable
-private fun Composer(draft: String, onDraft: (String) -> Unit, onSend: () -> Unit) {
-    val can = draft.isNotBlank()
+private fun Composer(
+    draft: String,
+    onDraft: (String) -> Unit,
+    busy: Boolean,
+    canSend: Boolean,
+    onSend: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val can = draft.isNotBlank() && canSend && !busy
     Column(
         Modifier.fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface)
@@ -508,8 +566,14 @@ private fun Composer(draft: String, onDraft: (String) -> Unit, onSend: () -> Uni
                 onValueChange = onDraft,
                 modifier = Modifier.weight(1f),
                 placeholder = {
-                    Text("说点什么，或让它动手", fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        when {
+                            !canSend -> "先去挑一个模型"
+                            busy -> "正在生成…（可点右边停止）"
+                            else -> "说点什么，或让它动手"
+                        },
+                        fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 },
                 maxLines = 5,
                 shape = RoundedCornerShape(20.dp),
@@ -523,17 +587,28 @@ private fun Composer(draft: String, onDraft: (String) -> Unit, onSend: () -> Uni
                 ),
             )
             Spacer(Modifier.width(7.dp))
+            // 🔴 busy 时这个按钮变「停止」：手机上模型一旦开始胡写，用户必须能掐断，
+            //    否则只能锁屏杀进程 —— 而杀进程会连带丢掉这一轮已经生成的内容。
             Surface(
-                color = if (can) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.surfaceVariant,
+                color = when {
+                    busy -> StatusColors.fail
+                    can -> MaterialTheme.colorScheme.primary
+                    else -> MaterialTheme.colorScheme.surfaceVariant
+                },
                 shape = CircleShape,
-                modifier = Modifier.size(40.dp).clickable(enabled = can) { onSend() },
+                modifier = Modifier.size(40.dp).clickable(enabled = busy || can) {
+                    if (busy) onStop() else onSend()
+                },
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Icon(
-                        Icons.Filled.ArrowUpward, "发送",
-                        tint = if (can) MaterialTheme.colorScheme.onPrimary
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        if (busy) Icons.Filled.Stop else Icons.Filled.ArrowUpward,
+                        if (busy) "停止" else "发送",
+                        tint = when {
+                            busy -> Color.White
+                            can -> MaterialTheme.colorScheme.onPrimary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                         modifier = Modifier.size(19.dp),
                     )
                 }
