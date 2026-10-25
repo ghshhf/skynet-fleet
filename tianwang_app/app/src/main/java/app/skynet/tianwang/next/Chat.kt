@@ -13,6 +13,7 @@ data class ChatMsg(
     val at: Long = System.currentTimeMillis(),
     val streaming: Boolean = false,
     val failed: String = "",
+    val media: List<Media> = emptyList(),   // 生成的图/视频 —— 手机端已具备生成能力，这里只渲染
 ) {
     enum class Role { USER, ASSISTANT, SYSTEM }
 }
@@ -119,3 +120,70 @@ object Demo {
         ),
     )
 }
+
+/** 网关（云端引擎的真实状态 —— 来自云侧 /api/providers）。 */
+data class Gateway(
+    val id: String = "",
+    val status: String = "死",
+    val endpoint: String = "",
+    val latencyMs: Int = 0,
+    val modelCount: Int = 0,
+    val note: String = "",
+)
+
+/** 一项能力（工具箱的数据源 —— 来自云侧 /api/caps，按 domain 分组）。 */
+data class Capability(
+    val name: String = "",
+    val title: String = "",
+    val domain: String = "",
+    val params: List<CapParam> = emptyList(),
+    val sideEffect: Boolean = false,
+    val destructive: Boolean = false,
+    val approval: String = "auto",
+    val note: String = "",
+)
+
+data class CapParam(
+    val name: String = "",
+    val type: String = "str",
+    val desc: String = "",
+    val required: Boolean = false,
+)
+
+/** 工具单点执行的结果（工具箱点一下之后的回显）。 */
+data class ToolResult(
+    val ok: Boolean = false,
+    val text: String = "",
+    val err: String = "",
+)
+
+/** 项目任务进度（来自云侧 /api/tasks）。 */
+data class Phase(
+    val id: String = "",
+    val name: String = "",
+    val done: Boolean = false,
+)
+
+data class TaskBoard(
+    val phases: List<Phase> = emptyList(),
+    val recentCommits: List<String> = emptyList(),
+    val branch: String = "",
+)
+
+/** 一条媒体附件（生成的图片 / 视频 —— 手机端已具备生成能力，这里只负责渲染）。 */
+data class Media(
+    val kind: Kind = Kind.IMAGE,
+    val uri: String = "",        // http(s) 或 file:// 或 content://
+    val caption: String = "",
+) {
+    enum class Kind { IMAGE, VIDEO }
+}
+
+/** 云侧连接配置（存在 SharedPreferences，设置页读写）。 */
+data class AgentConfig(
+    val url: String = "http://127.0.0.1:9124",
+    val token: String = "",
+) {
+    fun valid(): Boolean = url.isNotBlank() && token.isNotBlank()
+}
+

@@ -24,6 +24,7 @@
 那种情况不执行任何东西，把错误原文回填给模型让它自己改。
 """
 import time
+import json
 
 from . import providers as P
 from . import toolschema as TS
@@ -224,12 +225,16 @@ def run(question, executor, caps=None, tools=None, index=None,
                 fire("denied", {"round": rnd, "cap": c.cap})
                 continue
             used_caps.add(c.cap)
-            fire("exec", {"round": rnd, "cap": c.cap})
+            fire("exec", {"round": rnd, "cap": c.cap,
+                          "args": json.dumps(c.args, ensure_ascii=False)})
             ok, text = _exec(executor, c.cap, c.args)
             text = TS.clip_result(text)
             steps.append(Step(rnd, c.cap, c.args, ok, text, "" if ok else text))
             results[c.id or c.tool] = text
-            fire("done", {"round": rnd, "cap": c.cap, "ok": ok, "len": len(text)})
+            # 🔴 手机端要在这张卡上显示真结果 —— 必须把 text 透传过去，
+            # 只发 len 的话手机端只能显示「完成」却看不到工具到底吐了什么。
+            fire("done", {"round": rnd, "cap": c.cap, "ok": ok,
+                          "text": text, "ms": 0})
 
         messages.extend(TS.tool_result_messages(calls, results, flavor))
 
