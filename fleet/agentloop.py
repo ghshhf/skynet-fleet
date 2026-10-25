@@ -46,19 +46,25 @@ BUDGET_S = 90
 class Step:
     """走了一步的记录（每步一个工具调用）。"""
 
-    __slots__ = ("round", "cap", "args", "ok", "text", "error")
+    __slots__ = ("round", "cap", "args", "ok", "text", "error", "approval")
 
-    def __init__(self, rnd=0, cap="", args=None, ok=False, text="", error=""):
+    def __init__(self, rnd=0, cap="", args=None, ok=False, text="", error="",
+                 approval=None):
         self.round = rnd
         self.cap = cap
         self.args = args or {}
         self.ok = ok
         self.text = text
         self.error = error
+        # 被闸门拦下时的票号（{"id":...,"level":...}）。手机端靠它知道去批哪一条；
+        # 没被拦就是 None。不许只把票号塞进 text——那是给人看的字，模型和
+        # 手机端都不该去文本里抠 JSON。
+        self.approval = approval
 
     def as_dict(self):
         return {"round": self.round, "cap": self.cap, "args": self.args,
-                "ok": self.ok, "text": self.text, "error": self.error}
+                "ok": self.ok, "text": self.text, "error": self.error,
+                "approval": self.approval}
 
     def __repr__(self):
         if self.error:
@@ -92,7 +98,7 @@ def _summarize_steps(steps, why=""):
     return head + "\n" + "\n".join(lines)
 
 
-def _exec(executor, cap, args):
+def _exec(executor, cap, args, sink=None):
     """调一次执行层，把结果统一成 (ok, 文本)。
 
     执行层可能是 Registry（返回 DeviceResult），也可能只是个函数（返回 str）。
@@ -130,6 +136,11 @@ def _exec(executor, cap, args):
             data = data if data is not None else d.get("data")
 
     ok = True if raw_ok is None else bool(raw_ok)
+    # 闸门拦下时 Registry.call 把票号放在 data.approval；不捞出来，
+    # 手机端收到「需要确认」却不知道该确认哪一条，只能再问一遍。
+    if sink is not None and isinstance(data, dict) \
+            and isinstance(data.get("approval"), dict):
+        sink["approval"] = data["approval"]
     if not ok:
         return False, err or "执行失败（没说原因）"
     if data is None or data == {}:
@@ -299,14 +310,18 @@ def _run_loop(question, executor, caps=None, tools=None, index=None,
             used_caps.add(c.cap)
             fire("exec", {"round": rnd, "cap": c.cap,
                           "args": json.dumps(c.args, ensure_ascii=False)})
-            ok, text = _exec(executor, c.cap, c.args)
+            sink = {}
+            ok, text = _exec(executor, c.cap, c.args, sink=sink)
             text = TS.clip_result(text)
-            steps.append(Step(rnd, c.cap, c.args, ok, text, "" if ok else text))
+            st = Step(rnd, c.cap, c.args, ok, text, "" if ok else text,
+                      approval=sink.get("approval"))
+            steps.append(st)
             results[c.id or c.tool] = text
             # 🔴 手机端要在这张卡上显示真结果 —— 必须把 text 透传过去，
             # 只发 len 的话手机端只能显示「完成」却看不到工具到底吐了什么。
             fire("done", {"round": rnd, "cap": c.cap, "ok": ok,
-                          "text": text, "ms": 0})
+                          "text": text, "ms": 0,
+                          "approval": sink.get("approval")})
 
         messages.extend(TS.tool_result_messages(calls, results, flavor))
 
@@ -679,6 +694,28 @@ def _selftest():
            "不给 journal 时 messages 应只有 system+question 两条，实得 %d"
            % len(hist_seen[0]))
         j.close_connection()
+
+    # ---- 审批票号：闸门拦下时必须透传到 step（手机端靠它知道批准哪条）----
+    def ex_denied(cap, args):
+        if cap == "pc.state":
+            return {"ok": False, "code": "denied", "err": "需要确认",
+                    "data": {"approval": {"id": "t42", "level": 1, "cap": cap}}}
+        return "x"
+
+    def fake_chat_deny(messages, provs=None, need=None, model=None, tools=None,
+                       quota=None, account="", tool_choice=None, **kw):
+        return {"ok": True, "used": "p", "used_model": "m", "tokens": 1, "why": [],
+                "content": "", "raw": _mkresp([("pc.state", {})])}
+
+    P.chat = fake_chat_deny
+    try:
+        rd = run("点一下", ex_denied, caps=caps, index=index,
+                 quota=P.Quota(":memory:"), max_rounds=1)
+    finally:
+        P.chat = orig
+    ck(rd["steps"] and (rd["steps"][0].get("approval") or {}).get("id") == "t42",
+       "闸门票号必须透传到 step，实得 %r"
+       % (rd["steps"][0] if rd["steps"] else None))
 
     if fails:
         print("agentloop selftest: FAIL")
