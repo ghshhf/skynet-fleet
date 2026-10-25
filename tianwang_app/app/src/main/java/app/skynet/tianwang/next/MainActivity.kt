@@ -23,6 +23,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Assignment
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Memory
@@ -68,6 +70,7 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Net.init(applicationContext)
         enableEdgeToEdge()
         setContent {
             TianwangTheme {
@@ -78,7 +81,7 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class Tab(val label: String) {
-    CHAT("对话"), MODELS("模型"), FLEET("编队"), SETTINGS("设置")
+    CHAT("对话"), MODELS("模型"), TOOLS("工具箱"), TASKS("任务"), FLEET("编队"), SETTINGS("设置")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -97,42 +100,61 @@ private fun App() {
     fun send(text: String) {
         if (busy) return
         msgs.add(ChatMsg(role = ChatMsg.Role.USER, text = text))
-        // 原型：先用假流式把「输入 → 工具 → 回答」这条链路走通，
-        // 真链路（本地 llama.cpp / 云端 SSE）接进来时只换这一段的实现。
         val replyId = java.util.UUID.randomUUID().toString()
         msgs.add(ChatMsg(id = replyId, role = ChatMsg.Role.ASSISTANT, streaming = true))
         busy = true
-        scope.launch {
-            val steps = listOf(
-                "fleet.nodes" to "{\"detail\":true}",
-                "model.route" to "{\"prefer\":\"${current.kind}\"}",
-            )
-            val done = mutableListOf<ToolCall>()
-            delay(280)
-            steps.forEachIndexed { i, (n, a) ->
-                val running = ToolCall(name = n, args = a, state = ToolCall.State.RUNNING)
-                done.add(running)
-                update(msgs, replyId) { it.copy(tools = done.toList()) }
-                delay(420 + i * 160L)
-                done[done.lastIndex] = running.copy(
-                    state = ToolCall.State.OK,
-                    result = if (n == "fleet.nodes")
-                        "2 台在线 / 共 ${Demo.nodes.size} 台"
-                    else "已选 ${current.label}",
-                    ms = 300 + i * 120L,
+        if (Net.hasConfig()) {
+            // 真链路：手机 → 云侧 SSE → 电脑侧 agentloop 真跑（工具 + 回答都是真的）
+            val steps = androidx.compose.runtime.mutableStateListOf<ToolCall>()
+            scope.launch {
+                Net.streamAgent(text,
+                    onStep = { tc ->
+                        val i = steps.indexOfFirst { it.id == tc.id }
+                        if (i >= 0) steps[i] = tc else steps.add(tc)
+                        update(msgs, replyId) { it.copy(tools = steps.toList()) }
+                    },
+                    onAnswer = { ans, finalSteps ->
+                        update(msgs, replyId) { it.copy(text = ans, tools = finalSteps, streaming = false) }
+                        busy = false
+                    },
+                    onError = { e ->
+                        update(msgs, replyId) { it.copy(failed = e, streaming = false) }
+                        busy = false
+                    })
+            }
+        } else {
+            // 未连云侧：用假流式把「输入 → 工具 → 回答」这条链路走通
+            scope.launch {
+                val steps = listOf(
+                    "fleet.nodes" to "{\"detail\":true}",
+                    "model.route" to "{\"prefer\":\"${current.kind}\"}",
                 )
-                update(msgs, replyId) { it.copy(tools = done.toList()) }
+                val done = mutableListOf<ToolCall>()
+                delay(280)
+                steps.forEachIndexed { i, (n, a) ->
+                    val running = ToolCall(name = n, args = a, state = ToolCall.State.RUNNING)
+                    done.add(running)
+                    update(msgs, replyId) { it.copy(tools = done.toList()) }
+                    delay(420 + i * 160L)
+                    done[done.lastIndex] = running.copy(
+                        state = ToolCall.State.OK,
+                        result = if (n == "fleet.nodes")
+                            "2 台在线 / 共 ${Demo.nodes.size} 台"
+                        else "已选 ${current.label}",
+                        ms = 300 + i * 120L,
+                    )
+                    update(msgs, replyId) { it.copy(tools = done.toList()) }
+                }
+                val body = "收到。当前走 **${current.label}**" +
+                    (if (current.kind == BackendKind.LOCAL) "（本地，不出手机）" else "（云端）") +
+                    "。\n\n这是离线演示回答——在「设置」里连上云侧后，上面这几张卡片会变成真的工具调用。"
+                body.split(" ").forEach { w ->
+                    update(msgs, replyId) { it.copy(text = it.text + w + " ") }
+                    delay(55)
+                }
+                update(msgs, replyId) { it.copy(streaming = false) }
+                busy = false
             }
-            val body = "收到。当前走 **${current.label}**" +
-                (if (current.kind == BackendKind.LOCAL) "（本地，不出手机）" else "（云端）") +
-                "。\n\n这条是原型的假流式回答——把模型层接上之后，" +
-                "上面这几张卡片会换成真的工具调用。"
-            body.split(" ").forEach { w ->
-                update(msgs, replyId) { it.copy(text = it.text + w + " ") }
-                delay(55)
-            }
-            update(msgs, replyId) { it.copy(streaming = false) }
-            busy = false
         }
     }
 
@@ -153,6 +175,8 @@ private fun App() {
                                 Tab.CHAT -> msgs.lastOrNull { it.role == ChatMsg.Role.USER }?.text
                                     ?.take(20) ?: "新对话"
                                 Tab.MODELS -> "本地 + 云端，一个列表"
+                                Tab.TOOLS -> "电脑侧真实能力"
+                                Tab.TASKS -> "项目整体进度"
                                 Tab.FLEET -> "我在编队里的位置"
                                 Tab.SETTINGS -> "会改变行为的开关"
                             },
@@ -202,6 +226,8 @@ private fun App() {
                                     when (t) {
                                         Tab.CHAT -> Icons.Filled.ChatBubbleOutline
                                         Tab.MODELS -> Icons.Filled.Memory
+                                        Tab.TOOLS -> Icons.Filled.Build
+                                        Tab.TASKS -> Icons.Filled.Assignment
                                         Tab.FLEET -> Icons.Filled.Devices
                                         Tab.SETTINGS -> Icons.Filled.Settings
                                     },
@@ -231,6 +257,8 @@ private fun App() {
                     onSend = { send(it) },
                 )
                 Tab.MODELS -> ModelsScreen(Demo.models, current.id) { current = it }
+                Tab.TOOLS -> ToolsScreen()
+                Tab.TASKS -> TasksScreen()
                 Tab.FLEET -> FleetScreen(Demo.nodes)
                 Tab.SETTINGS -> SettingsScreen()
             }

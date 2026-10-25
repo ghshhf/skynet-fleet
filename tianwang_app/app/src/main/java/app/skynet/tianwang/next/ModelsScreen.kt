@@ -29,6 +29,11 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -54,6 +59,15 @@ fun ModelsScreen(
     currentId: String,
     onPick: (ModelProfile) -> Unit,
 ) {
+    var gateways by remember { mutableStateOf<List<Gateway>>(emptyList()) }
+    var gwErr by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        if (Net.hasConfig()) {
+            runCatching { Net.getProviders() }
+                .onSuccess { gateways = it }
+                .onFailure { gwErr = it.message ?: "拉取失败" }
+        }
+    }
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
@@ -79,6 +93,25 @@ fun ModelsScreen(
                 title = "云端引擎",
                 sub = "OpenAI 兼容端点 · 长上下文 · 需要联网",
             )
+        }
+        // 🔴 P1 判据：这里要能看见至少 2 个网关的真实状态（活/死、延迟、模型数）。
+        // 数据来自云侧 /api/providers，不是写死的 demo。
+        item("gateways") {
+            if (gwErr.isNotEmpty()) {
+                Text(gwErr, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+            } else if (gateways.isEmpty()) {
+                Text("（未检测到网关 —— 云侧未启动，或本机还没在「设置」连上）",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                // 🔴 Compose 铁律：forEach 的 lambda 不是 @Composable 上下文，
+                // 不能在里面直接调自由组合函数 GatewayRow。用 for 循环（纯控制流），
+                // 循环体落在 Column 的可组合作用域里，调用才合法。
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (gw in gateways) {
+                        GatewayRow(gw)
+                    }
+                }
+            }
         }
         items(models.filter { it.kind == BackendKind.CLOUD }, key = { it.id }) {
             ModelRow(it, it.id == currentId) { onPick(it) }
@@ -206,5 +239,44 @@ private fun ModelRow(m: ModelProfile, active: Boolean, onClick: () -> Unit) {
                 maxLines = 1,
             )
         }
+    }
+}
+
+/** 一个网关的真实状态卡（来自云侧 /api/providers）。活/死用色点 + 文案双重表达。 */
+@Composable
+private fun GatewayRow(gw: Gateway) {
+    val alive = gw.status == "活"
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape)
+            .background(if (alive) StatusColors.ok else StatusColors.fail))
+        Spacer(Modifier.width(9.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                gw.id.ifBlank { gw.endpoint }, fontSize = 13.sp,
+                fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface,
+            )
+            val sub = buildList {
+                if (gw.endpoint.isNotBlank()) add(gw.endpoint)
+                if (gw.modelCount > 0) add("${gw.modelCount} 模型")
+                if (gw.latencyMs > 0) add("${gw.latencyMs}ms")
+            }.joinToString(" · ")
+            if (sub.isNotBlank()) {
+                Text(
+                    sub, fontSize = 10.5.sp, fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Text(
+            gw.status, fontSize = 11.sp,
+            color = if (alive) StatusColors.ok else StatusColors.fail,
+        )
     }
 }

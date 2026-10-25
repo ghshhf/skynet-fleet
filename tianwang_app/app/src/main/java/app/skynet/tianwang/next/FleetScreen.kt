@@ -155,6 +155,10 @@ fun SettingsScreen() {
         }
         item {
             Spacer(Modifier.height(12.dp))
+            AgentConfigScreen()
+        }
+        item {
+            Spacer(Modifier.height(12.dp))
             GroupTitle("关于")
             InfoRow("版本", "0.1-proto（Compose 原型）")
             InfoRow("后端", "天网编队 · 控制面 + 本地推理 + 云端")
