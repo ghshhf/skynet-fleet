@@ -33,6 +33,9 @@ target_include_directories(fleet_llama PRIVATE
 target_link_libraries(fleet_llama PRIVATE
     llama
     ggml
+    # JNI 里直接读 GGUF 元数据（层数/训练上下文）——gguf_* 在 ggml-base，
+    # 静态链接必须显式列出，否则混合模式的「按比例切层」链接不过。
+    ggml-base
     android
     log)
 
