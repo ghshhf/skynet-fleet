@@ -9,16 +9,35 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-JAVA="/d/tools/jdk25_raw/jdk-25.0.4.1+1/bin"
-BT="/d/DevTools/Android/build-tools/35.0.0"
-PLATFORM="/d/DevTools/Android/platforms/android-35/android.jar"
-PY="/d/tools/python/python.exe"
 PASS="fleetbridge"
 
+# ---- 工具链定位：候选制，别写死（2026-10-26 改）----
+# 原先 JAVA/BT/PLATFORM/PY 四个路径全写死在 `/d/tools/...`、`/d/DevTools/...`，
+# D 盘整体搬走之后脚本第一步就 `缺依赖: .../javac.exe` 直接退，而它想干的事
+# （编那个几十 KB 的桥 APK）一点没变。写死路径 = 换个盘就废，和「不写死设备」
+# 是同一条道理：**能力跟着探测结果走，不跟着上一次的目录结构走**。
+pick() { for c in "$@"; do [ -e "$c" ] && { printf '%s' "$c"; return 0; }; done; return 1; }
+
+SDK="$(pick "${ANDROID_SDK_ROOT:-}" /g/sdk /d/DevTools/Android "$HOME/Android/Sdk" || true)"
+JAVA_BIN="$(pick "${JAVA_HOME:-}/bin" /g/_tools/jdk-25/bin /d/tools/jdk25_raw/jdk-25.0.4.1+1/bin || true)"
+BT="$(pick "${SDK:+$SDK/build-tools/35.0.1}" "${SDK:+$SDK/build-tools/35.0.0}" \
+           ${SDK:+$SDK/build-tools/37.0.0} ${SDK:+$SDK/build-tools/34.0.0} || true)"
+PLATFORM="$(pick "${SDK:+$SDK/platforms/android-35/android.jar}" \
+                ${SDK:+$SDK/platforms/android-36/android.jar} || true)"
+PY="$(pick /g/Python312/python.exe /d/tools/python/python.exe "$(command -v python 2>/dev/null || true)" || true)"
+
+[ -n "$SDK" ]      || { echo "找不到 Android SDK（试过 /g/sdk、/d/DevTools/Android）" >&2; exit 1; }
+[ -n "$JAVA_BIN" ] || { echo "找不到 JDK（试过 /g/_tools/jdk-25、/d/tools/jdk25_raw）" >&2; exit 1; }
+[ -n "$BT" ]       || { echo "找不到 build-tools（在 $SDK/build-tools 下）" >&2; exit 1; }
+[ -n "$PLATFORM" ] || { echo "找不到 platforms/android-35/android.jar（SDK=$SDK）" >&2; exit 1; }
+[ -n "$PY" ]       || { echo "找不到 python" >&2; exit 1; }
+JAVA="$JAVA_BIN"
+
 export PATH="$JAVA:$PATH"
-# d8.bat / apksigner.bat 会读 JAVA_HOME，而系统里那个还指着已消失的 E 盘，
-# 必须在本脚本内覆盖成真实 JDK 的 Windows 路径，否则 bat 直接拒绝启动
-export JAVA_HOME="D:\\tools\\jdk25_raw\\jdk-25.0.4.1+1"
+# d8.bat / apksigner.bat 会读 JAVA_HOME，而系统里那个可能指着已经不存在的盘，
+# 必须在本脚本内覆盖成真实 JDK 的 **Windows** 路径（bat 不认 /g/... 这种 MSYS 路径）
+export JAVA_HOME="$(cygpath -w "$(dirname "$JAVA_BIN")" 2>/dev/null || echo "$JAVA_BIN")"
+echo "SDK=$SDK"; echo "JAVA_HOME=$JAVA_HOME"; echo "BT=$BT"
 cd "$HERE"
 
 for f in "$JAVA/javac.exe" "$BT/aapt2.exe" "$BT/d8.bat" "$BT/apksigner.bat" "$PLATFORM"; do
@@ -86,5 +105,14 @@ SIZE=$("$PY" -c "import os,sys;print(os.path.getsize(sys.argv[1]))" build/fleet-
 echo "[5/5] 产物 build/fleet-bridge.apk  ${SIZE} 字节"
 echo "--------"
 echo "令牌：$TOKEN"
-echo "安装：adb install -r build/fleet-bridge.apk"
+echo "安装：adb install --no-streaming -r build/fleet-bridge.apk"
+# 🔴 必须 --no-streaming（2026-10-26 实测）：MIUI/HyperOS 对**流式安装**直接回
+#    INSTALL_FAILED_USER_RESTRICTED: Install canceled by user（就算屏幕亮着、
+#    人就守着也一样，它不给弹窗）。换成 push 安装（--no-streaming）一次就过，
+#    全程不用点屏幕。
+# 🔴 而且**别 uninstall 再装**：卸载后无障碍授权一起没了，而这代 ROM 不让
+#    adb 写 secure settings（`settings put` 与 `pm grant` 全被拒），
+#    只能人去「设置 → 无障碍 → 编队桥」手开一次。
+#    只要 keystore.jks 还在（本脚本会复用，不会重新生成），
+#    覆盖安装就是无痛的一条命令。
 echo "授权：手机 设置 → 无障碍 → 已下载的服务 → 「编队桥」→ 打开"

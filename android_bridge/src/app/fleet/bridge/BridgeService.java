@@ -17,6 +17,8 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Path;
@@ -241,12 +243,64 @@ public class BridgeService extends AccessibilityService {
     private String setText(String text) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return "ERR no-window";
-        AccessibilityNodeInfo focus = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-        if (focus == null) return "ERR no-focus";
+
+        // 🔴 三级下落（2026-10-26 修）。原先只有第 ① 级，且只在
+        //    `findFocus(FOCUS_INPUT)` 那一个节点上试 —— 真机实测：
+        //    Compose 的输入框焦点挂在一个 `android.view.View` 包装节点上
+        //    （不是 EditText），`ACTION_SET_TEXT` 在它身上**返回 false**，
+        //    于是所有「打字」类指令一律 `ERR text-rejected`。
+        //    表现就是：能点、能滑、能返回，就是打不了字 —— 半个残废。
+        //
+        //    ① 焦点节点自己能收 SET_TEXT 就最省事；
+        //    ② 不行就在树里找**真正的可编辑节点**（isEditable），先 FOCUS 再 SET_TEXT；
+        //    ③ 还不行就走剪贴板：把文字塞进 Clipboard，再对可编辑节点发 ACTION_PASTE。
+        //       剪贴板这条路绕开了「谁能收 SET_TEXT」的实现差异，只要求节点支持粘贴。
         Bundle args = new Bundle();
         args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
-        boolean ok = focus.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
-        return ok ? "OK text" : "ERR text-rejected";
+
+        AccessibilityNodeInfo focus = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+        if (focus != null && focus.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+            return "OK text (focus)";
+        }
+
+        AccessibilityNodeInfo edit = findEditable(root, new int[]{0});
+        if (edit != null) {
+            edit.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            if (edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                return "OK text (editable)";
+            }
+            if (pasteInto(edit, text)) return "OK text (paste)";
+        }
+
+        // 最后一搏：焦点节点粘贴（有些实现只在焦点节点上认 PASTE）
+        if (focus != null && pasteInto(focus, text)) return "OK text (focus-paste)";
+        return "ERR text-rejected";
+    }
+
+    /** 树里第一个可编辑节点。Compose 里真正的输入节点往往藏在几层 View 下面。 */
+    private AccessibilityNodeInfo findEditable(AccessibilityNodeInfo n, int[] guard) {
+        if (n == null || guard[0] > 400) return null;
+        guard[0]++;
+        if (n.isEditable()) return n;
+        for (int i = 0; i < n.getChildCount(); i++) {
+            AccessibilityNodeInfo c = n.getChild(i);
+            if (c == null) continue;
+            AccessibilityNodeInfo hit = findEditable(c, guard);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
+
+    /** 剪贴板 + ACTION_PASTE。失败返回 false，由上层继续找别的路。 */
+    private boolean pasteInto(AccessibilityNodeInfo n, String text) {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm == null) return false;
+            cm.setPrimaryClip(ClipData.newPlainText("fleet", text));
+            return n.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private String global(int action) {

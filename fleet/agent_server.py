@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import secrets
 import subprocess
@@ -43,9 +44,51 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fleet import providers as P        # noqa: E402
 from fleet import agentloop             # noqa: E402
 from fleet import catalog               # noqa: E402
+from fleet import toolschema as TS      # noqa: E402
+from fleet import gate as G             # noqa: E402
 from fleet.core import registry as regmod  # noqa: E402
 
 TOKEN_HEADER = "X-Fleet-Token"
+
+# 🔴 对话默认**只给秒回能力**。根因是 2026-10-25 真机实测：模型为答
+# 「有哪些网关」去调 net.scan（局域网端口指纹扫描）——几十秒，直接把一轮
+# 对话拖死，手机端 readTimeout 一到就报 timeout。工具表就是权限边界，
+# 也是**时延边界**：慢扫描 / 长任务 / 会再调 LLM 的（递归）一律不进对话默认表。
+# 这些能力仍在 /api/caps 全量可见、仍可在工具箱单点执行——只是不让 LLM 在
+# 对话里随手挑中。要跑慢活，用户显式点工具箱，不走对话主链路。
+SLOW_OR_UNSAFE_FOR_CHAT = {
+    # 局域网/无线/设备扫描（慢，逐设备多问，实测 net.wallprobe 单发 17 秒）
+    "net.scan", "net.nearby", "net.survey", "scene.scan", "adb.wifi.scan",
+    "net.dissect", "net.wallprobe", "proximity.estimate", "proximity.track",
+    "proximity.calibrate",
+    # 联网探测（慢/外网）
+    "web.discover", "web.diffuse", "web.probe", "web.corpus", "web.papers",
+    "osint.crt", "osint.dns", "osint.rdap",
+    "osint.shodan", "ssh.banner", "ssh.exec", "mqtt.probe", "mqtt.pub", "mqtt.sub",
+    # 逆向/红外逐个试（交互式、慢）
+    "re.ir", "re.ble", "re.binary", "re.ask", "re.proto", "re.bits", "re.bits_extract",
+    "ir.trial", "ir.command", "ir.send",
+    # 长渲染 / 生图生视频（分钟级）
+    "render.reel", "render.html", "render.frame", "video.gen", "image.gen",
+    # 会再调 LLM ⇒ 递归；重复探测网关（ai.list 已秒回）
+    "ai.chat", "ai.complete", "ai.status",
+    # 其它长任务/常驻
+    "job.submit", "sentinel.watch", "life.sentinel", "life.log",
+    "hotspot.roam", "phone.hotspot",
+}
+
+
+#: 告诉模型「动手类能力是过闸门的」，否则它一看到 denied 会以为工具坏了、
+#: 换个参数反复重试——那是白白烧轮次，还把「等你点确认」讲成「我做不到」。
+GATE_PROMPT = (
+    "【动手类能力都过审批闸门】\n"
+    "· 点按/输入/启动应用/改系统这类会改变设备状态的能力，执行前要过闸门。\n"
+    "· 如果工具结果里 code=denied 且带「待确认 #xxxx」，说明**这条已经替你排上了**，"
+    "正等人在手机上点一下允许。\n"
+    "· 这时**不要换参数重试、不要换别的工具绕**，直接告诉人：哪一步等你确认、"
+    "确认后我会继续。\n"
+    "· 只有 code 是 unavailable / error 时，才值得换个办法再试一次。"
+)
 
 
 def _need(value, default):
@@ -60,7 +103,12 @@ class FleetAgentServer:
         self.host = "0.0.0.0" if lan else host
         self.want_port = port
         self.token = token or _need("FLEET_AGENT_TOKEN", secrets.token_urlsafe(32))
-        self.gate = gate
+        # 🔴 默认**装**一道闸门，不是留 None（2026-10-25）。
+        # `Registry.call` 对副作用能力是 fail-closed 的：没 gate 就一律拒。
+        # 这个服务原先 gate=None，结果手机端 `input.tap` / `pc.shell` 全撞在这
+        # 一行上——看着连上了，一动手就「需要审批闸门」。留 None 等于**拆门**，
+        # 所以默认给一个真闸门（默认策略 = 逐次确认，仍然 fail-closed）。
+        self.gate = gate if gate is not None else G.ApprovalGate()
         # 🔴 关键：self._reg 必须初始为 None，registry() 才会在首请求时真正
         # catalog.build()。否则这里预置了一个空 Registry，registry() 见它非 None
         # 就直接返回空的，导致 /api/caps 永远返回 0 项（手机工具箱全空）。
@@ -84,10 +132,27 @@ class FleetAgentServer:
         except Exception as e:           # 执行层抛了也得给手机一个可读的因
             return {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}
         if hasattr(r, "as_dict"):
-            return r.as_dict()
-        if isinstance(r, dict):
-            return r
-        return {"ok": True, "data": r}
+            out = r.as_dict()
+        elif isinstance(r, dict):
+            out = r
+        else:
+            out = {"ok": True, "data": r}
+        # ---- 被闸门拦下的，把「票号」一起带回去 ----
+        # 光回一句「需要确认」手机端没法接：它不知道该确认哪一条。
+        # 票号是这次调用的唯一锚点，批准后再用**同一组参数**重发一次即可。
+        if not out.get("ok") and str(out.get("code") or "") == "denied":
+            try:
+                t = self.gate.find_pending(cap, out.get("device") or "", args)
+            except Exception:
+                t = None
+            if t:
+                data = dict(out.get("data") or {})
+                data["approval"] = {"id": t["id"], "level": t["level"],
+                                    "cap": t["cap"], "device": t["dev"],
+                                    "why": t["why"],
+                                    "how": "POST /api/approve {id, allow} 后重发本次调用"}
+                out["data"] = data
+        return out
 
     # --- 鉴权：401（没带）/ 403（带了不对）必须分得开 --------------------------------
     def _authorized(self, headers):
@@ -123,47 +188,189 @@ class FleetAgentServer:
             groups.setdefault(d["domain"], []).append(d["name"])
         return {"caps": flat, "groups": groups}
 
-    def agent_sse(self, question, history=None):
-        """生成器：逐事件 yield SSE 文本。executor 走本服务的真实执行层。"""
+    def _env_facts(self):
+        """把实时探测到的网关/后端状态压成一句事实，喂给模型当「当前环境」。
+
+        🔴 2026-10-25 真机实测的教训：模型为答「有哪些网关」会去挑 net.scan /
+        net.wallprobe 这类慢扫描工具（单个 17 秒），把一轮对话拖到 timeout。
+        根治不是继续加黑名单（打地鼠），而是**把答案直接递到模型眼前**——
+        它读到「zen-gate 活(125 模型)」就会直接引用，不再为了环境问题去跑重活。
+        探测失败就返回空串，不影响主流程。
+        """
+        try:
+            provs = P.probe_all()
+        except Exception:
+            return ""
+        alive = [p for p in provs if p.alive]
+        dead = [p for p in provs if not p.alive]
+        parts = ["%s 活(%d 模型/%dms)" % (p.id, len(p.models or []), p.latency_ms or 0)
+                 for p in alive]
+        parts += ["%s 死" % p.id for p in dead]
+        return ("【当前环境实况·已实时探测，直接引用，别再调扫描工具】\n"
+                "网关/后端共 %d 个：%s"
+                % (len(provs), "；".join(parts) if parts else "无"))
+
+    def agent_sse(self, question, history=None, lang=""):
+        """生成器：**真流式**逐事件 yield SSE 文本。executor 走本服务的真实执行层。
+
+        [lang] 是手机端设置里的「回复语言」（默认 zh-CN）。由**手机端**决定、
+        这里只负责落到 system 提示里 —— 语言偏好属于设备主人的习惯，
+        不该在服务端写死，同一台服务器可能连着好几个人的设备。
+
+        🔴 2026-10-25 修的假流式坑：旧版用闭包 events=[] 先 collect 完再 yield，
+        agentloop.run() 整个跑完（几十秒）手机端一个字节都收不到，最后 readTimeout
+        一到期就报 timeout。改成 queue + worker 线程：事件一产生就立刻推给手机，
+        thinking/exec/done 边跑边显示，不再是 60 秒黑屏后一窝蜂涌出。
+        """
         yield "event: meta\ndata: %s\n\n" % json.dumps(
             {"question": question}, ensure_ascii=False)
 
-        # on_event 是回调，不能 yield 给外层；用闭包把事件塞进 list，外层逐个发。
-        events = []
+        # 对话默认工具表：只留秒回能力，剔掉慢扫描/长任务/递归 LLM（见 SLOW_OR_UNSAFE_FOR_CHAT）
+        caps = self.registry().capabilities()
+        fast_caps = [c for c in caps if c.name not in SLOW_OR_UNSAFE_FOR_CHAT]
+        # 🔴 `include_unsafe=True`（2026-10-25 修）
+        # 原先给的是 False，而 `_visible()` 见到 side_effect 就整条剔掉 ——
+        # 于是 `input.tap` / `input.type` / `app.launch` 这些「让手机真动起来」
+        # 的能力**根本没进过工具表**，模型压根不知道它们存在。
+        # 表现就是：手机端问「点一下工具箱」，模型读完屏幕、读完 UI 树，
+        # 然后客客气气回一段话，一步都没动 —— 看起来像模型不肯干，
+        # 其实是**表里没这支笔**。
+        #
+        # 为什么不在这儿再设一道白名单：工具表只回答「模型能不能提议」，
+        # 「能不能真做」是闸门的事。两处都判 = 两套真相，迟早打架。
+        # 危险能力进表不会自己执行，它只会被闸门拦成「待确认 #id」，
+        # 反而让模型能把「这一步要你点一下」如实讲给主人听。
+        tools = TS.tools_for(TS.FLAVOR_OPENAI, fast_caps, include_unsafe=True)
+        # 🔴 把实时探测到的网关/后端状态作为「环境实况」直接喂给模型：
+        # 于是「有哪些网关」从「跑一堆慢扫描工具」变成「读这句直接答」，
+        # 一轮出结果、不调工具，时延从几十秒压到几秒。
+        system = agentloop.SYSTEM + "\n\n" + self._env_facts() + "\n\n" + GATE_PROMPT
+        # 语言约束：手机端设的「回复语言」优先。空/未传 = 不加任何约束（跟随提问）。
+        _LANG = {
+            "zh-CN": "始终使用简体中文回答。即使用户用其他语言提问，也用简体中文回复。",
+            "zh-TW": "始終使用繁體中文回答，用語以台灣習慣為準。",
+            "en": "Always answer in English, even if the question is in another language.",
+        }
+        if lang in _LANG:
+            system += "\n\n" + _LANG[lang]
+
+        q = queue.Queue()
 
         def fire(phase, payload=None):
             payload = payload or {}
             if phase in ("think",):
                 return
-            events.append((phase, payload))
+            q.put((phase, payload))
 
-        try:
-            res = agentloop.run(question, self.executor, on_event=fire)
-        except Exception as e:
-            yield "event: error\ndata: %s\n\n" % json.dumps(
-                {"err": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False)
-            return
+        def worker():
+            try:
+                res = agentloop.run(question, self.executor, caps=fast_caps,
+                                    tools=tools, system=system, on_event=fire)
+                q.put(("__answer__", res))
+            except Exception as e:
+                q.put(("__error__", "%s: %s" % (type(e).__name__, e)))
 
-        # 先把过程中积累的事件发出去（step / exec / done / status）
-        # 🔴 exec 必须进 step：手机端靠 exec 事件创建「运行中」卡片，
-        # 否则只有 done 一个事件，卡片永远停在 RUNNING 或凭空变成 OK。
-        for phase, payload in events:
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            phase, payload = q.get()
+            if phase == "__answer__":
+                res = payload
+                yield "event: answer\ndata: %s\n\n" % json.dumps({
+                    "ok": res.get("ok", False),
+                    "answer": res.get("answer", ""),
+                    "used": res.get("used", ""),
+                    "used_model": res.get("used_model", ""),
+                    "rounds": res.get("rounds", 0),
+                    "steps": res.get("steps", []),
+                }, ensure_ascii=False)
+                return
+            if phase == "__error__":
+                yield "event: error\ndata: %s\n\n" % json.dumps(
+                    {"err": payload}, ensure_ascii=False)
+                return
+            # 🔴 exec 必须进 step：手机端靠 exec 事件创建「运行中」卡片，
+            # 否则只有 done 一个事件，卡片永远停在 RUNNING 或凭空变成 OK。
             kind = "step" if phase in ("step", "exec", "done") else "status"
             yield "event: %s\ndata: %s\n\n" % (kind, json.dumps(
                 {"phase": phase, **payload}, ensure_ascii=False))
 
-        yield "event: answer\ndata: %s\n\n" % json.dumps({
-            "ok": res.get("ok", False),
-            "answer": res.get("answer", ""),
-            "used": res.get("used", ""),
-            "used_model": res.get("used_model", ""),
-            "rounds": res.get("rounds", 0),
-            "steps": res.get("steps", []),
-        }, ensure_ascii=False)
-
     def tool_exec(self, name, args):
         r = self.executor(name, args)
         return r
+
+    # --- 审批：把「闸门」从一句拒绝变成一个可点的确认 ---------------------------
+    def approvals(self):
+        """当前策略 + 挂着等确认的票。手机设置页靠它显示「有几件事等你点」。"""
+        try:
+            snap = self.gate.snapshot()
+        except AttributeError:
+            return {"ok": True, "mode": "custom",
+                    "note": "闸门是外部传入的自定义实现，没有快照接口", "waiting": []}
+        snap["ok"] = True
+        return snap
+
+    def approve(self, tid, allow=True):
+        if not tid:
+            return {"ok": False, "err": "缺 id"}
+        fn = getattr(self.gate, "approve", None)
+        if fn is None:
+            return {"ok": False, "err": "当前闸门不支持逐条批准"}
+        return fn(tid, allow)
+
+    def nodes(self):
+        """编队节点快照：本机 + 控制面注册表里的在线节点。
+
+        🔴 为什么要有这个端点（2026-10-25）：手机端「编队」页原先用的是写死的
+        四条假节点（1号机/2号机/旧笔记本…）。换一台电脑、换一个局域网，那四条
+        立刻全是错的，而且会把「其实一个节点都没连上」显示成「2/4 在线」。
+        节点的真实来源只有控制面注册表 —— 拿得到就给真的，拿不到就明说拿不到。
+        """
+        import platform as _pf
+        import socket as _sk
+
+        try:
+            host = _sk.gethostname()
+        except Exception:
+            host = ""
+        try:
+            ips = sorted({a for a in _sk.gethostbyname_ex(host)[2] if not a.startswith("127.")})
+        except Exception:
+            ips = []
+
+        caps_n = 0
+        try:
+            caps_n = len(self.registry().capabilities())
+        except Exception:
+            pass
+
+        cp_ok, cp_err, members = False, "", []
+        try:
+            from fleet import controlplane as CP
+            cp_ok = bool(CP.available())
+            if cp_ok:
+                members = list(CP.registry_nodes() or [])
+            else:
+                cp_err = CP.import_error() or "控制面未就绪"
+        except Exception as e:
+            cp_err = "%s: %s" % (type(e).__name__, e)
+
+        nodes = []
+        for name in members:
+            nodes.append({"name": str(name), "online": True, "kind": "member",
+                          "note": "控制面注册表"})
+        return {
+            "self": {
+                "name": host,
+                "ips": ips,
+                "platform": _pf.system() + " " + _pf.release(),
+                "caps": caps_n,
+                "role": "控制面",
+            },
+            "controlplane": {"available": cp_ok, "err": cp_err},
+            "nodes": nodes,
+            "at": time.time(),
+        }
 
     def tasks(self):
         """项目进度：阶段（计划书 §六 的 P0-P4 ✅/❌）+ 近期提交 + 分支。
@@ -235,12 +442,20 @@ class FleetAgentServer:
                     if not self._auth():
                         return
                     self._send(200, server.tasks())
+                elif path == "/api/nodes":
+                    if not self._auth():
+                        return
+                    self._send(200, server.nodes())
+                elif path == "/api/approvals":
+                    if not self._auth():
+                        return
+                    self._send(200, server.approvals())
                 else:
                     self._send(404, {"ok": False, "err": "no route: %s" % path})
 
             def do_POST(self):
                 path = urlparse(self.path).path
-                if path not in ("/api/agent", "/api/tool/exec"):
+                if path not in ("/api/agent", "/api/tool/exec", "/api/approve"):
                     self._send(404, {"ok": False, "err": "no route: %s" % path})
                     return
                 if not self._auth():
@@ -262,6 +477,11 @@ class FleetAgentServer:
                     self._send(200, server.tool_exec(name, args))
                     return
 
+                if path == "/api/approve":
+                    self._send(200, server.approve(body.get("id") or "",
+                                                   body.get("allow", True) is not False))
+                    return
+
                 # /api/agent —— SSE
                 q = (body.get("question") or "").strip()
                 if not q:
@@ -274,7 +494,8 @@ class FleetAgentServer:
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 try:
-                    for chunk in server.agent_sse(q, body.get("history")):
+                    for chunk in server.agent_sse(q, body.get("history"),
+                                                  body.get("lang") or ""):
                         self.wfile.write(chunk.encode("utf-8"))
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
@@ -302,15 +523,33 @@ def main(argv=None):
     ap.add_argument("--lan", action="store_true", help="暴露到局域网（默认只绑 127.0.0.1）")
     ap.add_argument("--token", default=None, help="Bearer token（默认启动随机生成）")
     ap.add_argument("--selftest", action="store_true", help="跑自测后退出")
+    # ---- 审批闸门（有副作用的能力要不要放、放哪些）----
+    ap.add_argument("--gate-file", default="",
+                    help="闸门策略文件（默认 fleet_gate.json；文件不存在 = 什么都问）")
+    ap.add_argument("--gate-mode", default=None, choices=("ask", "allow", "deny"),
+                    help="没写进 allow/deny 的能力怎么办（默认 ask = 逐次确认）")
+    ap.add_argument("--allow", action="append", default=[], metavar="PATTERN",
+                    help="免问的能力（可多次给；支持 input.* 这种通配）。"
+                         "破坏性动作盖不住——它们永远要一次一票")
+    ap.add_argument("--deny", action="append", default=[], metavar="PATTERN",
+                    help="明文否决的能力（可多次给；连确认票都不给）")
     args = ap.parse_args(argv)
 
     if args.selftest:
         return _selftest()
 
+    gate = G.ApprovalGate(path=args.gate_file or G.DEFAULT_PATH,
+                          mode=args.gate_mode,
+                          allow=args.allow or None,
+                          deny=args.deny or None)
     srv = FleetAgentServer(host=args.host or "127.0.0.1", port=args.port,
-                           lan=args.lan, token=args.token)
+                           lan=args.lan, token=args.token, gate=gate)
+    snap = gate.snapshot()
     print("[agent_server] token = %s" % srv.token)
     print("[agent_server] 绑定 %s:%d" % (srv.host, args.port or 0))
+    print("[agent_server] 闸门 mode=%s allow=%s deny=%s%s" % (
+        snap["mode"], snap["allow"] or "-", snap["deny"] or "-",
+        "" if snap["file_present"] else "（无策略文件 ⇒ 什么都问）"))
     print("[agent_server] 手机地址（配合 adb reverse tcp:%d tcp:%d）：" %
           (args.port or 0, srv.bind_port))
     try:

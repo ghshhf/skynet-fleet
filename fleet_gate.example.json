@@ -1,0 +1,19 @@
+{
+  "_说明": [
+    "天网审批闸门策略。字段全在这里，改完存盘即生效（服务按 mtime 自动重读，不用重启）。",
+    "mode    : ask | allow | deny —— 没写进 allow / deny 的能力怎么办。默认 ask。",
+    "allow   : 免问清单，支持通配（input.* 盖住 input.tap / input.type）。",
+    "          🔴 只对「有副作用但可逆」的能力有效；破坏性动作（destructive）",
+    "             即使写进来也不静默执行，必须一次一票。",
+    "deny    : 明文否决，优先级最高，连确认票都不开（写了就是不打算做）。",
+    "ticket_ttl : 待确认票的有效期（秒）。过期作废，重新问。",
+    "把本文件复制成 fleet_gate.json 就生效；删掉 fleet_gate.json 立刻退回「什么都问」。"
+  ],
+  "mode": "ask",
+  "allow": [
+    "input.*",
+    "app.launch"
+  ],
+  "deny": [],
+  "ticket_ttl": 120
+}

@@ -40,6 +40,9 @@ ui_automation/adskip_rules.json
 ui_automation/adskip_rules.json.tmp
 fleet_queue.json
 fleet_queue.json.tmp
+
+# 审批闸门策略 = 本机授权，不进仓库（模板见 fleet_gate.example.json）
+fleet_gate.json
 tmp/
 .workbuddy/
 
@@ -103,3 +106,4 @@ android_bridge/keystore.jks
 
 # 测试产物（不进库）
 out/
+.fleet_agent_token

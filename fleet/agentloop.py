@@ -66,6 +66,32 @@ class Step:
         return f"<Step r{self.round} {self.cap} ok={self.ok} len={len(self.text)}>"
 
 
+def _summarize_steps(steps, why=""):
+    """总结没成 / 总结是空的时，用**已经真发生的事**拼一句人话。
+
+    🔴 为什么必须有这个（2026-10-25 真机实测）
+      工具跑完了、动作也真做了，但「收尾总结」那次调用回来 `content` 是空串
+      （免费网关常这样）。原先直接把空串当 answer 发下去，手机端就是**一片空白**
+      —— 用户不知道刚才到底动没动手，只能再问一遍，白烧一轮。
+      空白是最坏的结果：它既没告诉人成了，也没告诉人没成。
+
+      所以这里不许编造结论，只做一件事：**如实复述这轮真跑了什么**。
+      模型没给结论就写「没给结论」，不替它下判断。
+    """
+    if not steps:
+        return why or "这一轮没跑到任何工具，也没拿到结论。可以再说具体点吗？"
+    lines = []
+    for s in steps:
+        mark = "✓" if s.ok else "✗"
+        brief = (s.text or s.error or "").strip().replace("\n", " ")
+        if len(brief) > 120:
+            brief = brief[:120] + "…"
+        lines.append("%s %s%s" % (mark, s.cap, ("：" + brief) if brief else ""))
+    head = "（模型没给出总结，下面是这一轮实际跑了的东西）" if not why else \
+           "（%s）" % why
+    return head + "\n" + "\n".join(lines)
+
+
 def _exec(executor, cap, args):
     """调一次执行层，把结果统一成 (ok, 文本)。
 
@@ -81,18 +107,32 @@ def _exec(executor, cap, args):
         return False, "执行层没返回任何东西"
     if isinstance(r, str):
         return True, r
-    # DeviceResult-like（也可能是 dict —— 两种都得认，认错就是「跑了但没内容」）
-    raw_ok = r.get("ok") if isinstance(r, dict) else getattr(r, "ok", None)
+
+    # ① 先把「两种形态」收敛成同一份字段。
+    #    🔴 这里原来是个真伤（2026-10-25 查出来的）：
+    #       载荷用 `getattr(r, "data", None)` 取 —— 对 **dict** 永远取不到
+    #       （dict 没有 .data 属性），于是 `data is None` 直接返回空字符串。
+    #       而 `FleetAgentServer.executor` 返回的正是 dict ⇒ **所有**工具结果
+    #       送到模型眼前都是空白。模型等于蒙着眼睛调工具，答不出来只能瞎猜，
+    #       表现成「工具跑了但没内容」——工具本身一点问题都没有。
+    #    所以：dict 走 `.get`，对象走 `getattr`，谁也不许借对方的语法。
+    if isinstance(r, dict):
+        raw_ok = r.get("ok")
+        data = r.get("data")
+        err = r.get("err") or ""
+    else:
+        raw_ok = getattr(r, "ok", None)
+        data = getattr(r, "data", None)
+        err = getattr(r, "err", "") or ""
+        if hasattr(r, "as_dict"):
+            d = r.as_dict()
+            err = err or (d.get("err") or "")
+            data = data if data is not None else d.get("data")
+
     ok = True if raw_ok is None else bool(raw_ok)
-    data = getattr(r, "data", None)
-    err = getattr(r, "err", "") or ""
-    if hasattr(r, "as_dict"):
-        d = r.as_dict()
-        err = err or (d.get("err") or "")
-        data = data if data is not None else d.get("data")
     if not ok:
         return False, err or "执行失败（没说原因）"
-    if data is None:
+    if data is None or data == {}:
         return True, ""
     if isinstance(data, str):
         return True, data
@@ -183,13 +223,15 @@ def run(question, executor, caps=None, tools=None, index=None,
         if not TS.has_calls(raw, flavor):
             # 这轮没要工具 ⇒ 它认为可以答了
             fire("answer", {"round": rnd})
-            return {"ok": True, "answer": res.get("content", ""),
+            return {"ok": True, "answer": res.get("content") or _summarize_steps(steps),
                     "steps": [s.as_dict() for s in steps], "rounds": rnd,
                     "why": res.get("why", []), **last}
 
         calls = TS.extract_calls(raw, flavor, index)
         if not calls:
-            return {"ok": True, "answer": res.get("content", ""),
+            return {"ok": True,
+                    "answer": res.get("content") or _summarize_steps(
+                        steps, "模型说要调工具，但解析不出来"),
                     "steps": [s.as_dict() for s in steps], "rounds": rnd,
                     "err": "模型说要调工具，但解析不出来（形状不认识）", **last}
 
@@ -243,14 +285,18 @@ def run(question, executor, caps=None, tools=None, index=None,
     fire("finalize", {"rounds": max_rounds})
     final = P.chat(messages, provs=provs, need=need, model=model,
                    quota=quota, account=account)
-    if final.get("ok"):
-        return {"ok": True, "answer": final.get("content", ""),
+    content = (final.get("content") or "") if final.get("ok") else ""
+    if content.strip():
+        return {"ok": True, "answer": content,
                 "steps": [s.as_dict() for s in steps], "rounds": max_rounds,
                 "used": final.get("used", ""), "used_model": final.get("used_model", ""),
                 "why": final.get("why", [])}
-    return {"ok": True, "answer": "", "steps": [s.as_dict() for s in steps],
-            "rounds": max_rounds,
-            "err": "轮次用尽，且最后一次总结也没成：" + (final.get("err") or "")}
+    # 总结没成、或者总结回来是空串 ⇒ 用真跑过的东西兜底，绝不给一个空白回答
+    why = "" if final.get("ok") else ("最后一轮总结失败：" + (final.get("err") or ""))
+    return {"ok": True, "answer": _summarize_steps(steps, why),
+            "steps": [s.as_dict() for s in steps], "rounds": max_rounds,
+            "used": final.get("used", ""), "used_model": final.get("used_model", ""),
+            "why": final.get("why", []), "fallback": True}
 
 
 # ---------------------------------------------------------------- 自测
