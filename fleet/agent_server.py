@@ -116,6 +116,7 @@ class FleetAgentServer:
         self._lock = threading.Lock()
         self.httpd = None
         self.bind_port = port
+        self._journal = None            # 懒加载，见 journal()
 
     # --- 懒加载 registry：catalog.build 会注册能力表 + 探测设备，首请求再建 ----------
     def registry(self):
@@ -124,6 +125,24 @@ class FleetAgentServer:
                 if self._reg is None:
                     self._reg = catalog.build(gate=self.gate)
         return self._reg
+
+    def journal(self):
+        """跨请求复用的对话流水（**每次 new 一个 = 每次失忆**）。
+
+        默认和桌面共用 `fleet_journal.db`：手机聊的、桌面聊的在同一张表里，
+        换设备也接着上文——这正是「她记得」要的效果。
+        建失败（路径/权限）就记个 False 别再重试，agentloop 会自动退化成
+        无记忆的一轮：记忆是增强不是主链路，不许因为它把服务起不来。
+        """
+        if self._journal is None:
+            with self._lock:
+                if self._journal is None:
+                    try:
+                        import journal as journal_mod
+                        self._journal = journal_mod.Journal("fleet_journal.db")
+                    except Exception:
+                        self._journal = False    # 试过了，别再试
+        return self._journal or None
 
     def executor(self, cap, args):
         """工具执行层：能力真在电脑侧跑。闸门（gate）交给 Registry 自己管。"""
@@ -265,7 +284,8 @@ class FleetAgentServer:
         def worker():
             try:
                 res = agentloop.run(question, self.executor, caps=fast_caps,
-                                    tools=tools, system=system, on_event=fire)
+                                    tools=tools, system=system, on_event=fire,
+                                    journal=self.journal())
                 q.put(("__answer__", res))
             except Exception as e:
                 q.put(("__error__", "%s: %s" % (type(e).__name__, e)))

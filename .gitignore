@@ -114,3 +114,15 @@ out/
 _*.png
 _*.xml
 ui_*.xml
+
+# 安卓端本地构建产物（2026-10-26 补）
+# 第一代 tianwang_android/jni 下 llama.cpp 编译中间物 875M + build 172M，
+# 目录总和 1GB 级；此前没挡，`git add .` 手滑一次就把一整个 NDK 工具链塞进库。
+# 只挡目录（带尾斜杠），不误伤同目录的 build.sh / build-sd.sh（源文件，已追踪）。
+tianwang_android/jni/build/
+tianwang_android/jni/build-sd/
+tianwang_android/build/
+# 第二代 tianwang_app（Gradle/Android 标准产物目录）
+tianwang_app/app/build/
+tianwang_app/build/
+.gradle/
