@@ -1698,13 +1698,97 @@
 
     $("sendBtn").addEventListener("click", doSend);
 
-    // 麦克风：W1 只占位，明确告诉用户还没接
+    // 麦克风：真录音。
+    // 🔴 2026-10-26：以前这块是占位——点了只弹个条说「W4 才录」，而语音视图那边
+    // 早就用 getUserMedia 录真音了。同一套能力两处待遇不一致，是典型的「点了像空气」。
+    // 现在复用语音视图那套（getUserMedia → 48k 降 16k → wav → /api/voice/recognize），
+    // 唯一区别：结果**填进输入框**而不是自动发出去——识别错了还能改，不许替主人发送。
+    var MIC = { on: false, stream: null, ac: null, node: null, src: null, chunks: [], rate: 48000 };
+
+    function micStop() {
+      if (!MIC.on) { return; }
+      MIC.on = false;
+      try { MIC.node.disconnect(); } catch (e) { /* 已断 */ }
+      try { MIC.src.disconnect(); } catch (e) { /* 已断 */ }
+      try { MIC.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { /* 已停 */ }
+      try { MIC.ac.close(); } catch (e) { /* 已关 */ }
+      $("micBtn").classList.remove("on");
+      $("voiceBar").hidden = true;
+
+      var total = 0, i;
+      for (i = 0; i < MIC.chunks.length; i++) { total += MIC.chunks[i].length; }
+      var buf = new Float32Array(total), off = 0;
+      for (i = 0; i < MIC.chunks.length; i++) { buf.set(MIC.chunks[i], off); off += MIC.chunks[i].length; }
+      MIC.chunks = [];
+      // 不到 0.1 秒当作没录到：别拿一段空气去问后端，省一趟也省一句误导
+      if (total < 1600) { toast("没录到声音，再说一次", true); return; }
+
+      var pcm = vvDown(buf, MIC.rate, 16000);
+      var blob = new Blob([vvEncodeWav(pcm, 16000)], { type: "audio/wav" });
+      $("voiceText").textContent = "识别中……";
+      $("voiceBar").hidden = false;
+      fetch("/api/voice/recognize", {
+        method: "POST",
+        headers: { "X-Fleet-Token": TOKEN, "Content-Type": "audio/wav" },
+        body: blob, cache: "no-store"
+      }).then(function (r) {
+        return r.text().then(function (txt) {
+          var d = null;
+          try { d = JSON.parse(txt); } catch (e) { d = null; }
+          $("voiceBar").hidden = true;
+          if (!d || !d.ok) {
+            toast("识别失败：" + ((d && d.err) || txt.slice(0, 80) || "无响应"), true);
+            return;
+          }
+          var t = (d.text || "").trim();
+          if (!t) { toast("没听清，再说一次", true); return; }
+          var inp = $("input");
+          inp.value = (inp.value.trim() ? inp.value.replace(/\s+$/, "") + " " : "") + t;
+          $("sendBtn").disabled = !inp.value.trim();
+          inp.focus();
+          toast("已识别：" + t);
+        });
+      }).catch(function (e) {
+        $("voiceBar").hidden = true;
+        toast("识别失败：" + ((e && e.message) || e), true);
+      });
+    }
+
     $("micBtn").addEventListener("click", function () {
-      $("voiceBar").hidden = !$("voiceBar").hidden;
-      $("micBtn").classList.toggle("on", !$("voiceBar").hidden);
-      if (!$("voiceBar").hidden) {
-        $("voiceText").textContent = "语音还没接上（W4 才录）—— 现在只是界面占位";
+      if (MIC.on) { return micStop(); }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return toast("这个窗口拿不到麦克风接口", true);
       }
+      navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      }).then(function (stream) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          return toast("这个窗口没有 AudioContext，录不了音", true);
+        }
+        MIC.stream = stream;
+        MIC.ac = new AC();
+        MIC.rate = MIC.ac.sampleRate || 48000;
+        MIC.src = MIC.ac.createMediaStreamSource(stream);
+        MIC.node = MIC.ac.createScriptProcessor(4096, 1, 1);
+        MIC.chunks = [];
+        MIC.node.onaudioprocess = function (ev) {
+          MIC.chunks.push(new Float32Array(ev.inputBuffer.getChannelData(0)));
+        };
+        MIC.src.connect(MIC.node);
+        MIC.node.connect(MIC.ac.destination);
+        MIC.on = true;
+        $("micBtn").classList.add("on");
+        $("voiceBar").hidden = false;
+        $("voiceText").textContent = "正在听……（再点一下结束）";
+      }).catch(function (e) {
+        var n = (e && e.name) || "";
+        toast("拿不到麦克风：" + (n === "NotAllowedError" ? "被拒绝，允许后重试（地址栏旁的权限图标）"
+          : n === "NotFoundError" ? "系统里找不到麦克风设备"
+            : n === "NotReadableError" ? "被别的程序占着"
+              : ((e && e.message) || String(e))), true);
+      });
     });
 
     // 主题切换
