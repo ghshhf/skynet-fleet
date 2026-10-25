@@ -107,3 +107,10 @@ android_bridge/keystore.jks
 # 测试产物（不进库）
 out/
 .fleet_agent_token
+
+# 真机调试产物（adb screencap / uiautomator dump）
+# 2026-10-26：这类文件每次调真机都会落一地，之前只有 ui_chat*.xml 被挡，
+# 剩下的以 ?? 污染 git status，迟早有人 git add -A 误提。现在按前缀整体挡掉。
+_*.png
+_*.xml
+ui_*.xml
