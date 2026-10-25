@@ -42,6 +42,7 @@ from .. import pair as PAIR
 from .. import pairtls as PTLS
 from ..catalog import build
 from .. import VERSION as FLEET_VERSION
+from .. import doctor as DOCTOR
 from .approval import ApprovalBroker
 
 # 仓库根（fleet/gui/server.py → 上三级）。角色卡、人格状态这些平铺模块都在根下。
@@ -741,6 +742,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(self._host_panel())
         if path == "/api/shot":
             return self._shot_png()
+        if path == "/api/doctor":
+            return self._json(DOCTOR.scan())
         self._err(404, f"没有这个接口: {path}")
 
     def _api_post(self, path):
@@ -754,6 +757,16 @@ class _Handler(BaseHTTPRequestHandler):
         # 分流，否则会被判成「请求体不是合法 JSON」。
         if path == "/api/voice/recognize":
             return self._post_voice_recognize()
+        # doctor 的「点一下装依赖」不需要 body，赶在 _read_json 前分流
+        if path == "/api/doctor/fix":
+            rep = DOCTOR.scan()
+            cmd, out = DOCTOR.fix_pips(rep)
+            return self._json({
+                "ok": True,
+                "cmd": cmd,
+                "returncode": getattr(out, "returncode", None) if out else None,
+                "miss_pips": rep["miss_pips"],
+            })
         # /api/mcp 也要赶在 _read_json 之前分流：JSON-RPC 的批请求是一个
         # **数组**，而 _read_json 只认对象（它会先把请求体读走，再回 400）。
         if path == "/api/mcp":

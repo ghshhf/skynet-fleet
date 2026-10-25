@@ -291,6 +291,7 @@ CASES = [
     # 全离线：chat 用假的、执行层用假的，验的是串得对不对 + 三条缰绳 +
     # **工具表即权限边界**（模型叫了没给它的 pc.shell ⇒ 不许执行）。
     ("eval_t40_agentloop", ["-m", "fleet.agentloop", "--selftest"], HERE, 120),
+    ("eval_t41_doctor", ["-m", "fleet.doctor", "--selftest"], HERE, 60),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
