@@ -143,10 +143,38 @@ def _exec(executor, cap, args):
         return True, str(data)
 
 
-def run(question, executor, caps=None, tools=None, index=None,
-        provs=None, need=None, model=None, account="", quota=None,
-        max_rounds=MAX_ROUNDS, budget_s=BUDGET_S, system=SYSTEM,
-        flavor=TS.FLAVOR_OPENAI, on_event=None):
+def _history_messages(journal, hours=24, limit=20, max_chars=600):
+    """从 journal 捞最近的人机对话，转成 OpenAI messages 历史。
+
+    这是「她记得昨天」的物理实现：上一轮的 (问, 答) 会被带进这次的 messages。
+    没有这一步，每轮 run 都是失忆的——追问「那磁盘呢」它不知道「那」指什么。
+
+    为什么截断到 limit 条 / max_chars 字：历史会撑爆上下文窗口，且越老越不值钱。
+    「够用又不爆」比「全带上」对模型更友好。
+    """
+    if journal is None:
+        return []
+    try:
+        rows = journal.recent(hours=hours, kinds=("user", "her"), limit=limit)
+    except Exception:
+        return []          # 记忆坏了不许拖垮对话——退化成无记忆，不是报错
+    out = []
+    for r in rows:
+        body = (r.get("body") or "").strip()
+        if not body:
+            continue
+        if len(body) > max_chars:
+            body = body[:max_chars] + "…"
+        # journal 里人说的记 user、她说的记 her；后者对模型就是 assistant
+        role = "user" if r.get("kind") == "user" else "assistant"
+        out.append({"role": role, "content": body})
+    return out
+
+
+def _run_loop(question, executor, caps=None, tools=None, index=None,
+              provs=None, need=None, model=None, account="", quota=None,
+              max_rounds=MAX_ROUNDS, budget_s=BUDGET_S, system=SYSTEM,
+              flavor=TS.FLAVOR_OPENAI, on_event=None, history=None):
     """跑完一圈。返回 dict。
 
     参数：
@@ -197,8 +225,10 @@ def run(question, executor, caps=None, tools=None, index=None,
         allowed = {t["name"] for t in tools}
     quota = quota if quota is not None else P.Quota()
 
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": question}]
+    messages = [{"role": "system", "content": system}]
+    if history:
+        messages.extend(history)        # 先摆历史，再问当前这句
+    messages.append({"role": "user", "content": question})
     last = {"used": "", "used_model": "", "why": []}
 
     for rnd in range(1, max_rounds + 1):
@@ -297,6 +327,52 @@ def run(question, executor, caps=None, tools=None, index=None,
             "steps": [s.as_dict() for s in steps], "rounds": max_rounds,
             "used": final.get("used", ""), "used_model": final.get("used_model", ""),
             "why": final.get("why", []), "fallback": True}
+
+
+def _persist(journal, question, res):
+    """落一笔人机对话进 journal —— 「她会记得」的写侧。
+
+    只记成功且有内容的答复：失败那一轮 answer 为空（或步骤摘要），
+    记下去会让下次历史里冒出「没答上来」的空白，反而污染上下文。
+    问句一律记（那是主人真说过的话，哪怕这一轮没答好）。
+
+    落库失败不许把已经跑完的一轮变成失败——记忆是增强，不是主链路。
+    """
+    if journal is None:
+        return
+    try:
+        q = (question or "").strip()
+        if q:
+            journal.log("user", "user", q[:2000])
+        ans = (res.get("answer") or "").strip()
+        if res.get("ok") and ans:
+            journal.log("her", "her", ans[:4000])
+    except Exception:
+        pass
+
+
+def run(question, executor, caps=None, tools=None, index=None,
+        provs=None, need=None, model=None, account="", quota=None,
+        max_rounds=MAX_ROUNDS, budget_s=BUDGET_S, system=SYSTEM,
+        flavor=TS.FLAVOR_OPENAI, on_event=None,
+        journal=None, history_hours=24, history_limit=20):
+    """跑完一圈（带记忆）。参数见 `_run_loop`；额外两个：
+
+      `journal`     给了就接记忆：开跑前从它捞最近的人机对话塞进上下文，
+                    跑完把这一轮的 (问, 答) 落回去。不给 = 无记忆的一轮
+                    （老调用方行为完全不变）。
+                    传 `journal.Journal(...)` 实例；**上层必须复用同一个实例**，
+                    每次 new 一个等于每次失忆。
+      `history_hours` / `history_limit`  回看多久、带多少条（默认 24h / 20 条）。
+    """
+    history = _history_messages(journal, history_hours, history_limit)
+    res = _run_loop(question, executor, caps=caps, tools=tools, index=index,
+                    provs=provs, need=need, model=model, account=account,
+                    quota=quota, max_rounds=max_rounds, budget_s=budget_s,
+                    system=system, flavor=flavor, on_event=on_event,
+                    history=history)
+    _persist(journal, question, res)
+    return res
 
 
 # ---------------------------------------------------------------- 自测
@@ -556,6 +632,53 @@ def _selftest():
     tt = TS.openai_tools(small)
     ck(len(tt) == 1 and tt[0]["function"]["parameters"]["required"] == ["text"],
        "收窄后的工具表要对")
+
+    # ---- 记忆：同一个 journal 跑两轮，第二轮必须带上第一轮 ----
+    # 判据就是「那磁盘呢」能接上——不靠模型聪明，靠把上一轮的问答塞进上下文。
+    try:
+        import journal as journal_mod
+    except Exception:
+        journal_mod = None
+    if journal_mod is not None:
+        j = journal_mod.Journal(":memory:")
+        hist_seen = []
+
+        def fake_chat_mem(messages, provs=None, need=None, model=None, tools=None,
+                          quota=None, account="", tool_choice=None, **kw):
+            hist_seen.append([m.get("content") for m in messages])
+            return {"ok": True, "used": "p", "used_model": "m", "tokens": 5,
+                    "why": [], "content": "CPU 12%、磁盘剩 233G。",
+                    "raw": {"choices": [{"message": {
+                        "role": "assistant", "content": "CPU 12%、磁盘剩 233G。"}}]}}
+
+        P.chat = fake_chat_mem
+        try:
+            r1 = run("这台机器怎么样", executor, caps=caps, index=index,
+                     quota=P.Quota(":memory:"), journal=j)
+            r2 = run("那磁盘呢", executor, caps=caps, index=index,
+                     quota=P.Quota(":memory:"), journal=j)
+        finally:
+            P.chat = orig
+
+        ck(r1["ok"] and r2["ok"], "带记忆两轮都应跑通")
+        ck(j.count() >= 4, "两轮应各落「问+答」，共 4 条，实得 %d" % j.count())
+        second = hist_seen[1] if len(hist_seen) > 1 else []
+        joined = "\n".join(x or "" for x in second)
+        ck("这台机器怎么样" in joined,
+           "第二轮必须带上第一轮的问句，否则「那磁盘呢」接不上")
+        ck("CPU 12%" in joined, "第二轮必须带上第一轮的答复")
+        # 不带 journal：行为必须和以前一模一样（只有 system + question）
+        hist_seen.clear()
+        P.chat = fake_chat_mem
+        try:
+            run("无记忆的一轮", executor, caps=caps, index=index,
+                quota=P.Quota(":memory:"))
+        finally:
+            P.chat = orig
+        ck(len(hist_seen[0]) == 2,
+           "不给 journal 时 messages 应只有 system+question 两条，实得 %d"
+           % len(hist_seen[0]))
+        j.close_connection()
 
     if fails:
         print("agentloop selftest: FAIL")
