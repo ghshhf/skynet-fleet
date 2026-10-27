@@ -255,6 +255,39 @@ def _render_screen(r):
     return "\n".join(lines)
 
 
+def _render_look(r):
+    """视觉观察的渲染：说人话，别甩 JSON。
+
+    为什么不复用 `_render_screen`：那个认的是文字树的键（foreground / labels），
+    look 回的是 app / scene / texts / issues——四个键一个都对不上，
+    复用会把「她看到了什么」渲染成空字符串。那是最糟的一种失败：
+    看着成功了，其实一个字都没说出来。
+    """
+    if not r.get("ok"):
+        return "看画面失败：%s" % (r.get("err") or "未知原因")
+    d = _d(r)
+    if d.get("caption"):
+        return str(d["caption"])
+    if d.get("raw") and not (d.get("scene") or d.get("app")):
+        return "看是看到了，但模型没按结构回：%s" % str(d["raw"])[:300]
+    lines = []
+    if d.get("app"):
+        lines.append("界面：%s" % d["app"])
+    if d.get("scene"):
+        lines.append("在做什么：%s" % d["scene"])
+    texts = [x for x in (d.get("texts") or []) if x][:8]
+    if texts:
+        lines.append("画面上的字：" + " | ".join(str(t) for t in texts))
+    if d.get("issues"):
+        lines.append("注意到：%s" % d["issues"])
+    if not lines:
+        return "画面里没读出可说的内容。"
+    el = (d.get("_meta") or {}).get("elapsed") or d.get("elapsed")
+    if el:
+        lines.append("（用时 %.1f 秒）" % float(el))
+    return "\n".join(lines)
+
+
 def _render_thermal(r):
     if not r.get("ok"):
         return f"读设备状态失败：{r.get('err') or '未知原因'}"
@@ -1129,8 +1162,15 @@ TOOLS = (
          argkey="target", resolve=resolve_app),
 
     Tool("screenshot_describe", "screen.read",
-         "看一眼手机当前屏幕上显示的内容（有什么文字、在哪个界面）。",
+         "读手机屏幕上的文字（前台是哪个应用、有哪些字）。"
+         "要看画面本身（图片、视频、图表、报错的图形）选 screen_look。",
          render=_render_screen),
+
+    Tool("screen_look", "screen.look",
+         "真正看一眼手机屏幕的**画面**（截图送视觉模型）。"
+         "图片、视频、图表、报错弹窗的图形部分，只有它能看见；"
+         "纯粹想读界面文字还是用 screenshot_describe——更快，而且不出本机。",
+         perm=PERM_ASK, side=True, render=_render_look),
 
     Tool("device_status", "thermal.read",
          "查手机自身状态：电量、温度、存储、CPU。电脑的状态选 pc_sysinfo。",
@@ -1183,9 +1223,15 @@ TOOLS = (
          render=_mk_rows("windows", "窗口", keys=("title", "pid"))),
 
     Tool("pc_screenshot", "pcctl.screenshot",
-         "截一张电脑屏幕的画面（只是列出窗口标题选 pc_windows；"
-         "手机的屏幕选 screenshot_describe）。",
+         "把电脑屏幕存成一张 PNG 文件（要「看一眼屏幕上有什么」选 pc_look；"
+         "只列窗口标题选 pc_windows）。",
          render=_mk_kv(("path", "截图文件"), ("size", "尺寸"))),
+
+    Tool("pc_look", "pcctl.look",
+         "真正看一眼这台电脑屏幕的**画面**（截图送视觉模型）。"
+         "「我屏幕上写了什么/有没有报错/这界面是不是卡住了」都用它；"
+         "只是想存个截图文件才用 pc_screenshot。",
+         perm=PERM_ASK, side=True, render=_render_look),
 
     Tool("net_scan", "net.scan",
          "扫描局域网里有哪些设备（IP、端口、主机名）。"

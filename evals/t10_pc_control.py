@@ -50,7 +50,12 @@ READ_CAPS = ("pcctl.screenshot", "pcctl.windows", "pcctl.clipboard.read",
 ACT_CAPS = ("pcctl.app.launch", "pcctl.window.activate", "pcctl.window.close",
             "pcctl.mouse.move", "pcctl.mouse.click", "pcctl.key",
             "pcctl.text", "pcctl.clipboard.write", "pcctl.proc.kill")
-ALL_CAPS = READ_CAPS + ACT_CAPS
+#: 第三档（2026-10-28）：**看，但看的东西会出本机**。
+#: 为什么不并进 READ_CAPS：它确实不改这台机器，但截图要送视觉模型 →
+#: 屏幕内容离开本地。并进只读档就等于把「外发」登记成了「只读」，
+#: 以后谁查「哪些能力不碰外部」会被这张表骗。
+LOOK_CAPS = ("pcctl.look",)
+ALL_CAPS = READ_CAPS + LOOK_CAPS + ACT_CAPS
 
 FAIL = []
 
@@ -237,6 +242,10 @@ for name in READ_CAPS:
 for name in ACT_CAPS:
     c = reg.capability(name)
     check(c.approval == "ask" and c.side_effect, f"{name} ask 档 + 副作用")
+for name in LOOK_CAPS:
+    c = reg.capability(name)
+    check(c.approval == "ask" and c.side_effect,
+          f"{name} ask 档 + 标副作用（外发内容不是只读）")
 c = reg.capability("pcctl.proc.kill")
 check(c.destructive is True, "pcctl.proc.kill 标了 destructive（闸门要双确认）")
 
