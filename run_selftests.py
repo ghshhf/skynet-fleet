@@ -296,6 +296,11 @@ CASES = [
     # 这条断过一次（新链绕开老链的人格锚，同一台机器换链路换了个人），
     # 断的时候代码不报错、只有真跑看得出，所以要用门禁钉死。
     ("eval_t42_persona_wired", ["evals/t42_persona_wired.py"], HERE, 60),
+    # 视觉（2026-10-28）：仓库里四个取图能力全止步于「存成 PNG」，
+    # 模型这一侧一个字都读不到（screen.read 只回文字树，不是画面）。
+    # 这条钉的是「图真的进了 messages + 四种失败可分辨 + 画面外发必过闸门」。
+    # 全离线：chat 用假的，验接线不验模型质量。
+    ("eval_t43_vision_look", ["evals/t43_vision_look.py"], HERE, 90),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

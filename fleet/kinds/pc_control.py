@@ -52,6 +52,10 @@ CAPS = (
     "pcctl.clipboard.read",
     "pcctl.proc.list",
     "pcctl.sysinfo",
+    # 看（2026-10-28）：截图 + 送视觉模型，回结构化观察。
+    # 为什么不放进 READ_CAPS：它不改这台机器，但**屏幕内容会出本机**——
+    # 「不改设备」不等于「零风险」，这条按外发对待，闸在 catalog 层（approval=ask）。
+    "pcctl.look",
     # 动手
     "pcctl.app.launch",
     "pcctl.window.activate",
@@ -600,6 +604,34 @@ class PcControl(BaseDevice):
             "reversible": True,
             "note": "截图是「看」不是「改」。" + INJECT_DEFENSE,
         })
+
+    def _do_look(self, args):
+        """看这一屏：截图 → 缩略 → 视觉模型 → 结构化观察。
+
+        和 `pcctl.screenshot` 的分工：那个只负责「把画面存成文件」，
+        存完之后没有任何东西读得懂它；这个负责「读得懂」。
+        给了 path 就看那个文件，不给就现截一屏。
+        """
+        from .. import vision as V
+        has_path = bool(args.get("path"))
+        r = V.look(path=args.get("path") or None,
+                   source="file" if has_path else "screen",
+                   prompt=args.get("prompt") or "",
+                   mode=args.get("mode") or "structured",
+                   keep=bool(args.get("keep")))
+        if not r.get("ok"):
+            return R.error("pcctl.look",
+                           "卡在 %s 阶段：%s" % (r.get("stage"), r.get("err")),
+                           device=self.name, via=self.via)
+        data = dict(r.get("data") or {})
+        data.update({
+            "risk": RISK_LOW, "reversible": True,
+            "model": r.get("model") or "", "via_provider": r.get("via") or "",
+            "elapsed": r.get("elapsed"),
+            "note": "这一屏已送出本机去视觉模型（%s）。" % (r.get("model") or "?")
+                    + INJECT_DEFENSE,
+        })
+        return R.success("pcctl.look", self.name, via=self.via, data=data)
 
     def _do_windows(self, args):
         wins, reason = _list_windows()
