@@ -23,25 +23,29 @@ class PairTlsError(RuntimeError):
     """证书相关失败。err 必须是人能照着做的话（缺什么、去哪找）。"""
 
 
-#: 常见 openssl 位置（Windows）。Git for Windows 的 usr/bin 是主源；
-#: WorkBuddy 自带 PortableGit 与本机 D:/Git 都列上，哪台机器装哪不一样。
-_OPENSSL_CANDIDATES = [
-    r"C:\Program Files\Git\usr\bin\openssl.exe",
-    r"C:\Program Files (x86)\Git\usr\bin\openssl.exe",
-    r"D:\Git\usr\bin\openssl.exe",
-    r"C:\Program Files\WorkBuddy\resources\vendor\PortableGit\usr\bin\openssl.exe",
-]
+#: openssl 相对怎么摆。**不写盘符**：盘符由 fleet/locate.py 运行时枚举，
+#: 与这些结构做全组合。Git for Windows 的 usr/bin 是主源，
+#: WorkBuddy 自带 PortableGit 也认——各机器装哪不一样，不该靠硬编码列。
+_OPENSSL_HINTS = (
+    "Git/usr/bin",
+    "Program Files/Git/usr/bin",
+    "Program Files (x86)/Git/usr/bin",
+    "Program Files/WorkBuddy/resources/vendor/PortableGit/usr/bin",
+    "Git/bin",
+)
 
 
 def find_openssl():
-    """找 openssl.exe。返回路径；找不到返回 None（调用方负责明说）。"""
-    p = shutil.which("openssl")
-    if p:
-        return p
-    for c in _OPENSSL_CANDIDATES:
-        if os.path.isfile(c):
-            return c
-    # MSYS 视角的 /bin/openssl（Git Bash 里有，Windows 路径要换算）
+    """找 openssl.exe。返回路径；找不到返回 None（调用方负责明说）。
+
+    顺序：FLEET_OPENSSL 环境变量 → PATH → hints×本机盘符 → MSYS 的 /bin/openssl。
+    """
+    from . import locate as L
+    return L.exe("openssl", env="FLEET_OPENSSL", hints=_OPENSSL_HINTS) or _msys_openssl()
+
+
+def _msys_openssl():
+    """MSYS 视角的 /bin/openssl（Git Bash 里有，Windows 路径要换算）。"""
     try:
         r = subprocess.run(["cygpath", "-w", "/bin/openssl"],
                            capture_output=True, timeout=5)

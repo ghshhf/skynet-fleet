@@ -30,6 +30,32 @@ import tempfile
 import time
 import wave
 
+try:
+    from fleet import locate as _locate
+except Exception:          # 包路径没通时退回原兜底链，不影响语音可用
+    _locate = None
+
+
+def locate_dirs(hints):
+    """把「相对目录结构」展开成本机实际存在的目录（**不写盘符**）。
+
+    盘符由 fleet/locate.py 运行时枚举，这里只给结构。
+    找不到返回空列表，调用方按自己的兜底链继续走。
+
+    必须定义在模块顶部：TMP_DIR = _pick_tmp_dir() 在导入时就跑（第 63 行），
+    放后面会 NameError。
+    """
+    if _locate is None:
+        return []
+    out = []
+    for h in hints:
+        for root in _locate.roots():
+            d = os.path.join(root, h)
+            if os.path.isdir(d) and d not in out:
+                out.append(d)
+    return out
+
+
 def _pick_tmp_dir():
     """语音临时目录：环境变量 > 按盘存在性探测（E→D→G 兼容）> 系统 temp。
 
@@ -39,9 +65,8 @@ def _pick_tmp_dir():
     才采用；全部候选都不可用时退系统 temp。
     """
     env = os.environ.get("FLEET_VOICE_TMP")
-    cands = ([env] if env else []) + [
-        "E:/_tmp/fleet_voice", "D:/_tmp/fleet_voice",
-        "G:/_tmp/fleet_voice",                     # 兼容老配置
+    cands = ([env] if env else []) + locate_dirs(
+        ("_tmp/fleet_voice", "tmp/fleet_voice")) + [
         os.path.join(os.environ.get("TEMP") or ".", "fleet_voice"),
     ]
     for c in cands:
@@ -385,22 +410,37 @@ def _wav_is_silent(path, thresh=0.0015):
 
 
 def _ffmpeg():
-    """找 ffmpeg：环境变量 FLEET_FFMPEG > 已知路径 > PATH > imageio 自带的那份。
+    """找 ffmpeg：FLEET_FFMPEG > hints×本机盘符 > PATH > imageio 自带的那份。
 
-    最后一档是这次加的：本机 PATH 里一直没有 ffmpeg，于是 edge 合成完的 mp3
+    最后一档是之前加的：本机 PATH 里一直没有 ffmpeg，于是 edge 合成完的 mp3
     没法转 wav，整条在线 TTS 就静默跳过——caps() 里那句「没找到 ffmpeg，
     转码会跳过」就是这么来的。imageio_ffmpeg 这个包自带一份静态 ffmpeg，
     装了就能直接用，不必再让人手动装到 PATH。
+
+    2026-10-29：原来这里是 4 条写死的盘符路径（E:/dev、E:/_tools、D:/tools、
+    G:/dev）——2 个盘 × 2 个目录本来有 4 种组合，只硬编码了 4 条，换个盘就漏。
+    现在只写结构，盘符交给 locate，加盘自动覆盖。
     """
     cand = os.environ.get("FLEET_FFMPEG")
     if cand and os.path.isfile(cand):
         return cand
-    for fixed in ("E:/dev/ffmpeg/bin/ffmpeg.exe",
-                  "E:/_tools/ffmpeg/bin/ffmpeg.exe",
-                  "D:/tools/ffmpeg/bin/ffmpeg.exe",
-                  "G:/dev/ffmpeg/bin/ffmpeg.exe"):     # 兼容老配置
-        if os.path.isfile(fixed):
-            return fixed
+    if _locate is not None:
+        got = _locate.exe(
+            "ffmpeg", env="FLEET_FFMPEG",
+            hints=("tools/ffmpeg/bin", "dev/ffmpeg/bin",
+                   "_tools/ffmpeg/bin", "ffmpeg/bin"),
+            # 版本号目录猜不到（本机是 ffmpeg-master-latest-win64-gpl/bin），
+            # 用 under 在该前缀下递归兜
+            under=("tools/ffmpeg", "dev/ffmpeg", "_tools/ffmpeg"))
+        if got:
+            return got
+    else:
+        for d in locate_dirs(("tools/ffmpeg/bin", "dev/ffmpeg/bin",
+                              "_tools/ffmpeg/bin", "ffmpeg/bin")):
+            for exe in ("ffmpeg.exe", "ffmpeg"):
+                p = os.path.join(d, exe)
+                if os.path.isfile(p):
+                    return p
     got = shutil.which("ffmpeg")
     if got:
         return got
@@ -771,8 +811,8 @@ def _whisper_root():
     """决定 whisper 模型落盘目录。
 
     2026-10-22 实测事故：兜底值写死 `E:/_models/whisper`，E 盘一拔，
-    ctranslate2 建目录直接 `[WinError 3] 系统找不到指定的路径: 'E:\\'`，
-    ASR 全哑——而且报错里只有盘符，完全看不出是模型目录的问题。
+    ctranslate2 建目录直接 `[WinError 3] 系统找不到指定的路径`，
+    ASR 全哑——而且报错里只有一个光秃秃的盘符，完全看不出是模型目录的问题。
 
     规则改成：① 显式环境变量最优先（仍会建目录）；
     ② 老位置**只在真存在时**才用（不再硬造）；
@@ -801,8 +841,8 @@ def _whisper_root():
             return got
         print("[voice] FLEET_WHISPER_DIR=%r 不可写，改用默认位置" % env_root)
 
-    for c in ("E:/_models/whisper", "G:/_models/whisper",
-              "D:/work/_local_ai/whisper"):
+    for c in locate_dirs(("_models/whisper", "models/whisper",
+                          "work/_local_ai/whisper", "tmp/whisper")):
         if os.path.isdir(c):
             got = _try_make(c)
             if got:
@@ -853,8 +893,11 @@ def _load_whisper(model, device):
         return None, "none", "缺少 faster_whisper：%s" % e
 
     if root is None:
+        # 提示必须跟代码同一份事实：这里试过哪几处，就只报哪几处。
+        # 2026-10-29：原来还写着 `E:/_models/whisper`，而代码早就不试那个位置了——
+        # 过时的提示比没有提示更坑，人会照着去找一个根本不存在的目录。
         msg = ("找不到可写的 whisper 模型目录（试过 FLEET_WHISPER_DIR、"
-               "E:/_models/whisper、%LOCALAPPDATA%/fleet/whisper 与临时目录）。"
+               "各盘 _models/whisper、%LOCALAPPDATA%/fleet/whisper 与临时目录）。"
                "请设环境变量 FLEET_WHISPER_DIR 指到一个可写目录")
         _WHISPER_CACHE[key] = (None, "none", msg)
         return None, "none", msg

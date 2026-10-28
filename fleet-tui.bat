@@ -8,7 +8,7 @@ cd /d "%~dp0"
 
 set "PY="
 if defined FLEET_PY set "PY=%FLEET_PY%"
-if not defined PY if exist "D:\tools\python\python.exe" set "PY=D:\tools\python\python.exe"
+REM 便携版 python 装在哪个盘不写死（2026-10-29）：FLEET_PY 指，否则落到 py 启动器 / PATH 上的 python。
 if not defined PY (
     where py >nul 2>nul
     if not errorlevel 1 (

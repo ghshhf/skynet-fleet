@@ -72,15 +72,27 @@ from ..core.registry import (CANCEL_WORDS, CONFIRM_WORDS, VOICE_CONFIRM_KEY,
 
 # ---------------------------------------------------------------- 路径与常量
 
+def _legacy_paths(*parts):
+    """老机器把东西放在某个盘的固定结构里。盘符运行时枚举，结构照旧（2026-10-29）。
+
+    以前这里直接写 `D:/work/_local_ai/train_15b/...`，换机即失效。
+    """
+    try:
+        from .. import locate as _loc
+        return [Path(r).joinpath(*parts) for r in _loc.roots()]
+    except Exception:
+        return []
+
+
 #: polaris-audio-io 模块目录（听/说都在这）
 #: 🔴 跨机死路径家族（2026-10-24 与 netrunner 同一批修）：原默认钉在
 #:    `D:/work/_local_ai/train_15b/...`——那台机器上写的，换机即失效。
-#:    改成候选制：环境变量 → 与本仓并列 → 历史路径。全不命中就留空，
-#:    由 `_run_polaris` 如实报「模块不在」，不静默降级成别的失败。
+#:    改成候选制：环境变量 → 与本仓并列 → 历史结构（盘符由 locate 枚举）。
+#:    全不命中就留空，由 `_run_polaris` 如实报「模块不在」，不静默降级成别的失败。
 POLARIS_DIR = _discover_dir(
     "FLEET_POLARIS_DIR",
-    [_REPO_ROOT.parent / "train_15b" / "modules" / "polaris-audio-io",
-     r"D:/work/_local_ai/train_15b/modules/polaris-audio-io"])
+    [_REPO_ROOT.parent / "train_15b" / "modules" / "polaris-audio-io"]
+    + _legacy_paths("work", "_local_ai", "train_15b", "modules", "polaris-audio-io"))
 
 #: polaris 的 venv 解释器（**有** torch/transformers/soundfile 的那个）
 #: 🔴 前提已变（2026-10-24 实测）：这里原本假设「fleet 自带解释器没有 torch」，
@@ -89,8 +101,9 @@ POLARIS_DIR = _discover_dir(
 #: ⇒ 候选顺序：环境变量 → 历史 venv（有就用）→ 当前解释器（自带 torch 时）。
 #:    这样只剩模块目录不在时才失败，而不是先卡在解释器上。
 def _discover_polaris_py() -> str:
-    for cand in (os.environ.get("FLEET_POLARIS_PY", "").strip(),
-                 r"D:/work/_local_ai/train_15b/venv/Scripts/python.exe"):
+    for cand in [os.environ.get("FLEET_POLARIS_PY", "").strip()] + [
+            str(p) for p in _legacy_paths(
+                "work", "_local_ai", "train_15b", "venv", "Scripts", "python.exe")]:
         if cand and os.path.isfile(cand):
             return cand
     return sys.executable

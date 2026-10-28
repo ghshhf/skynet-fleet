@@ -43,6 +43,8 @@ import shutil
 import subprocess
 import sys
 
+from .. import locate as L
+
 #: 渲染后端脚本（Node）。仓库内，随包走。
 HTML_BACKEND = "htmlrender.js"
 
@@ -53,11 +55,14 @@ DEFAULT_DURATION = 5.0
 
 
 def _node():
-    """跑后端用哪个 node。优先 PATH 上的，其次本仓工具链旁的。"""
-    for cand in (shutil.which("node"), r"D:\node.exe", r"C:\Program Files\nodejs\node.exe"):
-        if cand and os.path.isfile(cand):
-            return cand
-    return ""
+    """跑后端用哪个 node。PATH → 本机常见安装位置（不写死盘符）。
+
+    2026-10-29：原来候选里写死 `D:\\node.exe` 和 `C:\\Program Files\\nodejs\\node.exe`。
+    这两个恰好是本机的情况，但换台机器 node 装在别处就又找不到——
+    而 PATH 里其实大多数时候就有，根本不必猜位置。
+    """
+    return L.exe("node", hints=("nodejs", "tools/node",
+                                "~/AppData/Roaming/npm"))
 
 
 def _playwright_root():
@@ -68,11 +73,11 @@ def _playwright_root():
     """
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(os.path.dirname(here))
-    cands = [
-        os.path.join(repo, "tools", "uicheck", "node_modules"),
-        r"D:\tools\uitools\node_modules",
-        os.path.join(repo, "node_modules"),
-    ]
+    cands = [os.path.join(repo, "tools", "uicheck", "node_modules")]
+    # 工具链目录：同样不写盘符，用「相对结构 × 本机根」找
+    for root in L.roots():
+        cands.append(os.path.join(root, "tools", "uitools", "node_modules"))
+    cands.append(os.path.join(repo, "node_modules"))
     for d in cands:
         if os.path.isdir(os.path.join(d, "playwright")):
             return d
@@ -95,17 +100,12 @@ def ffmpeg_path():
     p = os.environ.get("FLEET_FFMPEG", "").strip()
     if p and os.path.isfile(p):
         return p
-    w = shutil.which("ffmpeg")
-    if w:
-        return w
-    for d in (r"D:\tools\ffmpeg", r"C:\tools\ffmpeg"):
-        if not os.path.isdir(d):
-            continue
-        for root, _dirs, files in os.walk(d):
-            for fn in files:
-                if fn.lower() == "ffmpeg.exe":
-                    return os.path.join(root, fn)
-    return ""
+    return L.exe("ffmpeg", env="FLEET_FFMPEG",
+                 hints=("tools/ffmpeg/bin", "dev/ffmpeg/bin",
+                        "_tools/ffmpeg/bin", "ffmpeg/bin",
+                        "tools/ffmpeg", "_tools/ffmpeg"),
+                 # 版本号目录猜不到，用 under 在该前缀下递归（见 render.py 同处注释）
+                 under=("tools/ffmpeg", "dev/ffmpeg", "_tools/ffmpeg", "ffmpeg"))
 
 
 def check_env():

@@ -32,18 +32,26 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ANDROID_HOME = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
-# 🔴 跨机死路径家族（2026-10-24 与 netrunner 同一批修）：原候选只有
-#    D:/DevTools/Android（那台机器的 SDK）和 C:/Users/admin——换机即失效。
-#    本机实测工具链在 G:/sdk（build-tools 34/35/37 + platforms + adb 齐全），
-#    补进来；FLEET_ADB 环境变量仍是最高优先逃生口（adb 不在 PATH 时用）。
-_ADB_CANDIDATES = [
-    os.environ.get("FLEET_ADB", "").strip(),
-    (os.path.join(ANDROID_HOME, "platform-tools", "adb.exe") if ANDROID_HOME else ""),
-    "G:/sdk/platform-tools/adb.exe",
-    r"D:/DevTools/Android/platform-tools/adb.exe",
-    r"C:/Users/admin/AppData/Local/Android/Sdk/platform-tools/adb.exe",
-    "/usr/bin/adb",
-]
+
+try:
+    from fleet.locate import exe as _find_exe
+except Exception:      # 包路径没通时退回「只认 PATH 与环境变量」，不影响本模块可用
+    _find_exe = None
+
+# adb 相对怎么摆。**这里一个盘符都没有**：盘符由 fleet/locate.py 在运行时
+# 枚举本机根目录，再与这些相对结构做全组合（hints × roots）。
+# 踩过的三台机器分别放在   G:/sdk  ·  D:/DevTools/Android  ·
+# C:/Users/<用户名>/AppData/Local/Android/Sdk —— 正好是「同一个相对结构、不同根」，
+# 一套 hints 全覆盖。以前是一条条往候选里加盘符，加几个漏几个。
+# FLEET_ADB 环境变量永远最高优先（adb 装到怪地方时不用改代码）。
+_ADB_HINTS = tuple(h for h in (
+    (os.path.join(ANDROID_HOME, "platform-tools") if ANDROID_HOME else ""),
+    "sdk/platform-tools",
+    "DevTools/Android/platform-tools",
+    "~/AppData/Local/Android/Sdk/platform-tools",   # 用户名不写死，跟随当前用户
+    "Android/Sdk/platform-tools",
+    "/usr/bin",
+) if h)
 
 _BOUNDS = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
@@ -51,13 +59,13 @@ _BOUNDS = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 # ---------------------------------------------------------------- adb 基础
 
 def adb_path():
-    hit = shutil.which("adb")
-    if hit:
-        return hit
-    for p in _ADB_CANDIDATES:
-        if p and os.path.isfile(p):
-            return p
-    return ""
+    """找 adb：FLEET_ADB → PATH → hints × 本机盘符。找不到返回 ""。"""
+    if _find_exe is not None:
+        return _find_exe("adb", env=("FLEET_ADB",), hints=_ADB_HINTS)
+    cand = (os.environ.get("FLEET_ADB") or "").strip()
+    if cand and os.path.isfile(cand):
+        return cand
+    return shutil.which("adb") or ""
 
 
 def _run(serial, args, timeout=60):
