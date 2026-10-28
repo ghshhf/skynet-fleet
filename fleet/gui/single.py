@@ -40,7 +40,18 @@ MUTEX_PREFIX = "Local\\DeviceFleetGui-"
 
 
 def _default_key():
-    """同一份代码目录 = 同一个应用。装在两个目录就当两个应用，互不干扰。"""
+    """同一份安装 = 同一个应用；装在两个目录就当两个应用，互不干扰。
+
+    ⚠️ 冻扁包（PyInstaller onefile）**每次启动都解压到不同的 `_MEIxxxx` 临时目录**，
+    `__file__` 指向那里。如果拿代码目录当 key，每次启动都是一个新 key ——
+    互斥体名字跟着变，单实例直接失效。
+
+    2026-10-29 真跑抓到：`dist/fleet-gui.exe` 连开两次 → **3 个进程、2 个窗口**，
+    两套服务各管一半编队。源码形态测不出来，只有打包后才能复现。
+    ⇒ 冻结之后只能用 exe 自己的路径。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.normcase(os.path.abspath(sys.executable))
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     return os.path.normcase(os.path.abspath(root))
 
