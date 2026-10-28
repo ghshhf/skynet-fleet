@@ -95,6 +95,21 @@ def find_llama(explicit=""):
     )
 
 
+#: 不指名模型时的优先顺序。按**实测准确率**排，不按大小排，也不按新旧排。
+#: 2026-10-29 同一台核显机器、同一套 30 条 gold 唯一的中文测试集：
+#:   Qwen3.5-2B          27/30 · 423 tok · 5.2s   ← 默认
+#:   FunctionGemma-270M   6/30（快，但中文+多工具撑不住，还会直接开始聊天）
+#:   Qwen3-1.7B          域内 3/6，prompt 一长就散
+#:   Qwen3-0.6B          只在 ≤8 个工具时能用
+DEFAULT_MODELS = ("Qwen3.5-2B*.gguf", "Qwen3-1.7B*.gguf", "Qwen3-0.6B*.gguf")
+
+#: 自带对话模板、且**实测比项目模板更准**的模型关键字：这些不套项目模板。
+#: 判据不是「新就好」——Qwen3.5 的模板带自己的 think 段语法，套 qwen3 那份
+#: 会把它当纯 ChatML，多轮和 JSON 约束行为都会偏。加一个名字之前必须真跑
+#: 一遍 30 条（门禁 t46 只验参数名，验不了模板内容对不对）。
+EMBEDDED_TPL = ("qwen3.5", "qwen3next")
+
+
 def find_model(explicit=""):
     """找模型。explicit 可以是目录 / 文件全路径 / 单纯的文件名，三种都认。
 
@@ -120,6 +135,11 @@ def find_model(explicit=""):
         raise FileNotFoundError(
             "指名要的模型找不到：%s（已知位置里没有同名的，不拿别的顶替）"
             % explicit)
+    for pat in DEFAULT_MODELS:
+        hit = locate.file("", pattern=pat, env=(), hints=MODEL_HINTS,
+                          min_size=MODEL_MIN_BYTES)
+        if hit:
+            return hit
     return locate.file(
         "",
         env=("FLEET_LLM_MODEL", "FLEET_MODEL"),
@@ -155,7 +175,9 @@ def build_cmd(llama, model, port, ctx=4096, ngl=99, threads=8,
     挂十天没人发现，就是因为没有哪条门禁看过产线的命令行。
     """
     template = os.path.join(_ROOT, "templates", "qwen3_thinkblock.jinja")
-    use_template = (not no_template) and os.path.isfile(template)
+    low = os.path.basename(model).lower()
+    embedded = any(k in low for k in EMBEDDED_TPL)
+    use_template = (not no_template) and (not embedded) and os.path.isfile(template)
     cmd = [llama, "-m", model, "--port", str(port), "--host", "127.0.0.1",
            "-c", str(ctx), "-ngl", str(ngl), "-t", str(threads),
            "--jinja", "--reasoning-budget", "0", "--no-webui"]
@@ -219,7 +241,10 @@ def main():
     print("[start_llm] llama-server : %s" % llama)
     print("[start_llm] 模型         : %s" % model)
     print("[start_llm] 端口/上下文  : %d / %d%s" % (
-        a.port, a.ctx, "" if use_template else "（无自定义模板）"))
+        a.port, a.ctx,
+        "（用项目模板）" if use_template else
+        "（模型自带模板）" if any(k in os.path.basename(model).lower()
+                              for k in EMBEDDED_TPL) else "（无自定义模板）"))
 
     try:
         subprocess.Popen(

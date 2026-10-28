@@ -316,6 +316,10 @@ CASES = [
     # 因为「HTTP 200 + 有 tool 字段」在模板完全失效时也可能碰巧成立。
     # 无模型/无 llama-server 时 ④ 会明确 skip，不算通过。给 180s（要起进程）。
     ("eval_t46_decider_sees_tools", ["evals/t46_decider_sees_tools.py"], HERE, 180),
+    # t47：两级决策（规则定域 → 域内选工具）。t46 保证「模型看得见选项」，
+    # 这条保证「选项被收窄到能算得动」。最狠的一条是域覆盖：加了工具忘记归域，
+    # 那个工具永远不会出现在候选里，不报错、不掉分，只是「说了它不动」。
+    ("eval_t47_two_stage_decide", ["evals/t47_two_stage_decide.py"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
