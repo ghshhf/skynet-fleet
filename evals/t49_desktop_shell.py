@@ -179,6 +179,43 @@ def part_close_policy():
     check("唤起通道没起来" in app, "唤起通道起不来会如实报出来")
 
 
+# ---------------------------------------------------------------- F 冻结包 key
+
+def part_frozen_key():
+    """冻扁包的单实例 key —— 2026-10-29 真跑抓到过的真 bug。
+
+    PyInstaller onefile 每次启动解压到**不同的** `_MEIxxxx` 目录。
+    key 如果基于代码目录，每次启动都是新 key ⇒ 互斥体名字不同 ⇒ 单实例失效。
+    真实现象：`dist/fleet-gui.exe` 连开两次 → **3 个进程、2 个窗口**。
+    src 形态跑一万次也复现不了，只有打完包双击才看得见。
+    """
+    print("\n[F] 冻扁包 key：每次启动必须算出同一个值")
+    orig_frozen = getattr(sys, "frozen", None)
+    orig_exe = sys.executable
+    fake_exe = r"C:\Apps\Fleet\fleet-gui.exe"
+    try:
+        sys.frozen = True
+        sys.executable = fake_exe
+        k1 = S._default_key()
+        k2 = S._default_key()
+        check(os.path.normcase(k1) == os.path.normcase(fake_exe),
+              "冻结时 key = exe 自己的路径（不是 _MEIxxxx 临时目录）")
+        check(k1 == k2, "同一个 exe 两次启动 key 一致（单实例才可能生效）")
+        check("_mei" not in k1.lower(), "key 里没有 onefile 的临时解压目录")
+    finally:
+        if orig_frozen is None:
+            try:
+                del sys.frozen
+            except AttributeError:
+                pass
+        else:
+            sys.frozen = orig_frozen
+        sys.executable = orig_exe
+
+    check(S._default_key() == os.path.normcase(os.path.abspath(ROOT)),
+          "源码形态 key = 仓库目录（两副面孔各说对）")
+
+
 def main():
     print("=" * 52)
     print("t49_desktop_shell —— 桌面端成品化")
@@ -188,6 +225,7 @@ def main():
     part_single()
     part_autostart()
     part_close_policy()
+    part_frozen_key()
     print()
     print("=" * 52)
     print("t49_desktop_shell: %d ok / %d fail" % (OK, FAIL))

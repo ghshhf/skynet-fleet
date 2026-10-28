@@ -24,6 +24,8 @@
   --runtime-hook      冻扁后把只读的 MEIPASS 状态路径重定向到 %APPDATA%/fleet。
 """
 import os
+import sys
+
 from PyInstaller.__main__ import run
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,7 +76,11 @@ HIDDEN = [
 EXCLUDES = ["torch", "skynet", "listen", "speak", "rules_relay"]
 
 args = [
-    "--onefile",
+    # onefile = CI/分发的默认形态（单个 exe，`dist/fleet-gui.exe`，CI 的 artifact
+    # 路径和 --smoke 都按这个名字写的，别改默认）。
+    # onedir = 启动快得多（不用每次解压），是将来做安装包的形态；
+    # 用 `python tools/build_gui.py onedir` 打，产物在 dist/fleet-gui/。
+    "--onedir" if "onedir" in sys.argv[1:] else "--onefile",
     "--clean",
     "--name", "fleet-gui",
     "--windowed",
