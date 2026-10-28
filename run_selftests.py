@@ -320,6 +320,18 @@ CASES = [
     # 这条保证「选项被收窄到能算得动」。最狠的一条是域覆盖：加了工具忘记归域，
     # 那个工具永远不会出现在候选里，不报错、不掉分，只是「说了它不动」。
     ("eval_t47_two_stage_decide", ["evals/t47_two_stage_decide.py"], HERE, 120),
+    # t48：算力层（接外部算力）。t46 保证「模型看得见选项」，t47 保证
+    # 「选项收窄到算得动」，这条保证「用的算力是对的」——58 个工具本地 2B 要
+    # 52.9s，接上外部算力只要 2s，差的不是模型智力而是算力选错了。
+    # 重点在②：probe 说「通了」必须是真算过。三种假端点分别复现
+    # 「200+报错文本」「tokens 恒等」「真读到输入」，判据不看格式看副作用。
+    ("eval_t48_compute_layer", ["evals/t48_compute_layer.py"], HERE, 180),
+    # t49：桌面端成品化（单实例 / 托盘常驻 / 开机自启 / 窄窗口）。
+    # 起因见文件头：这程序是常驻服务，不是一次性窗口；但双击两次会起两份服务、
+    # 关掉窗口等于把她关了、开机不自启、最小宽度 1080 > 断点 900（断点从没生效）。
+    # [A] 段盯的是最容易悄悄退化的那处：pystray 不进 requirements →
+    # 包里 import 失败 → 托盘静默失效，代码全对能力没了（与 edge_tts 同形）。
+    ("eval_t49_desktop_shell", ["evals/t49_desktop_shell.py"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

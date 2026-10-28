@@ -62,6 +62,20 @@ LAST_FAIL = [""]
 def _fail(msg):
     LAST_FAIL[0] = msg
 
+
+#: 这次失败是不是「暂时性」的（换一个端点可能就通了）。
+#: 用容器元素而不是全局字符串，理由同 LAST_FAIL。
+#:
+#: 为什么要这个标记（2026-10-29）：接上外部算力之后第一件事就撞了 429 ——
+#: zen-gate 的免费额度被我连跑三轮跑分用光，于是 decide() 直接返回 None，
+#: 整个工具面消失。**外部算力必然有限流**，所以「一个端点不给算」不等于
+#: 「这件事做不了」。但也不能乱换：
+#:   · 429 / 5xx / 超时 / 连不上  → 暂时性，换下一个端点有意义
+#:   · 401 / 404 / 返回不是 JSON  → 配置或模型的问题，换过去一样错，
+#:                                  还多烧一轮时间和额度
+#: 这个区分跟 `ai_backends.classify_failure` 是同一套判据，别各写一份。
+LAST_RETRYABLE = [False]
+
 #: 权限三档。定义提前到文件顶部是因为 TOOLS 表要引用它们。
 #: auto = 直接跑；ask = 交给审批闸门（无闸门即 fail-closed 拒绝）；forbid = 永不跑。
 #: 与 Operit 的三档对齐，但**默认更保守**：有副作用的默认 ask，
@@ -167,12 +181,129 @@ def _schema_for(enum):
     }
 
 
-def _ask(base, system, enum, q, timeout, max_tokens=96):
+def _chat_url(base):
+    """把端点地址拼成 chat 完整地址。
+
+    **两种写法都会出现，必须都认**（2026-10-29 踩过）：
+      · `http://127.0.0.1:18080`      —— 老的环境变量写法，不带 /v1
+      · `http://127.0.0.1:8787/v1`    —— 算力层统一写到版本层
+
+    只按前一种拼，后者会变成 `/v1/v1/chat/completions`（404）；
+    只按后一种拼，前者会变成 `/chat/completions`（也 404）。
+    而 404 会被误读成「这个厂商不支持」，所以判断收在这一处。
+    """
+    b = (base or "").rstrip("/")
+    if b.endswith("/v1"):
+        return b + "/chat/completions"
+    return b + "/v1/chat/completions"
+
+
+def _decider_target(url=None):
+    """决策走哪个端点。返回 (base, key, model)。
+
+    三层优先级，每层都说清凭什么：
+      ① 调用方显式传 `url`        —— 跑分脚本 / 临时指定
+      ② 环境变量 `AT_DECIDER_URL` —— 部署时钉死（老路，保持兼容）
+      ③ 算力配置 `compute.route("decide")` —— 桌面端「算力」页里选的
+
+    前两层只给**地址**，第三层还给**key 和模型名**。
+    所以前两层要回查一次算力层：用户可能先用 env 写了地址，后来在桌面上
+    才补的 key —— 不回查的话，那个 key 永远用不上，表现为 401。
+
+    🔴 这一层存在的原因：在这之前决策端点只能靠环境变量，不认 key。
+    于是「外接算力」在代码上根本走不通（云端哪有不鉴权的），
+    「58 个工具选不动」就只能一路去抠本地小模型。
+    """
+    explicit = (url or os.environ.get("AT_DECIDER_URL") or "").strip()
+    if explicit:
+        base = explicit.rstrip("/")
+        try:
+            from . import compute as _C
+            for ep in _C._load()[0]:
+                if ep.base_url.rstrip("/") == base or \
+                        ep.base_url.rstrip("/") == base + "/v1" or \
+                        ep.base_url.rstrip("/").rsplit("/v1", 1)[0] == base:
+                    return base, ep.key, (ep.model or "")
+        except Exception:
+            pass
+        return base, "", ""
+
+    try:
+        from . import compute as _C
+        ep = _C.route("decide")
+        if ep is not None:
+            return ep.base_url.rstrip("/"), ep.key, (ep.model or "")
+    except Exception:
+        pass
+    return DECIDER_URL, "", ""
+
+
+def _content_of(d):
+    """从回包里取「它到底说了什么」。返回 (文本, 来源)。
+
+    🔴 2026-10-29 实测（zen-gate / 思考型模型）：
+        finish_reason: stop
+        content: ''                    ← 空
+        reasoning_content: '用户问手机还剩多少电，我需要查手机自身状态，
+                            应该用 device_status 工具。'
+    **它想对了，答案写在思考区，正文是空的。** 只读 `content` 就等于判它
+    「答歪了」，然后一路去调提示词、换模型——全在修一个不存在的毛病。
+
+    这是本项目第三次撞上同一形状：HTTP 200 且 finish_reason=stop，
+    正文却不是「答案」。前两次是 jinja 报错文本（模板参数名错）、
+    以及 prompt 压根没进去（tokens 恒等 18）。所以**凡是说「模型不会」之前，
+    先确认拿到的这段文字是它真的回答**。
+    """
+    try:
+        m = d["choices"][0].get("message") or {}
+    except Exception:
+        return "", ""
+    txt = (m.get("content") or "").strip()
+    if txt:
+        return txt, "content"
+    for alt in ("reasoning_content", "reasoning", "thinking"):
+        t = (m.get(alt) or "").strip()
+        if t:
+            return t, alt
+    return "", ""
+
+
+_JSON_IN_TEXT = re.compile(r"\{[^{}]{0,200}\}")
+
+
+def _salvage(txt, enum):
+    """从「不是 JSON 的回答」里捞出结构化的答案。捞不到就返回 None。
+
+    只在两种情况下认（**不许瞎猜**）：
+      ① 文本里有一段合法 JSON 对象，且它的 tool 值在清单里
+      ② 文本里恰好只提到一个清单里的工具名（唯一命中）
+
+    第 ② 条要求「唯一」：同时提到两三个工具名的思考过程，一律不认——
+    那是在权衡，不是在回答。认错了比认不出更坏：调用方会去执行一个错的工具。
+    """
+    for frag in _JSON_IN_TEXT.findall(txt):
+        try:
+            o = json.loads(frag)
+        except Exception:
+            continue
+        if isinstance(o, dict) and _pick_name(o, enum):
+            return o
+    hits = [n for n in enum if n and n != "none" and n in txt]
+    if len(hits) == 1:
+        return {"tool": hits[0], "arg": ""}
+    return None
+
+
+def _ask(target, system, enum, q, timeout, max_tokens=96):
     """打一次决策模型。返回 (obj, None) 或 (None, 失败原因)。
+
+    `target` 是 `(base, key, model)`。key 只有走云端端点时才非空；
+    本机 llama-server 不鉴权，传空即可。
 
     失败原因**只在这里生成**：连不上 / 超时 / 非 JSON / 非对象。判断是不是
     自己的问题（端点没起）还是模型的问题（答歪了），全靠这句。
     """
+    base, key, model = target if isinstance(target, (tuple, list)) else (target, "", "")
     payload = {
         "messages": [
             {"role": "system", "content": system},
@@ -183,33 +314,76 @@ def _ask(base, system, enum, q, timeout, max_tokens=96):
         "temperature": 0.1,
         "max_tokens": max_tokens,
     }
+    # 只有端点自己报了模型名才传。留空交给端点挑默认模型 ——
+    # 硬塞一个它不认识的名字，表现是 404 或「模型不存在」，比不传更坏。
+    if model:
+        payload["model"] = model
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+
+    def _no(msg, retry):
+        """失败的唯一出口。顺手记「换个别家能不能救」——漏标一处就等于
+        那个分支永不降级，而漏标是看不见的（表现为「偶尔不降级」）。"""
+        LAST_RETRYABLE[0] = retry
+        return None, msg
+
     try:
         req = urllib.request.Request(
-            base + "/v1/chat/completions",
+            _chat_url(base),
             data=json.dumps(payload, ensure_ascii=False).encode(),
-            method="POST", headers={"Content-Type": "application/json"})
+            method="POST", headers=headers)
         d = json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
     except urllib.error.HTTPError as e:
-        return None, "HTTP %s（端点 %s）" % (e.code, base)
+        # 401/403 要单独说：这是「算力配错了」，不是「模型不会」。
+        # 混成一句「HTTP 401」的话，人会去改提示词。
+        if e.code in (401, 403):
+            return _no("HTTP %s 鉴权失败（端点 %s）—— 算力页里这个端点的 key "
+                       "没填或不对" % (e.code, base), False)
+        if e.code == 404:
+            return _no("HTTP 404（端点 %s）—— 地址少了或多了 /v1，"
+                       "或者模型名它不认识" % base, False)
+        # 429 = 这一刻不给算，5xx = 它自己坏了。两种都是「换一家可能就行」。
+        return _no("HTTP %s（端点 %s）%s" % (
+            e.code, base,
+            " —— 限流了，换一个算力端点" if e.code == 429 else ""),
+            e.code in (429, 500, 502, 503, 504))
     except urllib.error.URLError as e:
         # socket 超时会被 urllib 包成 URLError(reason="timed out")，这时说
         # 「连不上」是错的——服务活着，只是没赶上。分清楚，排查方向才对。
         r = str(getattr(e, "reason", e))
         if "timed out" in r or "timeout" in r.lower():
-            return None, _timeout_msg(timeout, base)
-        return None, "连不上 %s（%s）——服务起了吗" % (base, r)
+            return _no(_timeout_msg(timeout, base), True)
+        return _no("连不上 %s（%s）——服务起了吗" % (base, r), True)
     except TimeoutError:
-        return None, _timeout_msg(timeout, base)
+        return _no(_timeout_msg(timeout, base), True)
     except Exception as e:
         # 决策层挂了不拖垮对话：这是「暂时状态」，调用方按无工具面继续。
-        return None, "%s: %s" % (type(e).__name__, str(e)[:80])
-    txt = (d["choices"][0]["message"].get("content") or "").strip()
+        return _no("%s: %s" % (type(e).__name__, str(e)[:80]), True)
+    txt, src = _content_of(d)
+    if not txt:
+        # 三种空法，得分开说，不然下次排查的人还得重走一遍：
+        fr = ""
+        try:
+            fr = d["choices"][0].get("finish_reason") or ""
+        except Exception:
+            pass
+        if fr == "length":
+            return _no("回答被 max_tokens（%d）截断了 —— 思考型模型会先烧一段"
+                       "再写正文，预算给小了正文就是空的" % max_tokens, False)
+        return _no("回包是空的（content / reasoning_content 都没有，"
+                   "finish=%r）" % fr, False)
     try:
         o = json.loads(txt)
     except Exception:
-        return None, "返回的不是 JSON：%r" % txt[:80]
+        o = _salvage(txt, enum)
+        if o is not None:
+            LAST_RETRYABLE[0] = False
+            return o, None
+        return _no("返回的不是 JSON（来源 %s）：%r" % (src, txt[:80]), False)
     if not isinstance(o, dict):
-        return None, "返回不是对象：%r" % txt[:80]
+        return _no("返回不是对象：%r" % txt[:80], False)
+    LAST_RETRYABLE[0] = False
     return o, None
 
 
@@ -248,6 +422,38 @@ def _domain_system(only=None):
 LAST_TRACE = []
 
 
+def _decider_targets(url=None):
+    """决策候选端点，第 0 个是首选，后面是后备。降级用。
+
+    为什么要「一串」而不是「一个」（2026-10-29 实测撞出来的）：
+    接上外部算力后第一件事就是 429 —— 我连跑三轮跑分，zen-gate 的免费额度
+    当场用光，于是 decide() 返回 None、整个工具面消失，看起来像「她突然不会
+    用工具了」。**外部算力必然有限流**，一个端点不给算 ≠ 这件事做不了。
+
+    但**显式指定时只给一个，不降级**：跑分要考的就是那个端点，
+    偷偷换成别家等于成绩作废。`AT_DECIDER_URL` 和参数都算显式。
+    """
+    explicit = (url or os.environ.get("AT_DECIDER_URL") or "").strip()
+    if explicit:
+        return [_decider_target(url)]
+    try:
+        from . import compute as _C
+        eps, conf = _C._load()
+        pinned = (conf.get("route") or {}).get("decide") or ""
+        pool = [e for e in eps if e.ready()]
+        pool.sort(key=_C._rank)
+        if pinned:
+            # 钉死的排第一，剩下的仍按档位当后备（不因为它挂了就让整件事挂）
+            pool.sort(key=lambda e: 0 if e.id == pinned else 1)
+        out = [(e.base_url.rstrip("/"), e.key, e.model or "") for e in pool[:2]]
+        # 只留 2 个候选。3 个以上会把 DECIDE_TIMEOUT=25s 平分到每个不到 8 秒，
+        # 连实测 8.6 秒的免 key 端点都跑不完 —— 多一个候选反而让每个都失败。
+        # 「试两个都挂」和「试五个都超时」对用户是一样的，但后者要多等 40 秒。
+        return out or [(DECIDER_URL, "", "")]
+    except Exception:
+        return [(DECIDER_URL, "", "")]
+
+
 def decide(question, url=None, timeout=DECIDE_TIMEOUT):
     """问决策模型：该用哪个工具。返回 {"tool": ..., "arg": ...}。
 
@@ -256,6 +462,10 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
       · {"tool": "<名字>", "arg": ...}  —— 用这个工具
       · None                            —— 决策层不可用（连不上/超时/输出非法），
                                            调用方按「无工具面」处理，不要重试
+
+    失败时**会顺着候选端点往下试**（见 `_decider_targets`）：429 / 5xx /
+    超时算「这家现在不给算」，换下一个还有救；401 / 404 / 答歪了算
+    「配置或模型的问题」，换过去一样错，直接返回 None 别白烧时间。
     """
     q = (question or "").strip()
     if not q:
@@ -264,28 +474,59 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
         LAST_TRACE[:] = ["规则短路：这句不需要工具"]
         return {"tool": "none", "arg": ""}
 
-    base = (url or os.environ.get("AT_DECIDER_URL", DECIDER_URL)).rstrip("/")
+    targets = _decider_targets(url)
     full = _full_mode()
-    key = (base, "full" if full else "scoped", q)
-    hit = _cache_get(key)
-    if hit is not None:
-        return dict(hit)            # 复制：别让调用方改坏缓存里那条
+    mode = "full" if full else "scoped"
+    t_start = time.time()
+    tried = []
+    last_err = ""
 
-    out, err = (_decide_full(q, base, timeout) if full
-                else _decide_scoped(q, base, timeout))
-    if err:
-        _fail(err)
-        return None
-    LAST_FAIL[0] = ""                   # 成功：把上一次的失败原因清掉
-    _cache_put(key, out)
-    return dict(out)
+    for i, target in enumerate(targets):
+        base, _key, model = target
+        # 缓存键必须带端点：换了算力之后，同一句话的答案可能不同（模型不同）。
+        # 只按问题缓存的话，切到云端还会拿本地那条旧答案，像「切了没生效」。
+        ck = (base, model or "-", mode, q)
+        hit = _cache_get(ck)
+        if hit is not None:
+            return dict(hit)        # 复制：别让调用方改坏缓存里那条
+
+        # 预算：平分剩下的时间，但每个至少给 5 秒（低于这个基本答不完，
+        # 试了也只是把总等待拖长）。最后一个用满剩余。
+        left_total = max(0.0, timeout - (time.time() - t_start))
+        if i == len(targets) - 1:
+            budget = max(5.0, left_total)
+        else:
+            budget = max(5.0, left_total / (len(targets) - i))
+
+        out, err = (_decide_full(q, target, budget) if full
+                    else _decide_scoped(q, target, budget))
+        if not err:
+            LAST_FAIL[0] = ""       # 成功：把上一次的失败原因清掉
+            if tried:
+                LAST_TRACE.append("（前 %d 个端点不可用：%s；最终由 %s 答）"
+                                  % (len(tried), "、".join(tried), base))
+            _cache_put(ck, out)
+            return dict(out)
+
+        last_err = err
+        tried.append(base)
+        # 不可重试，或已经是最后一个 → 收手
+        if not LAST_RETRYABLE[0] or i == len(targets) - 1:
+            _fail(err)
+            return None
+        LAST_TRACE.append("端点 %s 暂时不可用（%s），换下一个" % (base, err[:40]))
+
+    _fail(last_err or "没有可用的决策端点")
+    return None
 
 
-def _decide_full(q, base, timeout):
+def _decide_full(q, target, timeout):
     """一级制：58 个工具一次全给。给云端大模型用。"""
     enum = DECIDE_SCHEMA["properties"]["tool"]["enum"]
     LAST_TRACE[:] = ["一级制：%d 个工具一次给" % (len(enum) - 1)]
-    o, err = _ask(base, DECIDE_SYSTEM, enum, q, timeout, 160)
+    # max_tokens 320：思考型模型会先烧一段 reasoning 再写正文，160 会被截断
+    # 在思考阶段 ⇒ content 空 ⇒ 看起来像「不会」。实测（zen-gate）160 必空。
+    o, err = _ask(target, DECIDE_SYSTEM, enum, q, timeout, 320)
     if err:
         return None, err
     name = _pick_name(o, enum)
@@ -300,7 +541,7 @@ def _decide_full(q, base, timeout):
 MERGE_TOOL_CAP = 16
 
 
-def _decide_scoped(q, base, timeout):
+def _decide_scoped(q, target, timeout):
     """两级制：先定域（规则优先），再在域内选一个工具。
 
     域这一级有三种走法，按「能确定多少」递进：
@@ -319,7 +560,7 @@ def _decide_scoped(q, base, timeout):
         if len(merged) > MERGE_TOOL_CAP:
             # 合并太大就退一步：只在并列的域里问一句「哪一类」
             left = timeout - (time.time() - t0)
-            o, err = _ask(base, _domain_system(doms), doms + ["none"], q,
+            o, err = _ask(target, _domain_system(doms), doms + ["none"], q,
                           max(4.0, min(8.0, left * 0.4)), 32)
             if err:
                 LAST_TRACE[:] = trace + ["② 并集太大且定域失败：%s" % err]
@@ -337,7 +578,7 @@ def _decide_scoped(q, base, timeout):
     elif not doms:
         # 规则完全没话说，才花钱问模型
         left = timeout - (time.time() - t0)
-        o, err = _ask(base, _domain_system(), _domain_enum(), q,
+        o, err = _ask(target, _domain_system(), _domain_enum(), q,
                       max(4.0, min(8.0, left * 0.4)), 32)
         if err:
             trace.append("① 问模型定域失败：%s" % err)
@@ -363,7 +604,7 @@ def _decide_scoped(q, base, timeout):
     if left <= 0.2:
         LAST_TRACE[:] = trace + ["② 没时间了（定域已花 %.1fs）" % (time.time() - t0)]
         return None, "超时（定域就花了 %.1fs）" % (time.time() - t0)
-    o, err = _ask(base, _system_with(_lines_for(doms)), enum, q, left, 96)
+    o, err = _ask(target, _system_with(_lines_for(doms)), enum, q, left, 96)
     if err:
         trace.append("② 域内选择失败：%s" % err)
         LAST_TRACE[:] = trace

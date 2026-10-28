@@ -642,10 +642,39 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .vv-send:disabled{opacity:.5;cursor:not-allowed}
 .vv-hands.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-text)}
 
+/* ==========================================================================
+   窄窗口（2026-10-29）
+   三栏固定宽度是 212 + 296 = 508px。窗口还卡着最小 1080 的时候，这一条永远
+   进不来；把最小宽度放到 860 之后，860 宽时中栏只剩 352px，再窄就直接塌成
+   竖排（实测 456px 时「专家技能·连接器」一个字一行）。
+   所以这里不只是"缩一缩"，是有优先级的让位：
+     ① 900 以下：三栏都收窄，指标格降低每格下限（4 格 → 3 格也放得下）
+     ② 780 以下：**设备栏先让位**——它显示的东西在「设备」页里全都有
+     ③ 620 以下：侧边栏收到 150px，导航文字单行裁切（绝不逐字换行）
+   ========================================================================== */
 @media (max-width:900px){
   .vv-orb{width:200px;height:200px}
   .vv-bar{padding:8px 12px 14px;gap:8px}
   .vv-send,.vv-hands{padding:0 12px;font-size:12.5px}
+
+  .sidebar{width:180px;flex:0 0 180px}
+  .devpanel{width:248px;flex:0 0 248px}
+  .fl-grid{grid-template-columns:repeat(auto-fit,minmax(96px,1fr));padding:10px}
+}
+
+@media (max-width:780px){
+  /* 右侧设备栏让位：CPU/内存/进程这些在「设备」页里是同一份数据 */
+  .devpanel{display:none}
+  .sidebar{width:172px;flex:0 0 172px}
+}
+
+@media (max-width:620px){
+  .sidebar{width:150px;flex:0 0 150px}
+  /* 单行裁切：宁可省略号，也不要一个字一行 */
+  .sb-item,.sb-conv{white-space:nowrap;overflow:hidden}
+  .sb-brand small{display:none}
+  .main-head{padding:0 10px;gap:6px}
+  .fl-grid{padding:8px}
 }
 
 /* ==========================================================================
@@ -680,3 +709,84 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .doc-name{font-family:var(--mono);color:var(--fg);flex:0 0 auto}
 .doc-fix{color:var(--fg-3);font-size:11.5px;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;min-width:0}
+
+/* ==========================================================================
+   算力页（view-compute）
+   谁来算这件事 —— 端点清单 + 用途路由。
+   只用上面定义的变量，所以浅色/深色两套主题自动跟着走（不需要再写一份
+   html[data-theme="dark"] 覆盖）。对比度沿用现有口径：正文用 --fg/--fg-2，
+   accent 当文字色时用 --accent-text（--accent 在浅底上差 0.013 不达 AA）。
+   ========================================================================== */
+
+/* ---- ① 用途路由 ---- */
+.croute{background:var(--panel-2);border:1px solid var(--line-soft);
+  border-radius:var(--radius);padding:12px 14px;margin-bottom:14px}
+.crtitle{font-size:12px;color:var(--fg-2);margin-bottom:9px;font-weight:500}
+.crline{display:flex;align-items:center;gap:9px;padding:5px 0;
+  border-top:1px solid var(--line-soft);flex-wrap:wrap}
+.crline:first-of-type{border-top:none}
+.crname{font-size:12.5px;color:var(--fg);min-width:0;flex:0 1 auto}
+.crsel{font:inherit;font-size:12px;padding:3px 7px;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  max-width:260px}
+.crsel:focus{outline:2px solid var(--accent);outline-offset:-1px}
+/* 「实际会走谁」跟选中的值可能不一样（选中的没 key 时路由会退回），
+   所以这一项必须单独显示，不能靠下拉框的选中态去暗示。 */
+.crnow{font-size:11.5px;color:var(--ok);margin-left:auto}
+.crnow.bad{color:var(--danger)}
+
+/* ---- ② 端点卡片 ---- */
+.cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+  gap:10px}
+.ccard{gap:6px}
+/* 「已关闭」不能靠 opacity 表达。
+   实测（t31/a11y）：`opacity:.62` 会把整张卡的所有文字等比稀释，
+   卡片名掉到 4.46、标签掉到 2.33 / 2.51，全都不达 AA 4.5。
+   opacity 是「整体淡出」，它不认识「哪些是正文、哪些是装饰」。
+   改用三种不伤对比度的信号：虚线边框 + 底色变浅 + 标题降一档灰。 */
+.ccard.off{background:var(--bg);border-style:dashed}
+.ccard.off .cname{color:var(--fg-2)}
+.ccard .curl{font-family:var(--mono);font-size:11px;color:var(--fg-2);
+  word-break:break-all;line-height:1.5}
+.ccard .cmeta2{font-size:11px;color:var(--fg-3);line-height:1.5}
+.ccard .cmeta2.warn{color:var(--warn)}
+/* 状态徽标：四种状态必须能一眼分开 —— 「没测过」既不是通也不是不通 */
+.cpill{font-size:10.5px;padding:1.5px 7px;border-radius:20px;
+  border:1px solid var(--line);color:var(--fg-2);white-space:nowrap}
+.cpill.idle{background:var(--panel);color:var(--fg-3)}
+.cpill.ok{background:transparent;border-color:var(--ok);color:var(--ok)}
+.cpill.bad{background:transparent;border-color:var(--danger);
+  color:var(--danger)}
+.cpill.warn{background:transparent;border-color:var(--warn);color:var(--warn)}
+.cpill.wait{background:var(--accent-soft);border-color:var(--accent);
+  color:var(--accent-text)}
+.ctag{font-size:10px;padding:1px 6px;border-radius:20px;
+  border:1px solid var(--line);color:var(--fg-3)}
+.ctag.warn{border-color:var(--warn);color:var(--warn)}
+
+/* ---- 编辑控件 ---- */
+.ccard .cops{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  margin-top:2px;padding-top:8px;border-top:1px solid var(--line-soft)}
+.ccard .cops .hbtn{width:auto;height:auto;font-size:10.5px;padding:3px 10px}
+.ccard .cops .hbtn:hover{border-color:var(--accent);color:var(--accent-text)}
+.ccard .cops .hbtn.danger{color:var(--danger);border-color:var(--danger)}
+.ckey{font:inherit;font-size:11px;padding:3px 8px;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  width:150px;font-family:var(--mono)}
+.ckey:focus{outline:2px solid var(--accent);outline-offset:-1px}
+
+/* ---- ③ 添加端点 ---- */
+.cadd{background:var(--panel-2);border:1px solid var(--line-soft);
+  border-radius:var(--radius);padding:12px 14px;margin-top:14px;
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cadd .crtitle{width:100%;margin-bottom:2px}
+.cin{font:inherit;font-size:11.5px;padding:4px 9px;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  width:150px}
+.cin.grow{flex:1 1 260px;width:auto;min-width:200px}
+.cin:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.cin[type="checkbox"]{width:auto;margin-right:4px}
+.clab{display:flex;align-items:center;font-size:11.5px;color:var(--fg-2);
+  cursor:pointer}
+.cadd .hbtn{width:auto;height:auto;font-size:11px;padding:4px 12px}
+.cadd .hbtn.go{border-color:var(--accent);color:var(--accent-text)}

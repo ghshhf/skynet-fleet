@@ -45,7 +45,7 @@ v4 计划书把 N+1 定为「桌面端技能机制真正跑起来」，判据是
      用 Playwright 的 route 拦截来验——**不真记使用事件**，
      否则门禁自己会污染证据库（那是测试数据冒充真usage）。
 
-  ⑩ **token 是一道真门**：缺 401、错 403。
+  ⑩ **token 是一道真门**：缺 401、错也 401（凭据无效同类），文案区分。
 
 全离线、可复现：技能目录与证据库都在**临时 git 仓**里（回滚需要 git），
 不碰仓库里真技能、不连网、不点真鼠标。
@@ -441,7 +441,8 @@ try:
     st, js, err = http_json(f"{BASE}/api/skills/evolved")
     check(st == 401, f"不带 token → 401（实际 {st}）")
     st, js, err = http_json(f"{BASE}/api/skills/evolved", token="wrong")
-    check(st == 403, f"带错 token → 403（实际 {st}）")
+    # 2026-10-29：403 → 401，理由见 t7_gui_backend.py。
+    check(st == 401, f"带错 token → 401（实际 {st}）")
     st, js, err = http_json(f"{BASE}/api/skill/use", method="POST",
                             body={"name": NAME, "ok": True})
     check(st == 401, f"选用不带 token → 401（实际 {st}）")
