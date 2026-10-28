@@ -17,13 +17,19 @@ import argparse
 import os
 import sys
 
+from . import autostart as _autostart
 from .approval import ApprovalBroker
 from .server import FleetServer
+from .single import SingleInstance
+from .tray import Tray, data_dir
 
 WIN_TITLE = "设备编队"
 WIN_WIDTH = 1440
 WIN_HEIGHT = 900
-WIN_MIN = (1080, 680)
+# 最小尺寸曾经是 1080×680——那等于**禁止**窄窗口，而不是适配窄窗口。
+# 现实里的窄屏是 1366×768 的笔记本开一半（约 680 宽）和竖屏副屏。
+# 这里放到 860×560，网页侧另有一条 900px 断点兜窄屏布局。
+WIN_MIN = (860, 560)
 
 
 def _smoke():
@@ -95,6 +101,12 @@ def main(argv=None):
                     help="隧道端口（手机端 Prefs 默认就是 8000；两端要同一个数）")
     ap.add_argument("--lan", action="store_true",
                     help="局域网模式：绑 0.0.0.0（必须同时固定 FLEET_GUI_TOKEN，否则拒绝启动）")
+    ap.add_argument("--no-tray", action="store_true",
+                    help="不起托盘（关了窗口就退出，给无人值守/容器用）")
+    ap.add_argument("--quit-on-close", action="store_true",
+                    help="点窗口的叉就退出（默认是藏到托盘里继续跑）")
+    ap.add_argument("--autostart", action="store_true",
+                    help="开机自启模式：直接藏进托盘，不弹窗（注册表里写的就是这条）")
     args = ap.parse_args(argv)
 
     if args.smoke:
@@ -109,6 +121,20 @@ def main(argv=None):
         except Exception as e:
             raise SystemExit("语音模式起不来：%s\n（缺依赖就先 pip install -r requirements.txt）" % e)
         return _tianwang.main()
+
+    # 单实例：第二次双击不该起第二份服务——那会抢端口、各自认为自己在管编队，
+    # 审批弹窗还会出现在你看不见的那个窗口里。已经在跑就把它的窗口叫出来。
+    # 叫不醒也要说清"她在，但我叫不出来"，不能假装启动成功。
+    inst = SingleInstance()
+    if not inst.acquire():
+        if inst.poke():
+            print("[fleet-gui] 已经有一个在跑了，已把它的窗口叫出来。", flush=True)
+        else:
+            print("[fleet-gui] 已经有一个在跑，但没回应唤起%s。"
+                  "它可能在托盘里——右键托盘图标点「显示主窗口」；"
+                  "或者去任务管理器结束它再启。"
+                  % ("（%s）" % inst.last_error if inst.last_error else ""), flush=True)
+        return 0
 
     # W2：注入审批中枢。有副作用的能力会被注册表拦在闸门上，挂起等主人在
     # 弹窗里点确认。判定权始终在注册表层（要不要审批、几级、要不要双确认），
@@ -179,18 +205,125 @@ def main(argv=None):
                 time.sleep(1)
         except KeyboardInterrupt:
             srv.stop()
+        finally:
+            inst.release()
         return 0
 
     webview = _require_webview()
+
+    # 静默启动（开机自启）只有在托盘真能起来时才成立：
+    # 没有托盘还隐藏窗口 = 一个看不见也点不到、只能去任务管理器杀的进程。
+    tray_available = False
+    if not args.no_tray:
+        try:
+            import pystray  # noqa: F401
+            tray_available = True
+        except Exception:
+            tray_available = False
+    hidden_start = bool(args.autostart) and tray_available
+
     window = webview.create_window(
         WIN_TITLE, url,
         width=WIN_WIDTH, height=WIN_HEIGHT,
         min_size=WIN_MIN,
+        hidden=hidden_start,
         background_color="#15171a" if args.theme == "dark" else "#f7f8fa")
+
+    flags = {"quit": False, "tray": None}
+
+    def _show_window():
+        """把窗口叫出来：先 show 再 restore —— 最小化过的窗口光 show 不顶用。"""
+        try:
+            window.show()
+            window.restore()
+        except Exception as e:
+            print("[fleet-gui] 显示窗口失败：%s: %s" % (type(e).__name__, e), flush=True)
+
+    def _quit_app():
+        """真退出：托盘退出、窗口销毁、服务停掉，全走这一条。"""
+        flags["quit"] = True
+        if flags["tray"] is not None:
+            flags["tray"].stop()
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    def _on_closing():
+        """点窗口的叉：默认藏进托盘继续跑，除非明确要退出。"""
+        if flags["quit"] or args.quit_on_close or flags["tray"] is None:
+            flags["quit"] = True
+            return True
+        try:
+            window.hide()
+        except Exception:
+            return True
+        flags["tray"].notify("还在后台跑着。右键托盘图标 → 退出，才是真退出。")
+        return False
+
     try:
-        webview.start()
+        window.events.closing += _on_closing
+    except Exception as e:
+        # 老版本 pywebview 没有 closing 事件：退化成"关窗即退出"，但要说出来。
+        print("[fleet-gui] 这个 pywebview 不支持拦截关窗（%s），关窗口就是退出。"
+              % type(e).__name__, flush=True)
+
+    # 唤起通道：第二次双击时靠它把这个窗口叫出来。
+    if not inst.listen(_show_window):
+        print("[fleet-gui] 唤起通道没起来：%s。"
+              "第二次双击叫不出这个窗口（但不会起第二份服务）。"
+              % (inst.last_error or "未知原因"), flush=True)
+
+    if tray_available:
+        def _as_on():
+            ok, msg = _autostart.enable()
+            print("[fleet-gui] 开机自启：%s" % msg, flush=True)
+            if flags["tray"] is not None:
+                flags["tray"].notify(msg)
+
+        def _as_off():
+            ok, msg = _autostart.disable()
+            print("[fleet-gui] 开机自启：%s" % msg, flush=True)
+            if flags["tray"] is not None:
+                flags["tray"].notify(msg)
+
+        def _open_data():
+            d = data_dir()
+            try:
+                os.makedirs(d, exist_ok=True)
+                os.startfile(d)             # 只有 Windows 有；其他平台下面兜
+            except AttributeError:
+                print("[fleet-gui] 数据目录：%s" % d, flush=True)
+            except Exception as e:
+                print("[fleet-gui] 打开数据目录失败（%s），路径是 %s"
+                      % (e, d), flush=True)
+
+        flags["tray"] = Tray(
+            show=_show_window, quit=_quit_app, open_data=_open_data,
+            autostart_on=_as_on, autostart_off=_as_off,
+            autostart_state=lambda: _autostart.is_enabled(),
+            title=WIN_TITLE)
+        if not flags["tray"].start():
+            flags["tray"] = None
+    else:
+        print("[fleet-gui] 托盘没起来：关窗口就是退出。要常驻请 pip install pystray。",
+              flush=True)
+
+    def _after_start():
+        if hidden_start and flags["tray"] is not None:
+            try:
+                window.hide()
+            except Exception:
+                pass
+            flags["tray"].notify("已开机自启，在托盘里待着。")
+
+    try:
+        webview.start(_after_start)
     finally:
+        if flags["tray"] is not None:
+            flags["tray"].stop()
         srv.stop()
+        inst.release()
     return 0
 
 

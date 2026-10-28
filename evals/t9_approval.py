@@ -20,7 +20,8 @@ denied（带原因）。这是故意的 fail-closed，不是 bug。W2 加的是�
      两个能力同时在等审批时，回应其中一个，另一个照样能等到自己的回应；
      谁也不许把另一个的等待吃掉（各自独立的 Event）。
 
-  ⑤ **鉴权**：不带 token → 401；带错 token → 403。
+  ⑤ **鉴权**：不带 token → 401；带错 token 也 401（凭据无效都属这一类，
+     靠文案区分「忘了带」和「带错了」；403 留给「凭据有效但没权限」）。
      两种都带明确原因（照 secrets.compare_digest 的常数时间口径）。
 
   ⑥ **审批记录不能跨会话重放**。
@@ -324,10 +325,13 @@ try:
     check(st == 401, f"不带 token → 401（实际 {st}）")
     check(bool(js and js.get("err")), "401 带明确原因")
 
-    # ⑦b 带错 token → 403
+    # ⑦b 带错 token → 401（凭据无效）
+    # 判成 403 会让客户端以为「权限不足、重试没用」而不去刷新凭据。
+    # 403 仍留给「凭据有效但没权限」（管理口只认本机令牌）。
+    # 详见 t7_gui_backend.py 里的完整说明。
     st, js, _ = http_json(f"{BASE}/api/approvals", token="wrong-token")
-    check(st == 403, f"带错 token → 403（实际 {st}）")
-    check(bool(js and js.get("err")), "403 带明确原因")
+    check(st == 401, f"带错 token → 401（实际 {st}）")
+    check(bool(js and js.get("err")), "401 带明确原因")
 
     # ⑦c 带对 token → 200
     st, js, _ = http_json(f"{BASE}/api/approvals", token=TOKEN)

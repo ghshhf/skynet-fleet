@@ -43,6 +43,7 @@ from .. import pairtls as PTLS
 from ..catalog import build
 from .. import VERSION as FLEET_VERSION
 from .. import doctor as DOCTOR
+from .. import compute as COMPUTE
 from .approval import ApprovalBroker
 
 # 仓库根（fleet/gui/server.py → 上三级）。角色卡、人格状态这些平铺模块都在根下。
@@ -631,16 +632,24 @@ class _Handler(BaseHTTPRequestHandler):
         手机就 403 —— 这不是主人用错了，是设计缺陷。配对一次就该一直能用，
         撤销由主人单方面决定，不该由「电脑重启了」决定。
 
-        401 = 压根没带凭据；403 = 带了但对不上（旧令牌/已撤销设备/伪造）。
-        分开是为了在日志里区分「调用方忘了加头」（bug）和「有人拿旧凭据来敲」
-        （可疑行为）。比对一律 secrets.compare_digest，防时序侧信道。
+        401 = 凭据无效（没带，或带了但对不上）
+        403 = 凭据有效但没权限（例如管理口只认本机令牌，已配对的手机来敲）
+
+        🔴 2026-10-29 改：原来「令牌不对」回 403，理由是「在日志里区分
+        调用方忘了加头（bug）和有人拿旧凭据来敲（可疑）」。这个区分站不住：
+        按 RFC 7235，两种都是「没有有效凭据」，都该 401；403 留给
+        「凭据没问题，但你不该碰这个」。而且仓库里另一个服务
+        （`agent_server.py`）一直用 401，两个服务口径不同，客户端就得
+        写两套判断 —— 这正是最容易长期潜伏、只在换端时爆的那种不一致。
+        要区分「忘了带」还是「带错了」，看**错误文案**就够了，不该动状态码。
+        比对一律 secrets.compare_digest，防时序侧信道。
         """
         self._device = None
         got = self.headers.get(TOKEN_HEADER) or ""
         if got:
             if secrets.compare_digest(got, self.fleet.token):
                 return True, 200, ""
-            return False, 403, "令牌不对：不是本次启动注入的那枚"
+            return False, 401, "令牌不对：不是本次启动注入的那枚"
 
         raw = self.headers.get(DEVICE_HEADER) or ""
         if raw:
@@ -748,6 +757,12 @@ class _Handler(BaseHTTPRequestHandler):
             q = parse_qs(urlparse(self.path).query)
             deep = q.get("deep", ["0"])[0] in ("1", "true", "yes")
             return self._json(DOCTOR.scan(deep=deep))
+        if path == "/api/compute":
+            return self._compute_list()
+        if path == "/api/compute/probe":
+            # 探测是网络操作（最长 25s），用 POST。放 GET 里会被浏览器预取/缓存
+            # 在背后悄悄发起，白烧额度。
+            return self._err(405, "探测要用 POST")
         self._err(404, f"没有这个接口: {path}")
 
     def _api_post(self, path):
@@ -785,6 +800,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_call(body)
         if path == "/api/chat":
             return self._post_chat(body)
+        if path == "/api/compute/probe":
+            return self._post_compute_probe(body)
+        if path == "/api/compute/save":
+            return self._post_compute_save(body)
+        if path == "/api/compute/delete":
+            return self._post_compute_delete(body)
+        if path == "/api/compute/route":
+            return self._post_compute_route(body)
         if path == "/api/card/use":
             return self._post_card_use(body)
         if path == "/api/card/fetch":
@@ -2025,6 +2048,78 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Voice-Card", _hdrsafe(card_id))
         self.end_headers()
         self.wfile.write(data)
+
+    # ---------------- 算力（接外部算力） ----------------
+    #
+    # 为什么这四个端点要单独一组：在这之前「算力」是散在四个 env 里的实现细节，
+    # 桌面上一个都看不见。于是本地小模型跑不动的物理限制被当成能力上限，
+    # 一路去抠模型。这四个口把「谁的算力来算」变成用户能改的东西。
+
+    def _compute_list(self):
+        """全部端点 + 每个用途实际会走哪个。
+
+        **key 绝不回传**：只给 `key_hint`（*** + 末四位）。本服务里唯一
+        碰用户凭据的读口就是这里，收口在这一处。
+
+        同时明确回报两个文件路径 —— 用户的 key 是真落盘的，藏这个事实
+        比说清楚更危险（`snapshot()` 那次教训）。
+        """
+        try:
+            eps = COMPUTE.list_all()
+            rt = COMPUTE.routes()
+        except Exception as e:
+            return self._err(500, "算力配置读不出来：%s: %s"
+                             % (type(e).__name__, e))
+        return self._json({
+            "ok": True,
+            "endpoints": eps,
+            "routes": rt,
+            "purposes": COMPUTE.PURPOSES,
+            "conf_path": COMPUTE.CONF_PATH,
+            "keys_path": COMPUTE.KEYS_PATH,
+        })
+
+    def _post_compute_probe(self, body):
+        """真打一次，判断这个端点现在能不能算。
+
+        ⚠️ 两层的 `ok` 不是一回事，别混：
+           外层 ok          → 这个 HTTP 请求处理成功了
+           result.ok        → 端点真算出了东西
+        探测没通是**正常结果**，不是接口错误，所以照样回 200。
+        """
+        eid = str(body.get("id") or "").strip()
+        if not eid:
+            return self._err(400, "缺少 id")
+        try:
+            r = COMPUTE.probe(eid)
+        except Exception as e:
+            return self._err(500, "探测时出错：%s: %s" % (type(e).__name__, e))
+        return self._json({"ok": True, "result": r})
+
+    def _post_compute_save(self, body):
+        # key 只在传入时更新；不传=保持原样。这个区分在 COMPUTE.upsert 里做，
+        # 因为「改个模型名就把 key 洗掉」是那种事后完全看不出原因的坑。
+        pub, err = COMPUTE.upsert(body)
+        if err:
+            return self._err(400, err)
+        return self._json({"ok": True, "endpoint": pub})
+
+    def _post_compute_delete(self, body):
+        eid = str(body.get("id") or "").strip()
+        if not eid:
+            return self._err(400, "缺少 id")
+        ok, why = COMPUTE.remove(eid)
+        if not ok:
+            return self._err(400, why)
+        return self._json({"ok": True})
+
+    def _post_compute_route(self, body):
+        purpose = str(body.get("purpose") or "").strip()
+        eid = str(body.get("id") or "").strip()      # 空串 = 取消钉死
+        ok, why = COMPUTE.set_route(purpose, eid)
+        if not ok:
+            return self._err(400, why)
+        return self._json({"ok": True, "routes": COMPUTE.routes()})
 
     def _post_chat(self, body):
         prompt = (body.get("prompt") or "").strip()

@@ -401,15 +401,40 @@ try:
           "401 原因说清是「缺少凭据」而不是「凭据不对」（%s）" % (js.get("err") if js else ""))
 
     st, js, _ = http_json(f"{BASE}/api/health", token="wrong-token")
-    check(st == 403, f"带错 token → 403（实际 {st}）")
-    check(bool(js and js.get("err")), "错 token 的 403 也带原因")
+    # 🔴 2026-10-29 改：403 → 401。
+    #
+    # 原来是「没带凭据 401 / 凭据不对 403」，理由是「日志里能区分忘加头
+    # 和拿旧令牌来敲」。那个区分**用文案就够**，不该动状态码，原因是：
+    #   · 按 RFC 7235，401 是「没有有效凭据」（含凭据无效），403 是
+    #     「凭据有效但你不该碰这个」。把「令牌不对」判成 403，语义是反的。
+    #   · 更实际的代价：客户端看到 403 会认为「权限不够、重试没用」，
+    #     于是**不会去刷新凭据** —— 手机拿着过期令牌就永远卡住，
+    #     而真正该做的是重新认证（401 的信号）。
+    #   · 仓库里 `agent_server.py` 一直用 401 表示凭据问题，两个服务
+    #     口径不同，客户端就得写两套判断，这是只在换端时爆的那种不一致。
+    # 403 没被废掉：它留给「凭据有效但没权限」（管理口只认本机令牌，
+    # 已配对的手机来敲就是 403）。语义分工保住，只是换了边。
+    check(st == 401, f"带错 token → 401（实际 {st}）")
+    check(bool(js and js.get("err")), "错 token 的答复也带原因")
     check(bool(js and "不对" in (js.get("err") or "")),
-          "403 原因说清是「令牌不对」而不是「缺少令牌」（%s）" % (js.get("err") if js else ""))
+          "401 原因说清是「令牌不对」而不是「缺少令牌」（%s）" % (js.get("err") if js else ""))
 
-    # 401 与 403 必须是两个不同的状态码（合并成一条就退回了糊涂语义）。
-    st401, _, _ = http_json(f"{BASE}/api/health")
-    st403, _, _ = http_json(f"{BASE}/api/health", token="wrong-token")
-    check(st401 != st403, f"401 与 403 是两档（实际 {st401} / {st403}）")
+    # 「忘带」和「带错了」靠**文案**区分（这才是该区分的地方）。
+    st_miss, js_miss, _ = http_json(f"{BASE}/api/health")
+    st_wrong, js_wrong, _ = http_json(f"{BASE}/api/health", token="wrong-token")
+    check(st_miss == st_wrong == 401, "两种凭据问题同属 401（实际 %s / %s）"
+          % (st_miss, st_wrong))
+    check((js_miss.get("err") or "") != (js_wrong.get("err") or ""),
+          "但文案分得开：忘带 vs 带错")
+
+    # 403 仍然存在，且只用于「凭据没问题、但你不该碰这个」。
+    # 静态断言它的存在：`_authorized(gui_only=True)` 分支必须还回 403，
+    # 否则「401/403 分工」就变成了「只剩 401」，那是另一种退化。
+    with open(os.path.join(ROOT, "fleet", "gui", "server.py"),
+              encoding="utf-8") as f:
+        srv_src = f.read()
+    check("return False, 403" in srv_src,
+          "403 仍留给「凭据有效但没权限」（管理口分支）")
 
     st, js, _ = http_json(f"{BASE}/api/health", token=TOKEN)
     check(st == 200, f"带对 token → 200（实际 {st}）")

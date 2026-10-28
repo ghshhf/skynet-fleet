@@ -116,7 +116,9 @@ def _get(path, token=None):
 st, _ = _get("/api/host")
 check(st == 401, "设备页无 token → 401（没带凭据）")
 st, _ = _get("/api/host", "wrong-token")
-check(st == 403, "设备页带错 token → 403（带了但不对）")
+# 2026-10-29：403 → 401，理由见 t7_gui_backend.py（凭据无效属 401；
+# 403 会让客户端以为「重试没用」而不刷新凭据）。
+check(st == 401, "设备页带错 token → 401（凭据无效）")
 st, body = _get("/api/host", _srv.token)
 check(st == 200, "设备页带对 token → 200")
 

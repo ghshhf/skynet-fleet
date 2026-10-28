@@ -1991,6 +1991,11 @@
           loadCrew();
           return;
         }
+        if (view === "compute") {
+          showView("compute", "算力 · 谁来算这件事");
+          loadCompute();
+          return;
+        }
         if (view === "chat") {
           showView("chat", "设备编队");
           if (act === "new") { newTask(); }
@@ -2748,12 +2753,288 @@
   }
 
   /* ------------------------------------------------------------------ 视图切换 */
-  function showView(name, title) {
-    $("viewChat").classList.toggle("on", name === "chat");
+  function showView(name, title) {    $("viewChat").classList.toggle("on", name === "chat");
     $("viewAssets").classList.toggle("on", name === "assets");
     $("viewCrew").classList.toggle("on", name === "crew");
+    if ($("viewCompute")) { $("viewCompute").classList.toggle("on", name === "compute"); }
     if ($("viewVoice")) { $("viewVoice").classList.toggle("on", name === "voice"); }
     if (title) { $("viewTitle").textContent = title; }
+  }
+
+  /* ------------------------------------------------------------------ 算力
+     谁来算这件事。
+
+     为什么它配得上一个独立页面：在这之前「算力」是散在四个环境变量里的
+     实现细节（决策 `AT_DECIDER_URL` / 对话 `ai_backends` / 看图 `providers` /
+     语音另有一处），桌面上一个都看不见、改不了。于是「本地小模型 58 选 1
+     要 52.9 秒」这个**物理限制**被当成**能力上限**，一路去抠模型、抠分域。
+
+     实测对照（同一句问句、同样 58 个工具）：
+       本地 Qwen3.5-2B · 核显 CPU   2874 tokens / 52.9 秒 / 超时
+       外接 zen-gate（本机 8787）   3249 tokens /  1.9 秒 / 选对
+     ⇒ 差的不是模型智力，是算力选错了。这一页就是让「选算力」这件事可见、可改。
+
+     三条界面纪律：
+       ① 每个按钮都真发请求，没有一个是装饰；
+       ② 「测一下」显示的是**真耗时和真模型名**（网关会把模型名重映射，
+          所以要把实际跑的那个也显示出来，否则用户以为自己在用另一个模型）；
+       ③ key 只显示末四位，输入框永远不预填真 key —— 能看见就等于落进了
+          浏览器缓存和截图。 */
+  var COMPUTE = { data: null, busy: "" };
+
+  function loadCompute() {
+    var body = $("computeBody");
+    if (!body) { return; }
+    body.textContent = "";
+    body.appendChild(el("div", "creason", "读取中…"));
+    api("/api/compute").then(function (d) {
+      if (!d || !d.ok) { renderTabErr(body, (d && d.err) || "读不到算力配置"); return; }
+      COMPUTE.data = d;
+      renderCompute(body, d);
+    }).catch(function (e) {
+      renderTabErr(body, "读取算力配置失败：" + e);
+    });
+  }
+
+  function computeBadge(ep) {
+    // 四种状态必须区分开：「没测过」不等于「不通」。
+    // 把没测过画成红的，用户会以为坏了；画成绿的，用户会以为好了。
+    if (COMPUTE.busy === ep.id) { return el("span", "cpill wait", "测试中…"); }
+    if (ep.ok === true && ep.err) { return el("span", "cpill warn", "通了但可疑"); }
+    if (ep.ok === true) { return el("span", "cpill ok", "通 " + (ep.ms || 0) + "ms"); }
+    if (ep.ok === false) { return el("span", "cpill bad", "不通"); }
+    return el("span", "cpill idle", "没测过");
+  }
+
+  function renderCompute(body, d) {
+    body.textContent = "";
+
+    /* ---- ① 用途路由：每个用途现在走哪个 ---- */
+    var routeBox = el("div", "croute");
+    routeBox.appendChild(el("div", "crtitle",
+      "现在谁在算什么（点一下可以换）"));
+    var eps = d.endpoints || [];
+    var usable = eps.filter(function (e) { return e.ready; });
+
+    Object.keys(d.routes || {}).forEach(function (p) {
+      var r = d.routes[p];
+      var line = el("div", "crline");
+      line.appendChild(el("span", "crname", r.label || p));
+      var sel = document.createElement("select");
+      sel.className = "crsel";
+      // axe 要求表单控件有可访问名称：紧挨着的 .crname 是视觉标签，
+      // 但它跟 select 没有关联（没有 label/for，也没包在一起），所以在
+      // 屏幕阅读器里这四个下拉全是「组合框」。用 aria-label 绑上用途名。
+      sel.setAttribute("aria-label", (r.label || p) + " —— 走哪个算力");
+      var optAuto = document.createElement("option");
+      optAuto.value = "";
+      optAuto.textContent = "自动（免 key 优先）";
+      sel.appendChild(optAuto);
+      usable.forEach(function (e) {
+        var o = document.createElement("option");
+        o.value = e.id;
+        o.textContent = e.title;
+        sel.appendChild(o);
+      });
+      sel.value = r.pinned || "";
+      sel.addEventListener("change", function () {
+        api("/api/compute/route", { method: "POST",
+          body: { purpose: p, id: sel.value } }).then(function (res) {
+          if (!res || !res.ok) { toast((res && res.err) || "切换失败", true); return; }
+          COMPUTE.data.routes = res.routes;
+          toast("「" + (r.label || p) + "」已改走 " +
+            (sel.value || "自动"));
+          renderCompute(body, COMPUTE.data);
+        }).catch(function (e) { toast("切换失败：" + e, true); });
+      });
+      line.appendChild(sel);
+      // 「实际会走谁」要说出来：用户选了 A、但 A 没 key 时路由会退回自动，
+      // 只显示选中的值会让人以为已经生效了。
+      var actual = el("span", "crnow",
+        r.endpoint ? ("→ " + r.title) : "→ （没有可用端点）");
+      if (!r.endpoint) { actual.className = "crnow bad"; }
+      line.appendChild(actual);
+      routeBox.appendChild(line);
+    });
+    body.appendChild(routeBox);
+
+    /* ---- ② 端点清单 ---- */
+    var list = el("div", "cgrid");
+    eps.forEach(function (ep) {
+      var card = el("div", "card ccard");
+      if (!ep.ready) { card.classList.add("off"); }
+
+      var top = el("div", "ctop");
+      top.appendChild(el("span", "cname", ep.title));
+      if (ep.builtin) { top.appendChild(el("span", "ctag", "内置")); }
+      if (ep.need_key && !ep.has_key) { top.appendChild(el("span", "ctag warn", "缺 key")); }
+      top.appendChild(el("span", "grow"));
+      top.appendChild(computeBadge(ep));
+      card.appendChild(top);
+
+      card.appendChild(el("div", "curl", ep.base_url));
+      if (ep.model) {
+        card.appendChild(el("div", "cmeta2", "配置模型：" + ep.model));
+      }
+      // 网关会把模型名重映射（实测：配 flint-40b-free，实际跑 reflection/beam-free）。
+      // 不显示出来的话，用户以为自己在用一个模型，其实在跑另一个。
+      if (ep.seen_model && ep.seen_model !== ep.model) {
+        card.appendChild(el("div", "cmeta2 warn",
+          "实际跑的是：" + ep.seen_model));
+      }
+      if (ep.note) { card.appendChild(el("div", "cdesc", ep.note)); }
+      if (ep.err) { card.appendChild(el("div", "creason", ep.err)); }
+
+      var ops = el("div", "cops");
+
+      var btnProbe = el("button", "hbtn",
+        ep.ok === null ? "测一下" : "再测");
+      btnProbe.addEventListener("click", function () {
+        COMPUTE.busy = ep.id;
+        renderCompute(body, COMPUTE.data);
+        api("/api/compute/probe", { method: "POST", body: { id: ep.id } })
+          .then(function (res) {
+            COMPUTE.busy = "";
+            var r = (res && res.result) || {};
+            // 外层 ok 是「请求处理成功」，内层 r.ok 才是「端点真算出了东西」。
+            // 混起来会变成：端点 401，界面却弹「成功」。
+            if (!res || !res.ok) { toast((res && res.err) || "探测请求失败", true); }
+            else if (r.ok && !r.err) {
+              toast(ep.title + " 通了：" + (r.ms || 0) + "ms，模型 " +
+                (r.model || "未报") + "，" + (r.prompt_tokens || 0) + " tokens");
+            } else if (r.ok) {
+              toast(ep.title + " 通了但可疑：" + (r.err || ""), true);
+            } else {
+              toast(ep.title + " 不通：" + (r.err || "原因未知"), true);
+            }
+            loadCompute();
+          }).catch(function (e) {
+            COMPUTE.busy = ""; toast("探测失败：" + e, true); loadCompute();
+          });
+      });
+      ops.appendChild(btnProbe);
+
+      // key：需要鉴权的端点才出现输入框。**不预填**，只提示已有末四位。
+      if (ep.need_key) {
+        var kin = document.createElement("input");
+        kin.className = "ckey";
+        kin.type = "password";
+        kin.setAttribute("aria-label", ep.title + " 的密钥（只回末四位）");
+        kin.placeholder = ep.has_key ? ("已存 " + ep.key_hint + "，改就重填")
+          : "填 key（sk-… / ofm-…）";
+        kin.autocomplete = "off";
+        ops.appendChild(kin);
+
+        var btnSave = el("button", "hbtn", "保存");
+        btnSave.addEventListener("click", function () {
+          var v = kin.value.trim();
+          if (!v) { toast("输入框是空的；要清掉 key 请点「清空 key」", true); return; }
+          api("/api/compute/save", { method: "POST",
+            body: { id: ep.id, base_url: ep.base_url, need_key: true, key: v } })
+            .then(function (res) {
+              if (!res || !res.ok) { toast((res && res.err) || "保存失败", true); return; }
+              kin.value = "";
+              toast("已保存（key 落在本机 keys 文件里，不回传界面）");
+              loadCompute();
+            }).catch(function (e) { toast("保存失败：" + e, true); });
+        });
+        ops.appendChild(btnSave);
+
+        if (ep.has_key) {
+          var btnClear = el("button", "hbtn danger", "清空 key");
+          btnClear.addEventListener("click", function () {
+            api("/api/compute/save", { method: "POST",
+              body: { id: ep.id, base_url: ep.base_url, need_key: true, key: "" } })
+              .then(function (res) {
+                if (!res || !res.ok) { toast((res && res.err) || "清空失败", true); return; }
+                toast("已清空");
+                loadCompute();
+              }).catch(function (e) { toast("清空失败：" + e, true); });
+          });
+          ops.appendChild(btnClear);
+        }
+      }
+
+      if (!ep.builtin) {
+        var btnDel = el("button", "hbtn danger", "删除");
+        btnDel.addEventListener("click", function () {
+          api("/api/compute/delete", { method: "POST", body: { id: ep.id } })
+            .then(function (res) {
+              if (!res || !res.ok) { toast((res && res.err) || "删除失败", true); return; }
+              toast("已删除");
+              loadCompute();
+            }).catch(function (e) { toast("删除失败：" + e, true); });
+        });
+        ops.appendChild(btnDel);
+      }
+
+      card.appendChild(ops);
+      list.appendChild(card);
+    });
+    body.appendChild(list);
+
+    /* ---- ③ 加一个自己的端点 ---- */
+    var addBox = el("div", "cadd");
+    addBox.appendChild(el("div", "crtitle",
+      "接一个别的算力（任何 OpenAI 兼容端点都行）"));
+    var f1 = document.createElement("input");
+    f1.className = "cin"; f1.placeholder = "id（英文，如 relay）";
+    f1.setAttribute("aria-label", "新端点 id");
+    var f2 = document.createElement("input");
+    // placeholder 里刻意不写完整绝对 URL：门禁 ⑥「前端不许有外链」
+    // 是拿字符串字面量判的（只剔注释，不剔属性值）。那是一道**对的**防线
+    // （断网可用、不偷偷外传），所以要么别写 URL，要么改门禁——改门禁更坏。
+    f2.className = "cin grow"; f2.placeholder = "base_url（写到 /v1 为止，例如 api.deepseek.com/v1）";
+    f2.setAttribute("aria-label", "新端点 base_url");
+    var f3 = document.createElement("input");
+    f3.className = "cin"; f3.placeholder = "模型名（可留空）";
+    f3.setAttribute("aria-label", "新端点模型名");
+    var f4 = document.createElement("input");
+    f4.className = "cin"; f4.type = "password"; f4.placeholder = "key（免 key 就留空）";
+    f4.setAttribute("aria-label", "新端点密钥");
+    var f5 = document.createElement("input");
+    f5.className = "cin"; f5.type = "checkbox"; f5.id = "addNeedKey";
+    var f5lab = el("label", "clab");
+    f5lab.htmlFor = "addNeedKey";
+    f5lab.appendChild(f5);
+    f5lab.appendChild(document.createTextNode("需要 key"));
+    var btnAdd = el("button", "hbtn go", "添加并测试");
+    btnAdd.addEventListener("click", function () {
+      var id = f1.value.trim();
+      var base = f2.value.trim();
+      if (!id || !base) { toast("id 和 base_url 必填", true); return; }
+      api("/api/compute/save", { method: "POST", body: {
+        id: id, title: id, base_url: base, model: f3.value.trim(),
+        need_key: f5.checked, key: f4.value.trim()
+      } }).then(function (res) {
+        if (!res || !res.ok) { toast((res && res.err) || "添加失败", true); return; }
+        // 加完立刻测一次：让「加进来了」和「它能用」在同一秒里见分晓，
+        // 否则用户加完以为能用了，等真用的时候才发现 401。
+        return api("/api/compute/probe", { method: "POST", body: { id: id } })
+          .then(function (pr) {
+            var r = (pr && pr.result) || {};
+            if (r.ok && !r.err) { toast(id + " 已添加并接通：" + (r.ms || 0) + "ms"); }
+            else { toast(id + " 已添加，但没通：" + (r.err || "原因未知"), true); }
+            loadCompute();
+          });
+      }).catch(function (e) { toast("添加失败：" + e, true); });
+    });
+    addBox.appendChild(f1);
+    addBox.appendChild(f2);
+    addBox.appendChild(f3);
+    addBox.appendChild(f4);
+    addBox.appendChild(f5lab);
+    addBox.appendChild(btnAdd);
+    body.appendChild(addBox);
+
+    /* ---- ④ 坦白 key 存在哪 ---- */
+    // 用户的 key 是真落盘的。藏这个事实比说清楚更危险 ——
+    // `snapshot()` 那次「注释写不落盘、实际落盘」的教训就在这个仓库里。
+    var foot = el("div", "creason",
+      "key 存在本机：" + (d.keys_path || "?") +
+      "（配置在 " + (d.conf_path || "?") + "）。只在本机使用，不上传；" +
+      "界面只显示末四位，回包从不含完整 key。");
+    body.appendChild(foot);
   }
 
   /* ------------------------------------------------------------------ 搜索
