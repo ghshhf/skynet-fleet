@@ -10,6 +10,12 @@ node_modules/
 # 运行时凭据/状态（不入库）
 .fleet_tokens.json
 local.env
+# 🔴 2026-10-29：fleet_env.bat 里是真 API key，此前**一直在库里**（提交 ba6821a），
+#    而文件头注释还写着「已进 .gitignore，不要提交」——注释和事实不符。
+#    现在真挡上；模板见 scripts/fleet_env.example.bat（脱敏，可入库）。
+scripts/fleet_env.bat
+scripts/fleet_env.local.bat
+
 .fleet_pw.json
 .fleet_enroll_used.json
 fleet_enroll.json
