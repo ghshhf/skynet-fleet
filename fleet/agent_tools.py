@@ -1467,15 +1467,29 @@ def _derive():
     schema = {
         "type": "object",
         "properties": {
-            "tool": {"type": "string", "enum": enum},
-            "arg": {"type": "string"},
+            "tool": {
+                "type": "string",
+                "enum": enum,
+                "description": "选中的工具名，必须从 enum 里原样抄写（如 device_status）；"
+                               "不需要任何工具时填 none",
+            },
+            "arg": {
+                "type": "string",
+                "description": "工具的参数（搜索词/应用名/域名等）；不需要参数就留空字符串",
+            },
         },
         "required": ["tool", "arg"],
     }
     lines = "".join(t.line for t in TOOLS) + "- none：以上都不需要\n"
+    # 🔴 2026-10-29：以前这段只提 arg、从没提过 tool 字段，模型于是把**工具名**
+    # 也填进 arg（`{"arg": "device_status"}`），tool 字段直接不给 —— 决策层
+    # 永远拿不到工具名，看起来像「小模型不会选」，其实是没人告诉它往哪写。
+    # 实测：同模型同问句，明确说「工具名填 tool」后 0.6B / 1.7B 各 1/1 全对。
     system = (
-        "你是手机助手的调度器。根据用户消息判断该调用哪个工具，"
-        "需要参数的填在 arg（如搜索词、应用名），不需要参数的 arg 留空。\n"
+        "你是手机助手的调度器。从下面的可选工具里选**一个**：\n"
+        "· 把工具名原样抄进 tool 字段（如 \"device_status\"），不要改写、不要翻译；\n"
+        "· 需要参数就填在 arg（搜索词/应用名/域名等），不需要就留空字符串。\n"
+        "输出形如：{\"tool\": \"device_status\", \"arg\": \"\"}\n"
         "可选工具：\n" + lines +
         "纯代码、算术、翻译、闲聊一律选 none。只输出 JSON。"
     )

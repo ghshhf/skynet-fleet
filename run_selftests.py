@@ -310,6 +310,12 @@ CASES = [
     ("eval_t44_persona_reaches_model", ["evals/t44_persona_reaches_model.py"], HERE, 60),
     # 代码里不许写死盘符（软绑定）。起因见文件头：三套启动脚本各把 G:\ E:\ 写死。
     ("eval_t45_no_hardcoded_drive", ["evals/t45_no_hardcoded_drive.py"], HERE, 90),
+    # 「模型到底看到了什么」。起因见文件头：--chat-template 参数名错（路径被当模板
+    # 源码编译）+ 提示词从不说 tool 字段 + 58 工具 6141 tokens 超 25s 超时线，
+    # 三重故障静默了十天。判据④是「prompt_tokens 随 system 变长而变长」，
+    # 因为「HTTP 200 + 有 tool 字段」在模板完全失效时也可能碰巧成立。
+    # 无模型/无 llama-server 时 ④ 会明确 skip，不算通过。给 180s（要起进程）。
+    ("eval_t46_decider_sees_tools", ["evals/t46_decider_sees_tools.py"], HERE, 180),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

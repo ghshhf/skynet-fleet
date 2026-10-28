@@ -96,15 +96,30 @@ def find_llama(explicit=""):
 
 
 def find_model(explicit=""):
-    """找模型。explicit 可以是文件全路径，也可以是目录（里面挑最新的 gguf）。"""
+    """找模型。explicit 可以是目录 / 文件全路径 / 单纯的文件名，三种都认。
+
+    **指名了就必须用那一份，不许换一个顶上。** 今天真踩过：`--model
+    Qwen3-1.7B-Q8_0.gguf` 因为 cwd 下没这个文件，静默兜底成「已知位置里
+    最新的 gguf」= 0.6B，两个端口起的其实是同一个模型，对照实验当场作废。
+    名字是名字，位置是位置：位置可以自己找，找错就是错，找不到要报错。
+    """
     if explicit:
         if os.path.isdir(explicit):
             hits = [f for f in glob.glob(os.path.join(explicit, "*.gguf"))
                     if os.path.getsize(f) >= MODEL_MIN_BYTES]
             if hits:
                 return max(hits, key=os.path.getmtime)
-        elif os.path.isfile(explicit):
+            raise FileNotFoundError("目录里没有够大的 gguf：%s" % explicit)
+        if os.path.isfile(explicit):
             return explicit
+        # 给的是名字不是路径 → 按文件名去已知位置找，找到才算数
+        hit = locate.file(os.path.basename(explicit), env=(),
+                          hints=MODEL_HINTS, min_size=MODEL_MIN_BYTES)
+        if hit:
+            return hit
+        raise FileNotFoundError(
+            "指名要的模型找不到：%s（已知位置里没有同名的，不拿别的顶替）"
+            % explicit)
     return locate.file(
         "",
         env=("FLEET_LLM_MODEL", "FLEET_MODEL"),
@@ -131,6 +146,32 @@ def _log_tail(path, n=12):
         return "（读不到日志 %s：%s）" % (path, e)
 
 
+def build_cmd(llama, model, port, ctx=4096, ngl=99, threads=8,
+              log="", no_template=False):
+    """构造 llama-server 命令行。返回 (cmd, 是否用了自定义模板)。
+
+    **单拎出来是为了让门禁能验产线真正用的参数。** 门禁自己再拼一份 cmd，只能
+    证明「这样写是对的」，证明不了「我们是这样写的」——2026-10-29 那次模板参数
+    挂十天没人发现，就是因为没有哪条门禁看过产线的命令行。
+    """
+    template = os.path.join(_ROOT, "templates", "qwen3_thinkblock.jinja")
+    use_template = (not no_template) and os.path.isfile(template)
+    cmd = [llama, "-m", model, "--port", str(port), "--host", "127.0.0.1",
+           "-c", str(ctx), "-ngl", str(ngl), "-t", str(threads),
+           "--jinja", "--reasoning-budget", "0", "--no-webui"]
+    if log:
+        cmd += ["--log-file", log]
+    if use_template:
+        # 必须是 --chat-template-file（传路径），不是 --chat-template（传内容）。
+        # 传错这个参数名，llama-server 会把整条路径当 jinja 源码编译，报
+        #   Invalid template variable name: 'qwen3_thinkblock'
+        # 而且它**不返回 500**：HTTP 200 + finish_reason=stop，正文就是这段
+        # 错误文字。上游看到的是「模型答了一段废话」，不是「配置错了」。
+        # 从 10-22 到 10-29，所有本地模型的决策测试都在这个坑里，全部作废。
+        cmd += ["--chat-template-file", template]
+    return cmd, use_template
+
+
 def main():
     ap = argparse.ArgumentParser(description="无窗起 llama-server（天网本地脑）")
     ap.add_argument("--port", type=int, default=8080,
@@ -154,25 +195,26 @@ def main():
         print("  （llama.cpp 官方发布包：github.com/ggml-org/llama.cpp/releases）")
         return 1
 
-    model = find_model(a.model)
+    try:
+        model = find_model(a.model)
+    except FileNotFoundError as e:
+        print("[start_llm] %s" % e)
+        _complain("模型（.gguf，且 >%dMB）" % (MODEL_MIN_BYTES // 1048576),
+                  locate.explain("*.gguf", env=("FLEET_LLM_MODEL", "FLEET_MODEL"),
+                                 hints=MODEL_HINTS))
+        return 1
     if not model:
         _complain("模型（.gguf，且 >%dMB）" % (MODEL_MIN_BYTES // 1048576),
                   locate.explain("*.gguf", env=("FLEET_LLM_MODEL", "FLEET_MODEL"),
                                  hints=MODEL_HINTS))
         return 1
 
-    template = os.path.join(_ROOT, "templates", "qwen3_thinkblock.jinja")
-    use_template = (not a.no_template) and os.path.isfile(template)
-
     tag = ("_" + a.tag) if a.tag else ""
     log = os.path.join(os.environ.get("TEMP") or ".", "tianwang_llama%s.log" % tag)
 
-    cmd = [llama, "-m", model, "--port", str(a.port), "--host", "127.0.0.1",
-           "-c", str(a.ctx), "-ngl", str(a.ngl), "-t", str(a.threads),
-           "--jinja", "--reasoning-budget", "0", "--no-webui",
-           "--log-file", log]
-    if use_template:
-        cmd += ["--chat-template", template]
+    cmd, use_template = build_cmd(
+        llama, model, a.port, ctx=a.ctx, ngl=a.ngl, threads=a.threads,
+        log=log, no_template=a.no_template)
 
     print("[start_llm] llama-server : %s" % llama)
     print("[start_llm] 模型         : %s" % model)
