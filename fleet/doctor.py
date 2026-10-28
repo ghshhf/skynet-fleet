@@ -345,8 +345,22 @@ def _selftest():
     assert d["alive"] is False, "死端口必须报 alive=False"
     assert d["url"] == "http://127.0.0.1:1", "要如实回报探的是哪个地址"
     assert d["why"], "失败要给原因，不能只说 false"
-    d2 = _probe_decider("", timeout=0.3)     # 空地址：跟随默认，仍应是死
-    assert d2["alive"] is False and d2["url"], "空地址要回落到默认地址并如实报"
+    # ⚠️ 空地址要回落到默认地址。但**绝不能用真实的 18080 来断言 alive=False**——
+    #    决策服务真起着的时候 alive 就是 True，门禁会随环境变红变绿。
+    #    2026-10-29 踩过：为了验别的功能起了一次本地决策服务，t41 当场从绿变红，
+    #    看上去像代码回归，其实是断言把「机器当前状态」当成了「应有行为」。
+    #    修法：用 AT_DECIDER_URL 把默认指到死端口，只验「回落 + 如实回报」。
+    _old = os.environ.get("AT_DECIDER_URL")
+    os.environ["AT_DECIDER_URL"] = "http://127.0.0.1:1"
+    try:
+        d2 = _probe_decider("", timeout=0.3)
+    finally:
+        if _old is None:
+            os.environ.pop("AT_DECIDER_URL", None)
+        else:
+            os.environ["AT_DECIDER_URL"] = _old
+    assert d2["url"] == "http://127.0.0.1:1", "空地址要回落到默认地址并如实报"
+    assert d2["alive"] is False, "指到死端口时必须报 alive=False"
     # 报错文案必须点明后果——只说「连不上」用户不知道这意味着什么
     _fake = {"decider": {"url": "http://127.0.0.1:18080", "alive": False,
                          "why": "refused"}, "verdict": "warn", "caps_total": 1,

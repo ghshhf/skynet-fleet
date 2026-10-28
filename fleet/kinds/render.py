@@ -32,6 +32,7 @@ import sys
 import tempfile
 
 from ..core import BaseDevice, DeviceResult as R
+from .. import locate as L
 from . import render_html
 
 #: 引擎位置。优先环境变量，其次用户级技能目录。
@@ -60,26 +61,39 @@ def engine_dir():
 
 
 def ffmpeg_path():
-    """找到 ffmpeg。找不到返回 ""。"""
-    p = os.environ.get(FFMPEG_ENV, "").strip()
-    if p and (os.path.isfile(p) or shutil.which(p)):
-        return p
-    w = shutil.which("ffmpeg")
-    if w:
-        return w
-    for d in (r"D:\tools\ffmpeg", r"C:\tools\ffmpeg"):
-        for root, _dirs, files in os.walk(d) if os.path.isdir(d) else []:
-            for fn in files:
-                if fn.lower() == "ffmpeg.exe":
-                    return os.path.join(root, fn)
-    return ""
+    """找到 ffmpeg。找不到返回 ""。
+
+    2026-10-29：原来只在 `D:\\tools\\ffmpeg` 和 `C:\\tools\\ffmpeg` 两个位置
+    递归 walk——两个盘符都是那台机器的布局，换盘就找不到，而且 walk 还慢。
+    现在「相对结构」交给 locate，盘符由它运行时枚举（见 fleet/locate.py）。
+    """
+    return L.exe("ffmpeg", env=FFMPEG_ENV,
+                 hints=("tools/ffmpeg/bin", "dev/ffmpeg/bin",
+                        "_tools/ffmpeg/bin", "ffmpeg/bin",
+                        "tools/ffmpeg", "_tools/ffmpeg"),
+                 # 本机实测真身是 tools/ffmpeg/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe
+                 # ——中间那层是版本号目录，写进 hints 就等于又硬绑一次。用 under 递归兜。
+                 under=("tools/ffmpeg", "dev/ffmpeg", "_tools/ffmpeg", "ffmpeg"))
 
 
 def _py():
-    """跑引擎用哪个 python。优先本仓那支便携 python，其次当前解释器。"""
-    cand = r"D:\tools\python\python.exe"
-    if os.path.isfile(cand):
+    """跑引擎用哪个 python：FLEET_PY → 本机便携版 → 当前解释器。
+
+    为什么便携版必须比 PATH 上的 python 优先：引擎的 build.py 要 numpy/PIL。
+    本机实测：`tools/python` 那支有 numpy 2.5.4，系统 Python312 没有——
+    顺序反了就是 `render.frame 真渲染失败（退出码 1）` + 一串 ImportError。
+    2026-10-29 改软绑定时我图省事直接调了 locate（它的 PATH 是第 4 步、
+    hints 是第 5 步），PATH 上的 python 抢了先，门禁 eval_t14 当场抓到。
+    """
+    cand = (os.environ.get("FLEET_PY") or "").strip()
+    if cand and os.path.isfile(cand):
         return cand
+    # 只认同一个相对结构：本仓工具链的 tools/python。盘符交给 roots()。
+    for name in ("python.exe", "python"):
+        for root in L.roots():
+            p = os.path.join(root, "tools", "python", name)
+            if os.path.isfile(p):
+                return p
     return sys.executable
 
 

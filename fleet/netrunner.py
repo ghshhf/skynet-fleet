@@ -60,18 +60,27 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent   # fleet/ 的上一级 = �
 NETFORCE_MARKERS = ("resource_finder.py", os.path.join("skynet", "__init__.py"))
 PAPERS_MARKERS = ("tools/ai_frontier_crawl.py",)
 
-#: 候选目录。**不含私人盘符**；历史路径只作兼容，找不到自然跳过。
+#: 候选目录。**不含私人盘符**；历史布局靠 locate.roots() 运行时枚举根目录补上，
+#: 而不是把 `D:\code\netforce` 焊在列表里（2026-10-29）。
+def _legacy(*parts):
+    """老机器把东西放在某个盘的固定结构里。盘符运行时枚举，结构照旧。"""
+    try:
+        from . import locate as _loc
+        return [str(Path(r).joinpath(*parts)) for r in _loc.roots()]
+    except Exception:
+        return []
+
+
 DEFAULT_NETFORCE_DIRS = [
     str(_REPO_ROOT.parent / "netforce"),            # ① 与本仓并列（当前布局）
     str(_REPO_ROOT / "vendor" / "netforce"),        # ② 想内嵌放置时的落点
     str(_REPO_ROOT.parent / "code" / "netforce"),   # ③ 父目录下再套一层
-    r"D:\code\netforce",                            # ④ 历史布局（老机器）
-    str(Path.home() / "code" / "netforce"),         # ⑤ 用户目录习惯
-]
+    str(Path.home() / "code" / "netforce"),         # ④ 用户目录习惯
+] + _legacy("code", "netforce")                      # ⑤ 历史布局（任意盘的同名结构）
+
 DEFAULT_PAPERS_DIRS = [
     str(_REPO_ROOT.parent / "train_15b"),
-    r"D:\work\_local_ai\train_15b",
-]
+] + _legacy("work", "_local_ai", "train_15b")
 
 #: 数据落盘目录。netforce 侧 `CORPUS_DIR.mkdir(parents=True, exist_ok=True)`
 #: 会自建，所以这里只给路径、不预先创建。同样从 D:\work 挪到与本仓并列。

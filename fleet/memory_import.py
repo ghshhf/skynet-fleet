@@ -42,12 +42,79 @@ MEM_PREFIX = "mem:"
 DEFAULT_DB = "fleet_evidence.db"
 
 # 记忆根目录候选（按顺序找第一个存在的）
+# 记忆根目录候选（**顺序不代表优先级**，最终按内容特征挑，见 _pick_memory_dir）
+# 🔴 2026-10-29：原来这里第一行写死 `D:\.workbuddy\memory`，靠「第一个存在的」选中。
+#    本机实测两处**都存在**却是两回事：
+#      D:\.workbuddy\memory        天网项目记忆（10-23~10-28 连续日期 + MEMORY.md）
+#      C:\Users\admin\.workbuddy\memory  WorkBuddy 用户级记忆（8 月散日志 + 会话 md）
+#    靠位置/顺序永远选不准，只能靠内容判——谁的日志离现在最近，谁就是当前在用的。
 DEFAULT_DIRS = [
-    r"D:\.workbuddy\memory",
-    os.path.join(os.path.expanduser("~"), ".workbuddy", "memory"),
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 ".workbuddy", "memory"),
+                 ".workbuddy", "memory"),                      # ① 跟着仓库走
+    os.path.join(os.path.expanduser("~"), ".workbuddy", "memory"),  # ② 标准位置
 ]
+#: 历史布局：老机器把记忆放在 D 盘。仍然认，但不许它靠位置抢先。
+_LEGACY_DIRS = [r"D:\.workbuddy\memory"]
+
+#: 记忆目录里日期日志的文件名形状
+_DATE_FILE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\.md$")
+
+
+def _activity(d):
+    """这个目录「有多活跃」——里面最新那篇 YYYY-MM-DD.md 的日期。没有就 None。
+
+    用日期文件而不是 mtime：mtime 会因为备份、解压、rsync 整体刷新，
+    日期文件名则是写日志的人自己敲的，更接近「这份记忆活到哪天」。
+    """
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    best = None
+    for n in names:
+        m = _DATE_FILE.match(n)
+        if m:
+            try:
+                got = "%s-%s-%s" % (m.group(1), m.group(2), m.group(3))
+            except Exception:
+                continue
+            if best is None or got > best:
+                best = got
+    return best
+
+
+def _pick_memory_dir(explicit=None):
+    """挑一个记忆目录。返回 (路径, 说明) ；都不可用返回 (None, "")。
+
+    判定顺序：
+        1. 显式给的（--dir / FLEET_MEMORY_DIR）—— 人说哪就是哪，不猜
+        2. 候选里「有没有日期日志」→ 全是空目录就退回第一个存在的
+        3. 有日期日志的按**最新日期**排序，取最近的
+
+    第 3 步是关键：本机两个目录都在，但一个是项目的（10-28）、一个是
+    用户级的（8 月）。按顺序取第一个会读错源，按最近日期取不会。
+    """
+    cands = []
+    for c in ([explicit] if explicit else []) + \
+             [os.environ.get("FLEET_MEMORY_DIR", "").strip()] + \
+             DEFAULT_DIRS + _LEGACY_DIRS:
+        if c and os.path.isdir(c) and c not in cands:
+            cands.append(c)
+    if not cands:
+        return None, ""
+
+    scored = [(d, _activity(d)) for d in cands]
+    alive = [(d, a) for d, a in scored if a]
+    if alive:
+        alive.sort(key=lambda x: x[1], reverse=True)   # 日期大的在前
+        best, when = alive[0]
+        if len(alive) > 1:
+            return best, "按最新日志 %s 选中（另有 %d 个候选，最新的更旧）" % (
+                when, len(alive) - 1)
+        return best, "最新日志 %s" % when
+
+    # 一个日期日志都没有：退回第一个存在的，但要说清楚这是猜的
+    return cands[0], "没有日期日志，按顺序取了第一个存在的"
 
 # 单条最大长度（记忆条目普遍很长，落盘只留可读片段；全文回原文查）
 MAX_ITEM_CHARS = 500
@@ -265,21 +332,18 @@ def _main(argv):
                   "[--files a,b] [--max-items N] [--db <journal.db>] [--dry]")
             return 0
         i += 1
-    if root is None:
-        for cand in DEFAULT_DIRS:
-            if os.path.isdir(cand):
-                root = cand
-                break
-    if root is None:
-        print("找不到记忆目录（试 --dir 指定）")
+    picked, why = _pick_memory_dir(root)
+    if picked is None:
+        print("找不到记忆目录（--dir 指定，或 set FLEET_MEMORY_DIR=...）")
         return 2
+    root = picked
 
     j = J.Journal(db, cap=100000)
     try:
         st = import_dir(root, j, only=only, max_items=max_items, dry=dry)
     finally:
         j.close_connection()
-    print("记忆根目录：%s" % root)
+    print("记忆根目录：%s（%s）" % (root, why))
     print("文件 %d 个 / 抽到条目 %d 条 / 新写入 %d 条 / 重复跳过 %d 条" % (
         st["files"], st["items"], st["written"], st["skipped_dup"]))
     if st.get("error"):

@@ -308,6 +308,8 @@ CASES = [
     # 分层验：库能列卡 → 指针指到真卡 → system 含卡名 → 服务侧同一份 →
     # 不许是遗留的流水线帽子 → 卡库坏了也不许把服务搞挂。
     ("eval_t44_persona_reaches_model", ["evals/t44_persona_reaches_model.py"], HERE, 60),
+    # 代码里不许写死盘符（软绑定）。起因见文件头：三套启动脚本各把 G:\ E:\ 写死。
+    ("eval_t45_no_hardcoded_drive", ["evals/t45_no_hardcoded_drive.py"], HERE, 90),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

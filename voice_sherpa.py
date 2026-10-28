@@ -50,8 +50,17 @@ def _cand_dirs():
     local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
     out.append(os.path.join(local, "fleet", "tts"))
     out.append(os.path.join(os.path.expanduser("~"), ".cache", "fleet", "tts"))
-    out.append("D:/models/tts")
-    out.append("D:/tmp/tts")            # 联调用的临时位置，放最后
+    # 历史布局：老机器把 TTS 模型放在 D 盘。**不写盘符**——交给 locate 枚举本机根，
+    # 只给相对结构（2026-10-29）。加盘自动覆盖，换机不用改。
+    try:
+        from fleet import locate as _loc
+        for h in ("models/tts", "_models/tts", "tmp/tts"):
+            for root in _loc.roots():
+                d = os.path.join(root, h)
+                if os.path.isdir(d):
+                    out.append(d)
+    except Exception:
+        pass
     return [d for d in out if d and os.path.isdir(d)]
 
 
