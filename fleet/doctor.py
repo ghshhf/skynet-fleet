@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 
 from .deps import CAP_DEPS, PROJECT_DEPS, GUI_DEPS, Dep
 
@@ -114,6 +115,45 @@ def _summary(caps, proj, gui):
     return {"caps": cnt(caps), "project": cnt(proj), "gui": cnt(gui)}
 
 
+def _probe_decider(base=None, timeout=2.0):
+    """探决策端点（agent_tools.decide 用的那个）活不活。
+
+    为什么值得单列一项：`decide()` 失败时一律返回 None，调用方只看得到
+    「她没用工具 / 她时灵时不灵」——这和「模型答错」长得一模一样。没有这项，
+    判断「决策层到底起没起」只能靠手动 netstat + curl，等于把最容易踩的坑
+    留给现场排查。而它恰恰是**每台机器都要单独配**的东西（要 llama-server
+    和 gguf 模型），换台机器就没了。
+
+    先探 /health（llama.cpp 自带，最便宜），没有再退 /v1/models
+    （OpenAI 兼容网关通吃，zen-gate 这类就这么探）。
+    """
+    base = (base or os.environ.get("AT_DECIDER_URL") or "").rstrip("/")
+    if not base:
+        try:                                    # 没显式传就跟随 agent_tools 的默认
+            from . import agent_tools as T
+            base = str(T.DECIDER_URL).rstrip("/")
+        except Exception as e:
+            return {"url": "", "alive": False,
+                    "why": "读不到默认地址：%s" % type(e).__name__}
+    why = ""
+    for path in ("/health", "/v1/models"):
+        try:
+            with urllib.request.urlopen(base + path, timeout=timeout) as r:
+                raw = r.read(65536).decode("utf-8", "replace")
+            if path == "/health":
+                st = "ok"
+                try:
+                    st = (json.loads(raw) or {}).get("status") or "ok"
+                except Exception:
+                    st = raw.strip()[:40] or "ok"
+                return {"url": base, "alive": True, "via": "/health", "status": st}
+            ms = (json.loads(raw) or {}).get("data") or []
+            return {"url": base, "alive": True, "via": "/v1/models", "models": len(ms)}
+        except Exception as e:
+            why = "%s: %s" % (type(e).__name__, str(e)[:80])
+    return {"url": base, "alive": False, "why": why or "两条探路都没响应"}
+
+
 def _health(cap_rows, deep=False):
     """体检结论：能力可用率 +（可选）网关真实状态。
 
@@ -146,6 +186,12 @@ def _health(cap_rows, deep=False):
                 verdict = "fail"
         except Exception as e:
             h["gateways"] = {"err": "%s: %s" % (type(e).__name__, e)}
+        # 决策端点单独报一项。口径：死了**不升级成 fail**——网关活着她还能对话，
+        # 只是用不了工具；但也不能算 ok，否则「一句工具都调不出来」会被体检说成
+        # 一切正常（原来就是这个后果）。所以往下压一级到 warn。
+        h["decider"] = _probe_decider()
+        if not h["decider"].get("alive") and verdict == "ok":
+            verdict = "warn"
     h["verdict"] = verdict
     return h
 
@@ -162,6 +208,20 @@ def text_report(rep):
         lines.append("体检：%s · 能力可用 %d%%（%d/%d）%s" % (
             h.get("verdict", "?"), h.get("caps_usable_pct", 0),
             h.get("caps_ok", 0) + h.get("caps_na", 0), h.get("caps_total", 0), extra))
+        dc = h.get("decider")
+        if dc:
+            if dc.get("alive"):
+                tail = ("（%d 模型）" % dc["models"]) if "models" in dc else \
+                       ("（%s）" % dc.get("status", "ok"))
+                lines.append("决策模型：活 · %s%s" % (dc.get("url", ""), tail))
+            else:
+                # 说清后果，不只说「连不上」：用户看到「决策模型死了」不知道意味着什么。
+                lines.append("决策模型：✗ 没起来 · %s —— %s" % (
+                    dc.get("url") or "（未配置）",
+                    dc.get("why") or "无响应"))
+                lines.append("  ⇒ 后果：她还能对话，但**一个工具都调不出来**"
+                             "（表现为「时灵时不灵」）。起法见 start-decider.bat，"
+                             "或设 AT_DECIDER_URL 指向别的 OpenAI 兼容端点。")
     s = rep["summary"]
     lines.append("能力 %d（ok %d / warn %d / fail %d / 无依赖 %d）"
                  % (len(rep["caps"]), s["caps"]["ok"], s["caps"]["warn"],
@@ -276,8 +336,27 @@ def _selftest():
     assert h["verdict"] in ("ok", "warn", "fail"), "体检结论必须是三档之一"
     assert h["caps_fail"] >= 1, "全缺失时应有 fail"
     assert "gateways" not in h, "deep=False 不许去探网关（门禁全离线）"
+    assert "decider" not in h, "deep=False 也不许探决策端点（同样要全离线）"
     h2 = rep2["health"]
     assert h2["verdict"] == "ok", "全有依赖时体检应为 ok，实得 %r" % h2["verdict"]
+
+    # ---- 决策端点探针：只探本机死端口，毫秒级 refused，不算出网 ----
+    d = _probe_decider("http://127.0.0.1:1", timeout=0.3)
+    assert d["alive"] is False, "死端口必须报 alive=False"
+    assert d["url"] == "http://127.0.0.1:1", "要如实回报探的是哪个地址"
+    assert d["why"], "失败要给原因，不能只说 false"
+    d2 = _probe_decider("", timeout=0.3)     # 空地址：跟随默认，仍应是死
+    assert d2["alive"] is False and d2["url"], "空地址要回落到默认地址并如实报"
+    # 报错文案必须点明后果——只说「连不上」用户不知道这意味着什么
+    _fake = {"decider": {"url": "http://127.0.0.1:18080", "alive": False,
+                         "why": "refused"}, "verdict": "warn", "caps_total": 1,
+                 "caps_ok": 1, "caps_na": 0, "caps_fail": 0, "caps_usable_pct": 100}
+    _txt = text_report({"health": _fake, "caps": [],
+                        "summary": _summary([], [], []),
+                        "miss_pips": [], "miss_exes": [], "miss_repos": [],
+                        "project": [], "gui": []})
+    assert "决策模型" in _txt and "工具" in _txt, \
+        "报告必须说清「决策端点死了 = 工具调不出来」"
 
     txt = text_report(rep)
     assert "host.monitor" in txt and "psutil" in txt, "报告应含能力名与包名"
