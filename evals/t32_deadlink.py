@@ -37,7 +37,53 @@ def check(ok, msg):
         FAIL.append(msg)
 
 
+#: 真实卡库的人格指针。门禁跑完必须原样还回去。
+_ACTIVE = os.path.join(ROOT, "cards", "active.json")
+
+
+def _snap_active():
+    """备份人格指针。读不到就返回 None——不因为「本来没有」而造一个出来。"""
+    try:
+        with open(_ACTIVE, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _restore_active(snap):
+    """还回去。还不上也不许把门禁搞挂，但要吼一声（静默才是真糟糕）。"""
+    if snap is None:
+        return
+    try:
+        with open(_ACTIVE, "wb") as f:
+            f.write(snap)
+    except OSError as e:
+        print("  [X ] 人格指针没还回去：%s —— 天网的卡已经不是原来那张了"
+              % e, flush=True)
+
+
 def main():
+    """跑之前记下人格指针，跑完必须还回去。
+
+    🔴 2026-10-28 的真事故：本门禁调 tools/uicheck/clickaudit.js 点遍界面，
+    而卡库里每张卡都带「切换到这张」按钮——点一次就是**真的换人格**
+    （写 cards/active.json）。16 张点完，指针停在列表最后一个「验收者」上。
+    于是**每跑一次门禁，天网就从「大肥鱼」变成验收员**：问她"你能干什么"，
+    她答"逐条复现 EVIDENCE、跑不起来判 FAIL、交五段式答卷"。
+    10-26 修过一次（当时以为是人手切的），又漂回来——根源就是这条门禁，
+    没人想到"跑门禁"会改产品状态。
+
+    门禁的纪律是**只读**：可以看界面上有什么，但不能留下痕迹。
+    同理，以后往界面加"点一下就有持久影响"的按钮，这里也得跟着兜住。
+    """
+    snap = _snap_active()
+    try:
+        return _run()
+    finally:
+        _restore_active(snap)
+
+
+def _run():
     check(os.path.exists(AUDIT), "找到 tools/uicheck/clickaudit.js")
     node = os.environ.get("NODE_BIN") or "node"
     try:

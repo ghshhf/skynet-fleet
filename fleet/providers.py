@@ -81,6 +81,16 @@ class Provider:
         return self.key_hint
 
 
+#: 绝不能出现在任何对外输出里的字段（落盘/HTTP/日志/界面）。
+#:
+#: 加秘密字段只改这一处。注意两个消费方的形态不一样，别以为都自动安全了：
+#:   · `render()` 是**白名单**——逐个字段拼，天然漏不出新字段，但它也不读这里；
+#:   · `snapshot()` 是**黑名单**——`asdict()` 全量倒出再剔除，所以必须读这里。
+#: 这次出事的就是黑名单那侧漏了一个字段（`key_hint`），而 `render()` 那边
+#: 早有测试盯着，看起来"都防住了"。
+_SECRET_FIELDS = ("key", "key_hint")
+
+
 # 内置候选：每个都带「为什么是这个端口」的出处，省得下次再翻 README。
 BUILTIN = [
     Provider(
@@ -707,12 +717,21 @@ def chat(messages, provs=None, need=None, model=None, timeout=90,
 # ---------------------------------------------------------------------------
 
 def snapshot(path=None):
-    """把探测结果落一份，给 re_llm 之类的老读者用（形状与 ~/.workbuddy/models.json 对齐）。"""
+    """把探测结果落一份，给 re_llm 之类的老读者用（形状与 ~/.workbuddy/models.json 对齐）。
+
+    🔴 2026-10-28：原来只剔 `key`，把 `key_hint` 漏了。而 `key_hint` 是**真密钥**
+    （从网关自己的配置文件里读出来的，`real_key` 就用它去调模型），它的注释还写着
+    「内存；不打印、不落盘」——实际两件事都发生了：`/api/providers` 把它发给手机，
+    本函数又把它写进 `~/.fleet/providers_snapshot.json`。`render()` 那边早有一条
+    「渲染输出不许含密钥」的测试，这里没有，同一件事做两遍漏了一处。
+    现在统一收在 `_SECRET_FIELDS`，谁加秘密字段只改那一处。
+    """
     provs = probe_all()
     data = {
         "at": time.time(),
         "providers": [
-            {k: v for k, v in asdict(p).items() if k != "key"} for p in provs
+            {k: v for k, v in asdict(p).items() if k not in _SECRET_FIELDS}
+            for p in provs
         ],
         "models": [
             {
@@ -822,6 +841,15 @@ def _selftest():
     probe(leak, timeout=1.0)
     out = render([leak])
     ck("SUPER-SECRET" not in out, "渲染输出泄露了密钥")
+
+    # 8b) 落盘那份同样不许带密钥（2026-10-28 的真事故：render 防住了，snapshot 没防，
+    #     于是 zen-gate 的 36 字符真密钥被写进了 ~/.fleet/providers_snapshot.json，
+    #     还被 /api/providers 发给手机。同一件事做两遍、只防了一处。）
+    ck("key" in _SECRET_FIELDS and "key_hint" in _SECRET_FIELDS,
+       "_SECRET_FIELDS 必须同时盖住 key 与 key_hint")
+    dumped = {k: v for k, v in asdict(leak).items() if k not in _SECRET_FIELDS}
+    ck("SUPER-SECRET" not in json.dumps(dumped, ensure_ascii=False),
+       "snapshot 剔除规则漏了密钥字段")
 
     # ---- P2：路由 ----
     # 9) vendor_of：认得出的要说对，认不出的必须是 unknown（不许瞎猜成某一家）
