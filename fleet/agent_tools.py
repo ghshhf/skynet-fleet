@@ -111,6 +111,22 @@ def _cache_put(key, val):
     _DECIDE_CACHE[key] = dict(val)
 
 
+def _timeout_msg(timeout, base):
+    """超时时说清楚「是模型慢，还是工具面太大」。
+
+    2026-10-29：本机实测 58 个工具 = 6271 tokens、光 prompt 就 56.2 秒，
+    而 DECIDE_TIMEOUT=25s。原提示只说「模型答得慢，可加大超时」——照着调
+    只会把 25 调到 60，然后每句话都要等一分钟，还是慢，还是不知道为什么。
+    超时最常见的真原因不是模型慢，是**清单太长**：本机同一条问句实测
+    6 个工具 6.2s / 10 个 8.2s / 20 个 14.9s / 58 个 56.2s。
+    所以直接把这几个点报出来，让人一眼看出该裁不该调。
+    """
+    n = len(DECIDE_SCHEMA["properties"]["tool"]["enum"])
+    return ("超时 %.0fs（%s）——当前工具面 %d 个选项。本机实测 6 个 6.2s / "
+            "10 个 8.2s / 20 个 14.9s / 58 个 56.2s：先裁工具面，"
+            "别急着调大 DECIDE_TIMEOUT" % (timeout, base, n))
+
+
 def decide(question, url=None, timeout=DECIDE_TIMEOUT):
     """问决策模型：该用哪个工具。返回 {"tool": ..., "arg": ...}。
 
@@ -157,13 +173,12 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
             # 「连不上」是错的——服务活着，只是没赶上。分清楚，排查方向才对。
             r = str(getattr(e, "reason", e))
             if "timed out" in r or "timeout" in r.lower():
-                _fail("超时 %.0fs（%s）——服务活着但没答完，可加大 DECIDE_TIMEOUT"
-                      % (timeout, base))
+                _fail(_timeout_msg(timeout, base))
             else:
                 _fail("连不上 %s（%s）——服务起了吗" % (base, r))
             return None
         except TimeoutError:
-            _fail("超时 %.0fs（模型答得慢，不是答错）" % timeout)
+            _fail(_timeout_msg(timeout, base))
             return None
         txt = (d["choices"][0]["message"].get("content") or "").strip()
         try:
