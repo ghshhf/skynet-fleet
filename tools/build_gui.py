@@ -63,6 +63,11 @@ HIDDEN = [
     "cryptography", "pycryptodome",
     "PIL", "mss", "numpy", "psutil", "pyautogui", "rule_engine",
     "rich", "textual", "prompt_toolkit", "webview",
+    # ---- 托盘常驻（2026-10-29）----
+    # pystray 的平台后端是**运行时按平台动态导**的（pystray/__init__.py 里
+    # 通过 importlib 选 `pystray._win32`），静态分析看不到，只列 "pystray"
+    # 会出现「包里有包、后端收不到」，冻扁后图标起不来。
+    "pystray", "pystray._win32", "pystray._util",
 ]
 
 # 刻意排除（不在 fleet 解释器里出现：架构规定 / 外部仓库 / 可选模块）
