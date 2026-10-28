@@ -301,6 +301,13 @@ CASES = [
     # 这条钉的是「图真的进了 messages + 四种失败可分辨 + 画面外发必过闸门」。
     # 全离线：chat 用假的，验接线不验模型质量。
     ("eval_t43_vision_look", ["evals/t43_vision_look.py"], HERE, 90),
+    # 人格真的递到模型手里了吗（2026-10-28）。同「没生效」那件事栽过两次：
+    # 10-26 新链绕开老链的人格锚，system 只剩执行层口径；10-28 active.json
+    # 指向「验收者」，问她"你能干什么"得到"逐条复现 EVIDENCE、判 FAIL"。
+    # 两次都静默——106 项门禁全绿，因为没一条问过「她收到的是谁」。
+    # 分层验：库能列卡 → 指针指到真卡 → system 含卡名 → 服务侧同一份 →
+    # 不许是遗留的流水线帽子 → 卡库坏了也不许把服务搞挂。
+    ("eval_t44_persona_reaches_model", ["evals/t44_persona_reaches_model.py"], HERE, 60),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
@@ -341,21 +348,77 @@ def run_case(name, args, cwd, timeout):
         return False, "", f"找不到: {e}", -1
 
 
+#: 门禁跑完后必须还原的本机状态文件。
+#:
+#: 🔴 2026-10-28 的教训：**有门禁会改产品状态**。eval_t32_deadlink 点界面死链，
+#: 而卡库每张卡都带「切换到这张」按钮——点一次就是一次真实切卡。16 张点完，
+#: 指针停在列表最后一个「验收者」上。于是每跑一次门禁，天网的人格就从
+#: 「大肥鱼」变成验收员（问她"你能干什么"，答"逐条复现 EVIDENCE、判 FAIL"），
+#: 而 106 项门禁全绿——因为没一条门禁问过「她收到的是谁」。
+#: 10-26 修过一次同样的漂移，当时以为是人手切的，又漂回来：根源就在这儿。
+#:
+#: t32 自己已经加了 finally 还原（超时被 kill 时它兜不住）。这里是**最后一道闸**：
+#: 不管哪条门禁干的、也不管它有没有正常退出，跑完都对一遍、改回来、点出名字。
+_STATE_GUARD = [os.path.join(HERE, "cards", "active.json")]
+
+
+def _snap_states():
+    out = {}
+    for p in _STATE_GUARD:
+        try:
+            with open(p, "rb") as f:
+                out[p] = f.read()
+        except OSError:
+            out[p] = None
+    return out
+
+
+def _restore_states(snap):
+    """把被门禁改掉的本机状态还回去。返回 [(路径, 之前, 之后)]。"""
+    bad = []
+    for p, before in snap.items():
+        try:
+            with open(p, "rb") as f:
+                now = f.read()
+        except OSError:
+            now = None
+        if now == before:
+            continue
+        bad.append((p, before, now))
+        if before is not None:
+            try:
+                with open(p, "wb") as f:
+                    f.write(before)
+            except OSError:
+                pass
+    if bad:
+        print("\n⚠️  有门禁改动了本机状态，已还原（这些门禁该改成只读）：")
+        for p, b, a in bad:
+            print("   %s" % p)
+            print("     跑之前: %s" % (b or b"").decode("utf-8", "replace").replace("\n", " ")[:90])
+            print("     跑之后: %s" % (a or b"").decode("utf-8", "replace").replace("\n", " ")[:90])
+    return bad
+
+
 def main():
     only = [a.lower() for a in sys.argv[1:]]
     cases = [c for c in CASES if not only or any(o in c[0].lower() for o in only)]
     print(f"=== 天网工程离线自测：{len(cases)} 项 ===", flush=True)
     results = []
-    for name, args, cwd, timeout in cases:
-        print(f"\n----- {name} -----", flush=True)
-        ok, out, err, rc = run_case(name, args, cwd, timeout)
-        tail = "\n".join((out or "").strip().splitlines()[-8:])
-        if tail:
-            print(tail)
-        if err.strip():
-            print("[stderr]", "\n".join(err.strip().splitlines()[-4:]))
-        print(f"[{'PASS' if ok else 'FAIL'}] {name} (rc={rc})", flush=True)
-        results.append((name, ok))
+    snap = _snap_states()
+    try:
+        for name, args, cwd, timeout in cases:
+            print(f"\n----- {name} -----", flush=True)
+            ok, out, err, rc = run_case(name, args, cwd, timeout)
+            tail = "\n".join((out or "").strip().splitlines()[-8:])
+            if tail:
+                print(tail)
+            if err.strip():
+                print("[stderr]", "\n".join(err.strip().splitlines()[-4:]))
+            print(f"[{'PASS' if ok else 'FAIL'}] {name} (rc={rc})", flush=True)
+            results.append((name, ok))
+    finally:
+        _restore_states(snap)
 
     passed = sum(1 for _, ok in results if ok)
     print(f"\n=== 结果：{passed}/{len(results)} 通过 ===")
