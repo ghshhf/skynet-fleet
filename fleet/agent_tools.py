@@ -3,10 +3,14 @@
 
 为什么是这个形态（2026-10-24 定，全部有实测依据）：
 
-1. 决策 = 7 选 1 枚举（6 工具 + none），走 `response_format: json_schema`。
-   实测（Qwen3-1.7B，关思考）：16/16 全对、平均 5.1s。小模型守得住的
-   约束形式只有 schema 枚举——OpenAI tool_calls 协议它发不出来（0.6B/1.7B
-   都试过），多轮 agent loop 会崩（BFCL V4：4B 多轮 22%）。
+1. 决策 = schema 枚举 + 两级收窄（2026-10-29 起）。走
+   `response_format: json_schema`，先把候选压到域内 4~13 个，再让模型选。
+   **别再引用「7 选 1，16/16 全对」当现状**——那是只有 7 个工具时的成绩；
+   扩到 58 个之后，prompt 2874 tokens、在这台核显机器上要 52.9 秒，
+   超时线 25 秒，等于每次都失败（第 25/26 条，见 docs/总纲）。
+   现在：Qwen3.5-2B + 七域两级，产线 decide() 30/30、平均 5.9s。
+   小模型守得住的约束形式只有 schema 枚举——OpenAI tool_calls 协议它发不出来
+   （0.6B/1.7B 都试过），多轮 agent loop 会崩（BFCL V4：4B 多轮 22%）。
 
 2. 执行 = 服务端调能力注册表（caller callable），模型永远不直接碰 adb。
    模型输出的参数一律视为不可信：arg 只进白名单字段，执行层再校验。
@@ -15,13 +19,15 @@
    一次搜索塞 31 万字撑爆 4096 上下文的教训（HTTP 400），参数层再防一次。
 
 4. 规则短路：纯代码/算术/翻译/寒暄不进决策——省 4~8s 延迟，
-   也补 0.6B/1.7B「不该调时乱调」的短板（BFCL：0.6B 只有 76.5%）。
+   也补小模型「不该调时乱调」的短板（BFCL：0.6B 只有 76.5%）。
 """
 import json
 import os
 import re
 import time
 import urllib.request
+
+from . import toolselect
 
 #: 决策模型地址（OpenAI 兼容 /v1/chat/completions）。运行时可用 AT_DECIDER_URL 覆盖。
 #:
@@ -127,6 +133,121 @@ def _timeout_msg(timeout, base):
             "别急着调大 DECIDE_TIMEOUT" % (timeout, base, n))
 
 
+#: 工具面能不能一次全给：'' = 两级（规则定域 → 域内选），'1' = 58 个一次给。
+#:
+#: 🔴 2026-10-29：默认两级，原因是实测不是偏好。这台开发机是 Intel 核显、
+#: 全程 CPU（`-ngl 99` 是空转），Qwen3.5-2B 实测 **prompt 处理 54–65 tok/s、
+#: 生成 3.3 tok/s**：
+#:     58 个工具 2874 tokens ⇒ 52.9s（超时线 25s，必死）
+#:     13 个工具  468 tokens ⇒  7.2s + 生成 3.6s ≈ 11s（能过）
+#: 一次全给看起来「4 秒就答完」，那是**命中 prompt 缓存**（前缀一模一样才命中），
+#: 只要工具清单或前缀变一个字就退回 53 秒——不能拿缓存后的数字当预算。
+#: 云端大模型（上下文大、prefill 快）可以设 AT_DECIDE_FULL=1 关掉两级。
+def _full_mode():
+    return os.environ.get("AT_DECIDE_FULL", "") == "1"
+
+
+def _schema_for(enum):
+    """决策输出 schema。全量模式和域内模式共用这一份，只换 enum。"""
+    return {
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "enum": list(enum),
+                "description": "选中的名字，必须从 enum 里原样抄写（如 device_status）；"
+                               "不需要任何工具时填 none",
+            },
+            "arg": {
+                "type": "string",
+                "description": "工具的参数（搜索词/应用名/域名等）；不需要就留空字符串",
+            },
+        },
+        "required": ["tool", "arg"],
+    }
+
+
+def _ask(base, system, enum, q, timeout, max_tokens=96):
+    """打一次决策模型。返回 (obj, None) 或 (None, 失败原因)。
+
+    失败原因**只在这里生成**：连不上 / 超时 / 非 JSON / 非对象。判断是不是
+    自己的问题（端点没起）还是模型的问题（答歪了），全靠这句。
+    """
+    payload = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": q},
+        ],
+        "chat_template_kwargs": {"enable_thinking": False},
+        "response_format": {"type": "json_object", "schema": _schema_for(enum)},
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    }
+    try:
+        req = urllib.request.Request(
+            base + "/v1/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
+    except urllib.error.HTTPError as e:
+        return None, "HTTP %s（端点 %s）" % (e.code, base)
+    except urllib.error.URLError as e:
+        # socket 超时会被 urllib 包成 URLError(reason="timed out")，这时说
+        # 「连不上」是错的——服务活着，只是没赶上。分清楚，排查方向才对。
+        r = str(getattr(e, "reason", e))
+        if "timed out" in r or "timeout" in r.lower():
+            return None, _timeout_msg(timeout, base)
+        return None, "连不上 %s（%s）——服务起了吗" % (base, r)
+    except TimeoutError:
+        return None, _timeout_msg(timeout, base)
+    except Exception as e:
+        # 决策层挂了不拖垮对话：这是「暂时状态」，调用方按无工具面继续。
+        return None, "%s: %s" % (type(e).__name__, str(e)[:80])
+    txt = (d["choices"][0]["message"].get("content") or "").strip()
+    try:
+        o = json.loads(txt)
+    except Exception:
+        return None, "返回的不是 JSON：%r" % txt[:80]
+    if not isinstance(o, dict):
+        return None, "返回不是对象：%r" % txt[:80]
+    return o, None
+
+
+def _pick_name(o, enum):
+    """从回答里取名字。宽容收键名，但**值必须在清单里**（幻觉名照样拒）。
+
+    2026-10-26 的教训：schema 里明明写 `tool`，免费/小模型相当比例回成
+    `{"name": ...}`。只认 `tool` ⇒ 答对了也判非法 ⇒ 工具面时灵时不灵。
+    """
+    name = str(o.get("tool") or o.get("name") or o.get("tool_name") or "").strip()
+    return name if name in enum else None
+
+
+def _domain_enum():
+    return list(toolselect.DOMAINS.keys()) + ["none"]
+
+
+def _domain_system(only=None):
+    """第 1 级的提示：只问「哪一类」，不问具体工具。
+
+    一级只回域，好处是**出错能定位**：域错 = 规则/类别描述有问题，
+    域对工具错 = 域内工具描述重叠。混成一级只能看到一个错答案，改起来靠猜。
+    `only` 收窄候选（规则并列但并集太大时，只在这几类里挑）。
+    """
+    keys = list(only) if only else list(toolselect.DOMAINS.keys())
+    lines = "".join("- %s：%s\n" % (d, toolselect.DOMAINS[d][0]) for d in keys)
+    return ("判断用户这句话该找**哪一类**工具，把类别名原样抄进 tool 字段"
+            "（如 \"查\"），不要填具体工具名。\n"
+            "可选类别：\n" + lines +
+            "- none：不需要任何工具（闲聊、写代码、算术、翻译）\n"
+            "输出形如：{\"tool\": \"查\", \"arg\": \"\"}。只输出 JSON。")
+
+
+#: 最近一次决策走了哪几级、判了什么，给人排查用。决策「时灵时不灵」时
+#: 光看 LAST_FAIL 只知道挂了，不知道挂在哪一级。
+LAST_TRACE = []
+
+
 def decide(question, url=None, timeout=DECIDE_TIMEOUT):
     """问决策模型：该用哪个工具。返回 {"tool": ..., "arg": ...}。
 
@@ -140,72 +261,121 @@ def decide(question, url=None, timeout=DECIDE_TIMEOUT):
     if not q:
         return {"tool": "none", "arg": ""}
     if obvious_none(q):
+        LAST_TRACE[:] = ["规则短路：这句不需要工具"]
         return {"tool": "none", "arg": ""}
 
     base = (url or os.environ.get("AT_DECIDER_URL", DECIDER_URL)).rstrip("/")
-    key = (base, q)
+    full = _full_mode()
+    key = (base, "full" if full else "scoped", q)
     hit = _cache_get(key)
     if hit is not None:
         return dict(hit)            # 复制：别让调用方改坏缓存里那条
 
-    payload = {
-        "messages": [
-            {"role": "system", "content": DECIDE_SYSTEM},
-            {"role": "user", "content": q},
-        ],
-        "chat_template_kwargs": {"enable_thinking": False},
-        "response_format": {"type": "json_object", "schema": DECIDE_SCHEMA},
-        "temperature": 0.1,
-        "max_tokens": 160,
-    }
-    try:
-        req = urllib.request.Request(
-            base + "/v1/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode(),
-            method="POST", headers={"Content-Type": "application/json"})
-        try:
-            d = json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
-        except urllib.error.HTTPError as e:
-            _fail("HTTP %s（端点 %s）" % (e.code, base))
-            return None
-        except urllib.error.URLError as e:
-            # socket 超时会被 urllib 包成 URLError(reason="timed out")，这时说
-            # 「连不上」是错的——服务活着，只是没赶上。分清楚，排查方向才对。
-            r = str(getattr(e, "reason", e))
-            if "timed out" in r or "timeout" in r.lower():
-                _fail(_timeout_msg(timeout, base))
-            else:
-                _fail("连不上 %s（%s）——服务起了吗" % (base, r))
-            return None
-        except TimeoutError:
-            _fail(_timeout_msg(timeout, base))
-            return None
-        txt = (d["choices"][0]["message"].get("content") or "").strip()
-        try:
-            o = json.loads(txt)
-        except Exception:
-            _fail("返回的不是 JSON：%r" % txt[:80])
-            return None
-        if not isinstance(o, dict):
-            _fail("返回不是对象：%r" % txt[:80])
-            return None
-        # 🔴 2026-10-26：宽容收键名。schema 里明明写的是 `tool`，但免费/小模型
-        # 实测相当比例回成 `{"name": ...}`（意图是对的，键名不听话）。原来只认
-        # `tool` ⇒ 这些回答全被判成非法 ⇒ decide() 返回 None ⇒ 工具面时灵时不灵，
-        # 而且看不出是模型没听懂还是键名不对。键名不是重点，意图才是：
-        # 多收几个常见别名，但**值必须在 enum 里** —— 幻觉出来的工具名照样拒。
-        tool = str(o.get("tool") or o.get("name") or o.get("tool_name") or "").strip()
-        if tool not in DECIDE_SCHEMA["properties"]["tool"]["enum"]:
-            _fail("模型选的工具不在清单里：%r" % tool[:40])
-            return None
-        LAST_FAIL[0] = ""                   # 成功：把上一次的失败原因清掉
-        out = {"tool": tool, "arg": (o.get("arg") or "").strip()}
-        _cache_put(key, out)
-        return dict(out)
-    except Exception as e:
-        # 决策层挂了不拖垮对话：这是「暂时状态」，调用方按无工具面继续。
-        _fail("%s: %s" % (type(e).__name__, str(e)[:80]))
+    out, err = (_decide_full(q, base, timeout) if full
+                else _decide_scoped(q, base, timeout))
+    if err:
+        _fail(err)
         return None
+    LAST_FAIL[0] = ""                   # 成功：把上一次的失败原因清掉
+    _cache_put(key, out)
+    return dict(out)
+
+
+def _decide_full(q, base, timeout):
+    """一级制：58 个工具一次全给。给云端大模型用。"""
+    enum = DECIDE_SCHEMA["properties"]["tool"]["enum"]
+    LAST_TRACE[:] = ["一级制：%d 个工具一次给" % (len(enum) - 1)]
+    o, err = _ask(base, DECIDE_SYSTEM, enum, q, timeout, 160)
+    if err:
+        return None, err
+    name = _pick_name(o, enum)
+    if not name:
+        return None, "模型选的工具不在清单里：%r" % str(o.get("tool"))[:40]
+    return {"tool": name, "arg": (o.get("arg") or "").strip()}, None
+
+
+#: 合并两域之后工具数上限。超了就改为「先让模型在这两域里挑一个域」——
+#: 21 个工具的 prompt ≈ 700 tokens，在这台机器上要 11s 打底，再叠上生成就顶到
+#: 超时线了；而 2~3 个类别的选择只要 30 tokens，便宜得多。
+MERGE_TOOL_CAP = 16
+
+
+def _decide_scoped(q, base, timeout):
+    """两级制：先定域（规则优先），再在域内选一个工具。
+
+    域这一级有三种走法，按「能确定多少」递进：
+      · 规则高置信 → 直接用（0 延迟，占实测 30 条里的 29 条）；
+      · 规则并列   → 把并列域的工具合起来一次问完（不让模型猜域，猜错就不可挽回）；
+      · 规则无话   → 才问模型「哪一类」（6 个短标签，约 100 tokens）。
+    """
+    t0 = time.time()
+    trace = []
+    doms, hits, why = toolselect.candidate_domains(q)
+
+    if len(doms) > 1:
+        merged = [t for d in doms for t in toolselect.tools_of(d)]
+        trace.append("① 规则%s（%s）→ 合并 %d 个工具" %
+                     (why, "、".join(doms), len(merged)))
+        if len(merged) > MERGE_TOOL_CAP:
+            # 合并太大就退一步：只在并列的域里问一句「哪一类」
+            left = timeout - (time.time() - t0)
+            o, err = _ask(base, _domain_system(doms), doms + ["none"], q,
+                          max(4.0, min(8.0, left * 0.4)), 32)
+            if err:
+                LAST_TRACE[:] = trace + ["② 并集太大且定域失败：%s" % err]
+                return None, "分域失败（%s）" % err
+            one = _pick_name(o, doms + ["none"])
+            if one is None:
+                LAST_TRACE[:] = trace + ["② 模型回的类别不在并列域里"]
+                return None, "分域失败（类别不在并列域里）"
+            if one == "none":
+                LAST_TRACE[:] = trace + ["② 模型判定不需要工具"]
+                return {"tool": "none", "arg": ""}, None
+            doms = [one]
+            trace.append("② 并列域里模型选「%s」" % one)
+
+    elif not doms:
+        # 规则完全没话说，才花钱问模型
+        left = timeout - (time.time() - t0)
+        o, err = _ask(base, _domain_system(), _domain_enum(), q,
+                      max(4.0, min(8.0, left * 0.4)), 32)
+        if err:
+            trace.append("① 问模型定域失败：%s" % err)
+            LAST_TRACE[:] = trace
+            return None, "分域失败（%s）" % err
+        one = _pick_name(o, _domain_enum())
+        if one is None:
+            trace.append("① 模型回的类别不在清单：%r" % str(o.get("tool"))[:20])
+            LAST_TRACE[:] = trace
+            return None, "分域失败（类别不在清单）"
+        if one == "none":
+            trace.append("① 模型判定不需要工具")
+            LAST_TRACE[:] = trace
+            return {"tool": "none", "arg": ""}, None
+        doms = [one]
+        trace.append("① 问模型定域「%s」（规则%s：%s）" % (one, why, "无命中"))
+
+    enum = [t for d in doms for t in toolselect.tools_of(d)] + ["none"]
+    left = timeout - (time.time() - t0)
+    # 只剩一点点时间就别发了；但门槛要小到「只因真没时间才放弃」。
+    # 原来写 2.0 秒，结果调用方传 timeout=1（门禁就这么传）时**一次模型都没请求
+    # 就返回 None**，看起来像「地址没生效」——那是把配置问题伪装成超时，最坏的一种。
+    if left <= 0.2:
+        LAST_TRACE[:] = trace + ["② 没时间了（定域已花 %.1fs）" % (time.time() - t0)]
+        return None, "超时（定域就花了 %.1fs）" % (time.time() - t0)
+    o, err = _ask(base, _system_with(_lines_for(doms)), enum, q, left, 96)
+    if err:
+        trace.append("② 域内选择失败：%s" % err)
+        LAST_TRACE[:] = trace
+        return None, err
+    name = _pick_name(o, enum)
+    trace.append("② 域「%s」内 %d 选 1 → %s" %
+                 ("+".join(doms), len(enum) - 1, name or "非法"))
+    LAST_TRACE[:] = trace
+    if not name:
+        return None, "模型选的工具不在「%s」域清单里：%r" % (
+            "+".join(doms), str(o.get("tool"))[:40])
+    return {"tool": name, "arg": (o.get("arg") or "").strip()}, None
 
 
 # ---------------------------------------------------------------- 执行
@@ -1264,6 +1434,7 @@ TOOLS = (
 
     Tool("tree_read", "tree.read",
          "读手机当前界面的控件树：有哪些按钮、输入框及其位置。"
+         "问「某某按钮/控件在哪个位置、什么坐标」选这个。"
          "只要可见文字选 screenshot_describe。",
          render=_render_tree),
 
@@ -1274,7 +1445,8 @@ TOOLS = (
          render=_mk_kv(("ok", "已点击"), ("text", "目标"), ("err", "错误"))),
 
     Tool("input_type", "input.type",
-         "在手机当前输入框里输入文字（会真的打字）。",
+         "在手机当前输入框里输入文字（会真的打字）。"
+         "「在搜索框里输入…」「往输入框填…」都选这个，不是 web_search。",
          perm=PERM_ASK, side=True, argkey="text",
          render=_mk_kv(("ok", "已输入"), ("len", "输入长度"), ("err", "错误"))),
 
@@ -1287,8 +1459,9 @@ TOOLS = (
          render=_render_scene),
 
     Tool("ir_command", "ir.command",
-         "用手机红外遥控家电（电视/空调，按 品牌 设备 按键，如「小米 电视 关」）。"
-         "会真发红外信号（动手级，要确认）。只看能不能发选这个，开空调/关电视才用。",
+         "用手机红外遥控家电（电视/空调）。arg 写目标和动作，如「小米 电视 关」"
+         "「空调 26度」——品牌不确定也能发，用户说「把空调调到二十六度」就走这个。"
+         "会真发红外信号（动手级，要确认）。能不能发红外用 device_status 查。",
          perm=PERM_ASK, side=True, argkey="phrase", render=_render_ir),
 
     Tool("hotspot_on", "phone.hotspot",
@@ -1391,7 +1564,8 @@ TOOLS = (
 
     Tool("net_survey", "net.survey",
          "无线侦察：用 bettercap 发现周边 BLE/WiFi 设备。"
-         "问「周围有什么无线设备」选这个。只读，需 bettercap。",
+         "问「周围有什么无线设备」选这个。"
+         "问「局域网里有哪些机器/主机」选 net_scan，不是这个。只读，需 bettercap。",
          render=_render_net_survey),
 
     # ---- 外部情报（L4：OSINT，拆解公开面拿数据）----
@@ -1475,39 +1649,46 @@ TOOLS = (
 
 # ------------------------------------------------- 从 TOOLS 派生出各处常量
 
-def _derive():
-    """把 TOOLS 表展开成老代码用的四个结构。加工具只改 TOOLS。"""
-    names = [t.name for t in TOOLS]
-    enum = names + ["none"]
-    schema = {
-        "type": "object",
-        "properties": {
-            "tool": {
-                "type": "string",
-                "enum": enum,
-                "description": "选中的工具名，必须从 enum 里原样抄写（如 device_status）；"
-                               "不需要任何工具时填 none",
-            },
-            "arg": {
-                "type": "string",
-                "description": "工具的参数（搜索词/应用名/域名等）；不需要参数就留空字符串",
-            },
-        },
-        "required": ["tool", "arg"],
-    }
-    lines = "".join(t.line for t in TOOLS) + "- none：以上都不需要\n"
-    # 🔴 2026-10-29：以前这段只提 arg、从没提过 tool 字段，模型于是把**工具名**
-    # 也填进 arg（`{"arg": "device_status"}`），tool 字段直接不给 —— 决策层
-    # 永远拿不到工具名，看起来像「小模型不会选」，其实是没人告诉它往哪写。
-    # 实测：同模型同问句，明确说「工具名填 tool」后 0.6B / 1.7B 各 1/1 全对。
-    system = (
-        "你是手机助手的调度器。从下面的可选工具里选**一个**：\n"
+def _system_with(lines):
+    """拼决策系统提示。**只有这一份模板**，全量模式和域内模式都走它。
+
+    抽出来是因为 2026-10-29 那次事故的形状：schema 里有 `tool` 字段、
+    提示词里却只提 `arg`，两处各自维护、谁也不核对，模型于是把工具名塞进
+    arg。同一个规矩写在两个地方，必然漂。现在文案只有一处，域内模式只换
+    后半段的工具清单。
+    """
+    return (
+        "你能操作手机和电脑上的工具。从下面的可选工具里选**一个**：\n"
         "· 把工具名原样抄进 tool 字段（如 \"device_status\"），不要改写、不要翻译；\n"
         "· 需要参数就填在 arg（搜索词/应用名/域名等），不需要就留空字符串。\n"
         "输出形如：{\"tool\": \"device_status\", \"arg\": \"\"}\n"
         "可选工具：\n" + lines +
         "纯代码、算术、翻译、闲聊一律选 none。只输出 JSON。"
     )
+
+
+def _lines_for(doms):
+    """只取这些域的工具说明行。复用 TOOLS 表的 line，不另抄一份描述。
+
+    接多个域是为「规则并列」那一档：把两个域合起来让模型一次选完，
+    比先让模型猜域再选工具少一次出错机会（猜错域是不可挽回的）。
+    """
+    if isinstance(doms, str):
+        doms = [doms]
+    want = set()
+    for d in doms:
+        want.update(toolselect.tools_of(d))
+    return "".join(t.line for t in TOOLS if t.name in want) + \
+        "- none：以上都不需要\n"
+
+
+def _derive():
+    """把 TOOLS 表展开成老代码用的四个结构。加工具只改 TOOLS。"""
+    names = [t.name for t in TOOLS]
+    enum = names + ["none"]
+    schema = _schema_for(enum)
+    lines = "".join(t.line for t in TOOLS) + "- none：以上都不需要\n"
+    system = _system_with(lines)
     executors = {t.name: t for t in TOOLS}
     tiers = {t.name: t.perm for t in TOOLS}
     return schema, lines, system, executors, tiers
