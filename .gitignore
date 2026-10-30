@@ -132,3 +132,8 @@ tianwang_android/build/
 tianwang_app/app/build/
 tianwang_app/build/
 .gradle/
+
+# 门禁影响面映射与耗时记录（2026-10-30）：随代码变，每次 gate_map --build 重写，
+# 入库只会造成无意义的大 diff（几百行 JSON），也会让「映射过期」变成隐性问题。
+tools/.gate_map.json
+tools/.gate_times.json
