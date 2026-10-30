@@ -138,7 +138,11 @@ def part_autostart():
         check(A.state() == "off", "读不到 = off")
         A.current = lambda: A.command()
         check(A.state() == "on", "写的正好是当前这份 = on")
-        A.current = lambda: '"C:\\old\\python.exe" "C:\\old\\fleet_gui.py" --autostart'
+        # 假路径**不许带盘符字面量**：t45 会把任何一个 `X:\` 当成硬编码抓到。
+        # 这里要的只是「一个和当前这份不一样的 exe 路径」，用相对段拼出来就够了。
+        _old = os.path.join("Apps", "Old")
+        A.current = lambda: '"%s" "%s" --autostart' % (
+            os.path.join(_old, "python.exe"), os.path.join(_old, "fleet_gui.py"))
         check(A.state() == "stale", "指向别的副本 = stale（不是简单的已开启）")
         A.current = lambda: ""
         check(A.is_enabled() is False, "没有这一行 = 未开")
@@ -192,7 +196,8 @@ def part_frozen_key():
     print("\n[F] 冻扁包 key：每次启动必须算出同一个值")
     orig_frozen = getattr(sys, "frozen", None)
     orig_exe = sys.executable
-    fake_exe = r"C:\Apps\Fleet\fleet-gui.exe"
+    # 同 [D] 段：假路径不许写盘符字面量（t45 会抓）。相对段拼出来即可。
+    fake_exe = os.path.abspath(os.path.join("Apps", "Fleet", "fleet-gui.exe"))
     try:
         sys.frozen = True
         sys.executable = fake_exe
