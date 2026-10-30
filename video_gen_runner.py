@@ -2,14 +2,21 @@
 
 与 image_gen_runner 同构——把「怎么出视频」和「协议/参数」解耦。
 
-2026-10-30 更新：**手机本地已经能出视频了**，原来的结论（见下）被实测推翻。
-新后端 `localdream_backend`：手机 QNN NPU 走 t2i 首帧 → img2img 链式推进，
-512×512 / 12 步实测 2.7s/帧、10 分钟约 200 帧（≈17 秒 12fps 素材）。
+演进（三天三版，每版都是被实测推翻才改的）：
 
-原结论（保留作对照）：手机本地算力（Mali-G925 / 11GB）跑**扩散视频模型**
-（animatediff 一类）交互速度撑不住，所以早先只用 ffmpeg 出占位片。
-区别在于：帧链不是跑视频扩散模型，是拿 SD1.5 做逐帧 img2img —— 算力需求
-和单张出图同量级，这才是手机能扛的路线。
+① 最初：手机算力（Mali-G925 / 11GB）跑**扩散视频模型**（AnimateDiff 一类）
+   撑不住，所以只用 ffmpeg 出占位片。
+② 2026-10-30 上午：**手机能出真视频了** —— 不跑视频扩散模型，拿 SD1.5 做逐帧
+   img2img 链（算力需求和单张出图同量级）。512×512/12 步 2.7s/帧。
+③ 2026-10-30 晚上：**②的画面是错的**（观感抽搐、无目的漂移、越走越糊），
+   根因是「时间轴根本不存在」——fps 只是编码参数，运动幅度全靠模型自由发挥。
+   改成 `fleet/motion.py` 的「稀疏关键帧 + 几何运镜 + 合成播放帧」：
+     · 关键帧先按运镜 warp，再喂 img2img（运动精确，模型只补细节）
+     · 播放帧用关键帧 warp + 交叉淡化合成，**不调模型**
+   定量对照（同 prompt/seed/模型，2 秒）：旧做法帧间差 12.33、新做法 3.36~2.15，
+   旧做法画面在无目的地漂移，新做法是稳定推近。详见 localdream_backend 的 docstring。
+
+后端优先级（_default_backend）：local-dream（手机 NPU，真画面）> CLI/ffmpeg（占位）。
 
 后端优先级（_default_backend）：local-dream（手机 NPU，真画面）> CLI/ffmpeg（占位）。
 """
@@ -114,21 +121,55 @@ def _encode_mp4(frame_dir, total, fps, out_path):
     return out_path
 
 
-def localdream_backend(prompt, duration=3, fps=12, size="512x512", seed=-1, model=None,
-                       out_dir=None, denoise=0.35, steps=12, stabilize=True,
-                       anchor=0.12, on_frame=None, timeout=900):
-    """手机 NPU 帧链出视频：t2i 首帧 → img2img 逐帧推进 → mp4。
+def localdream_backend(prompt, duration=3, fps=24, size="512x512", seed=-1, model=None,
+                       out_dir=None, denoise=0.28, steps=12, stabilize=True,
+                       anchor=0.0, motion="push_in", gen_fps=6,
+                       prompts=None, encode=True, on_frame=None, timeout=1800):
+    """手机 NPU 出视频：**稀疏关键帧 + 运镜合成**，不是逐帧重画。
 
-    为什么不是逐帧 t2i：每帧独立采样就是「另一张画」，拼起来是幻灯片。
-    img2img 把上一帧当输入、只重噪 denoise 那么多，帧间才连得上。
+    ## 和上午那版（逐帧 img2img 链）的区别，以及为什么必须改
 
-    为什么必须 stabilize：纯链式有两个必然的累积病（实测 12 帧）——
-    VAE roundtrip 每帧编解码一次，边缘密度 21.6→9.95（糊）；
-    CFG 采样偏好把暗部越压越暗，亮度 88→33（黑）。
-    稳定器做三件事：颜色/亮度对齐首帧、锐度补回首帧水平、输入与首帧少量混合。
-    开了之后同一组参数下边缘回到 20.5、亮度回到 87.7，不再是「越走越糊的黑洞」。
+    上午那版是「每一帧都把上一帧丢进 img2img，seed+i，denoise 0.35」，然后按
+    fps 码片。它看起来抽搐、缓慢变形、越走越糊，根因是**时间轴根本不存在**：
+      - 运动幅度由模型自由发挥，fps 只是编码参数 —— 12fps / 24fps 出来的
+        运动速度一模一样，只改播放快慢；
+      - 帧之间没有几何联系，模型每帧重新「猜」一次画面，就是在抖；
+      - 想让镜头推近，没有任何可控的旋钮。
 
-    返回 (mp4 路径, 帧目录)。未配置/手机不可达一律抛 RuntimeError 说清原因。
+    现在分成两层（见 `fleet/motion.py` 的分析）：
+      ① **关键帧**（gen_fps，默认 6/秒）—— 模型生成，但输入**先按运镜 warp 过**：
+         `src = warp(上一关键帧, cam_{i-1} → cam_i, pad)`，denoise 保持低值。
+         运动由几何精确决定，模型只补细节。这就是 Deforum 2D 模式的做法
+         （`helpers/animation.py:184-213`），把 cv2.warpPerspective 换成 PIL affine。
+      ② **播放帧**（fps，默认 24/秒）—— 不再调模型，用关键帧 warp + 交叉淡化合成：
+         `P(t) = lerp(warp(K[i], cam_i→cam_t), warp(K[i+1], cam_{i+1}→cam_t), smoothstep(p))`
+         两个候选都被推到**同一个 t 时刻视角**，像素几乎对齐，所以混合不重影。
+
+    ⇒ 播放帧率是「免费」的，只有关键帧花算力。3 秒片 = 19 张关键帧（约 51 秒）
+      铺成 72 帧 24fps，而不是 72 次生成。
+
+    ## 为什么还留着 stabilize
+    VAE roundtrip 每帧编解码一次、CFG 采样偏好压暗部，这两个累积病在关键帧层面
+    依然存在（实测 12 帧：边缘 21.6→9.95、亮度 88→33）。稳定器把每个关键帧的
+    颜色/亮度对齐首帧、锐度补回首帧水平，不是给「抖动」打补丁。
+
+    ## 参数
+    prompt     主提示词
+    duration   时长（秒）
+    fps        **播放**帧率（24 电影感 / 30 短视频）
+    gen_fps    **关键帧**密度（每秒钟生成几张）。越大越贵越细腻，6 是好起点
+    motion     运镜：预设名（push_in/pull_out/pan_left/pan_right/tilt_up/tilt_down/
+               dolly/sway/orbit/none）或一个 motion.Track 实例
+    prompts    [(t_sec, prompt), ...] 提示词时间表（Deforum 的 prompt travel）：
+               到点的关键帧换词，并且**在该点附近自动抬高 denoise** 让画面真的变，
+               其余时刻保持低 denoise —— 只在需要内容变化处重绘，而不是每帧抖
+    denoise    关键帧 img2img 强度基线（默认 0.28，偏低，运动交给 warp）
+
+    encode=False 时**不编 mp4**（返回 ("", 帧目录)）—— 分镜层要拿到播放帧再
+    做画布适配、字幕、转场，编一遍再解一遍纯属浪费。
+
+    返回 (mp4 路径, 帧目录)。帧目录里 `kf_*.png` 是关键帧、`f_*.png` 是播放帧。
+    未配置/手机不可达一律抛 RuntimeError 说清原因。
     """
     import base64 as _b
     import io as _io
@@ -136,6 +177,11 @@ def localdream_backend(prompt, duration=3, fps=12, size="512x512", seed=-1, mode
 
     import image_gen_runner as ig
     from PIL import Image
+
+    try:
+        from fleet import motion as mo
+    except Exception:  # 单文件直跑（sys.path 只到 fleet/）
+        import motion as mo
 
     _need_pil()
     host, ctl, gen = ig._ld_endpoints()
@@ -153,12 +199,28 @@ def localdream_backend(prompt, duration=3, fps=12, size="512x512", seed=-1, mode
     try:
         fps = max(1, min(60, int(fps)))
     except (TypeError, ValueError):
-        fps = 12
+        fps = 24
+    try:
+        gen_fps = float(gen_fps)
+    except (TypeError, ValueError):
+        gen_fps = 6.0
+    gen_fps = max(0.5, min(float(fps), gen_fps))
     try:
         duration = float(duration)
     except (TypeError, ValueError):
         duration = 3.0
-    total = max(2, int(round(duration * fps)))
+
+    if isinstance(motion, mo.Track):
+        track = motion
+    else:
+        try:
+            track = mo.Track(motion or "none")
+        except ValueError as e:
+            raise RuntimeError(str(e))
+    ktimes = mo.key_times(duration, gen_fps)
+    dur = ktimes[-1]
+    pad_ratio = mo.pad_for(track, dur)
+
     try:
         seed = int(seed)
     except (TypeError, ValueError):
@@ -174,17 +236,56 @@ def localdream_backend(prompt, duration=3, fps=12, size="512x512", seed=-1, mode
     frame_dir = os.path.join(out_dir, tag)
     os.makedirs(frame_dir, exist_ok=True)
 
+    # 提示词时间表先排序、规整
+    table = []
+    for it in (prompts or []):
+        try:
+            table.append((float(it[0]), str(it[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    table.sort(key=lambda r: r[0])
+
+    def _prompt_at(t):
+        cur = prompt
+        for pt, p in table:
+            if t >= pt - 1e-9:
+                cur = p
+        return cur
+
+    def _denoise_at(t):
+        dn = float(denoise)
+        if table:
+            # 换词点附近抬强度，让内容真变；其余时刻保持低强度不抖
+            half = 0.5 / max(gen_fps, 1e-6)
+            for pt, _p in table:
+                if pt <= 0:
+                    continue
+                if abs(t - pt) <= half:
+                    return min(0.62, dn * 1.9)
+        return dn
+
     neg = ("lowres, bad anatomy, worst face, extra fingers, missing fingers, "
            "blurry, watermark, text, signature")
+    kframes = []
     ref = None
     ref_edge = 0.0
-    made = 0
-    for i in range(total):
-        path = os.path.join(frame_dir, "f_%04d.png" % i)
+    prev_img = None
+    prev_cam = None
+    for i, t in enumerate(ktimes):
+        cam = track.at(t, dur)
+        # 步骤分层：首帧要把画面「定调」，用全步数；后续是低 denoise 的
+        # img2img，只走 28% 左右的采样轨迹，再给全步数纯属烧时间（实测
+        # 512x768 全步数 9.0s / 六五折后 ~5.5s，画质肉眼看不出差别）。
+        # 例外：提示词切换点画面要真重绘，那里给回全步数。
+        use_steps = int(steps)
+        if i > 0:
+            use_steps = max(6, int(round(int(steps) * 0.65)))
+            if table and _denoise_at(t) > float(denoise) * 1.2:
+                use_steps = int(steps)
         payload = {
-            "prompt": prompt,
+            "prompt": _prompt_at(t),
             "negative_prompt": neg,
-            "steps": int(steps),
+            "steps": use_steps,
             "cfg": 7.0,
             "width": w,
             "height": h,
@@ -192,37 +293,57 @@ def localdream_backend(prompt, duration=3, fps=12, size="512x512", seed=-1, mode
             "show_diffusion_process": False,
             "seed": base_seed + i,
         }
-        if i > 0:
-            prev = Image.open(os.path.join(frame_dir, "f_%04d.png" % (i - 1))).convert("RGB")
-            src = _blend(ref, prev, anchor) if (stabilize and ref is not None and anchor > 0) else prev
+        if i > 0 and prev_img is not None:
+            # ★ 这一步是全部差别所在：先把上一关键帧按运镜推到当前视角，再喂模型。
+            src = mo.warp(prev_img, prev_cam, cam, (w, h), pad_ratio)
             buf = _io.BytesIO()
             src.save(buf, format="PNG")
             payload["image"] = _b.b64encode(buf.getvalue()).decode()
-            payload["denoise_strength"] = float(denoise)
+            payload["denoise_strength"] = _denoise_at(t)
 
         img_b64, meta = ig._ld_stream_generate(
             opener, f"http://{host}:{gen}/generate", payload, timeout)
         im = Image.open(_io.BytesIO(_b.b64decode(img_b64))).convert("RGB")
         if stabilize:
             if ref is None:
-                ref = im
-                ref_edge = _edge(ref)
+                ref, ref_edge = im, _edge(im)
             else:
                 im = _color_match(im, ref)
                 im = _sharpen_to(im, ref_edge)
-        im.save(path)
-        made += 1
+        im.save(os.path.join(frame_dir, "kf_%04d.png" % i))
+        kframes.append(im)
+        prev_img, prev_cam = im, cam
         if on_frame:
             try:
-                on_frame(i, total, meta)
+                on_frame(i, len(ktimes), t)
             except Exception:
                 pass
 
-    if made < 2:
-        raise RuntimeError(f"只出了 {made} 帧，凑不成视频")
+    if len(kframes) < 2:
+        raise RuntimeError(f"只出了 {len(kframes)} 张关键帧，凑不成视频")
 
-    mp4 = os.path.join(out_dir, tag + ".mp4")
-    _encode_mp4(frame_dir, made, fps, mp4)
+    # 关键帧 → 播放帧（不调模型，纯几何合成）
+    made, used_pad = mo.render_playback(
+        kframes, ktimes, track, dur, fps, out_dir=frame_dir, prefix="f",
+        pad_ratio=pad_ratio, ref_size=(w, h))
+
+    mp4 = ""
+    if encode:
+        mp4 = os.path.join(out_dir, tag + ".mp4")
+        _encode_mp4(frame_dir, len(made), fps, mp4)
+    # 记账：这次到底花了多少次生成 / 出片多长，别靠估
+    try:
+        with open(os.path.join(frame_dir, "plan.json"), "w", encoding="utf-8") as f:
+            import json as _js
+            _js.dump({
+                "duration": round(dur, 4), "gen_fps": gen_fps, "play_fps": fps,
+                "keyframes": len(kframes), "playframes": len(made),
+                "motion": repr(track), "pad_ratio": round(used_pad, 4),
+                "size": [w, h], "denoise": denoise,
+                "prompts": table,
+            }, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     return mp4, frame_dir
 
 
@@ -301,6 +422,11 @@ def _default_backend(prompt, duration, fps, size, seed, model, **kw):
 def _accepts_kw(fn):
     """后端是否吃得下帧链参数。别用「试调用再 catch TypeError」——
     后端内部真抛 TypeError 时会被误当成签名不匹配，悄悄吞掉一个真错误。"""
+    return _fn_accepts(fn, "denoise")
+
+
+def _fn_accepts(fn, name):
+    """fn 吃不吃这个关键字参数（有 **kwargs 也算吃）。"""
     import inspect
     try:
         sig = inspect.signature(fn)
@@ -309,17 +435,22 @@ def _accepts_kw(fn):
     for p in sig.parameters.values():
         if p.kind is p.VAR_KEYWORD:
             return True
-    return "denoise" in sig.parameters
+    return name in sig.parameters
 
 
-def run(prompt, duration=3, fps=12, size="512x512", seed=-1, model=None,
-        backend=None, denoise=0.35, steps=12, stabilize=True, anchor=0.12):
+def run(prompt, duration=3, fps=24, size="512x512", seed=-1, model=None,
+        backend=None, denoise=0.28, steps=12, stabilize=True, anchor=0.0,
+        motion="push_in", gen_fps=6, prompts=None):
     """出一段视频。
 
     返回 {"ok": bool, "path": str, "err": str}。
 
     backend: 可注入（测试用）；默认 _default_backend：
-      手机 NPU 帧链（FLEET_LOCAL_DREAM）> PC CLI/ffmpeg 占位片。
+      手机 NPU 稀疏关键帧 + 运镜合成（FLEET_LOCAL_DREAM）> PC CLI/ffmpeg 占位片。
+
+    fps 是**播放**帧率，gen_fps 是**关键帧**密度，两者分开 —— 详见
+    `localdream_backend` 的说明。motion 是运镜预设名或 motion.Track。
+
     任何异常都不外抛——能力未接好就如实说「未配置」，不交空。
     """
     prompt = (prompt or "").strip()
@@ -333,18 +464,23 @@ def run(prompt, duration=3, fps=12, size="512x512", seed=-1, model=None,
         try:
             fps = int(fps)
         except (TypeError, ValueError):
-            fps = 12
+            fps = 24
         try:
             seed = int(seed)
         except (TypeError, ValueError):
             seed = -1
         fn = backend or _default_backend
-        if _accepts_kw(fn):
-            path = fn(prompt, duration, fps, size, seed, model,
-                      denoise=denoise, steps=steps,
-                      stabilize=stabilize, anchor=anchor)
-        else:
-            path = fn(prompt, duration, fps, size, seed, model)
+        # 按参数名逐个投喂：后端不接受某个参数就不传，而不是一刀切「全传或全不传」。
+        # 这样给老后端塞新旋钮（motion / gen_fps）不会把它打死。
+        kw = {}
+        for name, val in (("out_dir", None), ("denoise", denoise), ("steps", steps),
+                          ("stabilize", stabilize), ("anchor", anchor),
+                          ("motion", motion), ("gen_fps", gen_fps),
+                          ("prompts", prompts)):
+            if val is None or not _fn_accepts(fn, name):
+                continue
+            kw[name] = val
+        path = fn(prompt, duration, fps, size, seed, model, **kw)
         return {"ok": True, "path": path, "err": ""}
     except Exception as e:
         return {"ok": False, "path": "", "err": f"{type(e).__name__}: {e}"}
@@ -389,7 +525,8 @@ def _selftest():
         return 1
 
     st = {"serving": None, "state": "idle", "width": None, "height": None,
-          "selects": 0, "calls": 0, "seen_images": 0, "payload": None}
+          "selects": 0, "calls": 0, "seen_images": 0, "payload": None,
+          "in_diffs": []}
 
     def frame_png(idx):
         """第 idx 帧：整幅变暗 + 细噪声（保证边缘密度不为 0，稳定器才有得算）。"""
@@ -458,15 +595,35 @@ def _selftest():
                 st["payload"] = _j.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 st["payload"] = {}
-            if st["payload"].get("image"):
+            img_in = st["payload"].get("image")
+            if img_in:
                 st["seen_images"] += 1
+                # 记「这次送进来的图」与「上一次返回的图」的平均像素差：
+                # 运镜接上了 → 送进来的是 warp 过的版本，差 > 0；
+                # 运镜没接上（或 motion=none）→ 送进来的就是原图，差 ≈ 0。
+                try:
+                    arr = np.asarray(
+                        Image.open(io.BytesIO(_b.b64decode(img_in))).convert("RGB"),
+                        dtype=np.float32)
+                    if st.get("last_out") is not None:
+                        st["in_diffs"].append(
+                            float(np.abs(arr - st["last_out"]).mean()))
+                except Exception:
+                    pass
             idx = st["calls"]
             st["calls"] += 1
+            b64 = frame_png(idx)
+            try:
+                st["last_out"] = np.asarray(
+                    Image.open(io.BytesIO(_b.b64decode(b64))).convert("RGB"),
+                    dtype=np.float32)
+            except Exception:
+                pass
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             self.wfile.write(("event: complete\ndata: %s\n\n" % _j.dumps(
-                {"type": "complete", "image": frame_png(idx), "format": "png",
+                {"type": "complete", "image": b64, "format": "png",
                  "seed": st["payload"].get("seed", 0)})).encode("utf-8"))
 
     ctl = HTTPServer(("127.0.0.1", 0), Ctl)
@@ -524,21 +681,60 @@ def _selftest():
         os.environ["HTTPS_PROXY"] = "http://127.0.0.1:1"
 
         st.update({"calls": 0, "seen_images": 0, "selects": 0, "state": "idle",
-                   "serving": None, "width": None, "height": None})
+                   "serving": None, "width": None, "height": None,
+                   "last_out": None, "in_diffs": []})
         mp4, fdir = localdream_backend(
             "a rainy street", duration=1, fps=4, size="512x512", seed=7,
-            model="fake-model", out_dir=tmp, steps=4, stabilize=True, anchor=0.0)
+            model="fake-model", out_dir=tmp, steps=4, stabilize=True, anchor=0.0,
+            gen_fps=4, motion="push_in")
         check(os.path.isfile(mp4) and os.path.getsize(mp4) > 1024, "mp4 落盘且非空")
         frames = sorted(f for f in os.listdir(fdir) if f.startswith("f_"))
-        check(len(frames) == 4, "帧数 = duration*fps = 4（实际 %d）" % len(frames))
+        check(len(frames) == 4, "播放帧数 = duration*fps = 4（实际 %d）" % len(frames))
+        kfs = sorted(f for f in os.listdir(fdir) if f.startswith("kf_"))
+        check(len(kfs) == 5,
+              "关键帧数 = duration*gen_fps+1 = 5（实际 %d）" % len(kfs))
         with Image.open(os.path.join(fdir, frames[0])) as im:
             check(im.size == (512, 512), "帧尺寸 512x512（实际 %s）" % (im.size,))
         check(st["selects"] == 1, "/select 被调用一次（模型切换）")
-        check(st["seen_images"] == 3,
-              "第 2 帧起才带 image 走 img2img（实际 %d）" % st["seen_images"])
+        check(st["calls"] == 5,
+              "只调了 5 次生成，不是 4 帧播放帧 —— 播放帧不花算力（实际 %d）"
+              % st["calls"])
+        check(st["seen_images"] == 4,
+              "第 2 张关键帧起才带 image 走 img2img（实际 %d）" % st["seen_images"])
         p = st["payload"] or {}
         check(p.get("output_format") == "png", "显式要 png")
         check(isinstance(p.get("denoise_strength"), float), "img2img 带 denoise_strength")
+        planf = os.path.join(fdir, "plan.json")
+        check(os.path.isfile(planf), "落 plan.json 记账（关键帧/播放帧/运镜）")
+        if os.path.isfile(planf):
+            with open(planf, encoding="utf-8") as fh:
+                pl = _j.load(fh)
+            check(pl.get("keyframes") == 5 and pl.get("playframes") == 4,
+                  "plan.json 记账对得上：kf=%s pf=%s"
+                  % (pl.get("keyframes"), pl.get("playframes")))
+
+        section("运镜到底接进 img2img 没有（这是这次改动的全部意义）")
+        # 判据必须关掉稳定器再比 —— 稳定器会事后拉亮度/补锐度，
+        # 那样「送进模型的输入」和「上次返回的原图」本来就不同，量不出运镜。
+        # 关掉之后：none 的输入 == 上一关键帧原样（差 0），push_in 的输入 ==
+        # 上一关键帧的 1.14 倍放大版（差必然 > 0）。
+        def _probe(motion_name, sub):
+            st.update({"calls": 0, "seen_images": 0, "selects": 0, "state": "idle",
+                       "serving": None, "width": None, "height": None,
+                       "last_out": None, "in_diffs": []})
+            localdream_backend(
+                "a rainy street", duration=1, fps=4, size="512x512", seed=7,
+                model="fake-model", out_dir=os.path.join(tmp, sub), steps=4,
+                stabilize=False, anchor=0.0, gen_fps=4, motion=motion_name)
+            return list(st["in_diffs"])
+
+        d_none = _probe("none", "probe_none")
+        check(d_none and max(d_none) < 0.6,
+              "none：输入就是上一关键帧原样（最大差 %.2f）" % (max(d_none) if d_none else -1))
+        d_push = _probe("push_in", "probe_push")
+        check(d_push and max(d_push) > 1.0,
+              "push_in：关键帧输入被 warp 过（最大差 %.2f，共 %d 次）"
+              % (max(d_push) if d_push else -1, len(d_push)))
 
         section("稳定器：假后端每帧变暗，开稳定器亮度要回来")
         def lum_of(path):
@@ -551,7 +747,8 @@ def _selftest():
               "开稳定器：末帧亮度贴住首帧（%.1f vs %.1f）" % (last, first))
 
         st.update({"calls": 0, "seen_images": 0, "selects": 0, "state": "idle",
-                   "serving": None, "width": None, "height": None})
+                   "serving": None, "width": None, "height": None,
+                   "last_out": None, "in_diffs": []})
         _mp4b, fdirb = localdream_backend(
             "a rainy street", duration=1, fps=4, size="512x512", seed=7,
             model="fake-model", out_dir=os.path.join(tmp, "raw"), steps=4,
@@ -565,7 +762,8 @@ def _selftest():
 
         section("run() 默认后端")
         st.update({"calls": 0, "seen_images": 0, "selects": 0, "state": "idle",
-                   "serving": None, "width": None, "height": None})
+                   "serving": None, "width": None, "height": None,
+                   "last_out": None, "in_diffs": []})
         r = run("a rainy street", duration=1, fps=3, size="512x512", steps=4,
                 model="fake-model")
         check(r["ok"] is True, "run() 成功：%s" % (r["err"] or "ok"))

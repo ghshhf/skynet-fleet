@@ -75,8 +75,12 @@ MEMORY_SYNC = "memory_sync"              # commander -> node: {id, op: export|im
 MEMORY_SYNC_RESULT = "memory_sync_result" # node -> commander: {id, ok, items?, count?, err?}
 
 # ---- 视频生成（P3 壳 + 远端路由）：本地算力撑不住，壳登记 + 路由到 PC/云端节点 ----
-VIDEO_GEN = "video_gen"                 # commander -> node: {id, prompt, duration?, fps?, size?, seed?, model?}
+VIDEO_GEN = "video_gen"                 # commander -> node: {id, prompt, duration?, fps?, size?, seed?, model?, motion?, gen_fps?, prompts?}
 VIDEO_GEN_RESULT = "video_gen_result"   # node -> commander: {id, ok, path?, err?}
+
+# ---- 漫剧 / 分镜成片（画布 + 多镜头 + 字幕 + 配音 + 转场）----
+VIDEO_STORY = "video_story"             # commander -> node: {id, board}  board 见 fleet/storyboard.py
+VIDEO_STORY_RESULT = "video_story_result"  # node -> commander: {id, ok, path?, shots?, err?}
 
 # ---- 她 P4 能力请求 + 授权门 ----
 CAP_REQ = "cap_req"           # node(她) -> commander: {cap, reason}

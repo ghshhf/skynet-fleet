@@ -107,25 +107,59 @@ SPECS = {
         ],
     },
     "video.gen": {
-        "title": "视频生成（手机 NPU 帧链 / 远端路由）",
-        "desc": "生成一段短视频。真后端已落地：手机 QNN NPU 走「t2i 首帧 → img2img 链式推进」，"
-                "带帧稳定器（对抗 VAE roundtrip 累积变糊与 CFG 累积变暗），实测 512×512/12 步 "
-                "2.7s/帧、10 分钟约 200 帧。逐帧 t2i 会出幻灯片，所以必须走链。"
+        "title": "视频生成（手机 NPU：稀疏关键帧 + 几何运镜）",
+        "desc": "生成一段短视频。**时间轴是显式的**：运动由相机轨迹（zoom/pan/rotate）"
+                "精确决定，扩散模型只补细节 —— 关键帧先按运镜 warp 过再喂 img2img，"
+                "播放帧则用关键帧 warp + 交叉淡化合成，**不花算力**。"
+                "实测 512x512：关键帧 2.7~5.4s/张，播放帧合成近乎免费，"
+                "所以 3 秒 24fps 片只需 19 张关键帧而不是 72 张。"
+                "反面教材（已废弃的旧做法）：逐帧 img2img、seed+i、denoise 0.35 —— "
+                "帧间没有几何联系，观感是抽搐/无目的漂移（实测帧间差 12.3，新做法 3.4）。"
                 "未配手机时退回 ffmpeg 占位片（黑底打字），那不是画面。",
         "params": [
             {"name": "prompt", "type": "str", "required": True, "desc": "正向提示词"},
-            {"name": "duration", "type": "int", "required": False, "desc": "时长秒（默认 3，帧数=duration×fps）"},
-            {"name": "fps", "type": "int", "required": False, "desc": "帧率（默认 12；手机出片走 8~12 更划算）"},
+            {"name": "duration", "type": "int", "required": False, "desc": "时长秒（默认 3）"},
+            {"name": "fps", "type": "int", "required": False,
+             "desc": "**播放**帧率（默认 24）。可以随便拉高，播放帧不花算力"},
+            {"name": "gen_fps", "type": "float", "required": False,
+             "desc": "**关键帧**密度（每秒生成几张，默认 6）。这才是真正烧算力的旋钮："
+                     "6 ≈ 电影感、2~3 ≈ 慢运镜够用、1 ≈ 省到极限"},
+            {"name": "motion", "type": "str", "required": False,
+             "desc": "运镜：push_in(推近,默认)/pull_out/pan_left/pan_right/tilt_up/"
+                     "tilt_down/dolly/sway/orbit/none"},
+            {"name": "prompts", "type": "json", "required": False,
+             "desc": '提示词时间表 [[秒, "提示词"], ...]（Deforum 的 prompt travel）：'
+                     "到点换词，并在该点自动抬高 denoise 让画面真变，其余时刻保持低 denoise"},
             {"name": "size", "type": "str", "required": False,
              "desc": "尺寸，只允许 512x512/768x768/1024x1024/768x512/512x768/1024x768/768x1024（表外没有 patch，会出噪声）"},
             {"name": "seed", "type": "int", "required": False, "desc": "随机种子，-1 随机"},
             {"name": "model", "type": "str", "required": False,
              "desc": "模型 id（anythingv5 动漫 / chilloutmix、absolutereality 写实）"},
             {"name": "denoise", "type": "float", "required": False,
-             "desc": "帧间重噪强度（默认 0.35；0.3 稳、0.45 动得狠但易崩）"},
-            {"name": "steps", "type": "int", "required": False, "desc": "每帧步数（默认 12）"},
-            {"name": "stabilize", "type": "bool", "required": False,
-             "desc": "帧稳定器（默认开）：颜色/亮度对齐首帧 + 锐度补偿 + 与首帧少量混合"},
+             "desc": "关键帧 img2img 强度（默认 0.28）。运动交给 warp，这里别调高，高了就是重绘"},
+            {"name": "steps", "type": "int", "required": False,
+             "desc": "首帧步数（默认 12）；后续关键帧自动按 65% 走（低 denoise 走不满轨迹，全步数纯烧时间）"},
+        ],
+    },
+    "video.story": {
+        "title": "漫剧成片（画布 + 分镜 + 字幕 + 配音）",
+        "desc": "一份 board → 一条可直接发的竖屏漫剧。这一层对应市面上的"
+                "「节点式无限画布」工作台（提示词→出图→图生视频→配音→剪辑），"
+                "这里压成一次调用。**台词决定镜头时长**：先合成配音拿到真实语音秒数，"
+                "镜头时长取 max(编剧写的, 语音+0.35s)，再反过来出画面 —— "
+                "这是行业做法，也是上一版「时间帧不对」的另一半原因。"
+                "分工：屏幕画面换成了手机 NPU 出的关键帧 + 几何运镜，字幕/转场/混音本地算。"
+                "诚实标注：角色一致性只能靠文字锚点 + 固定 seed，做不到 IP-Adapter/LoRA 那级。",
+        "params": [
+            {"name": "board", "type": "json", "required": True,
+             "desc": "分镜数据：{title, canvas(9:16/16:9/3:4/4:5/1:1/2.39:1), fps, gen_fps,"
+                     " style, voice, bgm:{preset,gain}, characters:[{name,anchor}],"
+                     " shots:[{prompt, sec, camera, cast, subtitle, transition(cut/fade/dissolve),"
+                     " denoise, seed}]}"},
+            {"name": "model", "type": "str", "required": False,
+             "desc": "出图模型（默认跟 board.model）"},
+            {"name": "dry_run", "type": "bool", "required": False,
+             "desc": "只算账不出片：返回分镜数/秒数/关键帧数/预估耗时"},
         ],
     },
     "image.poster": {
@@ -285,6 +319,7 @@ ALIASES = {
     "perceive.report": "perceive",
     "image.gen.run": "image.gen",
     "video.gen.run": "video.gen",
+    "video.story.run": "video.story",
     "fleet.memory.sync.run": "fleet.memory.sync",
     "job.run": "job.submit",
     "art.put": "artifact.put",

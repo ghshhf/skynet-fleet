@@ -46,9 +46,17 @@ CASES = [
     # 8808/8081，把 /info -> /status -> /select -> /generate(SSE) 真跑一遍。
     # 断言的是一条「协议拼错就必然失败」的链路，不依赖真机、不联网。
     ("image_gen_runner", ["image_gen_runner.py", "--selftest"], HERE, 90),
-    # 手机 NPU 帧链出视频：假手机（两个本地 HTTP 服务）+ 假后端自动变暗，
-    # 锁死两件事——帧确实走 img2img 链（不是逐帧 t2i），稳定器把亮度拉回首帧。
-    ("video_gen_runner", ["video_gen_runner.py", "--selftest"], HERE, 120),
+    # 时间线引擎：相机模型 + affine warp + 关键帧合成播放帧。
+    # 纯 CPU 纯数学，断言的是「方向对不对」（放大 2 倍=取中心一半、平移 1/4 画宽、
+    # zoom-out 不出黑边），这类错看不出来但会毁掉整条片。
+    ("motion", ["-m", "fleet.motion"], HERE, 60),
+    # 手机 NPU 出视频：假手机（两个本地 HTTP 服务）+ 假后端每帧变暗，
+    # 锁死四件事——关键帧数=duration*gen_fps+1、播放帧不花算力（调用次数对不上就挂）、
+    # 运镜真的 warp 进了 img2img（none 差 0 / push_in 差 >0）、稳定器把亮度拉回首帧。
+    ("video_gen_runner", ["video_gen_runner.py", "--selftest"], HERE, 180),
+    # 漫剧层：画布适配/挑尺寸/折行/字幕/编码/淡入淡出/叠化/board 校验/音频拼接。
+    # 不碰手机不联网（TTS 那部分只在真跑时用）。
+    ("storyboard", ["-m", "fleet.storyboard"], HERE, 120),
     # 出图 → 成品海报：四种版式尺寸、超长标题不溢出、缺图/未知版式如实报错。
     ("poster_runner", ["poster_runner.py", "--selftest"], HERE, 60),
     # 联网组件：31 项纯离线断言（要不要联网的判定、垃圾结果过滤、HTML 清洗、

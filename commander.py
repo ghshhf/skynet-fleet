@@ -1085,6 +1085,7 @@ def _cmd_relay_fetch(name, url):
 _JOB_MSG = {
     "image.gen": common.IMAGE_GEN,
     "video.gen": common.VIDEO_GEN,
+    "video.story": common.VIDEO_STORY,
     "shell.exec": common.EXEC,
     "exec": common.EXEC,
     "fleet.memory.sync": common.MEMORY_SYNC,
