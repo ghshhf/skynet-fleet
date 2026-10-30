@@ -25,8 +25,17 @@ object Net {
         sp.edit().putString(K_URL, url.trim()).putString(K_TOKEN, token.trim()).apply()
     }
 
-    fun loadConfig(): AgentConfig =
-        AgentConfig(sp.getString(K_URL, "") ?: "", sp.getString(K_TOKEN, "") ?: "")
+    fun loadConfig(): AgentConfig {
+        // 注意：getString 的第二个参数只在 key 不存在时生效。用户之前点过「保存」
+        // 但地址框是空的，存下来的就是空串，光给默认值救不回来 —— 所以这里显式
+        // 把空串也折回默认地址。没这个兜底，界面会一直显示「没填地址」。
+        val savedUrl = sp.getString(K_URL, "") ?: ""
+        val savedToken = sp.getString(K_TOKEN, "") ?: ""
+        return AgentConfig(
+            url = if (savedUrl.isBlank()) Api.DEFAULT_BASE else savedUrl,
+            token = savedToken,
+        )
+    }
 
     fun hasConfig(): Boolean = loadConfig().valid()
 
@@ -39,7 +48,7 @@ object Net {
     }
 
     suspend fun getProviders(): List<Gateway> = withContext(Dispatchers.IO) {
-        val c = auth("${loadConfig().url}/api/providers")
+        val c = auth(Api.endpoint(loadConfig().url, "/api/providers"))
         try {
             if (c.responseCode != 200) return@withContext emptyList()
             val root = JSONObject(c.readBody())
@@ -48,7 +57,7 @@ object Net {
     }
 
     suspend fun getCaps(): Map<String, List<Capability>> = withContext(Dispatchers.IO) {
-        val c = auth("${loadConfig().url}/api/caps")
+        val c = auth(Api.endpoint(loadConfig().url, "/api/caps"))
         try {
             if (c.responseCode != 200) return@withContext emptyMap()
             val root = JSONObject(c.readBody())
@@ -71,7 +80,7 @@ object Net {
 
     suspend fun execTool(name: String, args: Map<String, Any>): ToolResult =
         withContext(Dispatchers.IO) {
-            val c = auth("${loadConfig().url}/api/tool/exec")
+            val c = auth(Api.endpoint(loadConfig().url, "/api/tool/exec"))
             c.requestMethod = "POST"
             c.setRequestProperty("Content-Type", "application/json")
             c.doOutput = true
@@ -88,7 +97,7 @@ object Net {
      * 控制面是否可用。拉不到就返回空并带上原因，绝不塞占位节点糊弄界面。
      */
     suspend fun getNodes(): FleetSnapshot = withContext(Dispatchers.IO) {
-        val c = auth("${loadConfig().url}/api/nodes")
+        val c = auth(Api.endpoint(loadConfig().url, "/api/nodes"))
         try {
             if (c.responseCode != 200) {
                 return@withContext FleetSnapshot(err = "HTTP ${c.responseCode}")
@@ -139,7 +148,7 @@ object Net {
     }
 
     suspend fun getTasks(): TaskBoard = withContext(Dispatchers.IO) {
-        val c = auth("${loadConfig().url}/api/tasks")
+        val c = auth(Api.endpoint(loadConfig().url, "/api/tasks"))
         try {
             if (c.responseCode != 200) return@withContext TaskBoard()
             val root = JSONObject(c.readBody())
@@ -165,7 +174,7 @@ object Net {
         onAnswer: (String, List<ToolCall>) -> Unit,
         onError: (String) -> Unit,
     ) = withContext(Dispatchers.IO) {
-        val c = auth("${loadConfig().url}/api/agent")
+        val c = auth(Api.endpoint(loadConfig().url, "/api/agent"))
         c.requestMethod = "POST"
         c.setRequestProperty("Content-Type", "application/json")
         c.doOutput = true
@@ -181,21 +190,13 @@ object Net {
                 onError("HTTP ${c.responseCode}")
                 return@withContext
             }
-            var event = ""
-            val data = StringBuilder()
+            val parser = SseParser()
             c.inputStream.bufferedReader().useLines { lines ->
                 for (line in lines) {
-                    when {
-                        line.startsWith("event:") -> event = line.substring(6).trim()
-                        line.startsWith("data:") -> data.append(line.substring(5).trim())
-                        line.isEmpty() -> {
-                            if (data.isNotEmpty()) dispatch(event, data.toString(), steps, onStep, onAnswer)
-                            event = ""; data.clear()
-                        }
-                    }
+                    parser.feed(line)?.let { dispatch(it.event, it.data, steps, onStep, onAnswer) }
                 }
             }
-            if (data.isNotEmpty()) dispatch(event, data.toString(), steps, onStep, onAnswer)
+            parser.flush()?.let { dispatch(it.event, it.data, steps, onStep, onAnswer) }
         } catch (e: Exception) {
             onError(e.message ?: e.javaClass.simpleName)
         } finally { c.disconnect() }

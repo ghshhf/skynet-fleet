@@ -51,6 +51,35 @@ bash tianwang_app/build.sh debug    # debug，约 55 MB（含 tooling，仅调�
 > debug 包 55 MB 不是代码大，是 `material-icons-extended` 里几千个图标；
 > release 开了 R8 + shrinkResources 之后只留引用到的十几个 ⇒ 2.2 MB。
 
+## 测试
+
+```bash
+cd tianwang_app
+JAVA_HOME=<jdk17+> ./gradlew :app:testDebugUnitTest
+```
+
+17 个 JVM 单测，**不需要真机、不插 USB**，几十秒跑完：
+
+| 文件 | 测什么 | 为什么值得测 |
+|---|---|---|
+| `ApiTest` | 云侧地址归一化 + 端点拼接 | `no protocol: /api/providers` 就是「空地址直接拼路径」造出来的；地址尾部的 `/` 还会拼出 `//api/xxx` |
+| `SseParserTest` | SSE 事件切分（多行 `data:`、无尾空行、注释行） | 多行 data 直接 `append` 会粘成非法 JSON，再被 `runCatching` 静默吞掉 —— 表现是「对话没反应」，查起来极慢 |
+| `JsonParseTest` | `/api/providers`、`/api/caps` 的解析 | 字段名错一个字母，界面就是一片空白，而空白跟「服务端真没数据」长得一模一样 |
+
+真机侧（依赖手机，**不进门禁**）：
+
+```bash
+adb reverse tcp:9124 tcp:9124          # 手机 127.0.0.1:9124 → 电脑 9124
+adb shell am start -n app.skynet.tianwang.next/.MainActivity
+```
+
+> MIUI 会拦 `adb shell input tap`（`INJECT_EVENTS`），除非开发者选项里开了
+> 「USB 调试（安全设置）」。没开的话 `input tap` 静默无效，真机 UI 验证只能手点。
+> 装包也一样：`adb install` 会返回 `INSTALL_FAILED_USER_RESTRICTED`，
+> 改用 `am start -a android.intent.action.INSTALL_PACKAGE -d file:///sdcard/Download/x.apk`
+> 就能直接弹安装器让手点。
+
+
 ## 还没接的
 
 - `LocalBackend` 只是桩：要接 llama.cpp JNI（照 `tianwang_android/jni/` 那套 CMake）
