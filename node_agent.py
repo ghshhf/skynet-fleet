@@ -270,6 +270,8 @@ def _dispatch(s, m, name, sandbox):
         _do_image_gen(s, m)
     elif t == common.VIDEO_GEN:
         _do_video_gen(s, m)
+    elif t == common.VIDEO_STORY:
+        _do_video_story(s, m)
     elif t == common.MEMORY_SYNC:
         _do_memory_sync(s, m)
     elif t == common.UI_SKIP:
@@ -401,16 +403,42 @@ def _do_video_gen(s, m, backend=None):
     """
     mid = m.get("id")
     try:
+        # 运镜 / 关键帧密度 / 提示词时间表 都要透传：它们是「时间轴」的旋钮，
+        # 少传一个就退回「每帧自由发挥」的老行为。
         res = video_gen_runner.run(
             m.get("prompt", ""), duration=m.get("duration", 3), fps=m.get("fps", 24),
             size=m.get("size", "512x512"), seed=int(m.get("seed", -1)),
-            model=m.get("model"), backend=backend)
+            model=m.get("model"), backend=backend,
+            motion=m.get("motion") or "push_in",
+            gen_fps=m.get("gen_fps") or 6,
+            prompts=m.get("prompts"),
+            denoise=float(m.get("denoise") or 0.28),
+            steps=int(m.get("steps") or 12))
         common.send_msg(s, {"t": common.VIDEO_GEN_RESULT, "id": mid,
                             "ok": res["ok"], "path": res.get("path", ""),
                             "err": res.get("err", "")})
     except Exception as e:
         common.send_msg(s, {"t": common.VIDEO_GEN_RESULT, "id": mid, "ok": False,
                             "path": "", "err": str(e)})
+
+
+def _do_video_story(s, m, backend=None):
+    """漫剧成片：一份 board（画布 + 多镜头 + 台词）→ 一条带字幕配音的片。
+
+    这一层把「出图/出视频/排版/配音」串成了流水线，节点侧只负责跑，
+    编排逻辑全在 fleet/storyboard.py 里（可单独测）。
+    """
+    mid = m.get("id")
+    try:
+        from fleet import storyboard
+        res = storyboard.run_board(m.get("board") or {}, model=m.get("model"))
+        common.send_msg(s, {"t": common.VIDEO_STORY_RESULT, "id": mid,
+                            "ok": res.get("ok"), "path": res.get("path", ""),
+                            "shots": res.get("shots") or [],
+                            "err": res.get("err", "")})
+    except Exception as e:
+        common.send_msg(s, {"t": common.VIDEO_STORY_RESULT, "id": mid, "ok": False,
+                            "path": "", "shots": [], "err": str(e)})
 
 
 _DEFAULT_UI_RULES = [{

@@ -537,17 +537,30 @@ CAPABILITIES = [
                        Param("model", "str", doc="模型名，留给桥接层")),
                side_effect=True,
                note="出图落手机 Pictures/fleet/；本节点没接 android_bridge 时如实说「后端未配置」"),
-    # ---- 视频生成（P3 壳 + 远端路由）：手机本地算力撑不住视频扩散，先登记能力壳 ----
-    Capability("video.gen", "生成一段视频（壳 + 远端路由）",
+    # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
+    Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
                        Param("duration", "int", doc="时长秒，默认 3"),
-                       Param("fps", "int", doc="帧率，默认 24"),
+                       Param("fps", "int", doc="**播放**帧率，默认 24（不花算力，可以拉高）"),
+                       Param("gen_fps", "float", doc="**关键帧**密度，默认 6；这才是烧算力的旋钮"),
+                       Param("motion", "str",
+                             doc="运镜：push_in/pull_out/pan_left/pan_right/tilt_up/"
+                                 "tilt_down/dolly/sway/orbit/none"),
                        Param("size", "str", doc="如 512x512，默认 512x512"),
                        Param("seed", "int", doc="随机种子，-1=随机，默认 -1"),
-                       Param("model", "str", doc="模型名，留给后端")),
+                       Param("model", "str", doc="模型名，留给后端"),
+                       Param("denoise", "float", doc="关键帧 img2img 强度，默认 0.28"),
+                       Param("steps", "int", doc="首帧步数，默认 12（后续自动 65%）")),
                side_effect=True,
-               note="手机本地不跑视频扩散（算力/显存/耗时撑不住）；本节点未配视频后端时"
-                    "如实说「未配置」，路由远端走 relay 到 PC/云端节点"),
+               note="运动由相机轨迹精确决定、播放帧靠 warp 合成不调模型；"
+                    "旧的逐帧 img2img 链已废弃（帧间无几何联系，观感抽搐）"),
+    Capability("video.story", "漫剧成片（画布 + 分镜 + 字幕 + 配音）",
+               params=(Param("board", "json", True, "分镜数据（见 fleet/storyboard.py）"),
+                       Param("model", "str", doc="出图模型，默认跟 board.model"),
+                       Param("dry_run", "bool", doc="只算账不出片")),
+               side_effect=True,
+               note="台词决定镜头时长：先合成配音拿真实秒数，再反过来出画面；"
+                    "等价于市面上的「节点式无限画布」，这里压成一次调用"),
     # ---- 本机操控（kind=host：这台机器既是控制面也是被控端，学 Cherry computerUse）----
     Capability("host.monitor", "本机资源监控（CPU/内存/磁盘/网速 + 进程表）",
                note="可视化主屏的数据源；纯读，不碰系统"),
