@@ -65,8 +65,11 @@ jobs:
         run: python tools/build_gui.py
 
       - name: 冒烟打包产物
-        # onefile 冷启动要先解压，等不够会误判成坏了，所以只报不挡
-        continue-on-error: true
+        # 真挡，不再 continue-on-error。
+        # 原来写"只报不挡"的理由是「onefile 冷启动要先解压，等不够会误判」——
+        # 2026-10-29 实测：`--smoke` **不建窗口、不 import webview**，直接起服务探
+        # /api/health，退出码稳定为 0（本机冻扁包实测）。既然等得够，就不该留
+        # 「产物坏了也不红」这个口子——那和注释骗人是同一类问题。
         run: dist\fleet-gui.exe --smoke
 
       - uses: actions/upload-artifact@v4
