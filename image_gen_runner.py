@@ -240,11 +240,17 @@ def _ld_json(opener, url, timeout, payload=None):
 
 
 def _ld_ensure_model(opener, host, ctl, model, width, height, wait_s=300):
-    """确保手机侧加载的是 model（同模型则零成本）。返回实际生效的 model id。"""
+    """确保手机侧加载的是 model 且跑在 width×height。返回实际生效的 model id。"""
     import time as _t
     status = _ld_json(opener, f"http://{host}:{ctl}/status", 15)
     serving = status.get("serving_model_id")
-    if not model or serving == model:
+    # 分辨率是**后端启动参数**，不是请求参数：SD1.5 NPU 的 unet.bin 按分辨率切过，
+    # 非 512 要在拉起进程时传 `--patch 768.patch`。所以宽高一变就必须重新 select，
+    # 哪怕模型还是同一个——拿 512 的权重跑 768 的 latent，出来的是纯噪声（实测）。
+    same_size = status.get("width") == width and status.get("height") == height
+    if serving and not same_size:
+        model = model or serving
+    if not model or (serving == model and same_size):
         if status.get("state") == "error":
             raise RuntimeError(
                 f"手机后端处于错误态：{status.get('message') or '未知'}"
@@ -266,7 +272,8 @@ def _ld_ensure_model(opener, host, ctl, model, width, height, wait_s=300):
         st = _ld_json(opener, f"http://{host}:{ctl}/status", 15)
         state = st.get("state") or ""
         last = state
-        if state == "running" and st.get("serving_model_id") == model:
+        if (state == "running" and st.get("serving_model_id") == model
+                and st.get("width") == width and st.get("height") == height):
             return model
         if state == "error":
             raise RuntimeError(
@@ -276,6 +283,27 @@ def _ld_ensure_model(opener, host, ctl, model, width, height, wait_s=300):
     raise RuntimeError(
         f"等手机加载模型 {model} 超过 {wait_s}s，最后状态={last or '?'}；"
         "模型太大或没下载完时会出现这种情况")
+
+
+def _ld_wait_health(opener, host, gen, timeout=150):
+    """等生成口真的在听。
+
+    /status 先变 running、8081 后起来（进程还要加载 800MB 权重），中间那几秒
+    请求会被直接断掉。不探这一步，报出来的是「拒连」，看着像手机掉线。
+    """
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        try:
+            with opener.open(f"http://{host}:{gen}/health", timeout=3) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        _t.sleep(1.0)
+    raise RuntimeError(
+        f"手机 {host}:{gen} 等 {timeout}s 还没开始监听——/status 说 running，"
+        "但后端进程可能还在加载权重，或者已经退出了（看手机 logcat 的 BackendService）")
 
 
 def _ld_stream_generate(opener, url, payload, timeout):
@@ -349,6 +377,7 @@ def localdream_backend(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.
             raise RuntimeError(f"size 解析失败：{size!r}（要 WxH，如 512x512）")
 
     _ld_ensure_model(opener, host, ctl, model, w, h)
+    _ld_wait_health(opener, host, gen)
 
     payload = {
         "prompt": prompt,
@@ -454,7 +483,8 @@ def _selftest():
         print("\n[" + t + "]")
 
     # 假手机侧的可变状态
-    st = {"serving": None, "state": "idle", "mode": "ok", "payload": None, "selects": 0}
+    st = {"serving": None, "state": "idle", "mode": "ok", "payload": None,
+          "selects": 0, "width": None, "height": None}
 
     class Ctl(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -476,7 +506,7 @@ def _selftest():
                 return self._send({
                     "serving_model_id": st["serving"], "state": st["state"],
                     "message": None, "error_model_id": None,
-                    "width": None, "height": None})
+                    "width": st["width"], "height": st["height"]})
             return self._send({"error": "not found"}, 404)
 
         def do_POST(self):
@@ -488,6 +518,8 @@ def _selftest():
             if self.path == "/select":
                 st["selects"] += 1
                 st["serving"] = body.get("model_id")
+                st["width"] = body.get("width")
+                st["height"] = body.get("height")
                 st["state"] = "running"
                 return self._send({"ok": True})
             return self._send({"error": "not found"}, 404)
@@ -495,6 +527,15 @@ def _selftest():
     class Gen(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        def do_GET(self):
+            ok = self.path == "/health"
+            body = b"{}"
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             n = int(self.headers.get("Content-Length") or 0)
