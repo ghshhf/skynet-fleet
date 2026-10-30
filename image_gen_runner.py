@@ -65,8 +65,17 @@ def _default_backend(prompt, neg, size, steps, seed, cfg, model):
     优先级按速度排：local-dream 走骁龙 HTP，同一 prompt 比 sd.cpp 的
     CPU/Vulkan 快数倍；桥次之（能跑但慢）；PC 最慢但显存大、模型全。
     """
-    # 0) 手机 local-dream（QNN NPU）
-    if os.environ.get("FLEET_LOCAL_DREAM"):
+    # 0) 手机 NPU。**两条路**：有 FLEET_LOCAL_DREAM_ENGINE 就自己拉起 native 引擎
+    #    （不需要 App 在前台、不需要 host mode）；否则借 App 的 8808 控制口。
+    host_or_direct = os.environ.get("FLEET_LOCAL_DREAM")
+    if not host_or_direct:
+        try:
+            from fleet import engine as _eng
+            if _eng.enabled():
+                host_or_direct = "direct"
+        except Exception:
+            host_or_direct = ""
+    if host_or_direct:
         return localdream_backend(prompt, neg, size, steps, seed, cfg, model)
     # 1) 手机桥（android_bridge → SdBridge）
     if os.environ.get("FLEET_ANDROID_BRIDGE"):
@@ -197,7 +206,17 @@ def _ld_endpoints():
     接受 "192.168.1.5"、"http://192.168.1.5"、"192.168.1.5:8081"。
     带端口时视为**生成口**（最常改的就是这个），控制口由
     FLEET_LOCAL_DREAM_CONTROL 覆盖，默认 8808。
+
+    直驱模式（设了 FLEET_LOCAL_DREAM_ENGINE=host:port）时生成口换成我们自己的
+    引擎端口 —— App 的 8808 控制口就完全不需要了。
     """
+    try:
+        from fleet import engine as _eng
+        if _eng.enabled():
+            eh, ep = _eng.endpoint()
+            return eh, 0, ep
+    except Exception:
+        pass
     raw = (os.environ.get("FLEET_LOCAL_DREAM") or "").strip()
     if not raw:
         raise RuntimeError(
@@ -265,6 +284,19 @@ def _ld_select(opener, host, ctl, model, width, height):
 def _ld_ensure_model(opener, host, ctl, model, width, height, wait_s=300):
     """确保手机侧加载的是 model 且跑在 width×height。返回实际生效的 model id。"""
     import time as _t
+    try:
+        from fleet import engine as _eng
+        direct = _eng.enabled()
+    except Exception:
+        direct = False
+    if direct:
+        # 直驱：自己拉起 native 引擎进程（App 不需要在前台，也不需要 host mode）
+        info = _eng.start(model, int(width), int(height), port=None, host=host,
+                          timeout=wait_s)
+        if not info.get("ok"):
+            raise RuntimeError("手机 NPU 引擎起不来：%s" % (info.get("err") or "未知"))
+        return info.get("model") or model or ""
+
     status = _ld_json(opener, f"http://{host}:{ctl}/status", 15)
     serving = status.get("serving_model_id")
     # 分辨率是**后端启动参数**，不是请求参数：SD1.5 NPU 的 unet.bin 按分辨率切过，
@@ -378,16 +410,23 @@ def localdream_backend(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.
     import time as _t
     host, ctl, gen = _ld_endpoints()
     opener = _ld_opener()
-
     try:
-        info = _ld_json(opener, f"http://{host}:{ctl}/info", 10)
-    except Exception as e:
-        raise RuntimeError(
-            f"连不上手机控制口 {host}:{ctl}（{type(e).__name__}: {e}）——"
-            "多半是 host mode 没开，或手机不在同一网段")
-    if info.get("app") != "localdream":
-        raise RuntimeError(
-            f"{host}:{ctl} 不是 local-dream 的控制口（/info 返回 app={info.get('app')!r}）")
+        from fleet import engine as _eng
+        direct = _eng.enabled()
+    except Exception:
+        direct = False
+
+    if not direct:
+        # 走 App 模式才需要 App 的控制口；直驱模式下手机侧没有 8808
+        try:
+            info = _ld_json(opener, f"http://{host}:{ctl}/info", 10)
+        except Exception as e:
+            raise RuntimeError(
+                f"连不上手机控制口 {host}:{ctl}（{type(e).__name__}: {e}）——"
+                "多半是 host mode 没开，或手机不在同一网段")
+        if info.get("app") != "localdream":
+            raise RuntimeError(
+                f"{host}:{ctl} 不是 local-dream 的控制口（/info 返回 app={info.get('app')!r}）")
 
     w, h = 512, 512
     if size and "x" in str(size).lower():

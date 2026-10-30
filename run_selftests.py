@@ -56,6 +56,10 @@ CASES = [
     # 8808/8081，把 /info -> /status -> /select -> /generate(SSE) 真跑一遍。
     # 断言的是一条「协议拼错就必然失败」的链路，不依赖真机、不联网。
     ("image_gen_runner", ["image_gen_runner.py", "--selftest"], HERE, 90),
+    # 引擎直驱：patch 命名规则 + 启动脚本拼装 + endpoint 解析。
+    # 这几项是「能不能脱离 App 自己拉起 NPU 引擎」的全部要点：patch 挑错会出纯噪声、
+    # LD_LIBRARY_PATH/ADSP_LIBRARY_PATH 少一段就是 QnnDevice_create 0x36b1。
+    ("engine", ["-m", "fleet.engine"], HERE, 60),
     # 时间线引擎：相机模型 + affine warp + 关键帧合成播放帧。
     # 纯 CPU 纯数学，断言的是「方向对不对」（放大 2 倍=取中心一半、平移 1/4 画宽、
     # zoom-out 不出黑边），这类错看不出来但会毁掉整条片。

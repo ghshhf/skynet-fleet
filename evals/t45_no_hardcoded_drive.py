@@ -91,6 +91,9 @@ def _scan():
     found = []
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
+        # 点开头的隐藏文件是本机产物/缓存（如 tools/.gate_map.json），不是源码，
+        # 里面存的本机绝对路径是正常的——它们不入 Git，也不代表「代码里写死了路径」
+        filenames = [f for f in filenames if not f.startswith(".")]
         rel_dir = os.path.relpath(dirpath, ROOT).replace("\\", "/")
         if rel_dir.startswith("tools/uicheck/shots"):
             continue
