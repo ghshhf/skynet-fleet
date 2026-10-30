@@ -46,6 +46,11 @@ CASES = [
     # 8808/8081，把 /info -> /status -> /select -> /generate(SSE) 真跑一遍。
     # 断言的是一条「协议拼错就必然失败」的链路，不依赖真机、不联网。
     ("image_gen_runner", ["image_gen_runner.py", "--selftest"], HERE, 90),
+    # 手机 NPU 帧链出视频：假手机（两个本地 HTTP 服务）+ 假后端自动变暗，
+    # 锁死两件事——帧确实走 img2img 链（不是逐帧 t2i），稳定器把亮度拉回首帧。
+    ("video_gen_runner", ["video_gen_runner.py", "--selftest"], HERE, 120),
+    # 出图 → 成品海报：四种版式尺寸、超长标题不溢出、缺图/未知版式如实报错。
+    ("poster_runner", ["poster_runner.py", "--selftest"], HERE, 60),
     # 联网组件：31 项纯离线断言（要不要联网的判定、垃圾结果过滤、HTML 清洗、
     # 资料拼接）。真联网的活不进门禁 —— 门禁不许依赖外网。
     ("webtool", ["webtool.py", "--selftest"], HERE, 30),
@@ -362,18 +367,60 @@ def _dec(b):
     return b.decode("utf-8", "replace")
 
 
+#: 慢门禁：需要真实浏览器 / 真实模型 / 真实设备，单条十几分钟。
+#:
+#: 2026-10-29 实测：全量 24 分 45 秒，**其中 t32 一条占约 15 分钟**
+#: （Playwright 逐个点界面元素，点一次等 2 秒判"有没有反应"，超时给了 920s）。
+#: 主人的规矩是「全部干完再跑一次」，那这一次就不该被一条慢活拖成半小时。
+#: 所以拆两档：
+#:   默认      → 快档（跳过这里列出的），2~4 分钟，日常改完就跑
+#:   --slow    → 快档 + 慢门禁，发版前跑
+#:   --all     → 同上（alias，语义更直白）
+#:   显式点名   → 无论快慢都跑（`python run_selftests.py t32`）
+SLOW = {"eval_t32_deadlink"}
+
+
 def run_case(name, args, cwd, timeout):
     cmd = [PY] + args
     try:
-        r = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout)
-        out = _dec(r.stdout)
-        err = _dec(r.stderr)
-        ok = r.returncode == 0
-        return ok, out, err, r.returncode
-    except subprocess.TimeoutExpired:
-        return False, "", f"超时({timeout}s)", -1
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
     except FileNotFoundError as e:
         return False, "", f"找不到: {e}", -1
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode == 0, _dec(out), _dec(err), p.returncode
+    except subprocess.TimeoutExpired:
+        # 🔴 超时必须连**整棵进程树**一起杀。2026-10-29 实测：
+        # t32 起的是 node + chromium，只 kill 直接子进程会让孙子们继续跑到天荒地老
+        # ——既占 CPU，又可能继续改产品状态（t32 点界面会真的切卡）。
+        # 原实现 subprocess.run(timeout=) 就是只杀父，于是「超时」形同虚设。
+        killed = 0
+        try:
+            import psutil
+            parent = psutil.Process(p.pid)
+            kids = parent.children(recursive=True)
+            for k in kids:
+                try:
+                    k.kill()
+                    killed += 1
+                except Exception:
+                    pass
+            try:
+                parent.kill()
+                killed += 1
+            except Exception:
+                pass
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        try:
+            out, err = p.communicate(timeout=20)
+        except Exception:
+            out, err = b"", b""
+        return False, _dec(out), f"超时({timeout}s)，已杀 {killed} 个进程", -1
 
 
 #: 门禁跑完后必须还原的本机状态文件。
@@ -429,8 +476,17 @@ def _restore_states(snap):
 
 
 def main():
-    only = [a.lower() for a in sys.argv[1:]]
+    raw = sys.argv[1:]
+    flags = {a.lower() for a in raw if a.startswith("--")}
+    only = [a.lower() for a in raw if not a.startswith("--")]
+    include_slow = bool(flags & {"--slow", "--all"})
     cases = [c for c in CASES if not only or any(o in c[0].lower() for o in only)]
+    if not include_slow and not only:
+        skipped = [c[0] for c in cases if c[0] in SLOW]
+        cases = [c for c in cases if c[0] not in SLOW]
+        if skipped:
+            print("（跳过 %d 条慢门禁：%s —— 要跑加 --slow）"
+                  % (len(skipped), ", ".join(skipped)), flush=True)
     print(f"=== 天网工程离线自测：{len(cases)} 项 ===", flush=True)
     results = []
     snap = _snap_states()

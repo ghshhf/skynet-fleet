@@ -239,6 +239,29 @@ def _ld_json(opener, url, timeout, payload=None):
         raise RuntimeError(f"{url} 返回的不是 JSON：{raw[:200]}")
 
 
+def _ld_select(opener, host, ctl, model, width, height):
+    """POST /select；遇到 404 model not found 先刷新目录再试一次。
+
+    后推上去的模型（adb 直接塞进 files/models/）不在 App 内存里的模型表里，
+    /select 会回 404。RemoteHostService 的 /models 是**全量重扫**，注释里
+    写明「让 host mode 启动后才下载/导入的模型可见」——所以刷新一次就能看见。
+    不刷的话，自动化场景（没人手点 App）会一直报「model not found」。
+    """
+    url = f"http://{host}:{ctl}/select"
+    payload = {"model_id": model, "width": width, "height": height}
+    try:
+        return _ld_json(opener, url, 30, payload)
+    except Exception as e:
+        name = type(e).__name__
+        if "HTTPError" not in name and "404" not in str(e):
+            raise
+        try:
+            _ld_json(opener, f"http://{host}:{ctl}/models", 180)
+        except Exception:
+            pass
+        return _ld_json(opener, url, 30, payload)
+
+
 def _ld_ensure_model(opener, host, ctl, model, width, height, wait_s=300):
     """确保手机侧加载的是 model 且跑在 width×height。返回实际生效的 model id。"""
     import time as _t
@@ -259,10 +282,7 @@ def _ld_ensure_model(opener, host, ctl, model, width, height, wait_s=300):
 
     # /select 是异步的：它只是把加载请求交给 BackendService，进程重启并加载
     # 权重要几十秒，必须轮询 /status 到 running 才能发 /generate，否则会打空。
-    sel = _ld_json(
-        opener, f"http://{host}:{ctl}/select", 30,
-        {"model_id": model, "width": width, "height": height},
-    )
+    sel = _ld_select(opener, host, ctl, model, width, height)
     if isinstance(sel, dict) and sel.get("error"):
         raise RuntimeError(f"手机 /select 拒绝：{sel.get('error')}")
 
@@ -484,7 +504,8 @@ def _selftest():
 
     # 假手机侧的可变状态
     st = {"serving": None, "state": "idle", "mode": "ok", "payload": None,
-          "selects": 0, "width": None, "height": None}
+          "selects": 0, "width": None, "height": None,
+          "known": {"sd15-npu"}, "models_calls": 0}
 
     class Ctl(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -507,6 +528,11 @@ def _selftest():
                     "serving_model_id": st["serving"], "state": st["state"],
                     "message": None, "error_model_id": None,
                     "width": st["width"], "height": st["height"]})
+            if self.path == "/models":
+                # 真机是全量重扫模型目录：重扫后「后推上去的模型」才可见
+                st["models_calls"] += 1
+                st["known"].add("late-model")
+                return self._send({"models": [], "useImg2img": True})
             return self._send({"error": "not found"}, 404)
 
         def do_POST(self):
@@ -516,8 +542,11 @@ def _selftest():
             except ValueError:
                 body = {}
             if self.path == "/select":
+                mid = body.get("model_id")
+                if mid not in st["known"]:
+                    return self._send({"error": "model not found"}, 404)
                 st["selects"] += 1
-                st["serving"] = body.get("model_id")
+                st["serving"] = mid
                 st["width"] = body.get("width")
                 st["height"] = body.get("height")
                 st["state"] = "running"
@@ -630,6 +659,14 @@ def _selftest():
         before = st["selects"]
         r = run("x", model="sd15-npu")
         check(st["selects"] == before, "同模型第二次不再 /select（不重启进程）")
+
+        # ---- 5b. 后推的模型：404 时先 /models 重扫再试（自动化场景没人手点 App）
+        section("后推模型的可见性")
+        st["models_calls"] = 0
+        r = run("x", model="late-model")
+        check(r["ok"] is True, "后推的模型能 select 上: %s" % (r["err"] or ""))
+        check(st["models_calls"] == 1, "/models 被调用一次做全量重扫")
+        check(st["serving"] == "late-model", "重扫后 serving 切到该模型")
 
         # ---- 6. 手机侧报错要透出原因
         section("失败带原因")
