@@ -56,9 +56,28 @@
 自测命令（全部离线，不碰真机、不需联网）：
 
 ```bash
-python run_selftests.py            # 一键跑全部（推荐）
-python run_selftests.py ui rule    # 只跑名字含 ui/rule 的
+python run_selftests.py --changed        # 日常用这个：只跑被改动文件波及的项
+python run_selftests.py motion storyboard # 按名字子串挑
+python run_selftests.py --all            # 全量（发布前跑）
+python run_selftests.py --slowest        # 看历史耗时排行，谁在拖后腿
 ```
+
+**为什么不再每次全量跑**：117 项串起来十几分钟，而改一行 `fleet/motion.py` 跟手机配对、
+桌面壳、审批闭环毫无关系。手工给每项贴模块标签是死路（新增一项就漂），所以
+`tools/gate_map.py` 从代码里**推**影响面：每个自测项的入口文件做 import 闭包，
+得到「这项依赖哪些文件」，再用 `git status/diff` 反查。
+
+关键是**保留依赖距离**：`commander` 的自测并没有 import `fleet/motion.py`，它是经
+`commander → node_agent → video_gen_runner → motion` 传过来的；把这种三层传递依赖
+也算「受影响」，最慢的那项就会被任何改动拖进来，按改动跑立刻退化成全量。
+所以默认只跑**直接依赖（距离 ≤1）**，更远的用 `--deep` 才带上。
+
+实测：改 `fleet/motion.py` → 2 项 13 秒；改视频三件套 → 5 项。碰上
+`capabilities.py` / `fleet/catalog.py` 这类被几十项直接依赖的**公共模块**，
+工具会明说「影响面是全仓级的」，那时才值得补一次 `--all`。
+
+刻意**不做并发**：这批测试会起本地 HTTP 服务、抢端口（`t48` 端口冲突就是老账），
+并行跑出来的红是假的，比慢更糟。
 
 ---
 
@@ -195,7 +214,7 @@ skynet-fleet/
 ├── platform_android.py  # Android 节点入网（adb 反向推送）
 ├── platform_apple.py    # Apple 桥接（macOS SSH / iOS 屏共 半可达）
 ├── platform_router.py   # 路由器/OpenWrt 节点（常开中枢候选）
-├── run_selftests.py     # 一键离线自测门禁（74 项）
+├── run_selftests.py     # 一键离线自测门禁（条数以 docs/_stats.json 为准；日常用 --changed）
 ├── ui_automation/       # ui_automation 节点能力（李跳跳抽象：adb 节点树+规则+点击+视觉兜底）
 ├── rfc/
 │   ├── remote-ai-service/   # RFC：远程 AI 即服务（瘦客户端）

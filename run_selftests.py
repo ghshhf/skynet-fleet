@@ -1,14 +1,24 @@
 """天网工程 · 一键离线自测。
 
-把仓库里所有「不需要真机、不需要网络」的自测串起来跑，作为每轮改动的门禁：
-  python run_selftests.py            # 全跑
-  python run_selftests.py ui rule    # 只跑名字含 ui/rule 的
+把仓库里所有「不需要真机、不需要网络」的自测串起来跑，作为每轮改动的门禁。
+
+  python run_selftests.py --changed         # 【日常用这个】只跑被改动文件波及的项
+  python run_selftests.py --changed HEAD~1  # 连同与某基线的差异一起算
+  python run_selftests.py video storyboard  # 按名字子串挑（老用法，仍在）
+  python run_selftests.py --all             # 全量（117 项，十几分钟，发布前跑）
+  python run_selftests.py --slowest         # 看历史耗时排行，谁在拖后腿
+
+`--changed` 的映射由 `tools/gate_map.py --build` 从代码里推出（入口文件 + import
+闭包），改了哪几个文件就只跑覆盖它们的项 —— 改 `fleet/motion.py` 只需 10 项几十秒，
+不必重跑手机配对和桌面壳。碰上公共模块（`capabilities.py` / `common.py` 这类被
+几十项依赖的）会明说「影响面是全仓级的」，那时才值得补一次 `--all`。
 
 任一失败即退出码 1。用便携 python 亦可：/d/tools/python/python.exe run_selftests.py
 """
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
@@ -483,39 +493,205 @@ def _restore_states(snap):
     return bad
 
 
+def _git_changed(base=None):
+    """当前工作区改动的 .py/.json 文件（含未跟踪），可选加上与 base 的差异。"""
+    files = set()
+    try:
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=HERE,
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace").stdout
+        for line in out.splitlines():
+            if len(line) < 4:
+                continue
+            p = line[3:].strip()
+            if " -> " in p:
+                p = p.split(" -> ", 1)[1]
+            files.add(p.replace("\\", "/"))
+        if base:
+            out = subprocess.run(["git", "diff", "--name-only", base], cwd=HERE,
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace").stdout
+            files |= {x.replace("\\", "/") for x in out.splitlines() if x.strip()}
+    except OSError:
+        return None
+    return {f for f in files if f.endswith((".py", ".json", ".yml", ".yaml"))}
+
+
+def _select_by_changed(base=None):
+    """按改动文件反查该跑哪些项。返回 (要跑的项, 说明行)。
+
+    映射由 tools/gate_map.py 从代码里推出来（入口文件 + import 闭包），
+    不是手贴标签，所以新增自测项自动生效、不会漂。
+    """
+    path = os.path.join(HERE, "tools", ".gate_map.json")
+    # 映射会过期的：新写的文件、新加的 import、挪走的模块，都能让它悄悄失准，
+    # 而「按改动跑」失准的后果是漏测（比慢严重得多）。生成只要 4 秒，
+    # 所以每次 --changed 都先重建，不赌缓存。
+    if "--stale-map" not in sys.argv:
+        gm = os.path.join(HERE, "tools", "gate_map.py")
+        if os.path.isfile(gm):
+            r = subprocess.run([PY, gm, "--build"], cwd=HERE,
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=180)
+            if r.returncode != 0:
+                tail = (r.stderr or "").strip().splitlines()
+                print("（重建影响面映射失败，用上次的；原因：%s）"
+                      % (tail[-1] if tail else "未知"))
+    if not os.path.isfile(path):
+        print("还没有影响面映射，先跑：python tools/gate_map.py --build")
+        return None, ""
+    import json as _j
+    data = _j.load(open(path, encoding="utf-8"))
+    files = _git_changed(base)
+    if files is None:
+        print("取不到 git 改动（不是仓库？），退回全量")
+        return CASES, ""
+    if not files:
+        print("工作区没有代码改动（只剩纯文档/未改）—— 不需要跑门禁。")
+        print("要强制全量：python run_selftests.py --all")
+        return [], ""
+
+    # 门禁/映射自身变了：任何映射都不足以判断，直接全量。
+    meta = {f for f in files
+            if os.path.basename(f) in ("run_selftests.py", "gate_map.py")}
+    if meta:
+        print("改的是门禁基础设施（%s）—— 跑全量。" % ", ".join(sorted(meta)))
+        return CASES, ""
+
+    rev = data.get("reverse") or {}
+    hit = {}
+    orphan = []
+    for f in sorted(files):
+        pairs = rev.get(f) or []
+        if not pairs:
+            orphan.append(f)
+        for n, d in pairs:
+            prev = hit.get(n)
+            if prev is None or d < prev[0]:
+                hit[n] = (d, f)
+    if not hit:
+        print("改动的文件没有任何自测项覆盖：")
+        for f in orphan:
+            print("  " + f)
+        print("这不是「不用测」，而是「测不到」—— 要么补一项，"
+              "要么这次改动手动挑几项跑。")
+        return [], ""
+    deep = "--deep" in sys.argv
+    keep = [n for n, (d, _) in hit.items() if d <= 1 or deep]
+    far = len(hit) - len(keep)
+    cases = [c for c in CASES if c[0] in keep]
+    print("改动 %d 文件 -> %d 项%s" % (
+        len(files), len(cases),
+        "（含 %d 项间接依赖，因为加了 --deep）" % far if deep and far else ""))
+    if far and not deep:
+        print("另有 %d 项是三层以上的传递依赖（改这里动不到它们的断言），"
+              "要一起跑加 --deep" % far)
+    # 只报「直接依赖」够多才算公共模块；深层传递被拉进来的不算
+    heavy = [f for f in files
+             if sum(1 for x in (rev.get(f) or []) if x[1] <= 1) >= 20]
+    if heavy:
+        print("\n⚠ 碰到公共模块（影响面本来就大，不是映射出错）：")
+        for f in heavy:
+            print("  %-38s %d 项直接依赖" % (
+                f, sum(1 for x in rev[f] if x[1] <= 1)))
+        print("  这些项跑完如果不放心，再补一次全量：python run_selftests.py --all")
+    return cases, ""
+
+
+def _record_times(spent):
+    """把每项耗时攒下来，下次就知道谁在拖后腿。"""
+    import json as _j
+    path = os.path.join(HERE, "tools", ".gate_times.json")
+    hist = {}
+    if os.path.isfile(path):
+        try:
+            hist = _j.load(open(path, encoding="utf-8"))
+        except ValueError:
+            hist = {}
+    for k, v in spent.items():
+        # 留最近一次，不取平均：代码变快变慢都要能立刻看见
+        hist[k] = round(float(v), 1)
+    try:
+        _j.dump(hist, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def show_slowest(n=15):
+    import json as _j
+    path = os.path.join(HERE, "tools", ".gate_times.json")
+    if not os.path.isfile(path):
+        print("还没有耗时记录，跑一次门禁（任意范围）就会开始记。")
+        return 0
+    hist = _j.load(open(path, encoding="utf-8"))
+    rows = sorted(hist.items(), key=lambda kv: -kv[1])[:n]
+    total = sum(hist.values())
+    print("已记录 %d 项，累计 %.1f 秒。最慢 %d 项：" % (len(hist), total, len(rows)))
+    for k, v in rows:
+        print("  %7.1fs  %-34s %4.1f%%" % (v, k, 100.0 * v / max(total, 1e-9)))
+    return 0
+
+
 def main():
     raw = sys.argv[1:]
     flags = {a.lower() for a in raw if a.startswith("--")}
     only = [a.lower() for a in raw if not a.startswith("--")]
     include_slow = bool(flags & {"--slow", "--all"})
-    cases = [c for c in CASES if not only or any(o in c[0].lower() for o in only)]
-    if not include_slow and not only:
-        skipped = [c[0] for c in cases if c[0] in SLOW]
-        cases = [c for c in cases if c[0] not in SLOW]
-        if skipped:
-            print("（跳过 %d 条慢门禁：%s —— 要跑加 --slow）"
-                  % (len(skipped), ", ".join(skipped)), flush=True)
+    if "--slowest" in flags:
+        return show_slowest()
+
+    # --changed [基线]：只跑被改动文件影响到的项。这是日常该用的入口 ——
+    # 117 项全量十几分钟，改一行 fleet/motion.py 没必要重跑手机配对。
+    cases = None
+    if "--changed" in flags:
+        base = None
+        for i, a in enumerate(raw):
+            if a == "--changed":
+                nxt = raw[i + 1] if i + 1 < len(raw) else ""
+                if nxt and not nxt.startswith("-"):
+                    base = nxt
+                break
+        cases, _ = _select_by_changed(base)
+        if cases is not None and not cases:
+            return 0
+
+    if cases is None:
+        cases = [c for c in CASES if not only or any(o in c[0].lower() for o in only)]
+        if not include_slow and not only:
+            skipped = [c[0] for c in cases if c[0] in SLOW]
+            cases = [c for c in cases if c[0] not in SLOW]
+            if skipped:
+                print("（跳过 %d 条慢门禁：%s —— 要跑加 --slow）"
+                      % (len(skipped), ", ".join(skipped)), flush=True)
     print(f"=== 天网工程离线自测：{len(cases)} 项 ===", flush=True)
     results = []
+    spent = {}
     snap = _snap_states()
     try:
         for name, args, cwd, timeout in cases:
             print(f"\n----- {name} -----", flush=True)
+            _t0 = time.time()
             ok, out, err, rc = run_case(name, args, cwd, timeout)
+            spent[name] = time.time() - _t0
             tail = "\n".join((out or "").strip().splitlines()[-8:])
             if tail:
                 print(tail)
             if err.strip():
                 print("[stderr]", "\n".join(err.strip().splitlines()[-4:]))
-            print(f"[{'PASS' if ok else 'FAIL'}] {name} (rc={rc})", flush=True)
+            print(f"[{'PASS' if ok else 'FAIL'}] {name} "
+                  f"(rc={rc}, {spent[name]:.1f}s)", flush=True)
             results.append((name, ok))
     finally:
         _restore_states(snap)
+        _record_times(spent)
 
     passed = sum(1 for _, ok in results if ok)
-    print(f"\n=== 结果：{passed}/{len(results)} 通过 ===")
+    total_s = sum(spent.values())
+    print(f"\n=== 结果：{passed}/{len(results)} 通过，耗时 {total_s:.0f}s ===")
     if passed != len(results):
+        slow = sorted(spent.items(), key=lambda kv: -kv[1])[:3]
         print("失败项:", ", ".join(n for n, ok in results if not ok))
+        print("这次最慢三项:", ", ".join("%s %.0fs" % kv for kv in slow))
         return 1
     return 0
 
