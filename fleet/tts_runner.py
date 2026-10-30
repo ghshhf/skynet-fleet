@@ -49,6 +49,7 @@
 """
 import os
 import re
+import json
 import shutil
 import subprocess
 import tempfile
@@ -60,6 +61,25 @@ import numpy as np
 PHONE_BIN = "/data/local/tmp/sn-tts"
 PHONE_LIBCXX = "/data/local/tmp/libc++_shared.so"
 PHONE_WORK = "/data/local/tmp/tts_work"
+
+# ---- proot 侧（IndexTTS2 这类"要跑 Python + torch"的引擎）--------------
+# 为什么不塞进 sherpa：sherpa-onnx 只吃 onnx，IndexTTS2 是 PyTorch 权重 +
+# 自回归 GPT + flow-matching 声码器，转换代价远大于收益。手机没有 root，
+# 走 proot（Termux 版）在 shell 域里跑 aarch64 Ubuntu + torch CPU 轮子，
+# 全程 adb 可驱动、不需要点屏幕。
+PROOT_ROOT = "/data/local/tmp/proot"      # 手机上的真实路径
+PROOT_UB = PROOT_ROOT + "/ub.sh"          # 启动器：proot -r ubuntu ... /bin/bash -c
+PROOT_JOBS = PROOT_ROOT + "/jobs"         # 任务目录（文本 json / 产出 wav）
+PROOT_MODELS = PROOT_ROOT + "/models"
+PROOT_HOST = "/host"                      # proot 内看到的 /data/local/tmp
+
+
+def _in_proot(path):
+    """把手机真实路径翻成 proot 内路径。/data/local/tmp 在 proot 里是 /host。"""
+    p = str(path)
+    if p.startswith("/data/local/tmp/"):
+        return PROOT_HOST + p[len("/data/local/tmp"):]
+    raise ValueError("只能映射 /data/local/tmp 下的路径: %r" % (path,))
 
 # ---- 引擎表：加一个新模型只改这里，不用再抄一遍拼参字符串 --------------
 # kind 决定 CLI 参数怎么拼；phone_dir 是手机上的模型目录；
@@ -106,6 +126,17 @@ ENGINES = {
         },
         "num_steps": 4,
         "note": "distill-flow-matching 克隆音色，24kHz，最自然；CPU 慢(RTF~3~5)，靠批量预合成消解",
+        "default_sid": 0,
+    },
+    "indextts2": {
+        "kind": "proot",
+        "phone_dir": PROOT_MODELS + "/indextts2",
+        "pc_dir": "",
+        "sr": 22050,
+        "ref_wav": "/host/proot/ref_zh.wav",
+        "diff_steps": 25,
+        "threads": 4,
+        "note": "IndexTTS2 1.5B 精品档，proot+torch 跑 CPU；RTF~33，一次加载跑 N 条；拿速度换质量",
         "default_sid": 0,
     },
 }
@@ -164,6 +195,21 @@ def phone_ready(engine=DEFAULT_ENGINE):
     rc, out, _ = _sh(["adb", "devices"], timeout=15)
     if rc != 0 or "\tdevice" not in out:
         return False, "adb 没连上设备"
+
+    if e["kind"] == "proot":
+        # proot 引擎要的是：启动器 + 批量脚本 + 模型配置 + 参考音频，四样齐活
+        probe = ("test -f %s && test -f %s/batch.py && test -f %s/config.yaml "
+                 "&& test -f %s && echo READY"
+                 % (PROOT_UB, PROOT_ROOT, e["phone_dir"],
+                    e["ref_wav"].replace(PROOT_HOST, "/data/local/tmp")))
+        rc, out, _ = _sh(["adb", "shell", probe], timeout=20)
+        if rc != 0:
+            return False, "adb shell 不可用"
+        if "READY" not in (out or ""):
+            return False, ("手机端 proot 环境不全（缺 ub.sh / batch.py / 模型 / 参考音频），"
+                           "见 docs 或 _contrib/proot/setup_tts.sh")
+        return True, ""
+
     # 二进制 + 模型目录都在才算就绪
     rc, out, _ = _sh(["adb", "shell", "ls %s %s 2>/dev/null | wc -l"
                       % (PHONE_BIN, e["phone_dir"])], timeout=20)
@@ -235,6 +281,99 @@ def _phone_args(e, out_wav, sid=0, speed=1.0, ref=None, ref_text=None, threads=4
     return args
 
 
+def _proot_batch(items, e, threads=None, diff=None, warm=1, timeout=3600):
+    """在 proot 里**一次加载模型**跑完所有条目，再整目录拉回。
+
+    和 sherpa 那条路的本质区别 —— 也是"批量"真正的价值所在：
+    `phone_batch()` 对 sherpa 是 N 次进程启动，每次都要重新加载模型，批量
+    只省了 adb 往返；这里是一个 Python 进程跑 N 条，**加载只发生一次**。
+    IndexTTS2 实测加载 32s，100 条就是省下 53 分钟。
+
+    还有一层：proot 里预热 page cache 后 GPT 自回归少掉缺页，同一条文本的
+    RTF 从 66 掉到 33（实测 294s → 141s），这是翻倍，不是省零头。
+
+    items: [(text, out_path, sid, speed, ref, ref_text), ...]
+    返回 [(ok, path, sec, err), ...]，顺序与 items 一致。
+    """
+    stamp = str(int(time.time() * 1000))
+    remote_dir = "%s/%s" % (PROOT_JOBS, stamp)
+    remote_json = remote_dir + ".json"
+    texts = [it[0] if isinstance(it, (list, tuple)) else it for it in items]
+
+    fd, local_json = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    fd, local_script = tempfile.mkstemp(suffix=".sh")
+    os.close(fd)
+    try:
+        with open(local_json, "w", encoding="utf-8") as f:
+            json.dump(texts, f, ensure_ascii=False)
+
+        rc, out, err = _sh(["adb", "push", local_json, remote_json], timeout=60)
+        if rc != 0:
+            msg = "推文本失败: %s" % (err or out).strip()[:200]
+            return [(False, "", 0.0, msg) for _ in items]
+
+        th = int(threads or e.get("threads", 4))
+        ds = int(diff or e.get("diff_steps", 25))
+        inner = ("export IDX_THREADS=%d IDX_DIFF_STEPS=%d IDX_WARM=%d; "
+                 "cd /root && python3 /host/proot/batch.py %s %s %s"
+                 % (th, ds, int(warm), e["ref_wav"],
+                    _in_proot(remote_dir), _in_proot(remote_json)))
+        script = ("#!/system/bin/sh\n"
+                  "mkdir -p %s %s\n"
+                  "cd %s\n"
+                  "sh %s '%s'\n"
+                  "echo EXIT=$?\n"
+                  % (remote_dir, PROOT_JOBS, PROOT_ROOT, PROOT_UB, inner))
+        with open(local_script, "w", encoding="utf-8", newline="\n") as f:
+            f.write(script)
+
+        rc, out, err = _sh(["adb", "push", local_script,
+                            "/data/local/tmp/proot_job.sh"], timeout=60)
+        if rc != 0:
+            msg = "推脚本失败: %s" % (err or out).strip()[:200]
+            return [(False, "", 0.0, msg) for _ in items]
+        rc, out, err = _sh(["adb", "shell", "sh /data/local/tmp/proot_job.sh"],
+                           timeout=timeout)
+    finally:
+        for p in (local_json, local_script):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    log = (out or "") + (err or "")
+    if "EXIT=0" not in log:
+        tail = " ".join(log.strip().splitlines()[-4:])[:400]
+        return [(False, "", 0.0, "proot 批量失败: %s" % tail) for _ in items]
+
+    local_root = tempfile.mkdtemp()
+    _sh(["adb", "pull", remote_dir, local_root], timeout=300)
+    results = []
+    for i, it in enumerate(items):
+        local = (list(it) + [None] * 6)[1]
+        if not local:
+            local = os.path.join(tempfile.gettempdir(), "tts_%s_%d.wav" % (stamp, i))
+        src = None
+        for cand in (os.path.join(local_root, stamp, "seg_%03d.wav" % i),
+                     os.path.join(local_root, "seg_%03d.wav" % i)):
+            if os.path.isfile(cand) and os.path.getsize(cand) >= 1024:
+                src = cand
+                break
+        if src:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(local)), exist_ok=True)
+                shutil.copy(src, local)
+                results.append((True, local, wav_seconds(local), ""))
+            except Exception as ex:
+                results.append((False, "", 0.0, "落盘失败: %s" % ex))
+        else:
+            results.append((False, "", 0.0, "远端未产出 seg_%03d.wav" % i))
+    _sh(["adb", "shell", "rm -rf %s %s" % (remote_dir, remote_json)], timeout=30)
+    shutil.rmtree(local_root, ignore_errors=True)
+    return results
+
+
 def phone_synth(text, out_path=None, engine=DEFAULT_ENGINE, sid=None, speed=1.0,
                 ref=None, ref_text=None, threads=4, timeout=180):
     """手机本地合成（任意引擎）。返回 (wav 路径, 秒数, 日志)。失败抛 RuntimeError。
@@ -254,6 +393,16 @@ def phone_synth(text, out_path=None, engine=DEFAULT_ENGINE, sid=None, speed=1.0,
     if out_path is None:
         out_path = os.path.join(tempfile.gettempdir(), "tts_%d.wav" % stamp)
     remote_wav = "%s/o_%d.wav" % (PHONE_WORK, stamp)
+
+    if e["kind"] == "proot":
+        # proot 引擎不走 sherpa CLI。单条也走批量那条路（内部就是 N=1），
+        # 免得维护两套拼参逻辑 —— 代价是每次都要付 32s 加载，所以单条慎用。
+        ok1, path, sec, err = _proot_batch(
+            [(text, out_path, sid, speed, ref, ref_text)], e,
+            threads=threads, timeout=max(timeout, 600))[0]
+        if not ok1:
+            raise RuntimeError("手机合成失败[%s]: %s" % (engine, err))
+        return path, sec, "proot"
 
     args = _phone_args(e, remote_wav, sid, speed, ref, ref_text, threads)
     script = (
@@ -315,6 +464,11 @@ def phone_batch(items, engine=DEFAULT_ENGINE, threads=4, timeout=900):
     ok, why = phone_ready(engine)
     if not ok:
         return [(False, "", 0.0, why) for _ in items]
+
+    if e["kind"] == "proot":
+        # 真正的"一次加载跑 N 条"。默认超时给足：100 条 × RTF 33 是大头。
+        return _proot_batch(items, e, threads=threads,
+                            timeout=max(timeout, 3600))
 
     stamp = int(time.time() * 1000)
     remote_dir = "%s/batch_%d" % (PHONE_WORK, stamp)

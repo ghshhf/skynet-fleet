@@ -41,6 +41,9 @@ VOICE_REGISTRY = {
                   ref_text=ZIPV_REFS["news-female-2"], speed=1.0),
     "雷军":    dict(engine="zipv", ref="leijun-1",
                   ref_text=ZIPV_REFS["leijun-1"], speed=1.0),
+    # 精品档：IndexTTS2 1.5B，手机 proot + torch CPU。单条 RTF~33（141s 出 4.3s），
+    # 所以**只适合先 prewarm 整批、再 take 秒回**；直接 take 未命中的句子要等两分多钟。
+    "精品-女":  dict(engine="indextts2", speed=1.0),
 }
 
 
@@ -68,8 +71,24 @@ def _cache_path(voice, text, speed):
 
 
 def _backend_for(spec):
+    """挑后端：手机 proot > 手机 sherpa > PC。
+
+    proot 引擎（indextts2）和 sherpa 是两条完全不同的路，不能混着 fallback：
+    手机没部署时降到 PC 也没用（PC 上没这套 torch 环境），所以单独标一个
+    backend 值，调用方按它分流，别让它悄悄掉进 `_pc_synth` 报一个看不懂的错。
+    """
+    e = tr.ENGINES.get(spec["engine"], {})
     ok, _ = tr.phone_ready(spec["engine"])
+    if e.get("kind") == "proot":
+        return "phone_proot" if ok else "unavailable"
     return "phone_sherpa" if ok else "pc_sherpa"
+
+
+def _need_phone(backend, voice):
+    if backend == "unavailable":
+        raise RuntimeError(
+            "音色 %r 用的引擎在手机上没就绪（proot 环境不全），"
+            "先跑 tts_runner.deploy / 检查 _contrib/proot/setup_tts.sh" % voice)
 
 
 def take(voice, text, speed=None, backend=None):
@@ -82,7 +101,8 @@ def take(voice, text, speed=None, backend=None):
     if os.path.isfile(cp) and os.path.getsize(cp) >= 1024:
         return cp
     backend = backend or _backend_for(spec)
-    if backend == "phone_sherpa":
+    _need_phone(backend, voice)
+    if backend in ("phone_sherpa", "phone_proot"):
         p, _, _ = tr.phone_synth(text, cp, engine=spec["engine"], sid=spec.get("sid", 0),
                                  speed=speed, ref=spec.get("ref"), ref_text=spec.get("ref_text"))
     else:
@@ -102,6 +122,7 @@ def prewarm(voice, texts, speed=None, backend=None):
         raise KeyError("未知音色 %r（可选: %s）" % (voice, ", ".join(VOICE_REGISTRY)))
     speed = speed or spec.get("speed", 1.0)
     backend = backend or _backend_for(spec)
+    _need_phone(backend, voice)
 
     pending = []  # (text, cache_path)
     result = {}
@@ -115,7 +136,7 @@ def prewarm(voice, texts, speed=None, backend=None):
     if not pending:
         return result
 
-    if backend == "phone_sherpa":
+    if backend in ("phone_sherpa", "phone_proot"):
         items = [(t, cp, spec.get("sid"), speed, spec.get("ref"), spec.get("ref_text"))
                  for t, cp in pending]
         res = tr.phone_batch(items, engine=spec["engine"], threads=4)
