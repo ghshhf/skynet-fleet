@@ -364,8 +364,20 @@ def localdream_backend(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.
     if seed is not None and int(seed) >= 0:
         payload["seed"] = int(seed)
 
-    image_b64, meta = _ld_stream_generate(
-        opener, f"http://{host}:{gen}/generate", payload, timeout)
+    try:
+        image_b64, meta = _ld_stream_generate(
+            opener, f"http://{host}:{gen}/generate", payload, timeout)
+    except Exception as e:
+        # 8081 是 native 后端进程自己监听的：没加载模型就没这个端口。
+        # 直接 POST 拿到的 RemoteDisconnected 看着像断网，实际是后端没起——
+        # 和 App 那句「设备可能不受支持」同一个病：报现象不报病因。
+        name, text = type(e).__name__, str(e)
+        if "RemoteDisconnected" in name or "Remote end closed" in text:
+            raise RuntimeError(
+                f"手机 :{gen} 拒连——8081 只有 native 后端加载模型后才会监听，"
+                "/status 是 idle 时它就是死的。先 /select（或手机上点进模型页）再生成。"
+                f"（原始错误 {name}: {text}）")
+        raise
 
     out_dir = out_dir or os.environ.get("FLEET_SD_OUT") or os.path.join(
         os.path.expanduser("~"), ".fleet", "sd_out")
