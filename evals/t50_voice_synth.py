@@ -60,6 +60,30 @@ def main():
         except Exception as ex:
             check(False, "引擎 %s 参数拼装抛错: %s" % (eng, ex))
 
+    # ---------- ①b proot 引擎（indextts2）：不走 sherpa CLI，单独验分流与路径映射 ----
+    # 它不能进上面那个循环 —— _phone_args 是拼 sherpa 参数的，proot 引擎进去必抛错。
+    e_px = tr.ENGINES.get("indextts2")
+    if e_px is None:
+        check(False, "引擎表缺 indextts2（proot 精品档）")
+    else:
+        check(e_px.get("kind") == "proot", "indextts2 的 kind=proot（不走 sherpa CLI）")
+        check(e_px.get("ref_wav", "").startswith("/host/"),
+              "indextts2 的 ref_wav 用 proot 内路径（/host/...）")
+        try:
+            mapped = tr._in_proot("/data/local/tmp/proot/jobs/1")
+            check(mapped == "/host/proot/jobs/1",
+                  "proot 路径映射 /data/local/tmp -> /host（%s）" % mapped)
+        except Exception as ex:
+            check(False, "proot 路径映射抛错: %s" % ex)
+        try:
+            tr._in_proot("/sdcard/x")
+            check(False, "非 /data/local/tmp 路径应拒绝映射（实际放行了）")
+        except ValueError:
+            check(True, "非 /data/local/tmp 路径明确拒绝映射")
+        b = vb._backend_for(vb.VOICE_REGISTRY.get("精品-女", {"engine": "indextts2"}))
+        check(b in ("phone_proot", "unavailable"),
+              "精品-女 后端只会是 phone_proot/unavailable，不会悄悄掉进 PC（实际 %s）" % b)
+
     # ---------- ② zipv 缺 ref/ref_text 必须报错（引擎自身也没默认参考音色时）----------
     e_noref = {"kind": "zipvoice", "phone_dir": "/tmp/x"}
     try:
