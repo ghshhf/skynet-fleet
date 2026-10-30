@@ -187,13 +187,21 @@ def localdream_backend(prompt, duration=3, fps=24, size="512x512", seed=-1, mode
     host, ctl, gen = ig._ld_endpoints()
     opener = ig._ld_opener()
     try:
-        info = ig._ld_json(opener, f"http://{host}:{ctl}/info", 10)
-    except Exception as e:
-        raise RuntimeError(
-            f"连不上手机控制口 {host}:{ctl}（{type(e).__name__}: {e}）——"
-            "多半是 host mode 没开，或手机不在同一网段")
-    if info.get("app") != "localdream":
-        raise RuntimeError(f"{host}:{ctl} 不是 local-dream 的控制口（app={info.get('app')!r}）")
+        from fleet import engine as _eng
+        direct = _eng.enabled()
+    except Exception:
+        direct = False
+    if not direct:
+        # 直驱模式下手机侧没有 8808 控制口，跳过 App 握手这一步
+        try:
+            info = ig._ld_json(opener, f"http://{host}:{ctl}/info", 10)
+        except Exception as e:
+            raise RuntimeError(
+                f"连不上手机控制口 {host}:{ctl}（{type(e).__name__}: {e}）——"
+                "多半是 host mode 没开，或手机不在同一网段")
+        if info.get("app") != "localdream":
+            raise RuntimeError(
+                f"{host}:{ctl} 不是 local-dream 的控制口（app={info.get('app')!r}）")
 
     w, h = _parse_wh(size)
     try:
