@@ -375,8 +375,62 @@ def _need_pil():
 DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 
 
-def tts(text, out_wav, voice=None, rate="+0%", timeout=60):
-    """edge_tts 合成一句台词 → wav。失败抛异常（调用方决定降级）。"""
+def tts_local(text, out_wav, voice=None, engine=None, ref=None, ref_text=None,
+              timeout=180):
+    """本地 TTS（手机 sherpa-onnx 优先，退 PC）。转成 24k 单声道后落到 out_wav。
+
+    为什么统一 24k：后面的混音/拼接路径全是按 edge-tts 的输出（24k 单声道）
+    写的，本地 TTS 出的是 44.1k。不归一化的话拼接点会变调、时长也会错。
+
+    engine / ref / ref_text 透传给 tts_runner：
+      · engine="matcha"（默认）高质量单人旁白，不吞字
+      · engine="zipv" + ref="新闻女" + ref_text=... 克隆任意音色（角色对话用）
+      · engine="zhll" + sid=N 多说话人（16kHz，电话音质）
+    """
+    try:
+        from fleet import tts_runner
+    except ImportError:
+        import tts_runner
+    res = tts_runner.run(text, None, voice=voice, engine=engine, ref=ref,
+                         ref_text=ref_text)
+    if not res.get("ok"):
+        raise RuntimeError(res.get("err") or "本地 TTS 失败")
+    src = res["path"]
+    if abs(tts_runner.wav_seconds(src) - res["sec"]) > 3.0:
+        raise RuntimeError("本地 TTS 时长对不上（%s vs %s）" % (res["sec"], src))
+    ff = _ffmpeg()
+    if not ff:
+        raise RuntimeError("转 wav 需要 ffmpeg")
+    proc = subprocess.run([ff, "-y", "-i", src, "-ar", "24000", "-ac", "1",
+                           "-c:a", "pcm_s16le", out_wav],
+                          capture_output=True, text=True, timeout=timeout)
+    try:
+        if os.path.abspath(src) != os.path.abspath(out_wav):
+            os.remove(src)
+    except Exception:
+        pass
+    if proc.returncode != 0 or not os.path.isfile(out_wav):
+        raise RuntimeError("ffmpeg 归一化失败：%s" % (proc.stderr or "")[-200:])
+
+
+def tts(text, out_wav, voice=None, rate="+0%", timeout=60, engine=None,
+        ref=None, ref_text=None):
+    """合成一句台词 → wav。**先本地，再云**。
+
+    本地（手机 sherpa-onnx）不联网、每句 2 秒级；云 edge-tts 音色更多
+    但要出网。漫剧几十条台词，默认走本地才成立 —— 云只是兜底。
+    engine/ref/ref_text 透传给本地引擎（见 tts_local）。
+    """
+    try:
+        return tts_local(text, out_wav, voice=voice, engine=engine, ref=ref,
+                         ref_text=ref_text, timeout=timeout)
+    except Exception as local_err:
+        _edge_tts(text, out_wav, voice=voice, rate=rate, timeout=timeout,
+                  local_err=local_err)
+
+
+def _edge_tts(text, out_wav, voice=None, rate="+0%", timeout=60, local_err=None):
+    """edge_tts 云合成（要求联网）。失败抛异常，异常里带上本地失败原因。"""
     text = str(text or "").strip()
     if not text:
         raise RuntimeError("台词为空")
@@ -384,7 +438,8 @@ def tts(text, out_wav, voice=None, rate="+0%", timeout=60):
         import asyncio
         import edge_tts
     except Exception as e:
-        raise RuntimeError("没装 edge-tts：pip install edge-tts（%s）" % e)
+        raise RuntimeError("没装 edge-tts：pip install edge-tts（%s）；%s"
+                           % (e, _note_local(local_err)))
     ff = _ffmpeg()
     if not ff:
         raise RuntimeError("转 wav 需要 ffmpeg")
@@ -397,7 +452,8 @@ def tts(text, out_wav, voice=None, rate="+0%", timeout=60):
     try:
         asyncio.run(_go())
     except Exception as e:
-        raise RuntimeError("edge-tts 合成失败（多半是断网）：%s: %s" % (type(e).__name__, e))
+        raise RuntimeError("edge-tts 合成失败（多半是断网）：%s: %s；%s"
+                           % (type(e).__name__, e, _note_local(local_err)))
     cmd = [ff, "-y", "-i", mp3, "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", out_wav]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     try:
@@ -406,6 +462,10 @@ def tts(text, out_wav, voice=None, rate="+0%", timeout=60):
         pass
     if proc.returncode != 0 or not os.path.isfile(out_wav):
         raise RuntimeError("ffmpeg 转 wav 失败：%s" % (proc.stderr or "")[-200:])
+
+
+def _note_local(local_err):
+    return ("本地 TTS 也没成（%s）" % local_err) if local_err else ""
     return out_wav
 
 
@@ -499,6 +559,11 @@ def validate(board, strict=True):
             "transition": (s.get("transition") or DEFAULT_TRANSITION).lower(),
             "denoise": float(s.get("denoise") or out["denoise"]),
             "seed": int(s.get("seed") if s.get("seed") is not None else 1000 + i * 7),
+            # 配音引擎覆盖项（透传给 tts_runner；None 表示用整片默认）
+            "tts_engine": s.get("tts_engine"),
+            "tts_ref": s.get("tts_ref"),
+            "tts_ref_text": s.get("tts_ref_text"),
+            "voice": s.get("voice"),
         })
         if norm[-1]["transition"] not in ("cut", "fade", "dissolve"):
             raise ValueError("第 %d 个镜头的转场 %r 不认识（cut/fade/dissolve）"
@@ -584,6 +649,11 @@ def run_board(board, out_dir=None, model=None, on_shot=None, with_voice=None,
     canvas = b["canvas"]
     W, H = canvas_size(canvas)
     want_voice = (b.get("voice") is not None) if with_voice is None else bool(with_voice)
+    # 整片默认引擎：board["tts_engine"] 指定（如 "matcha"/"zipv"），缺省走
+    # tts_runner 默认（matcha）。克隆类引擎（zipv）配 board["tts_ref"]/["tts_ref_text"]。
+    board_engine = b.get("tts_engine")
+    board_ref = b.get("tts_ref")
+    board_ref_text = b.get("tts_ref_text")
 
     # ---- ① 配音先行，拿真实时长 -----------------------------------------
     voices = []
@@ -592,8 +662,15 @@ def run_board(board, out_dir=None, model=None, on_shot=None, with_voice=None,
         entry = {"wav": "", "sec": 0.0, "err": ""}
         if want_voice and s["subtitle"]:
             wav = os.path.join(work, "v_%02d.wav" % i)
+            # 镜头可单独覆盖：s["tts_engine"] / s["voice"] / s["tts_ref"] / s["tts_ref_text"]
+            # 键存在但为 None 时回退到整片默认
+            sh_engine = s.get("tts_engine") or board_engine
+            sh_ref = s.get("tts_ref") or board_ref
+            sh_ref_text = s.get("tts_ref_text") or board_ref_text
+            sh_voice = s.get("voice") or b.get("voice")
             try:
-                tts(s["subtitle"], wav, voice=b.get("voice"))
+                tts(s["subtitle"], wav, voice=sh_voice, engine=sh_engine,
+                    ref=sh_ref, ref_text=sh_ref_text)
                 entry["wav"] = wav
                 entry["sec"] = wav_seconds(wav)
             except Exception as e:

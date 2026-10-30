@@ -5,8 +5,8 @@
 `fleet/storyboard.py` 原来直接调 `edge_tts` —— 那是微软的在线接口，断网就哑，
 而且每条台词都要出网。漫剧一次几十分钟、几十条台词，这条路既慢又不该依赖。
 
-现在手机自己能合成：`sherpa-onnx`（Android bionic 静态二进制）+ MeloTTS 中文模型，
-实测 8 Gen 1 上 RTF 0.48（4.5 秒语音用 2.18 秒算完），**全程离线**。
+现在手机自己能合成：`sherpa-onnx`（Android bionic 静态二进制）跑 CPU，
+**全程离线**。
 
 为什么不是"复用出图那个 NPU 引擎"
 ----------------------------------
@@ -16,24 +16,35 @@
     返回 0x3 = EPERM —— 这是 SELinux 层面的限制，只有 App 自己的进程
     （`untrusted_app` 域）能建。所以「从 shell 直接驱动 NPU」这条路对任意模型都
     不成立，不是我们没写对。
-  · TTS 不需要 NPU：模型才 170MB、计算量小，CPU 上已经比实时快一倍。
+  · TTS 不需要 NPU：几百 MB 的小模型、几百 GFLOPs，CPU 上已经够快。
     硬塞进 NPU 反而要过 QNN 转换、还可能掉精度（CosyVoice3-MNN 的记录里，
     整模型上 NPU 会导致 token 坍缩，只能把单个 q_proj 放上去，收益 5%）。
 
 所以这里的选择是「用对的引擎」而不是「用同一个引擎」：
 出图吃 NPU（算力瓶颈在那），TTS 吃 CPU（瓶颈不在那）。
 
+三条 engine 里真正的瓶颈是**模型加载，不是合成**
+------------------------------------------------
+实测 8 Gen 1 上同一句台词：
+
+    sherpa 自己打印：Elapsed 0.635 s（纯合成）
+    真实墙钟      ：4.65 s（含进程启动 + 170MB onnx 解析）
+
+**差出来的 4 秒一句都没花在合成上。** 40 条台词就是白白浪费两分半。
+所以「批量」这件事的价值不在并行计算，在**少起 39 次进程** ——
+`phone_batch()` 一次把 N 条推上去跑完、再一次性拉回来，就是这个意思。
+
 后端优先级
 ----------
-  1. `phone_sherpa`  手机本地 sherpa-onnx + MeloTTS（离线、快、免费）
+  1. `phone_sherpa`  手机本地 sherpa-onnx（离线、免费、最贴近"自己在说话"）
   2. `pc_sherpa`     PC 本地 sherpa-onnx（同一套模型，调试用）
   3. `edge`          edge-tts 云（有网、音色多，作兜底）
 
 用法
 ----
     from fleet import tts_runner
-    tts_runner.deploy()                      # 一次性部署（幂等）
-    r = tts_runner.run("那天夜里，海上起雾了。")
+    tts_runner.deploy("matcha")                # 一次性部署某个引擎（幂等）
+    r = tts_runner.run("那天夜里，海上起雾了。", engine="matcha")
     print(r["path"], r["sec"], r["backend"])
 """
 import os
@@ -43,17 +54,87 @@ import subprocess
 import tempfile
 import time
 
+import numpy as np
+
 # ---- 手机端部署位置 ----------------------------------------------------
 PHONE_BIN = "/data/local/tmp/sn-tts"
 PHONE_LIBCXX = "/data/local/tmp/libc++_shared.so"
-PHONE_MODEL_DIR = "/data/local/tmp/melo"
 PHONE_WORK = "/data/local/tmp/tts_work"
+
+# ---- 引擎表：加一个新模型只改这里，不用再抄一遍拼参字符串 --------------
+# kind 决定 CLI 参数怎么拼；phone_dir 是手机上的模型目录；
+# refs/ref_dir 给「克隆类」引擎（zipv）用 —— 给一段参考音频 + 参考文本即可换音色。
+ENGINES = {
+    "melo": {
+        "kind": "vits",
+        "phone_dir": "/data/local/tmp/melo",
+        "pc_dir": "vits-melo-tts-zh_en",
+        "sr": 44100,
+        "note": "中英双语 VITS，最快；缺点：会吞数字/年份（'1947' 静默丢字）",
+        "default_sid": 0,
+    },
+    "matcha": {
+        "kind": "matcha",
+        "phone_dir": "/data/local/tmp/matcha",
+        "pc_dir": "matcha-icefall-zh-baker",
+        "vocoder": "hifigan_v2.onnx",
+        "sr": 22050,
+        "rule_fsts": ["number.fst", "date.fst", "phone.fst"],
+        "note": "中文 Baker 女声，不吞字；需外挂声码器",
+        "default_sid": 0,
+    },
+    "zhll": {
+        "kind": "vits",
+        "phone_dir": "/data/local/tmp/zhll",
+        "pc_dir": "sherpa-onnx-vits-zh-ll",
+        "sr": 16000,
+        "rule_fsts": ["number.fst", "date.fst", "phone.fst", "new_heteronym.fst"],
+        "note": "16kHz 多说话人，电话音质（>8kHz 能量≈0），仅角色对话合适",
+        "default_sid": 0,
+    },
+    "zipv": {
+        "kind": "zipvoice",
+        "phone_dir": "/data/local/tmp/zipv",
+        "pc_dir": "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia",
+        "vocoder": "vocos_24khz.onnx",
+        "sr": 24000,
+        "ref_dir": "test_wavs",
+        "refs": {
+            "news-female": "各位村民, 大家新年好! 近期, 湖北省武汉市等多个地区",
+            "news-female-2": "本台消息, 中共中央国务院, 近日印发关于构建数据基础制度, 更好发挥数据要素作用的意见.",
+            "leijun-1": "那还是36年前, 1987年. 我呢考上了武汉大学的计算机系.",
+        },
+        "num_steps": 4,
+        "note": "distill-flow-matching 克隆音色，24kHz，最自然；CPU 慢(RTF~3~5)，靠批量预合成消解",
+        "default_sid": 0,
+    },
+}
+
+# 中文场景默认的「快档」引擎（实时/近实时），批量慢档请显式传 engine="zipv"
+DEFAULT_ENGINE = "matcha"
 
 # ---- PC 端模型（与手机同一套，调试/兜底用）-----------------------------
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+
+def _tts_dir():
+    """PC 上 TTS 模型根目录。模型可能不在仓库内（常见放在仓外的 _contrib/tts），
+    所以按候选逐个找，找到即返回。deploy/pc_synth 都用它，避免硬编码死路径。"""
+    cands = [
+        os.path.join(ROOT, "_contrib", "tts"),
+        os.path.join(os.path.dirname(ROOT), "_contrib", "tts"),
+        os.path.expanduser("~/.fleet/tts"),
+        "D:/code/_contrib/tts",
+    ]
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    return cands[0]
+
+
 PC_MODEL_CANDIDATES = [
-    os.path.join(ROOT, "_contrib", "tts", "vits-melo-tts-zh_en"),
+    os.path.join(_tts_dir(), "vits-melo-tts-zh_en"),
     os.path.expanduser("~/.fleet/tts/vits-melo-tts-zh_en"),
 ]
 
@@ -75,23 +156,25 @@ def _sh(cmd, timeout=120, check=False):
         return -1, "", "找不到命令: %s" % e
 
 
-def phone_ready():
-    """手机端能不能直接合成。返回 (bool, 原因)。"""
+def phone_ready(engine=DEFAULT_ENGINE):
+    """手机端能不能合成指定引擎。返回 (bool, 原因)。"""
+    e = ENGINES.get(engine)
+    if not e:
+        return False, "未知引擎 %r" % engine
     rc, out, _ = _sh(["adb", "devices"], timeout=15)
     if rc != 0 or "\tdevice" not in out:
         return False, "adb 没连上设备"
-    rc, out, _ = _sh(["adb", "shell",
-                      "ls %s %s 2>/dev/null | wc -l" % (PHONE_BIN, PHONE_MODEL_DIR + "/model.onnx")],
-                     timeout=20)
+    # 二进制 + 模型目录都在才算就绪
+    rc, out, _ = _sh(["adb", "shell", "ls %s %s 2>/dev/null | wc -l"
+                      % (PHONE_BIN, e["phone_dir"])], timeout=20)
     if rc != 0:
         return False, "adb shell 不可用"
-    # 期望两个路径都存在 → wc -l 给 2
     try:
         n = int((out or "0").strip().splitlines()[-1])
     except (ValueError, IndexError):
         n = 0
     if n < 2:
-        return False, "手机端还没部署（跑 tts_runner.deploy()）"
+        return False, "手机端还没部署引擎 %r（跑 tts_runner.deploy(%r)）" % (engine, engine)
     return True, ""
 
 
@@ -100,34 +183,86 @@ def _q(text):
     return "'" + str(text).replace("'", "'\\''") + "'"
 
 
-def phone_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4,
-                 timeout=180):
-    """手机本地合成。返回 (wav 路径, 秒数, 日志)。失败抛 RuntimeError。
+def _phone_args(e, out_wav, sid=0, speed=1.0, ref=None, ref_text=None, threads=4):
+    """按引擎 kind 拼出 sherpa-onnx-offline-tts 的参数列表（不含文本）。
+
+    之所以提成函数，是因为 melo/matcha/zipv 三种模型的 CLI 参数长得完全不同：
+    vits 用 --vits-* + --speed；matcha 用 --matcha-* + --matcha-length-scale；
+    zipv 用 --zipvoice-* 还要 --reference-audio/--reference-text。写死在脚本里
+    每加一个模型就得抄一遍。
+    """
+    d = e["phone_dir"]
+    args = [PHONE_BIN, "--num-threads=%d" % int(threads),
+            "--output-filename=%s" % out_wav]
+
+    if e["kind"] == "vits":
+        args += ["--vits-model=%s/model.onnx" % d,
+                 "--vits-lexicon=%s/lexicon.txt" % d,
+                 "--vits-tokens=%s/tokens.txt" % d,
+                 "--sid=%d" % int(sid),
+                 "--speed=%s" % float(speed)]
+        if e.get("rule_fsts"):
+            fst = ",".join("%s/%s" % (d, f) for f in e["rule_fsts"])
+            args.append("--tts-rule-fsts=%s" % fst)
+
+    elif e["kind"] == "matcha":
+        args += ["--matcha-acoustic-model=%s/%s" % (d, e.get("acoustic", "model-steps-3.onnx")),
+                 "--matcha-vocoder=%s/%s" % (d, e["vocoder"]),
+                 "--matcha-lexicon=%s/lexicon.txt" % d,
+                 "--matcha-tokens=%s/tokens.txt" % d,
+                 "--matcha-length-scale=%f" % float(1.0 / max(0.1, float(speed)))]
+        if e.get("rule_fsts"):
+            fst = ",".join("%s/%s" % (d, f) for f in e["rule_fsts"])
+            args.append("--tts-rule-fsts=%s" % fst)
+
+    elif e["kind"] == "zipvoice":
+        ref = ref or next(iter(e.get("refs", {})), None)
+        ref_text = ref_text or e.get("refs", {}).get(ref)
+        if not ref or not ref_text:
+            raise RuntimeError("zipvoice 需要参考音色 ref/ref_text")
+        args += ["--zipvoice-encoder=%s/encoder.int8.onnx" % d,
+                 "--zipvoice-decoder=%s/decoder.int8.onnx" % d,
+                 "--zipvoice-vocoder=%s/%s" % (d, e["vocoder"]),
+                 "--zipvoice-tokens=%s/tokens.txt" % d,
+                 "--zipvoice-lexicon=%s/lexicon.txt" % d,
+                 "--reference-audio=%s/%s/%s.wav" % (d, e.get("ref_dir", "test_wavs"), ref),
+                 # 参考文本含中文标点/空格，必须按 sh 规则加引号，否则被 shell 截断成多参
+                 "--reference-text=%s" % _q(ref_text),
+                 "--num-steps=%d" % int(e.get("num_steps", 4))]
+
+    else:
+        raise RuntimeError("引擎 kind=%r 暂不支持" % e["kind"])
+    return args
+
+
+def phone_synth(text, out_path=None, engine=DEFAULT_ENGINE, sid=None, speed=1.0,
+                ref=None, ref_text=None, threads=4, timeout=180):
+    """手机本地合成（任意引擎）。返回 (wav 路径, 秒数, 日志)。失败抛 RuntimeError。
 
     文本不直接进命令行 —— 中文标点、引号、$ 都可能被 shell 吃掉。
     做法是写一个一次性脚本推上去执行，文本在脚本里以单引号形式出现。
     """
-    ok, why = phone_ready()
+    e = ENGINES.get(engine)
+    if not e:
+        raise RuntimeError("未知引擎 %r" % engine)
+    ok, why = phone_ready(engine)
     if not ok:
         raise RuntimeError(why)
+    sid = e.get("default_sid", 0) if sid is None else int(sid)
 
     stamp = int(time.time() * 1000)
     if out_path is None:
         out_path = os.path.join(tempfile.gettempdir(), "tts_%d.wav" % stamp)
     remote_wav = "%s/o_%d.wav" % (PHONE_WORK, stamp)
 
+    args = _phone_args(e, remote_wav, sid, speed, ref, ref_text, threads)
     script = (
         "#!/system/bin/sh\n"
         "mkdir -p %s\n"
         "export LD_LIBRARY_PATH=/data/local/tmp\n"
-        "%s --vits-model=%s/model.onnx --vits-lexicon=%s/lexicon.txt "
-        "--vits-tokens=%s/tokens.txt --vits-data-dir=%s/espeak-ng-data "
-        "--output-filename=%s --num-threads=%d --sid=%d --vits-length-scale=%f "
-        "%s\n"
+        "%s %s\n"
         "echo EXIT=$?\n"
-    ) % (PHONE_WORK, PHONE_BIN, PHONE_MODEL_DIR, PHONE_MODEL_DIR,
-         PHONE_MODEL_DIR, PHONE_MODEL_DIR, remote_wav, int(threads),
-         int(sid), float(1.0 / max(0.1, float(speed))), _q(text))
+    ) % (PHONE_WORK, " ".join(args), _q(text))
 
     fd, local_script = tempfile.mkstemp(suffix=".sh")
     os.close(fd)
@@ -148,7 +283,8 @@ def phone_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4,
 
     log = (out or "") + (err or "")
     if rc != 0 or "EXIT=" not in log or "EXIT=0" not in log:
-        raise RuntimeError("手机合成失败: %s" % " ".join(log.strip().splitlines()[-3:])[:300])
+        raise RuntimeError("手机合成失败[%s]: %s"
+                           % (engine, " ".join(log.strip().splitlines()[-3:])[:300]))
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     rc, out, err = _sh(["adb", "pull", remote_wav, out_path], timeout=60)
@@ -162,6 +298,89 @@ def phone_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4,
     return out_path, sec, log
 
 
+def phone_batch(items, engine=DEFAULT_ENGINE, threads=4, timeout=900):
+    """一次性把多条台词推到手机跑完，再一次性拉回。
+
+    items: [(text, out_path_local, sid_or_None, speed_or_1.0, ref_or_None, ref_text_or_None), ...]
+    返回 [(ok, path, sec, err), ...]，顺序与 items 一致。
+
+    价值在哪：每条 sherpa 合成前都要重新加载模型（实测加载占单句墙钟 ~85%，
+    8 Gen 1 上 melo 一句真正合成 0.6s、墙钟 4.6s）。批量**省不掉加载**，但能把
+    N 次「push 脚本 + shell + pull 音频」的 adb 往返压成 1 次往返 + 1 次整目录
+    拉回。模型越慢越划算 —— zipv 一条几十秒，批量几乎零额外开销。
+    """
+    e = ENGINES.get(engine)
+    if not e:
+        return [(False, "", 0.0, "未知引擎 %r" % engine) for _ in items]
+    ok, why = phone_ready(engine)
+    if not ok:
+        return [(False, "", 0.0, why) for _ in items]
+
+    stamp = int(time.time() * 1000)
+    remote_dir = "%s/batch_%d" % (PHONE_WORK, stamp)
+    lines = ["#!/system/bin/sh", "mkdir -p %s" % remote_dir,
+             "export LD_LIBRARY_PATH=/data/local/tmp"]
+    remote_paths = []
+    for i, it in enumerate(items):
+        text, local, sid, speed, ref, ref_text = (list(it) + [None] * 6)[:6]
+        sid = e.get("default_sid", 0) if sid is None else int(sid)
+        rwav = "%s/%d.wav" % (remote_dir, i)
+        remote_paths.append((rwav, local))
+        args = _phone_args(e, rwav, sid, speed or 1.0, ref, ref_text, threads)
+        lines.append("%s %s" % (" ".join(args), _q(text)))
+    lines.append("echo BATCH_DONE")
+    script = "\n".join(lines) + "\n"
+
+    fd, local_script = tempfile.mkstemp(suffix=".sh")
+    os.close(fd)
+    try:
+        with open(local_script, "w", encoding="utf-8", newline="\n") as f:
+            f.write(script)
+        rc, out, err = _sh(["adb", "push", local_script, "/data/local/tmp/tts_batch.sh"],
+                           timeout=60)
+        if rc != 0:
+            return [(False, "", 0.0, "推脚本失败: %s" % (err or out).strip()[:200])
+                    for _ in items]
+        rc, out, err = _sh(["adb", "shell", "sh /data/local/tmp/tts_batch.sh"],
+                           timeout=timeout)
+    finally:
+        try:
+            os.remove(local_script)
+        except OSError:
+            pass
+
+    # 一次性把整目录拉回本地临时区，再按编号分发到各自目标路径
+    local_root = tempfile.mkdtemp()
+    _sh(["adb", "pull", remote_dir, local_root], timeout=180)
+    results = []
+    for i, (rwav, local) in enumerate(remote_paths):
+        src = None
+        for cand in (os.path.join(local_root, "%d.wav" % i),
+                     os.path.join(local_root, os.path.basename(remote_dir), "%d.wav" % i)):
+            if os.path.isfile(cand) and os.path.getsize(cand) >= 1024:
+                src = cand
+                break
+        if src:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(local)), exist_ok=True)
+                shutil.copy(src, local)
+                results.append((True, local, wav_seconds(local), ""))
+            except Exception as ex:
+                results.append((False, "", 0.0, "落盘失败: %s" % ex))
+        else:
+            results.append((False, "", 0.0, "远端未产出 %d.wav" % i))
+    _sh(["adb", "shell", "rm -rf %s" % remote_dir], timeout=20)
+    shutil.rmtree(local_root, ignore_errors=True)
+    return results
+
+
+def phone_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4,
+                 timeout=180):
+    """向后兼容：默认用 melo 引擎（原先的 baseline）。新代码请用 phone_synth。"""
+    return phone_synth(text, out_path, engine="melo", sid=sid, speed=speed,
+                       threads=threads, timeout=timeout)
+
+
 def pc_model_dir():
     for d in PC_MODEL_CANDIDATES:
         if os.path.isfile(os.path.join(d, "model.onnx")):
@@ -169,43 +388,107 @@ def pc_model_dir():
     return None
 
 
-def pc_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4):
-    """PC 本地合成（同一套模型）。没有模型/没装库就抛 RuntimeError。"""
-    d = pc_model_dir()
-    if not d:
-        raise RuntimeError("PC 上没有 MeloTTS 模型（找过: %s）"
-                           % ", ".join(PC_MODEL_CANDIDATES))
+def _pc_synth(text, out_path=None, engine="melo", sid=0, speed=1.0, ref=None,
+              ref_text=None, threads=4):
+    """PC 端用 Python 版 sherpa_onnx 合成（引擎无关）。没有模型/库就抛 RuntimeError。
+
+    这是调试 / 无手机时的等价替代：CLI 参数拼法和手机端 `_phone_args` 一一对应，
+    保证两边行为一致。手机端有的引擎这里都能跑（vits / matcha / zipvoice）。
+    """
+    e = ENGINES.get(engine)
+    if not e:
+        raise RuntimeError("未知引擎 %r" % engine)
     try:
         import sherpa_onnx
     except ImportError:
         raise RuntimeError("没装 sherpa_onnx（pip install sherpa-onnx）")
+    dl = _tts_dir()
+    d = os.path.join(dl, e["pc_dir"])
+    if not os.path.isdir(d):
+        raise RuntimeError("PC 上没有 %s 模型（找过 %s）" % (engine, d))
 
-    cfg = sherpa_onnx.OfflineTtsConfig(
-        model=sherpa_onnx.OfflineTtsModelConfig(
-            vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                model=os.path.join(d, "model.onnx"),
-                tokens=os.path.join(d, "tokens.txt"),
-                lexicon=os.path.join(d, "lexicon.txt"),
-                dict_dir=os.path.join(d, "dict"),
-                data_dir=os.path.join(d, "espeak-ng-data")),
-            num_threads=int(threads)),
-        max_num_sentences=2)
+    # 克隆类（zipvoice）：先把参考音频读成样本数组
+    ref_samples, ref_sr = None, 48000
+    if e["kind"] == "zipvoice":
+        ref = ref or next(iter(e.get("refs", {})), None)
+        ref_text = ref_text or e.get("refs", {}).get(ref)
+        if not ref or not ref_text:
+            raise RuntimeError("zipvoice 需要参考音色 ref/ref_text")
+        rp = os.path.join(d, e.get("ref_dir", "test_wavs"), "%s.wav" % ref)
+        import wave as _w
+        with _w.open(rp, "rb") as wf:
+            ref_sr = wf.getframerate()
+            ref_samples = np.frombuffer(wf.readframes(wf.getnframes()),
+                                       dtype="int16").astype(np.float32) / 32768.0
+
+    if e["kind"] == "vits":
+        cfg = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=os.path.join(d, "model.onnx"),
+                    tokens=os.path.join(d, "tokens.txt"),
+                    lexicon=os.path.join(d, "lexicon.txt"),
+                    dict_dir=os.path.join(d, "dict"),
+                    data_dir=os.path.join(d, "espeak-ng-data")),
+                num_threads=int(threads)),
+            max_num_sentences=2)
+    elif e["kind"] == "matcha":
+        voc = os.path.join(dl, e["vocoder"])
+        if not os.path.isfile(voc):
+            raise RuntimeError("缺 matcha 声码器 %s" % voc)
+        cfg = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                    acoustic_model=os.path.join(d, e.get("acoustic", "model-steps-3.onnx")),
+                    vocoder=voc,
+                    tokens=os.path.join(d, "tokens.txt"),
+                    lexicon=os.path.join(d, "lexicon.txt"),
+                    dict_dir=os.path.join(d, "dict")),
+                num_threads=int(threads)),
+            rule_fsts=",".join(os.path.join(d, f) for f in e.get("rule_fsts", [])),
+            max_num_sentences=2)
+    elif e["kind"] == "zipvoice":
+        voc = os.path.join(dl, e["vocoder"])
+        if not os.path.isfile(voc):
+            raise RuntimeError("缺 zipvoice 声码器 %s" % voc)
+        cfg = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                zipvoice=sherpa_onnx.OfflineTtsZipvoiceModelConfig(
+                    encoder=os.path.join(d, "encoder.int8.onnx"),
+                    decoder=os.path.join(d, "decoder.int8.onnx"),
+                    vocoder=voc,
+                    tokens=os.path.join(d, "tokens.txt"),
+                    lexicon=os.path.join(d, "lexicon.txt")),
+                num_threads=int(threads)),
+            max_num_sentences=2)
+    else:
+        raise RuntimeError("引擎 kind=%r 暂不支持（PC）" % e["kind"])
+
     tts = sherpa_onnx.OfflineTts(cfg)
-    a = tts.generate(text, sid=int(sid), speed=float(speed))
+    if e["kind"] == "zipvoice":
+        a = tts.generate(text, ref_text, ref_samples, ref_sr, float(speed),
+                         int(e.get("num_steps", 4)))
+    else:
+        a = tts.generate(text, sid=int(sid), speed=float(speed))
     if not a.samples:
         raise RuntimeError("合成结果为空（文本转 token 失败？）")
     if out_path is None:
         out_path = os.path.join(tempfile.gettempdir(),
                                 "tts_%d.wav" % int(time.time() * 1000))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    import wave
-    import numpy as np
-    with wave.open(out_path, "wb") as w:
+    import wave as _w
+    with _w.open(out_path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(a.sample_rate)
         w.writeframes((np.array(a.samples) * 32767).astype("int16").tobytes())
-    return out_path, len(a.samples) / float(a.sample_rate), "pc sherpa-onnx"
+    return out_path, len(a.samples) / float(a.sample_rate), "pc sherpa-onnx/%s" % engine
+
+
+def pc_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4):
+    """向后兼容：默认 melo 引擎。新代码请用 _pc_synth。"""
+    return _pc_synth(text, out_path, engine="melo", sid=sid, speed=speed,
+                     threads=threads)
 
 
 def edge_tts_backend(text, out_path=None, voice="zh-CN-YunxiNeural", speed=1.0):
@@ -258,34 +541,43 @@ def parse_stats(log):
 
 
 def _default_backend():
-    """手机 > PC > 云。手机能用就用手机，这条是「手机自己会说话」的意义所在。"""
-    ok, _ = phone_ready()
-    if ok:
-        return "phone_sherpa"
-    if pc_model_dir():
-        return "pc_sherpa"
+    """手机 > PC > 云。手机上只要有任意已部署引擎就先用手机。"""
+    for eng in ("matcha", "melo", "zhll", "zipv"):
+        ok, _ = phone_ready(eng)
+        if ok:
+            return "phone_sherpa"
+    for eng in ENGINES:
+        if os.path.isdir(os.path.join(ROOT, "_contrib", "tts", ENGINES[eng]["pc_dir"])):
+            return "pc_sherpa"
     return "edge"
 
 
-def run(text, out_path=None, voice=None, speed=1.0, backend=None, sid=None):
+def run(text, out_path=None, voice=None, speed=1.0, backend=None, sid=None,
+        engine=None, ref=None, ref_text=None):
     """合成一段语音。
 
     返回 {"ok", "path", "sec", "backend", "rtf", "err"}。任何异常都不外抛 ——
     漫剧流程里 TTS 挂了应该退回「无声成片」，而不是整条片报废。
+
+    engine 选手机/PC 本地用哪个引擎（"matcha" 默认；"zipv" 克隆音色要配 ref/ref_text）；
+    voice 只在走云兜底（edge）时当云音色名用。
     """
     text = (text or "").strip()
     if not text:
         return {"ok": False, "path": "", "sec": 0.0, "backend": "",
                 "rtf": 0.0, "err": "文本为空"}
     backend = backend or _default_backend()
+    engine = engine or DEFAULT_ENGINE
     sid = DEFAULT_SID if sid is None else int(sid)
     t0 = time.time()
     log = ""
     try:
         if backend == "phone_sherpa":
-            path, sec, log = phone_sherpa(text, out_path, sid=sid, speed=speed)
+            path, sec, log = phone_synth(text, out_path, engine=engine, sid=sid,
+                                        speed=speed, ref=ref, ref_text=ref_text)
         elif backend == "pc_sherpa":
-            path, sec, log = pc_sherpa(text, out_path, sid=sid, speed=speed)
+            path, sec, log = _pc_synth(text, out_path, engine=engine, sid=sid,
+                                       speed=speed, ref=ref, ref_text=ref_text)
         elif backend == "edge":
             path, sec, log = edge_tts_backend(text, out_path, voice=voice or
                                               "zh-CN-YunxiNeural", speed=speed)
@@ -296,7 +588,7 @@ def run(text, out_path=None, voice=None, speed=1.0, backend=None, sid=None):
                 "backend": backend, "rtf": st.get("rtf", 0.0),
                 "wall": round(time.time() - t0, 2), "err": ""}
     except Exception as e:
-        # 手机挂了退 PC，PC 挂了退云 —— 但只退一次，不无限转圈
+        # 本地挂了退云兜底一次，不无限转圈
         if backend != "edge":
             try:
                 path, sec, log = edge_tts_backend(text, out_path, speed=speed)
@@ -313,24 +605,38 @@ def run(text, out_path=None, voice=None, speed=1.0, backend=None, sid=None):
 
 # ---------------------------------------------------------------- 部署
 
-def deploy(bin_path=None, model_dir=None, libcxx=None, force=False):
-    """把二进制 + libc++_shared + 模型推到手机。幂等，已存在就跳过。
+def deploy(engine="melo", bin_path=None, model_dir=None, libcxx=None, force=False):
+    """把二进制 + libc++_shared + 某引擎的模型推到手机。幂等，已存在就跳过。
 
     三个文件从哪来（都写在返回值里，方便查）：
       · sn-tts        sherpa-onnx 的 android-aarch64-termux-static 里的
                       `sherpa-onnx-offline-tts`
       · libc++_shared Termux bootstrap 的 lib/ 下（NDK r26+ 版本；Android 系统
                       自带的太老，缺 __hash_memory 符号，二进制直接起不来）
-      · melo 模型     vits-melo-tts-zh_en（中英双语，170MB onnx）
+      · 模型          由 engine 决定（见 ENGINES[engine]["pc_dir"]）。克隆类模型
+                      （zipv）会额外把外挂声码器、参考音频一起补推上去。
+
+    用法：
+        tts_runner.deploy("melo")      # 默认
+        tts_runner.deploy("matcha")    # 不吞字，比 melo 自然
+        tts_runner.deploy("zipv")      # flow-matching 克隆音色，24kHz
+        tts_runner.deploy("zhll")      # 16kHz 多说话人
+    每个引擎都有一套独立模型目录，互不冲突，可以全推。
     """
-    dl = os.path.join(ROOT, "_contrib", "tts")
+    e = ENGINES.get(engine)
+    if not e:
+        return {"ok": False, "err": "未知引擎 %r（可选: %s）"
+                % (engine, ", ".join(ENGINES)),
+                "deployed": [], "skipped": []}
+    dl = _tts_dir()
     src_bin = bin_path or os.path.join(
         dl, "sherpa-onnx-v2.0.1-android-aarch64-termux-static", "bin",
         "sherpa-onnx-offline-tts")
     src_lib = libcxx or os.path.join(dl, "termuxlib", "lib", "libc++_shared.so")
-    src_model = model_dir or os.path.join(dl, "vits-melo-tts-zh_en")
+    src_model = model_dir or os.path.join(dl, e["pc_dir"])
 
     done, skipped = [], []
+    # 二进制 + lib 各引擎共用，先确保到位
     for src, dst, label in ((src_bin, PHONE_BIN, "sn-tts"),
                             (src_lib, PHONE_LIBCXX, "libc++_shared.so")):
         if not os.path.isfile(src):
@@ -347,22 +653,31 @@ def deploy(bin_path=None, model_dir=None, libcxx=None, force=False):
         done.append(label)
     _sh(["adb", "shell", "chmod 755 %s" % PHONE_BIN], timeout=15)
 
+    # 模型目录
     if not os.path.isdir(src_model):
         return {"ok": False, "err": "本地缺模型目录 %s" % src_model,
                 "deployed": done, "skipped": skipped}
-    rc, out, _ = _sh(["adb", "shell", "ls %s/model.onnx 2>/dev/null" % PHONE_MODEL_DIR],
-                     timeout=15)
-    if rc == 0 and "model.onnx" in (out or "") and not force:
-        skipped.append("melo 模型")
+    rc, out, _ = _sh(["adb", "shell", "ls %s 2>/dev/null" % e["phone_dir"]], timeout=15)
+    if rc == 0 and e["phone_dir"].split("/")[-1] in (out or "").split() and not force:
+        skipped.append("%s 模型" % engine)
     else:
-        rc, out, err = _sh(["adb", "push", src_model, PHONE_MODEL_DIR], timeout=900)
+        rc, out, err = _sh(["adb", "push", src_model + "/.", e["phone_dir"] + "/"],
+                           timeout=900)
         if rc != 0:
             return {"ok": False, "err": "推模型失败: %s" % (err or out)[:200],
                     "deployed": done, "skipped": skipped}
-        done.append("melo 模型")
+        done.append("%s 模型" % engine)
+
+    # 克隆类引擎：外挂声码器若在模型目录外（dl 根下），单独补推
+    if e.get("vocoder"):
+        vp = os.path.join(dl, e["vocoder"])
+        if os.path.isfile(vp):
+            _sh(["adb", "push", vp, "%s/%s" % (e["phone_dir"], e["vocoder"])],
+                timeout=300)
+
     _sh(["adb", "shell", "mkdir -p %s" % PHONE_WORK], timeout=15)
 
-    ok, why = phone_ready()
+    ok, why = phone_ready(engine)
     return {"ok": ok, "err": why, "deployed": done, "skipped": skipped}
 
 
