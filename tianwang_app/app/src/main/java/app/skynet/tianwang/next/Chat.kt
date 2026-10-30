@@ -265,9 +265,10 @@ data class Media(
 
 /** 云侧连接配置（存在 SharedPreferences，设置页读写）。 */
 data class AgentConfig(
-    val url: String = "http://127.0.0.1:9124",
+    val url: String = Api.DEFAULT_BASE,
     val token: String = "",
 ) {
-    fun valid(): Boolean = url.isNotBlank() && token.isNotBlank()
+    /** 地址要能收敛成绝对 URL（空串不行），token 不能空。 */
+    fun valid(): Boolean = Api.normalizeBase(url).isNotEmpty() && token.isNotBlank()
 }
 

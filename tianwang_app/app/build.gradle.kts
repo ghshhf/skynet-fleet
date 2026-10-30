@@ -98,4 +98,12 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.4")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // 手机端原来一条测试都没有。这里先只上 JVM 单测：不需要真机、
+    // 不占 USB、几秒钟跑完，覆盖的是「拼地址 / 解 SSE / 解 JSON」这类
+    // 出了错却只能靠人眼在手机上发现的地方。
+    // org.json 是必要依赖：android.jar 里的 JSONObject 在单测里是空壳，
+    // 不带这个 jar 一 new 就抛 "Stub!"。
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
