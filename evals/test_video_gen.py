@@ -23,11 +23,13 @@ def _ok_backend(prompt, duration, fps, size, seed, model):
 
 
 def test_unconfigured():
-    # 环境自适应：本机有 ffmpeg / FLEET_VIDEO_CLI 时 video.gen 是真可用的，
-    # 此时验「能出片」；两者都没有才验「如实报未配置」。
-    # （旧版固定断言 ok=False，在装了 ffmpeg 的机器上必红——那是测试假设，不是代码 bug。）
+    # 环境自适应：本机有手机 NPU 帧链 / ffmpeg / FLEET_VIDEO_CLI 时 video.gen 是真可用的，
+    # 此时验「能出片」；三者都没有才验「如实报未配置」。
+    # （旧版固定断言 ok=False，在装了 ffmpeg 的机器上必红——那是测试假设，不是代码 bug。
+    # 2026-10-30 起 FLEET_LOCAL_DREAM 也算真后端：手机 QNN NPU 帧链能出真画面。）
     import os as _os, shutil as _sh
-    has_backend = bool(_os.environ.get("FLEET_VIDEO_CLI")
+    has_backend = bool(_os.environ.get("FLEET_LOCAL_DREAM")
+                       or _os.environ.get("FLEET_VIDEO_CLI")
                        or _os.environ.get("FLEET_FFMPEG")
                        or _sh.which("ffmpeg"))
     r = video_gen_runner.run("海浪")

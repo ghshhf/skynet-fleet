@@ -94,16 +94,40 @@ SPECS = {
         ],
     },
     "video.gen": {
-        "title": "视频生成（壳 + 远端路由）",
-        "desc": "生成一段短视频；手机本地算力撑不住视频扩散模型，本节点未配视频后端时"
-                "如实说「未配置」，由编排层路由到 PC/云端视频节点（经 relay 端口转发）",
+        "title": "视频生成（手机 NPU 帧链 / 远端路由）",
+        "desc": "生成一段短视频。真后端已落地：手机 QNN NPU 走「t2i 首帧 → img2img 链式推进」，"
+                "带帧稳定器（对抗 VAE roundtrip 累积变糊与 CFG 累积变暗），实测 512×512/12 步 "
+                "2.7s/帧、10 分钟约 200 帧。逐帧 t2i 会出幻灯片，所以必须走链。"
+                "未配手机时退回 ffmpeg 占位片（黑底打字），那不是画面。",
         "params": [
             {"name": "prompt", "type": "str", "required": True, "desc": "正向提示词"},
-            {"name": "duration", "type": "int", "required": False, "desc": "时长秒（默认 3）"},
-            {"name": "fps", "type": "int", "required": False, "desc": "帧率（默认 24）"},
-            {"name": "size", "type": "str", "required": False, "desc": "尺寸，如 512x512"},
+            {"name": "duration", "type": "int", "required": False, "desc": "时长秒（默认 3，帧数=duration×fps）"},
+            {"name": "fps", "type": "int", "required": False, "desc": "帧率（默认 12；手机出片走 8~12 更划算）"},
+            {"name": "size", "type": "str", "required": False,
+             "desc": "尺寸，只允许 512x512/768x768/1024x1024/768x512/512x768/1024x768/768x1024（表外没有 patch，会出噪声）"},
             {"name": "seed", "type": "int", "required": False, "desc": "随机种子，-1 随机"},
-            {"name": "model", "type": "str", "required": False, "desc": "模型文件（留给后端）"},
+            {"name": "model", "type": "str", "required": False,
+             "desc": "模型 id（anythingv5 动漫 / chilloutmix、absolutereality 写实）"},
+            {"name": "denoise", "type": "float", "required": False,
+             "desc": "帧间重噪强度（默认 0.35；0.3 稳、0.45 动得狠但易崩）"},
+            {"name": "steps", "type": "int", "required": False, "desc": "每帧步数（默认 12）"},
+            {"name": "stabilize", "type": "bool", "required": False,
+             "desc": "帧稳定器（默认开）：颜色/亮度对齐首帧 + 锐度补偿 + 与首帧少量混合"},
+        ],
+    },
+    "image.poster": {
+        "title": "海报排版（出图 → 成品）",
+        "desc": "把出好的图排成可直接发的成品海报：版式、留白、标题层级、强调色全部本地算"
+                "（PIL + 系统字体，0.2 秒/张，不调模型不联网）。强调色从画面自己取，"
+                "所以每张海报跟着图走，不是写死的品牌色。四种版式：poster/square/story/full。",
+        "params": [
+            {"name": "image_path", "type": "str", "required": True, "desc": "底图路径（image.gen 的产出）"},
+            {"name": "title", "type": "str", "required": False, "desc": "主标题（按字数自动降字号，最多两行）"},
+            {"name": "sub", "type": "str", "required": False, "desc": "副标题 / 一行说明"},
+            {"name": "tag", "type": "str", "required": False, "desc": "左上角小标签（强调色底块）"},
+            {"name": "layout", "type": "str", "required": False,
+             "desc": "poster(1080×1350 上图下文) / square(1080×1080) / story(1080×1920) / full(全幅+底部渐变)"},
+            {"name": "footer", "type": "str", "required": False, "desc": "页脚自定义文字"},
         ],
     },
     "fleet.memory.sync": {
