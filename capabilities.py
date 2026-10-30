@@ -79,7 +79,9 @@ SPECS = {
     },
     "image.gen": {
         "title": "安卓出图（手机算力）",
-        "desc": "在本节点挂载的安卓手机上跑 SD 出图（SdBridge/QueueRunner），返回 PNG 路径；"
+        "desc": "在本节点挂载的安卓手机上出图，返回 PNG 路径。后端三选一，按速度排："
+                "local-dream（骁龙 QNN NPU，同一 prompt 比 sd.cpp 快数倍）、"
+                "SdBridge/QueueRunner（sd.cpp，CPU/Vulkan）、PC sd-cli。"
                 "PC 调度手机算力的实质落地（路线甲·N+2）",
         "params": [
             {"name": "prompt", "type": "str", "required": True, "desc": "正向提示词"},

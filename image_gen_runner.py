@@ -60,7 +60,14 @@ def _android_bridge_backend(prompt, neg, size, steps, seed, cfg, model):
 
 
 def _default_backend(prompt, neg, size, steps, seed, cfg, model):
-    """默认后端调度：手机桥优先，PC sd-cli 兜底，均未配则如实报错。"""
+    """默认后端调度：手机 NPU 优先，手机 sd.cpp 桥次之，PC sd-cli 兜底。
+
+    优先级按速度排：local-dream 走骁龙 HTP，同一 prompt 比 sd.cpp 的
+    CPU/Vulkan 快数倍；桥次之（能跑但慢）；PC 最慢但显存大、模型全。
+    """
+    # 0) 手机 local-dream（QNN NPU）
+    if os.environ.get("FLEET_LOCAL_DREAM"):
+        return localdream_backend(prompt, neg, size, steps, seed, cfg, model)
     # 1) 手机桥（android_bridge → SdBridge）
     if os.environ.get("FLEET_ANDROID_BRIDGE"):
         return _android_bridge_backend(prompt, neg, size, steps, seed, cfg, model)
@@ -69,8 +76,9 @@ def _default_backend(prompt, neg, size, steps, seed, cfg, model):
         return pc_sd_backend(prompt, neg, size, steps, seed, cfg, model)
     # 3) 均未配：如实说
     raise RuntimeError(
-        "image.gen 后端未配置：设 FLEET_ANDROID_BRIDGE（手机 SdBridge 桥）"
-        "或 FLEET_SD_CLI（PC stable-diffusion.cpp）；本节点未接出图能力时不应声明 image.gen")
+        "image.gen 后端未配置：设 FLEET_LOCAL_DREAM=<手机IP>（local-dream 的 QNN NPU，最快）"
+        "或 FLEET_ANDROID_BRIDGE（手机 SdBridge 桥）或 FLEET_SD_CLI（PC stable-diffusion.cpp）；"
+        "本节点未接出图能力时不应声明 image.gen")
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +174,214 @@ def pc_sd_backend(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0, mo
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# 手机出图后端：local-dream（骁龙 QNN NPU）。
+#
+# 与上面 android_bridge 那条路的区别：那条走 sd.cpp（CPU/Vulkan），这条直接
+# 用 HTP 跑 diffusion，同一个 prompt 快数倍；代价是模型得先在手机的 local-dream
+# 里下好，且 native 侧有全局生成互斥，一个进程同时只出一张。
+#
+# 手机开 host mode 后起两个口：
+#   8808 控制口：/info /models /select /status /stop
+#   8081 生成口：/generate（SSE）/tokenize /upscale
+# 本函数只碰这两个口，不改手机侧任何代码——所以它既能给天网当后端，也能单独
+# 当 local-dream 的脚本客户端用。
+# ---------------------------------------------------------------------------
+LOCAL_DREAM_CONTROL_PORT = 8808
+LOCAL_DREAM_GENERATION_PORT = 8081
+
+
+def _ld_endpoints():
+    """解析 FLEET_LOCAL_DREAM → (host, control_port, generation_port)。
+
+    接受 "192.168.1.5"、"http://192.168.1.5"、"192.168.1.5:8081"。
+    带端口时视为**生成口**（最常改的就是这个），控制口由
+    FLEET_LOCAL_DREAM_CONTROL 覆盖，默认 8808。
+    """
+    raw = (os.environ.get("FLEET_LOCAL_DREAM") or "").strip()
+    if not raw:
+        raise RuntimeError(
+            "手机出图后端未配置：设 FLEET_LOCAL_DREAM=<手机IP>（手机 local-dream 里开 host mode 后"
+            "会显示地址）；或设 FLEET_ANDROID_BRIDGE 走 sd.cpp 桥、FLEET_SD_CLI 走 PC")
+    if raw.startswith("http://") or raw.startswith("https://"):
+        raw = raw.split("://", 1)[1]
+    raw = raw.rstrip("/")
+    host, _, port = raw.partition(":")
+    gen = int(port) if port.isdigit() else LOCAL_DREAM_GENERATION_PORT
+    ctl_raw = (os.environ.get("FLEET_LOCAL_DREAM_CONTROL") or "").strip()
+    ctl = int(ctl_raw) if ctl_raw.isdigit() else LOCAL_DREAM_CONTROL_PORT
+    if not host:
+        raise RuntimeError(f"FLEET_LOCAL_DREAM 解析不出主机名：{os.environ.get('FLEET_LOCAL_DREAM')!r}")
+    return host, ctl, gen
+
+
+def _ld_opener():
+    # 局域网地址绝不能走代理：环境里 HTTP_PROXY 一旦指向死端口，urllib 会把
+    # 192.168.x.x 也塞给代理，报 WinError 10061，现场看着像「手机离线」。
+    import urllib.request as _u
+    return _u.build_opener(_u.ProxyHandler({}))
+
+
+def _ld_json(opener, url, timeout, payload=None):
+    import json as _j
+    import urllib.request as _u
+    data = None
+    headers = {}
+    if payload is not None:
+        data = _j.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = _u.Request(url, data=data, headers=headers)
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    try:
+        return _j.loads(raw)
+    except ValueError:
+        raise RuntimeError(f"{url} 返回的不是 JSON：{raw[:200]}")
+
+
+def _ld_ensure_model(opener, host, ctl, model, width, height, wait_s=300):
+    """确保手机侧加载的是 model（同模型则零成本）。返回实际生效的 model id。"""
+    import time as _t
+    status = _ld_json(opener, f"http://{host}:{ctl}/status", 15)
+    serving = status.get("serving_model_id")
+    if not model or serving == model:
+        if status.get("state") == "error":
+            raise RuntimeError(
+                f"手机后端处于错误态：{status.get('message') or '未知'}"
+                f"（模型 {status.get('error_model_id') or '?'}）")
+        return serving or ""
+
+    # /select 是异步的：它只是把加载请求交给 BackendService，进程重启并加载
+    # 权重要几十秒，必须轮询 /status 到 running 才能发 /generate，否则会打空。
+    sel = _ld_json(
+        opener, f"http://{host}:{ctl}/select", 30,
+        {"model_id": model, "width": width, "height": height},
+    )
+    if isinstance(sel, dict) and sel.get("error"):
+        raise RuntimeError(f"手机 /select 拒绝：{sel.get('error')}")
+
+    deadline = _t.time() + wait_s
+    last = ""
+    while _t.time() < deadline:
+        st = _ld_json(opener, f"http://{host}:{ctl}/status", 15)
+        state = st.get("state") or ""
+        last = state
+        if state == "running" and st.get("serving_model_id") == model:
+            return model
+        if state == "error":
+            raise RuntimeError(
+                f"手机加载模型失败：{st.get('message') or '未知'}"
+                f"（模型 {st.get('error_model_id') or model}）")
+        _t.sleep(1.0)
+    raise RuntimeError(
+        f"等手机加载模型 {model} 超过 {wait_s}s，最后状态={last or '?'}；"
+        "模型太大或没下载完时会出现这种情况")
+
+
+def _ld_stream_generate(opener, url, payload, timeout):
+    """POST /generate 并逐行读 SSE，返回 (image_b64, meta)。
+
+    local-dream 的 complete 事件长这样：
+        event: complete
+        data: {"type":"complete","image":"<base64>","format":"png","seed":…}
+    """
+    import json as _j
+    import urllib.request as _u
+    body = _j.dumps(payload).encode("utf-8")
+    req = _u.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+    event = ""
+    with opener.open(req, timeout=timeout) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith("event:"):
+                event = line[6:].strip()
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data:
+                continue
+            try:
+                obj = _j.loads(data)
+            except ValueError:
+                continue
+            if event == "error" or obj.get("type") == "error":
+                raise RuntimeError(f"手机出图报错：{obj.get('message') or '未知'}")
+            if event == "complete" or obj.get("type") == "complete":
+                image = obj.get("image") or ""
+                if not image:
+                    raise RuntimeError("手机 complete 事件里没有 image 字段")
+                return image, obj
+    raise RuntimeError("手机 SSE 流结束了但没有收到 complete 事件（出图被中断或客户端超时）")
+
+
+def localdream_backend(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0,
+                       model=None, out_dir=None, timeout=900):
+    """经手机 local-dream（QNN NPU）出图，把 PNG 落到本机，返回路径。
+
+    配置：FLEET_LOCAL_DREAM=<手机IP>；可选 FLEET_LOCAL_DREAM_CONTROL（默认 8808）、
+    FLEET_SD_OUT（输出目录）。model 给定时会先 /select 并等加载完成。
+    未配置或手机不可达时抛 RuntimeError，消息说清原因——不静默交空。
+    """
+    import base64 as _b
+    import time as _t
+    host, ctl, gen = _ld_endpoints()
+    opener = _ld_opener()
+
+    try:
+        info = _ld_json(opener, f"http://{host}:{ctl}/info", 10)
+    except Exception as e:
+        raise RuntimeError(
+            f"连不上手机控制口 {host}:{ctl}（{type(e).__name__}: {e}）——"
+            "多半是 host mode 没开，或手机不在同一网段")
+    if info.get("app") != "localdream":
+        raise RuntimeError(
+            f"{host}:{ctl} 不是 local-dream 的控制口（/info 返回 app={info.get('app')!r}）")
+
+    w, h = 512, 512
+    if size and "x" in str(size).lower():
+        try:
+            w, h = (int(v) for v in str(size).lower().split("x", 1))
+        except ValueError:
+            raise RuntimeError(f"size 解析失败：{size!r}（要 WxH，如 512x512）")
+
+    _ld_ensure_model(opener, host, ctl, model, w, h)
+
+    payload = {
+        "prompt": prompt,
+        "negative_prompt": neg or "",
+        "steps": int(steps),
+        "cfg": float(cfg),
+        "width": w,
+        "height": h,
+        # 默认是 "raw"（原始像素），必须显式要 png，否则拿到的不是 PNG 文件
+        "output_format": "png",
+        "show_diffusion_process": False,
+    }
+    if seed is not None and int(seed) >= 0:
+        payload["seed"] = int(seed)
+
+    image_b64, meta = _ld_stream_generate(
+        opener, f"http://{host}:{gen}/generate", payload, timeout)
+
+    out_dir = out_dir or os.environ.get("FLEET_SD_OUT") or os.path.join(
+        os.path.expanduser("~"), ".fleet", "sd_out")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(
+        out_dir, f"localdream_{int(_t.time() * 1000)}_{meta.get('seed', 'na')}.png")
+    try:
+        with open(out_path, "wb") as f:
+            f.write(_b.b64decode(image_b64))
+    except Exception as e:
+        raise RuntimeError(f"手机出图成功但写盘失败：{type(e).__name__}: {e}")
+    if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"手机出图成功但落盘为空：{out_path}")
+    return out_path
+
+
 def run(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0, model=None,
         backend=None, upload=False, bed=None):
     """出一张图，可选经 PicGo 上传到图床。
@@ -193,3 +409,225 @@ def run(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0, model=None,
         return result
     except Exception as e:
         return {"ok": False, "path": "", "url": "", "err": f"{type(e).__name__}: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# 自测：python image_gen_runner.py --selftest
+#
+# 不起真机。用两个本地 HTTP 服务冒充 local-dream 的 8808 / 8081，把
+# /info -> /status -> /select -> /generate(SSE) 整条链路真跑一遍。
+# 手机不在手边时，这是唯一能验证「协议拼错了没有」的办法。
+# ---------------------------------------------------------------------------
+# 1x1 PNG：用来确认落盘的是真图片，不是空文件、也不是 base64 原文
+_FAKE_PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+                 "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+
+def _selftest():
+    import json as _j
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    bad = []
+
+    def check(cond, msg):
+        if cond:
+            print("  [ok]", msg)
+        else:
+            print("  [!!]", msg)
+            bad.append(msg)
+
+    def section(t):
+        print("\n[" + t + "]")
+
+    # 假手机侧的可变状态
+    st = {"serving": None, "state": "idle", "mode": "ok", "payload": None, "selects": 0}
+
+    class Ctl(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, obj, code=200):
+            body = _j.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/info":
+                return self._send({"app": "localdream", "protocol": 1,
+                                   "version": "fake", "device": "FakePhone"})
+            if self.path == "/status":
+                return self._send({
+                    "serving_model_id": st["serving"], "state": st["state"],
+                    "message": None, "error_model_id": None,
+                    "width": None, "height": None})
+            return self._send({"error": "not found"}, 404)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = _j.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                body = {}
+            if self.path == "/select":
+                st["selects"] += 1
+                st["serving"] = body.get("model_id")
+                st["state"] = "running"
+                return self._send({"ok": True})
+            return self._send({"error": "not found"}, 404)
+
+    class Gen(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                st["payload"] = _j.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                st["payload"] = {}
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+
+            def ev(name, obj):
+                line = "event: %s\ndata: %s\n\n" % (name, _j.dumps(obj))
+                self.wfile.write(line.encode("utf-8"))
+
+            if st["mode"] == "error":
+                ev("error", {"type": "error", "message": "boom"})
+                return
+            if st["mode"] == "noimage":
+                ev("complete", {"type": "complete"})
+                return
+            ev("progress", {"type": "progress", "step": 1, "total": 20})
+            ev("complete", {"type": "complete", "image": _FAKE_PNG_B64,
+                            "format": "png", "seed": st["payload"].get("seed", 0)})
+
+    ctl = HTTPServer(("127.0.0.1", 0), Ctl)
+    gen = HTTPServer(("127.0.0.1", 0), Gen)
+    for s in (ctl, gen):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    ctl_port, gen_port = ctl.server_address[1], gen.server_address[1]
+
+    saved = {k: os.environ.get(k) for k in
+             ("FLEET_LOCAL_DREAM", "FLEET_LOCAL_DREAM_CONTROL", "FLEET_SD_OUT",
+              "FLEET_ANDROID_BRIDGE", "FLEET_SD_CLI", "HTTP_PROXY", "HTTPS_PROXY")}
+    tmp = tempfile.mkdtemp(prefix="ld_selftest_")
+    try:
+        # ---- 1. 未配置：必须报「未配置」，不能静默交空
+        section("未配置时如实报错")
+        for k in ("FLEET_LOCAL_DREAM", "FLEET_ANDROID_BRIDGE", "FLEET_SD_CLI"):
+            os.environ.pop(k, None)
+        r = run("a cat")
+        check(r["ok"] is False and "未配置" in r["err"], "没配后端 -> ok:false 且说未配置")
+        check(r["path"] == "", "失败时 path 为空，不交假路径")
+
+        # ---- 2. 空 prompt 先被拦，不去打网络
+        section("空 prompt")
+        r = run("   ")
+        check(r["ok"] is False and "prompt" in r["err"], "空 prompt 被拦")
+
+        # ---- 3. 正常链路
+        section("正常链路 /info -> /status -> /generate")
+        os.environ["FLEET_LOCAL_DREAM"] = "127.0.0.1:%d" % gen_port
+        os.environ["FLEET_LOCAL_DREAM_CONTROL"] = str(ctl_port)
+        os.environ["FLEET_SD_OUT"] = tmp
+        # 故意把代理指向死端口：局域网地址若被塞进代理，这条必然失败
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:1"
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:1"
+
+        r = run("a red apple", neg="blurry", size="512x768", steps=12, seed=42, cfg=6.5)
+        check(r["ok"] is True, "出图成功（且没被 HTTP_PROXY 带走）: %s" % (r["err"] or ""))
+        path = r["path"]
+        check(bool(path) and os.path.isfile(path), "返回的路径真实存在")
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                head = f.read(8)
+            check(head == b"\x89PNG\r\n\x1a\n", "落盘文件是合法 PNG（不是文本/base64 原文）")
+            check(os.path.getsize(path) > 0, "文件非空")
+
+        p = st["payload"] or {}
+        check(p.get("prompt") == "a red apple", "prompt 原样送到手机")
+        check(p.get("negative_prompt") == "blurry", "negative_prompt 送到手机")
+        check(p.get("width") == 512 and p.get("height") == 768, "WxH 正确拆分")
+        check(p.get("output_format") == "png",
+              "显式要 png（默认 raw，拿到的就不是图片文件）")
+        check(p.get("seed") == 42, "seed 透传")
+        check(p.get("show_diffusion_process") is False, "关掉逐步预览（省带宽）")
+
+        # ---- 4. seed<0 不传，交给手机随机
+        section("seed 语义")
+        st["payload"] = None
+        r = run("x", seed=-1)
+        check(r["ok"] is True and "seed" not in (st["payload"] or {}),
+              "seed=-1 时不传该字段（-1 到手机是 unsigned 溢出）")
+
+        # ---- 5. 指定模型会触发 /select
+        section("模型切换")
+        before = st["selects"]
+        r = run("x", model="sd15-npu")
+        check(r["ok"] is True, "带 model 出图成功")
+        check(st["selects"] == before + 1, "/select 被调用一次")
+        check(st["serving"] == "sd15-npu", "手机侧 serving_model_id 已切到目标模型")
+        before = st["selects"]
+        r = run("x", model="sd15-npu")
+        check(st["selects"] == before, "同模型第二次不再 /select（不重启进程）")
+
+        # ---- 6. 手机侧报错要透出原因
+        section("失败带原因")
+        st["mode"] = "error"
+        r = run("x")
+        check(r["ok"] is False and "boom" in r["err"], "SSE error 事件的 message 被透出")
+        st["mode"] = "noimage"
+        r = run("x")
+        check(r["ok"] is False and "image" in r["err"], "complete 缺 image 时报错")
+        st["mode"] = "ok"
+
+        # ---- 7. 连不上时不能说「出图了」
+        section("手机不可达")
+        os.environ["FLEET_LOCAL_DREAM"] = "127.0.0.1:1"
+        os.environ["FLEET_LOCAL_DREAM_CONTROL"] = "1"
+        r = run("x")
+        check(r["ok"] is False and ("连不上" in r["err"] or "拒绝" in r["err"]),
+              "连不上 -> 明确说连不上，而不是空结果")
+
+        # ---- 8. 端口/主机解析
+        section("地址解析")
+        os.environ["FLEET_LOCAL_DREAM"] = "http://192.168.1.9:9000"
+        os.environ["FLEET_LOCAL_DREAM_CONTROL"] = "9001"
+        h, c, g = _ld_endpoints()
+        check((h, c, g) == ("192.168.1.9", 9001, 9000),
+              "http:// 前缀与自定义端口被正确解析")
+        os.environ["FLEET_LOCAL_DREAM"] = "192.168.1.9"
+        os.environ.pop("FLEET_LOCAL_DREAM_CONTROL", None)
+        h, c, g = _ld_endpoints()
+        check((h, c, g) == ("192.168.1.9", 8808, 8081), "只给 IP 时用 8808/8081 默认口")
+    finally:
+        for s in (ctl, gen):
+            s.shutdown()
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    print()
+    if bad:
+        print("FAILED %d 项：" % len(bad))
+        for m in bad:
+            print("  -", m)
+        return 1
+    print("ALL PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--selftest" in _sys.argv:
+        _sys.exit(_selftest())
+    print(__doc__)

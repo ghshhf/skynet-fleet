@@ -42,6 +42,10 @@ CASES = [
     ("infrared", ["infrared.py", "--selftest"], HERE, 30),
     ("radio", ["radio.py", "--selftest"], HERE, 30),
     ("thermal", ["thermal.py", "--selftest"], HERE, 30),
+    # 手机出图后端（local-dream / QNN NPU）：两个本地假 HTTP 服务冒充手机的
+    # 8808/8081，把 /info -> /status -> /select -> /generate(SSE) 真跑一遍。
+    # 断言的是一条「协议拼错就必然失败」的链路，不依赖真机、不联网。
+    ("image_gen_runner", ["image_gen_runner.py", "--selftest"], HERE, 90),
     # 联网组件：31 项纯离线断言（要不要联网的判定、垃圾结果过滤、HTML 清洗、
     # 资料拼接）。真联网的活不进门禁 —— 门禁不许依赖外网。
     ("webtool", ["webtool.py", "--selftest"], HERE, 30),
