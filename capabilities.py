@@ -93,6 +93,19 @@ SPECS = {
             {"name": "model", "type": "str", "required": False, "desc": "模型文件（默认 Turbo）"},
         ],
     },
+    "image.upscale": {
+        "title": "放大 4 倍（手机 NPU）",
+        "desc": "把一张图在手机上做 4 倍放大（QNN 超分）。/upscale 是二进制协议："
+                "body 传裸 RGB，尺寸与权重路径走 header，回 JPEG。"
+                "性价比路线：512×512 出图 4s + 放大 4s = **8 秒拿到 2048×2048**，"
+                "比直接出 1024×768（38s）又大又快。需先 /select 过模型（复用同一 runtime）",
+        "params": [
+            {"name": "image_path", "type": "str", "required": True,
+             "desc": "要放大的图（image.gen 的产出）"},
+            {"name": "upscaler", "type": "str", "required": False,
+             "desc": "放大模型：realistic（写实，24MB）/ anime（动漫，11MB），默认 realistic"},
+        ],
+    },
     "video.gen": {
         "title": "视频生成（手机 NPU 帧链 / 远端路由）",
         "desc": "生成一段短视频。真后端已落地：手机 QNN NPU 走「t2i 首帧 → img2img 链式推进」，"

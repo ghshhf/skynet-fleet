@@ -443,6 +443,134 @@ def localdream_backend(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.
     return out_path
 
 
+def _ld_upscalers(opener, host, ctl):
+    """GET /models 拿已装放大模型的 path（手机上权重文件的绝对路径）。"""
+    d = _ld_json(opener, f"http://{host}:{ctl}/models", 180)
+    return d.get("upscalers") or []
+
+
+def localdream_upscale(image_path, upscaler="realistic", out_dir=None, timeout=600):
+    """手机 QNN NPU 4 倍放大，返回落盘路径。
+
+    /upscale 跟 /generate 不是一个协议：**body 直接是裸 RGB 字节**
+    （长度必须等于 W*H*3），尺寸和权重路径走 header（X-Image-Width/Height/
+    X-Upscaler-Path），回的是 image/jpeg + X-Output-Width/Height/Duration-Ms。
+
+    为什么这条路线值得单列：512×512 出图 4s + 放大 4s = **8 秒拿到 2048×2048**，
+    比直接出 1024×768（38s）又大又快。这是手机出图真正的性价比路线。
+
+    前置条件：/upscale 复用生成进程里的 QNN runtime，host mode 刚起、
+    还没 /select 过任何模型时，native 会抛 "QNN runtime is not initialized"。
+    """
+    import time as _t
+
+    import urllib.request as _u
+    from PIL import Image
+
+    host, ctl, gen = _ld_endpoints()
+    opener = _ld_opener()
+    if not image_path or not os.path.isfile(image_path):
+        raise RuntimeError(f"找不到要放大的图：{image_path!r}")
+
+    im = Image.open(image_path).convert("RGB")
+    w, h = im.size
+    body = im.tobytes()
+
+    ups = _ld_upscalers(opener, host, ctl)
+    if not ups:
+        raise RuntimeError(
+            "手机上没装放大模型。要下 upscaler 权重（约 24MB）："
+            "xororz/upscaler 的 4x_UltraSharpV2_Lite/upscaler_<芯片>.bin，"
+            "放到 files/models/upscaler_realistic/upscaler.bin")
+
+    target = None
+    want = (upscaler or "").strip()
+    for u in ups:
+        uid = str(u.get("id") or "")
+        if not want or uid == want or uid == "upscaler_" + want or want in uid:
+            target = u
+            break
+    if target is None:
+        target = ups[0]
+    up_path = str(target.get("path") or "")
+    if not up_path:
+        raise RuntimeError(f"放大模型 {target.get('id')} 没有可用的权重路径")
+
+    req = _u.Request(
+        f"http://{host}:{gen}/upscale", data=body,
+        headers={"Content-Type": "application/octet-stream",
+                 "X-Image-Width": str(w), "X-Image-Height": str(h),
+                 "X-Upscaler-Path": up_path},
+        method="POST")
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            data = resp.read()
+            out_w = resp.headers.get("X-Output-Width")
+            out_h = resp.headers.get("X-Output-Height")
+            dur = resp.headers.get("X-Duration-Ms")
+    except Exception as e:
+        name, text = type(e).__name__, str(e)
+        if "RemoteDisconnected" in name or "Remote end closed" in text:
+            raise RuntimeError(
+                f"手机 :{gen} 拒连——8081 只有 native 后端起来才会监听。"
+                "先 /select 一个模型（或手机上点进模型页）再放大")
+        blob = ""
+        try:
+            blob = e.read().decode("utf-8", "replace")  # HTTPError 带 body
+        except Exception:
+            pass
+        if "runtime is not initialized" in blob or "not initialized" in blob:
+            raise RuntimeError(
+                "手机 QNN runtime 还没初始化：/upscale 复用生成进程的 runtime，"
+                "先 /select 一个模型把后端拉起来再放大")
+        raise RuntimeError(f"手机放大失败（{name}）：{blob[:200] or text[:200]}")
+
+    if not data:
+        raise RuntimeError("手机放大返回了空 body")
+
+    out_dir = out_dir or os.environ.get("FLEET_SD_OUT") or os.path.join(
+        os.path.expanduser("~"), ".fleet", "sd_out")
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    out_path = os.path.join(out_dir, f"{stem}_x4_{int(_t.time() * 1000)}.jpg")
+    try:
+        with open(out_path, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        raise RuntimeError(f"放大成功但写盘失败：{type(e).__name__}: {e}")
+    if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"放大产物落盘为空：{out_path}")
+
+    # 服务端回的尺寸是权威值，顺带回填给调用方（调用方常拿不到 header）
+    localdream_upscale.last = {
+        "src": f"{w}x{h}", "out": f"{out_w or '?'}x{out_h or '?'}",
+        "server_ms": dur, "upscaler": target.get("id"),
+    }
+    return out_path
+
+
+def run_upscale(image_path, upscaler="realistic", out_dir=None, backend=None):
+    """放大一张图（4x）。返回 {"ok", "path", "src_size", "out_size", "server_ms", "err"}。"""
+    try:
+        if not image_path:
+            return {"ok": False, "path": "", "src_size": "", "out_size": "",
+                    "server_ms": "", "err": "image_path 不能为空"}
+        fn = backend or localdream_upscale
+        if backend is None:
+            p = fn(image_path, upscaler, out_dir)
+            meta = getattr(localdream_upscale, "last", {}) or {}
+        else:
+            # 注入的替身没有 header 信息，别把上一次真跑留下的 last 当它的
+            p = fn(image_path)
+            meta = {}
+        return {"ok": True, "path": p,
+                "src_size": meta.get("src", ""), "out_size": meta.get("out", ""),
+                "server_ms": meta.get("server_ms", ""), "err": ""}
+    except Exception as e:
+        return {"ok": False, "path": "", "src_size": "", "out_size": "",
+                "server_ms": "", "err": f"{type(e).__name__}: {e}"}
+
+
 def run(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0, model=None,
         backend=None, upload=False, bed=None):
     """出一张图，可选经 PicGo 上传到图床。
@@ -482,9 +610,23 @@ def run(prompt, neg="", size="512x512", steps=20, seed=-1, cfg=7.0, model=None,
 # 1x1 PNG：用来确认落盘的是真图片，不是空文件、也不是 base64 原文
 _FAKE_PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
                  "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+# 放大端点回的是 JPEG，用固定常量而不是在 handler 里现场编码——
+# handler 里抛异常会直接断连接，urllib 报 RemoteDisconnected，看着像「手机拒连」。
+_FAKE_JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQ"
+    "DQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQU"
+    "FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEA"
+    "AAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEI"
+    "I0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4"
+    "eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo"
+    "6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3"
+    "AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElK"
+    "U1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPE"
+    "xcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDmqKKK+1Pkj//Z")
 
 
 def _selftest():
+    import base64 as _b
     import json as _j
     import tempfile
     import threading
@@ -505,7 +647,9 @@ def _selftest():
     # 假手机侧的可变状态
     st = {"serving": None, "state": "idle", "mode": "ok", "payload": None,
           "selects": 0, "width": None, "height": None,
-          "known": {"sd15-npu"}, "models_calls": 0}
+          "known": {"sd15-npu"}, "models_calls": 0, "up": None,
+          "upscalers": [{"id": "upscaler_realistic",
+                         "path": "/data/user/0/pkg/files/models/upscaler_realistic/upscaler.bin"}]}
 
     class Ctl(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -532,7 +676,8 @@ def _selftest():
                 # 真机是全量重扫模型目录：重扫后「后推上去的模型」才可见
                 st["models_calls"] += 1
                 st["known"].add("late-model")
-                return self._send({"models": [], "useImg2img": True})
+                return self._send({"models": [], "useImg2img": True,
+                                   "upscalers": st["upscalers"]})
             return self._send({"error": "not found"}, 404)
 
         def do_POST(self):
@@ -568,6 +713,35 @@ def _selftest():
 
         def do_POST(self):
             n = int(self.headers.get("Content-Length") or 0)
+            if self.path == "/upscale":
+                raw = self.rfile.read(n) if n else b""
+                st["up"] = {"bytes": len(raw),
+                            "w": self.headers.get("X-Image-Width"),
+                            "h": self.headers.get("X-Image-Height"),
+                            "path": self.headers.get("X-Upscaler-Path")}
+                if st["mode"] == "up_no_runtime":
+                    body = b'{"error":{"message":"QNN runtime is not initialized for upscaling"}}'
+                    self.send_response(400)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                w = int(st["up"]["w"] or 0)
+                h = int(st["up"]["h"] or 0)
+                if n != w * h * 3:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                body = _b.b64decode(_FAKE_JPEG_B64)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("X-Output-Width", str(w * 4))
+                self.send_header("X-Output-Height", str(h * 4))
+                self.send_header("X-Duration-Ms", "7")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
                 st["payload"] = _j.loads(self.rfile.read(n) or b"{}")
             except ValueError:
@@ -667,6 +841,39 @@ def _selftest():
         check(r["ok"] is True, "后推的模型能 select 上: %s" % (r["err"] or ""))
         check(st["models_calls"] == 1, "/models 被调用一次做全量重扫")
         check(st["serving"] == "late-model", "重扫后 serving 切到该模型")
+
+        # ---- 5c. 放大：裸 RGB 协议 + header 契约 + 错误透出
+        section("放大 4x（/upscale 二进制协议）")
+        src = os.path.join(tmp, "up_src.png")
+        from PIL import Image as _Im
+        _Im.new("RGB", (64, 48), (200, 60, 60)).save(src)
+        st["up"] = None
+        r = run_upscale(src)
+        check(r["ok"] is True, "放大成功: %s" % (r["err"] or ""))
+        check(r["path"].lower().endswith(".jpg") and os.path.isfile(r["path"]),
+              "回的是 JPEG 且落盘")
+        check(r["out_size"] == "256x192", "服务端 X-Output-* 被读回（实际 %s）" % r["out_size"])
+        up = st["up"] or {}
+        check(up.get("bytes") == 64 * 48 * 3,
+              "body 是裸 RGB（长度 %s，应为 %d）" % (up.get("bytes"), 64 * 48 * 3))
+        check(up.get("w") == "64" and up.get("h") == "48", "宽高走 header")
+        check("upscaler_realistic" in str(up.get("path")), "权重路径来自 /models 的 path")
+
+        st["upscalers"] = []
+        r = run_upscale(src)
+        check(r["ok"] is False and "没装放大模型" in r["err"],
+              "没装放大模型 -> 明确说没装: %s" % r["err"][:60])
+        st["upscalers"] = [{"id": "upscaler_realistic",
+                            "path": "/data/user/0/pkg/files/models/upscaler_realistic/upscaler.bin"}]
+
+        st["mode"] = "up_no_runtime"
+        r = run_upscale(src)
+        check(r["ok"] is False and "runtime" in r["err"],
+              "QNN 未初始化 -> 说清要先 /select: %s" % r["err"][:60])
+        st["mode"] = "ok"
+
+        r = run_upscale("/no/such.png")
+        check(r["ok"] is False and "找不到" in r["err"], "缺图如实报错")
 
         # ---- 6. 手机侧报错要透出原因
         section("失败带原因")
