@@ -1,0 +1,29 @@
+# Render 蓝图：把 wsrelay 部署成一台「自己的中转」。
+#
+# 为什么选 Render：2026-10-31 实测 `*.onrender.com` 的随机子域名国内 TLS 握手成功
+# （1675ms），门牌号没被点名。同类可选的还有 koyeb.app(796ms)、up.railway.app(560ms)、
+# netlify.app(374ms)——换平台只需改 startCommand，wsrelay.py 本身不用动。
+#
+# 用法：
+#   1. 仓库推到 GitHub（公开仓库免费额度不限）；
+#   2. Render 控制台 → New → Blueprint → 选本仓库，它会读到这个文件；
+#   3. 部署完拿到形如 https://skynet-wsrelay-xxxx.onrender.com 的地址；
+#   4. 本机：python proxy.py --port 7822 --upstream-ws wss://那个地址/tunnel
+#
+# 免费档的真实限制（照实写，别指望它当宽带用）：
+#   · 512MB 内存 / 0.1 CPU —— 够转发，不够转码；
+#   · 15 分钟无请求就休眠，冷启动约 30 秒；
+#   · 每月 750 小时；
+#   · 出口是数据中心 IP，YouTube 可能要求登录验证（这是 YouTube 的策略，不是隧道的问题）。
+services:
+  - type: web
+    name: skynet-wsrelay
+    runtime: python
+    plan: free
+    rootDir: tools/cloudnode
+    buildCommand: "python -c \"print('wsrelay 零依赖，无需构建')\""
+    startCommand: "python wsrelay.py --serve --port $PORT"
+    healthCheckPath: /
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"

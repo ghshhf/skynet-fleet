@@ -38,6 +38,8 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -83,6 +85,8 @@ fun ChatScreen(
     onSend: (String) -> Unit,
     onStop: () -> Unit,
     onOpenSettings: () -> Unit,
+    speakOn: Boolean = false,
+    onToggleSpeak: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var draft by remember { mutableStateOf("") }
@@ -94,7 +98,7 @@ fun ChatScreen(
     }
 
     Column(modifier.fillMaxSize()) {
-        ModelBar(model, onPickModel)
+        ModelBar(model, onPickModel, speakOn, onToggleSpeak)
 
         if (msgs.isEmpty()) {
             // 🔴 空态就是空态。旧版这里塞了两条假对话（含假的工具调用和假结果），
@@ -151,7 +155,12 @@ fun ChatScreen(
 /* ---------------------------------- 顶栏 ---------------------------------- */
 
 @Composable
-private fun ModelBar(model: ModelProfile?, onPick: () -> Unit) {
+private fun ModelBar(
+    model: ModelProfile?,
+    onPick: () -> Unit,
+    speakOn: Boolean = false,
+    onToggleSpeak: () -> Unit = {},
+) {
     val isLocal = model?.kind == BackendKind.LOCAL
     Row(
         Modifier.fillMaxWidth()
@@ -185,6 +194,17 @@ private fun ModelBar(model: ModelProfile?, onPick: () -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.weight(1f))
+        // 喇叭 = 开不开她出声（总纲第 1 条的开关）。放对话页顶栏而不是设置页：
+        // 这是「这一句要不要念」的事，跑设置里翻两页就没人用了。
+        IconButton(onClick = onToggleSpeak, modifier = Modifier.size(30.dp)) {
+            Icon(
+                if (speakOn) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
+                contentDescription = if (speakOn) "关闭朗读" else "开启朗读",
+                tint = if (speakOn) MaterialTheme.colorScheme.primary
+                       else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(17.dp),
+            )
+        }
         Icon(
             Icons.Filled.ExpandMore, contentDescription = "切换模型",
             tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp),

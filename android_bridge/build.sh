@@ -55,7 +55,14 @@ if [ ! -f "$TOKEN_FILE" ] || [ "${1:-}" = "--new-token" ]; then
 fi
 TOKEN="$(cat "$TOKEN_FILE")"
 cp src/app/fleet/bridge/*.java build/src/app/fleet/bridge/
-sed -i "s/__TOKEN__/$TOKEN/" build/src/app/fleet/bridge/BridgeService.java
+# 令牌占位符现在不止出现在 BridgeService 里（控制端口搬到了保活壳），
+# 所以按目录扫 —— 只替换某一个文件的话，漏掉的那个会把 __TOKEN__ 原样打进包里，
+# 表现是"鉴权永远失败"，而且从代码里看一切正常。
+sed -i "s/__TOKEN__/$TOKEN/g" build/src/app/fleet/bridge/*.java
+if grep -q "__TOKEN__" build/src/app/fleet/bridge/*.java; then
+  echo "令牌占位符没替换干净：$(grep -l '__TOKEN__' build/src/app/fleet/bridge/*.java | tr '\n' ' ')" >&2
+  exit 1
+fi
 echo "$TOKEN" > build/token.txt
 
 # ② 编译 Java：--release 11 产出 class 55，d8 认得
@@ -105,14 +112,38 @@ SIZE=$("$PY" -c "import os,sys;print(os.path.getsize(sys.argv[1]))" build/fleet-
 echo "[5/5] 产物 build/fleet-bridge.apk  ${SIZE} 字节"
 echo "--------"
 echo "令牌：$TOKEN"
-echo "安装：adb install --no-streaming -r build/fleet-bridge.apk"
-# 🔴 必须 --no-streaming（2026-10-26 实测）：MIUI/HyperOS 对**流式安装**直接回
-#    INSTALL_FAILED_USER_RESTRICTED: Install canceled by user（就算屏幕亮着、
-#    人就守着也一样，它不给弹窗）。换成 push 安装（--no-streaming）一次就过，
-#    全程不用点屏幕。
-# 🔴 而且**别 uninstall 再装**：卸载后无障碍授权一起没了，而这代 ROM 不让
-#    adb 写 secure settings（`settings put` 与 `pm grant` 全被拒），
-#    只能人去「设置 → 无障碍 → 编队桥」手开一次。
-#    只要 keystore.jks 还在（本脚本会复用，不会重新生成），
+
+# ---- 安装（2026-11-01 重写）----
+# 三条路都试过了，只有第三条通：
+#   ① adb install --no-streaming  → INSTALL_FAILED_USER_RESTRICTED
+#      10-26 那次能过，这代 HyperOS 又收紧了，现在连屏幕亮着也拒
+#   ② am start + 系统安装器 GUI   → 卡在 ICP 备案弹窗，要靠无障碍点「继续安装」
+#      可无障碍正是要装的东西 —— 鸡生蛋，卸载后必死
+#   ③ pm install-create / -write / -commit 三连 → 过
+#      快捷命令 `pm install` 会带"需要用户确认"的标志，分步 session 不带。
+#      全程不需要碰屏幕，也不看 ICP 备案弹窗的脸色。
+#
+# 🔴 **别 uninstall 再装**：卸载后无障碍授权一起没了，而这代 ROM 不让 adb 写
+#    secure settings（`settings put` 与 `pm grant` 全被拒），只能人去
+#    「设置 → 无障碍 → 编队桥」手开一次。只要 keystore.jks 还在（本脚本会复用），
 #    覆盖安装就是无痛的一条命令。
+WANT_INSTALL=0
+for a in "$@"; do [ "$a" = "--install" ] && WANT_INSTALL=1; done
+
+if [ "$WANT_INSTALL" = "1" ]; then
+  ADB="$(pick "${SDK:+$SDK/platform-tools/adb.exe}" "$(command -v adb 2>/dev/null || true)" || true)"
+  [ -n "$ADB" ] || { echo "找不到 adb（试过 \$SDK/platform-tools 和 PATH）" >&2; exit 1; }
+  echo "安装：$ADB"
+  MSYS_NO_PATHCONV=1 "$ADB" push build/fleet-bridge.apk /data/local/tmp/fb.apk >/dev/null
+  OUT=$(MSYS_NO_PATHCONV=1 "$ADB" shell "pm install-create -r -t -S $SIZE" || true)
+  SID=$(printf '%s' "$OUT" | grep -oE '\[[0-9]+\]' | tr -d '[]' || true)
+  [ -n "$SID" ] || { echo "install-create 失败：$OUT" >&2; exit 1; }
+  MSYS_NO_PATHCONV=1 "$ADB" shell "pm install-write -S $SIZE $SID base /data/local/tmp/fb.apk" >/dev/null
+  MSYS_NO_PATHCONV=1 "$ADB" shell "pm install-commit $SID"
+  # 装完进程是新的，把前台服务立刻拉起来（不然要等用户解锁或系统绑无障碍）
+  MSYS_NO_PATHCONV=1 "$ADB" shell "am start -n app.fleet.bridge/.BridgeSetupActivity" >/dev/null 2>&1 || true
+  echo "已安装并拉起前台服务"
+else
+  echo "安装：bash build.sh --install"
+fi
 echo "授权：手机 设置 → 无障碍 → 已下载的服务 → 「编队桥」→ 打开"

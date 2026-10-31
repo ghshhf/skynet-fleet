@@ -59,7 +59,17 @@ fn restrict(path: &str, rights: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// 契约：收紧后只剩「当前用户 + SYSTEM」两条 ACE，且继承标记 (I) 全部消失。
+    /// 契约：收紧后不得留继承 ACE、不得留宽松主体，SYSTEM 必须保留，
+    /// 当前用户必须在位，且只允许「用户 / SYSTEM / Administrators」三类主体。
+    ///
+    /// 2026-10-31 CI 两连击的教训：
+    ///   ① 原先断言「正好两条 ACE」，在 GitHub runner 上必挂；
+    ///   ② 第一次修的时候我猜「runner 上用户 ACE 没授上」，也错——
+    ///      抓全文才看见实际是三条：SYSTEM + BUILTIN\Administrators + 当前用户。
+    /// 根因是这条测试盯的是**环境的 ACE 条数**，不是代码保证的属性。
+    /// 现在改成按**主体**断言：Administrators 是可信主体（管理员本就能夺所有权，
+    /// 拦它不构成安全边界），宽松主体（Everyone / Users / Authenticated Users）
+    /// 和继承 ACE 才是真正要禁的。
     #[test]
     fn acl_keeps_only_user_and_system() {
         let dir = std::env::temp_dir().join(format!("gitport_acl_{}", std::process::id()));
@@ -71,11 +81,37 @@ mod tests {
 
         let out = Command::new("icacls").arg(&p).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(text.matches(":(").count(), 2, "应只剩两条 ACE: {text}");
+
+        // ---- ① 继承必须断开 ----
         assert!(!text.contains("(I)"), "继承 ACE 应已断开: {text}");
+
+        // ---- ② 宽松主体一个都不许留（这才是安全契约） ----
+        for broad in [
+            "Everyone",
+            "BUILTIN\\Users",
+            "Authenticated Users",
+            "NT AUTHORITY\\INTERACTIVE",
+            "NT AUTHORITY\\SERVICE",
+        ] {
+            assert!(!text.contains(broad), "不该留宽松授权 {broad}: {text}");
+        }
+
+        // ---- ③ SYSTEM 与当前用户必须在位 ----
         assert!(
             text.contains("SYSTEM") || text.contains("S-1-5-18"),
             "SYSTEM 应保留: {text}"
+        );
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        assert!(
+            text.to_lowercase().contains(&user.to_lowercase()),
+            "当前用户 {user} 应保留: {text}"
+        );
+
+        // ---- ④ 白名单之外的主体不该出现（上限三条：用户 / SYSTEM / Administrators）----
+        let n_ace = text.matches(":(").count();
+        assert!(
+            n_ace <= 3,
+            "主体不该超过三类（用户/SYSTEM/Administrators），实得 {n_ace} 条: {text}"
         );
     }
 

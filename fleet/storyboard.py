@@ -382,10 +382,10 @@ def tts_local(text, out_wav, voice=None, engine=None, ref=None, ref_text=None,
     为什么统一 24k：后面的混音/拼接路径全是按 edge-tts 的输出（24k 单声道）
     写的，本地 TTS 出的是 44.1k。不归一化的话拼接点会变调、时长也会错。
 
-    engine / ref / ref_text 透传给 tts_runner：
-      · engine="matcha"（默认）高质量单人旁白，不吞字
-      · engine="zipv" + ref="新闻女" + ref_text=... 克隆任意音色（角色对话用）
-      · engine="zhll" + sid=N 多说话人（16kHz，电话音质）
+    engine / ref / ref_text 透传给 tts_runner（三档质量梯度，见 tts_runner.ENGINES）：
+      · engine="matcha"（默认）快档单人旁白，RTF 0.12，不吞字
+      · engine="zipv" + ref="新闻女" + ref_text=... 克隆任意音色，24kHz（RTF 1.37）
+      · engine="indextts2" 精品档（RTF 33，必须配合 voicebank.prewarm 批量预合成）
     """
     try:
         from fleet import tts_runner
@@ -414,19 +414,34 @@ def tts_local(text, out_wav, voice=None, engine=None, ref=None, ref_text=None,
 
 
 def tts(text, out_wav, voice=None, rate="+0%", timeout=60, engine=None,
-        ref=None, ref_text=None):
-    """合成一句台词 → wav。**先本地，再云**。
+        ref=None, ref_text=None, prefer="local"):
+    """合成一句台词 → wav。**先本地，再云端**（计划书《视频路线》第六节）。
 
-    本地（手机 sherpa-onnx）不联网、每句 2 秒级；云 edge-tts 音色更多
-    但要出网。漫剧几十条台词，默认走本地才成立 —— 云只是兜底。
-    engine/ref/ref_text 透传给本地引擎（见 tts_local）。
+    本地主体是手机 sherpa-onnx：不联网、不依赖任何 App、每句 2 秒级；
+    云端 edge-tts 只在本地挂了时兜底（音色更多，但要出网）。
+
+    2026-11-01 实测补记（不改变上面的默认顺序，只作为可选开关的依据）：
+    同一句 34 字中文，云端 edge-tts RTF 0.223、手机 matcha RTF 0.535 —— 云端更快。
+    想用云端主力就显式传 prefer="cloud"；默认仍按计划书走本地。
+    engine/ref/ref_text 只对本地那一路生效（见 tts_local）。
     """
-    try:
+    first, second = ("cloud", "local") if prefer == "cloud" else ("local", "cloud")
+
+    def _run(which, prev_err=None):
+        if which == "cloud":
+            return _edge_tts(text, out_wav, voice=voice, rate=rate, timeout=timeout,
+                             local_err=prev_err if first == "local" else None)
         return tts_local(text, out_wav, voice=voice, engine=engine, ref=ref,
                          ref_text=ref_text, timeout=timeout)
-    except Exception as local_err:
-        _edge_tts(text, out_wav, voice=voice, rate=rate, timeout=timeout,
-                  local_err=local_err)
+
+    try:
+        return _run(first)
+    except Exception as err_first:
+        try:
+            return _run(second, prev_err=err_first)
+        except Exception as err_second:
+            raise RuntimeError("配音两路都没成 —— 首选[%s]: %s；兜底[%s]: %s"
+                               % (first, err_first, second, err_second))
 
 
 def _edge_tts(text, out_wav, voice=None, rate="+0%", timeout=60, local_err=None):
@@ -438,7 +453,7 @@ def _edge_tts(text, out_wav, voice=None, rate="+0%", timeout=60, local_err=None)
         import asyncio
         import edge_tts
     except Exception as e:
-        raise RuntimeError("没装 edge-tts：pip install edge-tts（%s）；%s"
+        raise RuntimeError("没装 edge-tts：pip install edge-tts（%s）%s"
                            % (e, _note_local(local_err)))
     ff = _ffmpeg()
     if not ff:
@@ -452,7 +467,7 @@ def _edge_tts(text, out_wav, voice=None, rate="+0%", timeout=60, local_err=None)
     try:
         asyncio.run(_go())
     except Exception as e:
-        raise RuntimeError("edge-tts 合成失败（多半是断网）：%s: %s；%s"
+        raise RuntimeError("edge-tts 合成失败（多半是断网）：%s: %s%s"
                            % (type(e).__name__, e, _note_local(local_err)))
     cmd = [ff, "-y", "-i", mp3, "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", out_wav]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -465,7 +480,7 @@ def _edge_tts(text, out_wav, voice=None, rate="+0%", timeout=60, local_err=None)
 
 
 def _note_local(local_err):
-    return ("本地 TTS 也没成（%s）" % local_err) if local_err else ""
+    return ("；另一路也没成（%s）" % local_err) if local_err else ""
     return out_wav
 
 

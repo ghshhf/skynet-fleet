@@ -3,8 +3,10 @@
 把 gitport 从「手动双击 exe」升级为「天网可管控的外国流量加速通道」。
 
 gitport 是本地代理（127.0.0.1:7810 代理 / :7811 管理页），但它**不是通用翻墙**——
-只接管 sites.toml 登记的外国站点（GitHub / YouTube / Twitter / HuggingFace / arXiv …），
-其余流量必须 DIRECT，否则会拖垮国内站点。所以对外暴露的核心是「PAC 路由 + 按需开关」。
+只接管真正救得动的站点，其余流量必须 DIRECT，否则会拖垮国内站点。
+2026-10-31 实测定调：GitHub 是「按域名封、换 IP 即通」→ 可救；
+YouTube/Google 是「TLS 握手阶段按 IP 段整段切断」→ 分片无效，已从名单剔除。
+所以对外暴露的核心是「PAC 路由 + 按需开关 + 热点网关」。
 
 设计约束（与 netpath.py 同款克制）：
 - 零第三方依赖，只用标准库 + 必要时 subprocess。
@@ -14,11 +16,15 @@ gitport 是本地代理（127.0.0.1:7810 代理 / :7811 管理页），但它**�
     python netaccel.py status            # 看 gitport 在不在、代理开没开
     python netaccel.py start             # 启动 gitport（headless）+ 接管 git 代理
     python netaccel.py stop              # 停 gitport + 清 git / 系统代理
+    python netaccel.py gateway           # 把本机做成热点网关（7822 → gitport 7810）
+    python netaccel.py gateway-stop      # 只停网关，不动 gitport
+    python netaccel.py ci-fetch          # 从 GitHub Actions 拉最新成功产物到 dist/（编译交给 runner）
     python netaccel.py pac               # 打印当前 PAC 脚本（可落盘给浏览器/系统用）
     python netaccel.py system-proxy on   # 系统代理指向 PAC（仅登记域名走 7810）
     python netaccel.py system-proxy off  # 关系统代理
     python netaccel.py --selftest
 """
+import json
 import os
 import re
 import socket
@@ -31,47 +37,125 @@ PROXY_PORT = 7810
 WEBUI_PORT = 7811
 PROXY_ADDR = f"127.0.0.1:{PROXY_PORT}"
 
-# gitport 二进制相对本文件的路径（release 优先，debug 兜底）。
-# fleet/netaccel.py -> ../vendor/gitport-accel/target/.../release/gitport-github.exe
+# gitport 二进制候选路径。
+# 本机用 gnu 目标编（Strawberry MinGW），CI 用 msvc 编（runner 自带工具链）——
+# 两边都会产出，按「release 优先、msvc 次之、debug 兜底」的顺序找，
+# 不要写死一个目标三元组，否则换个编译方式就「找不到 exe」。
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _GITPORT_DIR = os.path.normpath(os.path.join(_HERE, "..", "vendor", "gitport-accel"))
-_EXE_RELEASE = os.path.join(
-    _GITPORT_DIR, "target", "x86_64-pc-windows-gnu", "release", "gitport-github.exe"
-)
-_EXE_DEBUG = os.path.join(
-    _GITPORT_DIR, "target", "x86_64-pc-windows-gnu", "debug", "gitport-github.exe"
-)
+_TRIPLES = ("x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc")
+_EXE_CANDIDATES = [
+    os.path.join(_GITPORT_DIR, "target", t, profile, "gitport-github.exe")
+    for profile in ("release", "debug")
+    for t in _TRIPLES
+]
+# CI 产物的下载解压位置（artifact 解出来就是 exe 本体，没有 target 结构）。
+# `netaccel.py ci-fetch` 就落在这里，是「编译交给 runner」这条规矩的落地点。
+CI_DIST_DIR = os.path.join(_GITPORT_DIR, "dist")
+_EXE_CANDIDATES.append(os.path.join(CI_DIST_DIR, "gitport-github.exe"))
 _SITES_TOML = os.path.join(_GITPORT_DIR, "sites.toml")
 _SITES_EXAMPLE = os.path.join(_GITPORT_DIR, "SITES_EXAMPLE.toml")
 
 # 内置受管域名（必须镜像 src/site.rs 的 default_profiles 域名）。
 # 这是 PAC 路由的真相来源之一；用户通过 sites.toml 追加的站点会被自动并入。
 # 旧 GitHub 生态域名（*.github.com / *.githubusercontent.com）覆盖全部 GitHub 流量。
+# 2026-10-31 实测定调：只登记「gitport 确实救得动」的站。
+#
+# YouTube / Twitter / Google 已从名单里剔除，理由是量出来的，不是猜的：
+#   ① DNS 就被污染（www.youtube.com 返回 31.13.92.37 = Facebook 的 IP）；
+#   ② 直接打 25 个真实 Google IP，只有 4 个 TCP 能建连；
+#   ③ 对这 4 个换任意 SNI（含 pypi/cloudflare）全部 ConnectionReset。
+# 结论是 Google 段在 TLS 握手阶段被按 IP 整段切断，跟 SNI 无关，分片救不了。
+# 把它们留在 PAC 里等于把流量导进死端口——浏览器白等超时，还不如 DIRECT 快速失败。
 BUILTIN_DOMAINS = [
-    # GitHub 全系
+    # GitHub 全系（换 IP 即通，实测 200/0.29s，gitport 的主战场）
     "github.com", "*.github.com",
     "githubusercontent.com", "*.githubusercontent.com",
-    # YouTube（Google 视频/CDN 基础设施）
-    "youtube.com", "www.youtube.com", "*.youtube.com",
-    "*.googlevideo.com", "*.ytimg.com", "*.ggpht.com",
-    # Twitter / X
-    "twitter.com", "*.twitter.com", "t.co", "*.t.co",
-    "*.twimg.com", "api.twitter.com", "pbs.twimg.com",
-    # HuggingFace（模型下载 / 数据集）
-    "huggingface.co", "*.huggingface.co", "*.hf.co",
-    "cdn-lfs.huggingface.co", "cdn-lfs.hf.co",
-    # arXiv（国外论文）
+    # arXiv（国外论文，直连可用，登记只为在必要时代理）
     "arxiv.org", "*.arxiv.org", "export.arxiv.org",
+]
+
+# 模型下载别走代理，走镜像更快：实测 hf-mirror 1.63MB/s、ModelScope 直连可用，
+# 而 huggingface.co 本身 IP 可达但 SNI 被封、且 DPI 流重组窗口 >3s（分片/乱序全无效）。
+MIRROR_HOSTS = [
+    "hf-mirror.com", "*.hf-mirror.com",
+    "modelscope.cn", "*.modelscope.cn",
 ]
 
 
 def find_exe():
-    """定位 gitport 二进制：release 优先，debug 兜底，再查环境变量。"""
-    env = os.environ.get("GITPORT_EXE")
-    for cand in (env, _EXE_RELEASE, _EXE_DEBUG):
-        if cand and os.path.isfile(cand):
-            return cand
-    return None
+    """定位 gitport 二进制：环境变量优先，其余候选按修改时间取最新。
+
+    为什么按 mtime 而不是写死顺序：本机可能同时躺着一个旧的 gnu 产物和一个
+    刚从 CI 拉下来的 msvc 产物。写死顺序会让「明明下了新的却还在跑旧的」，
+    这种 bug 不报错，只表现为「改了代码没生效」，最难查。
+    """
+    override = (os.environ.get("GITPORT_EXE") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+    best, best_m = None, -1.0
+    for cand in _EXE_CANDIDATES:
+        try:
+            m = os.path.getmtime(cand)
+        except OSError:
+            continue
+        if m > best_m:
+            best, best_m = cand, m
+    return best
+
+
+_REPO_ROOT = os.path.normpath(os.path.join(_GITPORT_DIR, "..", ".."))
+
+
+def ci_fetch(run_id=None, timeout=300):
+    """从 GitHub Actions 拉 build-gitport 最新的成功产物，落到 dist/。
+
+    2026-10-31 定调：编译一律交给 runner。runner 上 2~5 分钟出活，本机要十几分钟
+    还得看 E 盘脸色（Rust home / libclang / MinGW 头文件三条外部依赖），
+    「验证代码编得过」这件事本机没有任何优势。既然这样，「把产物拿回来」
+    就必须是一条命令，不能让「exe 在哪」再变成一次踩坑。
+
+    返回 (ok, 说明)；ok=False 时说明是给人看的失败原因。
+    """
+    from shutil import which
+
+    if not which("gh"):
+        return False, "没找到 gh（GitHub CLI）。要么装 gh，要么网页手动下 artifact"
+    if not run_id:
+        rc, out, _ = _safe_run(
+            ["gh", "run", "list", "--workflow=build-gitport.yml",
+             "--status=success", "--limit", "1",
+             "--json", "databaseId,headSha,createdAt"],
+            timeout=60, cwd=_REPO_ROOT)
+        try:
+            rows = json.loads(out or "[]")
+        except ValueError:
+            return False, f"查 CI 运行记录失败（rc={rc}）：{(out or '')[:200]}"
+        if not rows:
+            return False, "build-gitport 还没有一次成功运行——先让它绿，再来拿"
+        run_id = str(rows[0]["databaseId"])
+    os.makedirs(CI_DIST_DIR, exist_ok=True)
+    # 只清 exe/dll，不整个删目录（万一里面有人放的 sites.toml 之类）
+    for name in os.listdir(CI_DIST_DIR):
+        if name.lower().endswith((".exe", ".dll")):
+            try:
+                os.remove(os.path.join(CI_DIST_DIR, name))
+            except OSError:
+                pass
+    rc, out, err = _safe_run(
+        ["gh", "run", "download", str(run_id), "-n", "build-gitport-windows",
+         "-D", CI_DIST_DIR],
+        timeout=timeout, cwd=_REPO_ROOT)
+    if rc != 0:
+        return False, f"下载 artifact 失败（run {run_id}）：{((out or '') + (err or '')).strip()[:300]}"
+    exe = os.path.join(CI_DIST_DIR, "gitport-github.exe")
+    if not os.path.isfile(exe):
+        got = []
+        for root, _dirs, files in os.walk(CI_DIST_DIR):
+            got += files
+        return False, f"产物里没有 gitport-github.exe，实际解出：{got[:10]}"
+    mb = os.path.getsize(exe) / 1048576
+    return True, f"run {run_id} 已落地 {exe}（{mb:.2f} MB）"
 
 
 def is_running():
@@ -83,10 +167,10 @@ def is_running():
         return False
 
 
-def _safe_run(cmd, timeout=10):
+def _safe_run(cmd, timeout=10, cwd=None):
     """跑命令，安全解码输出（中文 Windows 的 netstat/taskkill 是 GBK，不能 text=True 硬解）。"""
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=cwd)
     except Exception as e:
         return -1, "", str(e)
     out = ""
@@ -127,7 +211,11 @@ def start(headless=True, wait=8):
     """
     exe = find_exe()
     if not exe:
-        return False, "找不到 gitport-github.exe（先跑 build_gitport.bat 编译）"
+        return False, (
+            "找不到 gitport-github.exe。两条路选一条：\n"
+            "  · 本地编译：vendor/gitport-accel/build_windows.sh\n"
+            "  · 让 CI 编：push 后从 GitHub Actions 的 build-gitport 产物下载"
+        )
     if is_running():
         return True, f"gitport 已经在跑（{PROXY_ADDR}）"
     args = [exe]
@@ -174,6 +262,102 @@ def stop():
         rc, out, err = _safe_run(["taskkill", "/IM", "gitport-github.exe", "/F", "/T"])
         return rc == 0, f"按名结束：{(out or err).strip()[:120]}"
     return False, "非 Windows 且按端口找不到 PID，无法结束"
+
+
+# --- 热点网关：把本机做成「连上就有代理」的网关 ---------------------
+#
+# 分层而不是重写：proxy.py 只负责「把局域网来的连接转交给 127.0.0.1:7810」，
+# 真正的 IP 池、失败沉底、ClientHello 分片全在 gitport 里。
+# 这样热点下的设备只填一个 代理=192.168.137.1:7822，不用装任何东西。
+LAN_PORT = 7822
+_GATEWAY_PY = os.path.normpath(
+    os.path.join(_HERE, "..", "tools", "cloudnode", "proxy.py")
+)
+
+
+def hotspot_ip():
+    """找移动热点网卡的网关地址（Windows 移动热点固定 192.168.137.1）。
+
+    找不到就返回 None —— 调用方据此提示「先开热点」，而不是瞎猜一个地址。
+    """
+    if not IS_WIN:
+        return None
+    rc, out, _ = _safe_run(["netsh", "interface", "ip", "show", "address"], timeout=8)
+    for line in (out or "").splitlines():
+        if "192.168.137." in line:
+            m = re.search(r"(192\.168\.137\.\d+)", line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def lan_running():
+    """7822 是否在监听（热点网关起来了）。"""
+    try:
+        with socket.create_connection(("127.0.0.1", LAN_PORT), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+def gateway_start(wait=8):
+    """启动热点网关。gitport 没跑就先拉起来。返回 (ok, 说明)。
+
+    如果设了环境变量 ``FLEET_WSRELAY``（形如 ``wss://xxx.onrender.com/tunnel``），
+    网关会把 WS 隧道当作最优先上游——那是唯一能覆盖墙外站点的通路，
+    因为本机 IP 池只救得动「换 IP 就通」的站（GitHub 这类）。
+    """
+    if not os.path.isfile(_GATEWAY_PY):
+        return False, f"找不到 {_GATEWAY_PY}"
+    if lan_running():
+        ip = hotspot_ip() or "0.0.0.0"
+        return True, f"网关已在跑（{ip}:{LAN_PORT}）"
+    if not is_running():
+        ok, msg = start()
+        if not ok:
+            return False, f"gitport 起不来，网关没有上游：{msg}"
+    args = [
+        sys.executable, _GATEWAY_PY,
+        "--host", "0.0.0.0", "--port", str(LAN_PORT),
+        "--upstream", PROXY_ADDR,
+    ]
+    wsrelay = os.environ.get("FLEET_WSRELAY", "").strip()
+    if wsrelay:
+        args += ["--upstream-ws", wsrelay]
+    try:
+        if IS_WIN:
+            creation = 0x00000200 | 0x00001000  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+            p = subprocess.Popen(
+                args, creationflags=creation, close_fds=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            p = subprocess.Popen(
+                args, start_new_session=True, close_fds=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+    except OSError as e:
+        return False, f"启动失败：{e}"
+    import time
+    for _ in range(max(1, int(wait * 10))):
+        if lan_running():
+            ip = hotspot_ip() or "0.0.0.0"
+            return True, f"已启动（pid={p.pid}）→ 热点设备代理填 {ip}:{LAN_PORT}"
+        time.sleep(0.1)
+    return False, f"起来了但 {LAN_PORT} 没监听，查 proxy.py 日志"
+
+
+def gateway_stop():
+    """停热点网关（只停 7822，不动 gitport 本身）。"""
+    if not lan_running():
+        return True, "热点网关本来就没跑"
+    pid = _find_pid_on_port(LAN_PORT)
+    if not pid:
+        return False, f"{LAN_PORT} 在监听但找不到 PID"
+    if IS_WIN:
+        rc, out, err = _safe_run(["taskkill", "/PID", str(pid), "/F", "/T"])
+        return rc == 0, f"{'已结束' if rc == 0 else '结束失败'} pid={pid}"
+    return False, "非 Windows 不支持"
 
 
 def git_proxy(on):
@@ -247,6 +431,11 @@ def sites_domains():
     if parsed and isinstance(parsed.get("sites"), list):
         for blk in parsed["sites"]:
             if not isinstance(blk, dict):
+                continue
+            # 没有种子的站点救不动（seeds 为空 = 池里没 IP 可试）。
+            # 把它的域名写进 PAC 只会把浏览器导进一条死路，宁可 DIRECT 快速失败。
+            seeds = blk.get("seeds")
+            if isinstance(seeds, list) and not seeds:
                 continue
             for d in (blk.get("domains") or []):
                 _add(d)
@@ -353,18 +542,22 @@ def _git_proxy_state():
 
 
 def _selftest():
-    # ① 受管域名非空且含关键站点
+    # ① 受管域名：github/arxiv 必须在；youtube/twitter/huggingface 必须不在
+    #    —— 这三条是 2026-10-31 实测结论，写成断言才不会被以后"顺手加回来"。
     doms = sites_domains()
-    for must in ("github.com", "youtube.com", "twitter.com", "huggingface.co", "arxiv.org"):
+    for must in ("github.com", "arxiv.org"):
         assert must in doms, f"缺 {must}：{doms}"
+    for banned in ("youtube.com", "twitter.com", "huggingface.co"):
+        assert banned not in doms, f"{banned} 实测救不动，不该出现在 PAC 里：{doms}"
     # ② PAC 生成：受管域名命中 PROXY，国内域名走 DIRECT
     pac = pac_script()
     assert 'PROXY 127.0.0.1:7810' in pac
     assert 'return "DIRECT";' in pac
     # 通配能同时覆盖裸域与子域
     assert "shExpMatch(host, \"*.github.com\")" in pac
+    assert "youtube" not in pac.lower(), "PAC 里不该再有 youtube"
     # ③ 端口常量
-    assert PROXY_PORT == 7810 and WEBUI_PORT == 7811
+    assert PROXY_PORT == 7810 and WEBUI_PORT == 7811 and LAN_PORT == 7822
     # ④ 二进制定位（debug 或 release 至少一个应存在，否则只告警不报错）
     exe = find_exe()
     if exe:
@@ -372,7 +565,11 @@ def _selftest():
     # ⑤ 系统代理关路径不炸
     ok, msg = system_proxy(False)
     assert isinstance(ok, bool), (ok, msg)
-    print(f"netaccel 自检：5 项全过（受管域名 {len(doms)} 个，exe={exe or '未编译'}）")
+    # ⑥ CI 产物通道：dist 必须在候选里，否则 ci-fetch 下完了也用不上（静默失效）
+    assert os.path.normpath(os.path.join(CI_DIST_DIR, "gitport-github.exe")) in [
+        os.path.normpath(c) for c in _EXE_CANDIDATES
+    ], "ci-fetch 的落地目录不在 find_exe 候选里"
+    print(f"netaccel 自检：6 项全过（受管域名 {len(doms)} 个，exe={exe or '未编译'}）")
 
 
 def main(argv=None):
@@ -404,6 +601,39 @@ def main(argv=None):
         print(("  ✓ " if ok else "  ✗ ") + msg)
         ok2, msg2 = git_proxy(False)
         print(("  ✓ " if ok2 else "  ✗ ") + msg2)
+        return 0 if ok else 1
+    if cmd == "gateway":
+        ok, msg = gateway_start()
+        print(("  ✓ " if ok else "  ✗ ") + msg)
+        if ok:
+            ip = hotspot_ip()
+            if ip:
+                print(f"  热点设备设置：HTTP/SOCKS 代理 {ip}:{LAN_PORT}")
+            else:
+                print("  提示：热点网卡没找到，先开「移动热点」再跑一次")
+            ws = os.environ.get("FLEET_WSRELAY", "").strip()
+            if ws:
+                print(f"  覆盖范围：经 WS 隧道 {ws}（可到墙外站）")
+            else:
+                print("  覆盖范围：GitHub 全系 / PyPI / arXiv；模型走 hf-mirror、ModelScope")
+                print("  要覆盖 YouTube 这类需设 FLEET_WSRELAY=wss://<你的中转>/tunnel")
+        return 0 if ok else 1
+    if cmd in ("gateway-stop", "gateway_stop"):
+        ok, msg = gateway_stop()
+        print(("  ✓ " if ok else "  ✗ ") + msg)
+        return 0 if ok else 1
+    if cmd in ("gateway-status", "gateway_status"):
+        ip = hotspot_ip()
+        print("【热点网关】")
+        print(f"  网卡地址    : {ip or '未找到（热点没开？）'}")
+        print(f"  运行中      : {'是 ' + str(ip or '0.0.0.0') + ':' + str(LAN_PORT) if lan_running() else '否'}")
+        return 0
+    if cmd in ("ci-fetch", "ci_fetch"):
+        run_id = argv[1] if len(argv) > 1 else None
+        ok, msg = ci_fetch(run_id)
+        print(("  ✓ " if ok else "  ✗ ") + msg)
+        if ok:
+            print("  提示：gateway 在跑的话，先 gateway-stop 再 gateway 才会用上新二进制")
         return 0 if ok else 1
     if cmd == "pac":
         sys.stdout.write(pac_script())
