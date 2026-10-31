@@ -30,12 +30,29 @@ fi
 echo "SDK      = $SDK"
 
 # Gradle 定位：PATH 上的可能坏（本机踩过：解压多套一层导致缺 lib/）。
-# 候选制，任一能用即可。
+# JDK 定位：不能直接信 JAVA_HOME。
+# 本机就踩过：JAVA_HOME=E:\DevTools\Java\jdk-21.0.11.10-hotspot，E 盘拔了以后
+# ${JAVA_HOME}/bin/java 根本不存在，而报错只会说"找不到能用的 gradle"——
+# 把人指向 gradle，真凶是 JDK。所以先验证 java 真能跑，跑不了就换候选。
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME}/bin/java" ]; then
+  for j in /d/DevTools/jdk* /d/DevTools/Java/jdk* /e/DevTools/Java/jdk*; do
+    if [ -x "$j/bin/java" ]; then export JAVA_HOME="$j"; break; fi
+  done
+fi
+if [ ! -x "${JAVA_HOME:-/nonexistent}/bin/java" ]; then
+  echo "找不到可用的 JDK：JAVA_HOME=${JAVA_HOME:-<空>}，候选 /d|/e DevTools 下也没有 jdk*" >&2
+  exit 1
+fi
+echo "JAVA     = $JAVA_HOME"
+
+# 候选制，任一能用即可。通配不加引号才会展开。
 GRADLE_BIN="${GRADLE_BIN:-}"
 if [ -z "$GRADLE_BIN" ]; then
   for c in "$(command -v gradle 2>/dev/null || true)" \
-           "/g/dev/gradle-dist/bin/gradle" \
-           "/g/dev/gradle-8.14/bin/gradle"; do
+           /d/DevTools/Gradle/*/bin/gradle \
+           /d/DevTools/gradle*/bin/gradle \
+           /g/dev/gradle-dist/bin/gradle \
+           /g/dev/gradle-8.14/bin/gradle; do
     if [ -n "$c" ] && [ -x "$c" ] && "$c" --version >/dev/null 2>&1; then
       GRADLE_BIN="$c"; break
     fi

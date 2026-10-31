@@ -212,7 +212,15 @@ private fun App() {
             ?: local.minByOrNull { it.sizeMb }
         if (Net.hasConfig()) {
             runCatching { Net.getProviders() }.onSuccess { gws ->
-                models.addAll(ModelCatalog.cloud(gws, Net.loadConfig().token))
+                val cloud = ModelCatalog.cloud(gws, Net.loadConfig().token)
+                models.addAll(cloud)
+                // 🔴 2026-10-31：只有云侧、没装本地 GGUF 的手机会永远卡在「未选模型」。
+                //    上面那句 current 只从 local 里挑，local 为空就是 null；云端模型虽然
+                //    进了列表，却没人把它设成当前项。实测这台手机就是这样：配置注入成功、
+                //    /api/agent 链路也通，顶栏还写着「未选模型 点这里去挑一个」，纯 UI 假故障。
+                if (current == null && cloud.isNotEmpty()) {
+                    current = cloud.firstOrNull { it.id == remembered } ?: cloud.first()
+                }
             }
         }
     }
