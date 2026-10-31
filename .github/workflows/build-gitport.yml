@@ -1,0 +1,111 @@
+name: build-gitport
+
+# 目的：把 gitport 的编译从本机搬到 runner 上。
+#
+# 为什么值得单开一个 workflow：
+#   本机编译这条链有三条外部依赖，任何一条崩了都编不出来——
+#     ① Rust 工具链（曾在 E 盘，盘一拔 cargo 就消失）
+#     ② libclang.dll（boringssl 的 bindgen 硬依赖，也在 E 盘）
+#     ③ MinGW 头文件（stddef.h / mm_malloc.h 分在两个目录）
+#   runner 上是全新的、可复现的环境，这三样都不缺。
+#   ⇒ 验证「代码编得过、测试跑得过」交给 CI；本机只负责跑已经跑通的旧 exe。
+#
+# 产物：build-gitport-windows 这个 artifact（含 exe + 运行时 DLL），可直接下载覆盖本地。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "vendor/gitport-accel/**"
+      - ".github/workflows/build-gitport.yml"
+  pull_request:
+    paths:
+      - "vendor/gitport-accel/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: vendor/gitport-accel
+    env:
+      # boring-sys 的 cmake 子进程会打一堆中文/特殊字符，统一 UTF-8 免炸
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSVC 而不是 gnu：runner 自带 MSVC 工具链，省掉整个 MinGW 依赖。
+      # boring-sys 需要 NASM 编 asm（x86_64 下必需），Go 用来跑 BoringSSL 的代码生成。
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: 确认 NASM / CMake
+        run: |
+          nasm -v
+          cmake --version | Select-Object -First 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/gitport-accel -> target
+          # 缓存键带上目标三元组，换目标不会误用旧缓存
+          key: msvc
+
+      # 先跑测试：编不过/测试红就直接失败，别浪费后面几分钟打 release
+      - name: 单元测试
+        run: cargo test --target x86_64-pc-windows-msvc --lib
+
+      - name: Release 构建
+        run: cargo build --target x86_64-pc-windows-msvc --release
+
+      - name: 收集产物（exe + 运行时 DLL）
+        shell: pwsh
+        run: |
+          $out = "dist"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = "target/x86_64-pc-windows-msvc/release/gitport-github.exe"
+          if (-not (Test-Path $exe)) { throw "没找到 $exe" }
+          Copy-Item $exe $out
+          # WebView2Loader.dll 由 webview2-com-sys 的构建产出带出来，管理页需要它
+          Get-ChildItem target/x86_64-pc-windows-msvc/release -Filter "*.dll" |
+            Copy-Item -Destination $out -ErrorAction SilentlyContinue
+          Get-ChildItem target/x86_64-pc-windows-msvc/release/build -Recurse -Filter "WebView2Loader.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName $out -Force }
+          Get-ChildItem $out | Format-Table Name, @{N="MB";E={[math]::Round($_.Length/1MB,2)}}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-gitport-windows
+          path: vendor/gitport-accel/dist/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 写 job summary
+        if: always()
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/gitport-github.exe"
+          $size = if (Test-Path $exe) { "{0:N2} MB" -f ((Get-Item $exe).Length/1MB) } else { "未产出" }
+          @"
+          ## gitport 构建结果
+
+          | 项 | 值 |
+          |---|---|
+          | 目标 | ``x86_64-pc-windows-msvc`` |
+          | 产物大小 | $size |
+          | 产物名 | ``build-gitport-windows`` |
+
+          下载 artifact 后覆盖到 ``vendor/gitport-accel/target/x86_64-pc-windows-gnu/release/``
+          即可被 ``fleet/netaccel.py`` 直接找到（它按 release 目录找 exe）。
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

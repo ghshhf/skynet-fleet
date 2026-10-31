@@ -143,3 +143,20 @@ tools/.gate_times.json
 tools/.cloudnode.env
 tools/.cloudnode_probe.json
 tools/.egress_scan.json
+
+# 云端节点运行时产物（2026-10-31）：订阅节点表、内核二进制、测速快照都不入库。
+# 节点表是第三方维护的、随时失效；内核 58MB 是构建产物，重新下即可。
+tools/cloudnode/sub/
+tools/cloudnode/bin/
+tools/cloudnode/mihomo.log
+
+# mihomo 订阅管道（2026-10-31 实验残留，结论是死路：2105 个节点协议层 0 通）。
+# 代码留在盘上备查，但不入库——它依赖的第三方节点表随时失效，入库即成谎言。
+tools/cloudnode/mihomo_build.py
+tools/cloudnode/mihomo_status.py
+tools/cloudnode/node_diag.py
+tools/cloudnode/cloudnode_up.py
+
+# libclang 本地副本（2026-10-31）：boringssl 的 bindgen 需要，20MB 级二进制。
+# 用 build_windows.sh 时自动找；缺了按脚本提示 pip 装一份即可，不入库。
+tools/.libclang/
