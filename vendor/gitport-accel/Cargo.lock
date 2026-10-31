@@ -1019,6 +1019,7 @@ dependencies = [
  "tokio-boring",
  "tokio-rustls",
  "tokio-util",
+ "toml 0.8.2",
  "tower-service",
  "tray-icon",
  "windows",

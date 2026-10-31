@@ -219,7 +219,8 @@ fn pac_script() -> String {
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let direct_list = config::DIRECT_HOSTS
+    let direct_list = config::global_sites()
+        .direct_hosts
         .iter()
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
@@ -273,7 +274,7 @@ struct StatusResp {
 }
 
 async fn api_status(State(st): State<Arc<App>>) -> Response {
-    let domain_count = config::GROUPS.iter().map(|g| g.patterns.len()).sum();
+    let domain_count = config::global_sites().groups.iter().map(|g| g.patterns.len()).sum();
     let pool_total: usize = pool::plans_snapshot().values().map(|v| v.len()).sum();
     write_json(&StatusResp {
         version: st.version.to_string(),

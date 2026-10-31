@@ -18,7 +18,7 @@ pub type BoringTls = tokio_boring::SslStream<TcpStream>;
 pub type BoringTlsSplit = tokio_boring::SslStream<SplitHello>;
 
 /// ClientHello 分片器：只拦第一个写（首字节 0x16 = TLS 握手记录），
-/// 按 `WHITELIST_SPLIT_SEGS` 段切开、段间等 `WHITELIST_SPLIT_GAP_MS` 再发下一段。
+/// 按 `whitelist_split_segs()` 段切开、段间等 `whitelist_split_gap_ms()` 再发下一段。
 /// DPI 要拼出完整 ClientHello 才能读 SNI，段间隔超过它的重组窗口就拼不齐。
 /// 握手完成后（`done`）一律直通，不碰应用数据帧。
 pub struct SplitHello {
@@ -43,8 +43,8 @@ impl SplitHello {
     pub fn new(inner: TcpStream) -> Self {
         Self {
             inner,
-            segs_left: crate::config::WHITELIST_SPLIT_SEGS.max(1),
-            gap: Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS),
+            segs_left: crate::config::whitelist_split_segs().max(1),
+            gap: Duration::from_millis(crate::config::whitelist_split_gap_ms()),
             timer: None,
             done: false,
             splitting: false,
@@ -560,7 +560,7 @@ mod split_hello_tests {
         assert_eq!(total, 300, "对端收到的字节数对不上");
         assert!(stamps.len() >= 2, "只收到一段，分片没生效");
         let spread = *stamps.last().unwrap() - stamps[0];
-        let want = Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS * 2 - 20);
+        let want = Duration::from_millis(crate::config::whitelist_split_gap_ms() * 2 - 20);
         assert!(
             spread >= want,
             "首末段间隔 {:?}，不足 {:?}，分片被合并或间隔没生效",
@@ -624,7 +624,7 @@ mod split_hello_tests {
         assert_eq!(total, 307, "对端收到的字节数对不上");
         assert!(stamps.len() >= 2, "续传段被直通吞掉，只发出一段");
         let spread = *stamps.last().unwrap() - stamps[0];
-        let want = Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS * 2 - 20);
+        let want = Duration::from_millis(crate::config::whitelist_split_gap_ms() * 2 - 20);
         assert!(
             spread >= want,
             "首末段间隔 {:?}，不足 {:?}，分片被合并或间隔没生效",
