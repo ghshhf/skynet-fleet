@@ -89,3 +89,87 @@ patterns = [
 # patterns = ["*.novelcdn.com"]
 # [whitelist]
 # "api.novelcdn.com" = "777"      # 新段 -> route.rs 补 FAMILY_WL_777
+
+# ============================================================================
+# 第二节 · 多站点画像（新 site.rs 格式，源码 src/site.rs）
+# ----------------------------------------------------------------------------
+# 第一节的 [[sites]] 是「GitHub 专用旧格式」（groups/whitelist/direct，供旧
+# sites.rs 消费）。本节是「多站点新格式」，供新 site.rs 消费，二者读同一个
+# sites.toml，各自取所需字段、互不干扰。新格式字段：
+#   domains[]          = 域名模式；"*.x" 通配子域，否则全等
+#   seeds[].ip         = IP 种子（DNS 污染免疫，直接拨号不查系统 DNS）
+#   seeds[].sni        = ClientHello SNI；空串=真名，非空=伪装 SNI（校验名恒真名）
+#   sni_disguise       = 站点级默认伪装 SNI（seeds[].sni 优先，二者皆空=真名）
+#   split_hello        = 是否对 ClientHello 首包分片（对抗 SNI RST；byedpi 同款）
+#   direct[]           = 直连白名单（不经代理，交系统 DNS）
+#
+# 加一个新站点 = 在此加一个 [[sites]] 块（带 seeds）。无需改代码：站点池名=站点名，
+# 与 GitHub 的 core/api/edge 池隔离，游标互不污染；无 seeds 的站点走通用隧道兜底。
+# 注意：seeds 里的 IP 是写死的「已知好 IP」，需随目标站点的边缘 IP 变动而更新。
+# ============================================================================
+
+# ---- 内置站点 2：YouTube（IP 串发 + 首包分片对抗 SNI RST）-------------------
+[[sites]]
+name = "youtube"
+domains = [
+    "youtube.com", "*.youtube.com",
+    "ytimg.com", "*.ytimg.com",
+    "googlevideo.com", "*.googlevideo.com",
+    "ggpht.com", "*.ggpht.com",
+    "googleapis.com", "*.googleapis.com",
+]
+seeds = [
+    { ip = "142.250.1.14",    sni = "www.youtube.com" },
+    { ip = "216.58.209.14",   sni = "www.youtube.com" },
+    { ip = "172.217.1.14",    sni = "www.youtube.com" },
+    { ip = "142.250.72.14",   sni = "www.youtube.com" },
+]
+sni_disguise = "www.google.com"
+split_hello = true
+
+# ---- 内置站点 3：Twitter / X（同款 IP 串发 + 分片）--------------------------
+[[sites]]
+name = "twitter"
+domains = [
+    "twitter.com", "*.twitter.com",
+    "x.com", "*.x.com",
+    "t.co", "*.t.co",
+    "twimg.com", "*.twimg.com",
+]
+seeds = [
+    { ip = "104.244.42.1",    sni = "twitter.com" },
+    { ip = "104.244.42.129",  sni = "twitter.com" },
+    { ip = "104.244.42.193",  sni = "twitter.com" },
+    { ip = "104.244.42.65",   sni = "twitter.com" },
+]
+sni_disguise = "abs.twimg.com"
+split_hello = true
+
+# ---- 内置站点 4：HuggingFace（Cloudflare 系，不分片更稳）--------------------
+[[sites]]
+name = "huggingface"
+domains = [
+    "huggingface.co", "*.huggingface.co",
+    "cdn-us.huggingface.co", "*.cdn-us.huggingface.co",
+    "hf.co", "*.hf.co",
+]
+seeds = [
+    { ip = "104.18.6.65",  sni = "huggingface.co" },
+    { ip = "104.18.7.65",  sni = "huggingface.co" },
+    { ip = "172.67.171.182", sni = "huggingface.co" },
+    { ip = "104.18.34.65", sni = "huggingface.co" },
+]
+sni_disguise = ""
+split_hello = false
+
+# ---- 内置站点 5：arXiv（论文站，不分片）-------------------------------------
+[[sites]]
+name = "arxiv"
+domains = ["arxiv.org", "*.arxiv.org"]
+seeds = [
+    { ip = "131.243.4.146", sni = "arxiv.org" },
+    { ip = "131.243.2.120", sni = "arxiv.org" },
+    { ip = "131.243.4.130", sni = "arxiv.org" },
+]
+sni_disguise = ""
+split_hello = false

@@ -4,6 +4,7 @@
 mod certgen;
 mod config;
 mod sites;
+mod site;
 mod desktop;
 mod fsx;
 mod logger;

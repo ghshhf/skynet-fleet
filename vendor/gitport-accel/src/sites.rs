@@ -31,8 +31,6 @@ struct SitesFile {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct SiteDef {
     #[serde(default)]
-    name: String,
-    #[serde(default)]
     groups: Vec<GroupDef>,
 }
 
