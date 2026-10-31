@@ -146,13 +146,17 @@ impl ProxyServer {
         }
         (self.log)(&format!("[CONNECT] {host} via {ip} -> 200已发, 开始转发"));
 
+        // 分片按站点画像可配：默认全开（与历史行为一致，对抗 SNI RST），
+        // 站点显式 split_hello=false 则关（HuggingFace/arXiv 等 Cloudflare 系不分片更稳）。
+        // 总闸 HELLO_SPLIT_ENABLED 仍优先——关总闸则一律不分片。
+        let split = config::site_split_hello(&host).unwrap_or(true);
         let (sent, recv) = bidir_copy(
             &mut client,
             &mut upstream,
             Some(std::time::Duration::from_secs(
                 config::TUNNEL_FIRST_BYTE_TIMEOUT_SECS,
             )),
-            true,
+            split,
         )
         .await;
         (self.log)(&format!("[隧道] {host} via {ip}: ↑{sent} ↓{recv}B"));
@@ -346,7 +350,12 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
     let name = config::pool_for(host);
     // 非 443 不走 IP 表：串发恒拨 443(dial_port)，git:// 9418 / SSH 22 会被
     // 连到 443 上对牛弹琴——按系统 DNS 普通 TCP 直连，端口照用。
-    if port == 443 && pool::SERIAL_POOLS.contains(&name) {
+    // 串发池（core/api/edge）与站点专用池（带 seeds 的站点画像）都走 IP 表串发；
+    // 无 seeds 的站点与未知域交系统 DNS（Tunnel 透传腿）。
+    if port == 443
+        && (pool::SERIAL_POOLS.contains(&name)
+            || config::site_for_host(host).is_some_and(|s| !s.seeds.is_empty()))
+    {
         let (conn, ip, _shape) = pool::serial_dial_skip(
             pool::DialSkip {
                 pool_name: name,

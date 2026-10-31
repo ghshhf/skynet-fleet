@@ -4,7 +4,10 @@
 //! 内置 GitHub 默认保证开箱即用，`sites.toml` 用于追加新站点（"加站点 = 加配置"）。
 //! 本文件只保留端口 / 超时 / 分片策略等常量，以及查询函数（数据源来自 `sites::global_sites()`）。
 
-use crate::sites::global_sites;
+// pub use: global_sites 需要在 config 模块外 (webui.rs) 经 config::global_sites() 访问
+pub use crate::sites::global_sites;
+// 多站点画像（site.rs）：供 route.rs / server / dial 统一调用。
+pub use crate::site::{global_site_table, is_site_direct, site_for_host, site_split_hello};
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// 默认端口（-port / -webui 可覆盖）。
@@ -110,14 +113,26 @@ pub fn whitelist_seg(host: &str) -> Option<&'static str> {
 }
 
 /// 域名 → 池名（"" = 非池）。精确 pattern 优先于通配符；总路由见 route::master_route。
+///
+/// 多站点扩展：先匹配站点画像（site.rs），站点若有 seeds → 进该站点专用池；
+/// 若无 seeds 但有域名 → 走通用隧道（Tunnel，池名 ""）。GitHub 等已有池的站点
+/// 先按 sites.rs 的 groups 命中，再回落站点画像。
 pub fn pool_for(host: &str) -> &'static str {
     // 直连必须先于一切。
-    if is_direct(host) {
+    if is_direct(host) || is_site_direct(host) {
         return "";
     }
     // 白名单进 edge 池：池里靠白名单族按 seg 选 IP，握手由 dial_one 切成真名 + 分片。
     if is_whitelist(host) {
         return "edge";
+    }
+    // 站点画像：有 seeds 的站点进站点专用池（名=站点名）。无 seeds 的站点
+    // （如 github，路由仍由旧 sites.rs 的 groups 决定）不在此短路，落到下方
+    // groups 匹配——否则会把 *.githubusercontent.com 等本归 edge 的域误切成 Tunnel。
+    if let Some(site) = site_for_host(host) {
+        if !site.seeds.is_empty() {
+            return site.name.as_str();
+        }
     }
     let s = global_sites();
     for g in &s.groups {
@@ -143,6 +158,12 @@ pub fn pooled_domains() -> impl Iterator<Item = &'static str> {
         .groups
         .iter()
         .flat_map(|g| g.patterns.iter().map(|p| p.as_str()))
+        .chain(
+            global_site_table()
+                .profiles
+                .iter()
+                .flat_map(|p| p.domains.iter().map(|d| d.as_str())),
+        )
 }
 
 #[cfg(test)]

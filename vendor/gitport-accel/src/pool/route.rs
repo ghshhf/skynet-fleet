@@ -3,6 +3,7 @@
 
 use super::SerialPlan;
 use crate::config;
+use crate::site;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +65,7 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
 /// 总路由：host → 处置。method/path 只影响 Mirror 分流（附件路径仅 GET/HEAD）。
 pub fn master_route(host: &str, method: &str, path: &str) -> Route {
     // 白名单必须先于一切：objects-origin 落 edge 通配符会 Fastly 500。
-    if config::is_direct(host) {
+    if config::is_direct(host) || config::is_site_direct(host) {
         return Route::System;
     }
     if matches!(method, "GET" | "HEAD")
@@ -87,6 +88,7 @@ pub enum Fallback {
     Dns,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct FamilyRoute {
     pub name: &'static str,
     pub host_of: fn(&str) -> bool,
@@ -94,8 +96,9 @@ pub struct FamilyRoute {
     pub fallback: Fallback,
 }
 
-pub struct PoolRoute {
-    pub pool: &'static str,
+#[derive(Debug, Clone, Copy)]
+pub struct PoolRoute<'a> {
+    pub pool: &'a str,
     pub families: &'static [FamilyRoute],
 }
 
@@ -226,7 +229,7 @@ const FAMILY_WL_AZURE: FamilyRoute = FamilyRoute {
     fallback: Fallback::Dns,
 };
 
-pub const POOL_ROUTES: &[PoolRoute] = &[
+pub const POOL_ROUTES: &[PoolRoute<'static>] = &[
     PoolRoute {
         pool: "core",
         families: &[FAMILY_ALL],
@@ -251,14 +254,44 @@ pub const POOL_ROUTES: &[PoolRoute] = &[
     },
 ];
 
-pub fn pool_route(pool: &str) -> Option<&'static PoolRoute> {
+/// 站点专用池的族表：站点自带 seeds，全部 IP 命中即可（FAMILY_ALL），
+/// SNI 伪装由 dial 一侧按站点画像透传。族名 = `{site_pool}/all`，游标与老池隔离。
+const SITE_FAMILY_ALL: FamilyRoute = FamilyRoute {
+    name: "all",
+    host_of: |_| true,
+    serves: |_h, _p| true,
+    fallback: Fallback::Dns,
+};
+
+pub fn pool_route(pool: &str) -> Option<&'static PoolRoute<'static>> {
     POOL_ROUTES.iter().find(|pr| pr.pool == pool)
+}
+
+/// 站点专用池的动态路由：site 池名 = 站点名，family 唯一 `all`（SITE_FAMILY_ALL，静态引用，
+/// 不捕获任何变量，避免悬垂/闭包 coerce 失败）。host_of 恒 `|_| true`——
+/// 站点池只由该站点的 host 触发，serial_family 拿到 pool+host 已配对，无需再筛。
+/// 供 serial_family / circle_keys 通过 pool_route_for 间接消费。
+pub fn site_pool_route(pool: &str) -> Option<PoolRoute<'_>> {
+    if site::host_belongs_to_site(pool) {
+        Some(PoolRoute {
+            pool,
+            families: &[SITE_FAMILY_ALL],
+        })
+    } else {
+        None
+    }
+}
+
+/// pool_route_for：优先返回站点专用池（动态构建），再回落静态 POOL_ROUTES。
+pub fn pool_route_for(pool: &str) -> Option<PoolRoute<'_>> {
+    site_pool_route(pool).or_else(|| pool_route(pool).cloned())
 }
 
 /// 串发族筛选：池内按 host 选族，未列族 host 归末族兜底（edge 即 auth）。
 /// passthrough = 真名腿（CONNECT 隧道 / 明文转发），content 族放宽到 .154/.215。
-pub fn serial_family(pool: &str, host: &str, passthrough: bool) -> Option<&'static FamilyRoute> {
-    let pr = pool_route(pool)?;
+/// 返回拥有的 FamilyRoute（站点池动态构建，无静态引用）。
+pub fn serial_family(pool: &str, host: &str, passthrough: bool) -> Option<FamilyRoute> {
+    let pr = pool_route_for(pool)?;
     let fam = pr
         .families
         .iter()
@@ -270,8 +303,9 @@ pub fn serial_family(pool: &str, host: &str, passthrough: bool) -> Option<&'stat
                 None
             }
         })?;
+    let mut fam = *fam;
     if passthrough && fam.name == "content" {
-        return Some(&FAMILY_CONTENT_PASSTHROUGH);
+        fam = FAMILY_CONTENT_PASSTHROUGH;
     }
     Some(fam)
 }

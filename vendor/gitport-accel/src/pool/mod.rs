@@ -35,12 +35,29 @@ pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 /// 游标圈规范键序；每族两把钥匙(主键/`~2` 副键)恒相邻，双通道各记各的。
 pub fn circle_keys() -> Vec<String> {
     let mut out = Vec::new();
-    for pool in SERIAL_POOLS {
+    let mut pools: Vec<String> = SERIAL_POOLS.iter().map(|s| s.to_string()).collect();
+    // 站点专用池（site.rs 画像带 seeds 的站点）也注册游标圈。
+    for p in crate::site::global_site_table().profiles.iter() {
+        if !p.seeds.is_empty() && !pools.contains(&p.name) {
+            pools.push(p.name.clone());
+        }
+    }
+    for pool in &pools {
         if let Some(pr) = route::pool_route(pool) {
             for f in pr.families {
                 let base = format!("{pool}/{}", f.name);
                 out.push(base.clone());
                 out.push(format!("{base}~2"));
+            }
+        }
+        // 站点池：pool_route 为 None 时按 site_pool_route 取族。
+        if route::pool_route(pool).is_none() {
+            if let Some(pr) = route::site_pool_route(pool) {
+                for f in pr.families {
+                    let base = format!("{pool}/{}", f.name);
+                    out.push(base.clone());
+                    out.push(format!("{base}~2"));
+                }
             }
         }
     }
@@ -342,6 +359,38 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             }
         }
         tab.pools.insert((*name).to_string(), plans);
+    }
+    // 站点专用池：把站点画像里带 seeds 的站点注册成独立池（名=站点名），
+    // 与 core/api/edge 隔离，避免游标互毒。SNI 走 seed 自带字段（透传腿原样透传，
+    // 由浏览器的 ClientHello 携带；MITM 腿按 seed.sni 伪装）。DNS 污染免疫（不查系统 DNS）。
+    for sp in crate::site::global_site_table().profiles.iter() {
+        if sp.seeds.is_empty() || tab.pools.contains_key(&sp.name) {
+            continue;
+        }
+        let plans: Vec<SerialPlan> = sp
+            .seeds
+            .iter()
+            .filter(|s| s.ip.parse::<std::net::IpAddr>().is_ok())
+            .map(|s| SerialPlan {
+                ip: s.ip.clone(),
+                // 种子独立 SNI 优先；空则回落站点级 sni_disguise（站点的统一伪装）。
+                sni: if s.sni.trim().is_empty() {
+                    sp.sni_disguise.trim().to_string()
+                } else {
+                    s.sni.trim().to_string()
+                },
+            })
+            .collect();
+        if !plans.is_empty() {
+            tab.pools.insert(sp.name.clone(), plans);
+            if let Some(log) = log.as_ref() {
+                log(&format!(
+                    "[串发] 站点池 {} 注册 {} 条 IP 种子(走串发拨号)",
+                    sp.name,
+                    tab.pools.get(&sp.name).map(|p| p.len()).unwrap_or(0)
+                ));
+            }
+        }
     }
     for (host, chain) in loaded_chains {
         if !CONTENT_HOSTS.contains(&host.as_str()) {
