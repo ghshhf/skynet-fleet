@@ -18,11 +18,13 @@ YouTube/Google 是「TLS 握手阶段按 IP 段整段切断」→ 分片无效�
     python netaccel.py stop              # 停 gitport + 清 git / 系统代理
     python netaccel.py gateway           # 把本机做成热点网关（7822 → gitport 7810）
     python netaccel.py gateway-stop      # 只停网关，不动 gitport
+    python netaccel.py ci-fetch          # 从 GitHub Actions 拉最新成功产物到 dist/（编译交给 runner）
     python netaccel.py pac               # 打印当前 PAC 脚本（可落盘给浏览器/系统用）
     python netaccel.py system-proxy on   # 系统代理指向 PAC（仅登记域名走 7810）
     python netaccel.py system-proxy off  # 关系统代理
     python netaccel.py --selftest
 """
+import json
 import os
 import re
 import socket
@@ -47,12 +49,10 @@ _EXE_CANDIDATES = [
     for profile in ("release", "debug")
     for t in _TRIPLES
 ]
-# CI 产物的下载解压位置（artifact 解出来就是 exe 本体，没有 target 结构）
-_EXE_CANDIDATES.append(os.path.join(_GITPORT_DIR, "dist", "gitport-github.exe"))
-_EXE_RELEASE = _EXE_CANDIDATES[0]
-_EXE_DEBUG = os.path.join(
-    _GITPORT_DIR, "target", "x86_64-pc-windows-gnu", "debug", "gitport-github.exe"
-)
+# CI 产物的下载解压位置（artifact 解出来就是 exe 本体，没有 target 结构）。
+# `netaccel.py ci-fetch` 就落在这里，是「编译交给 runner」这条规矩的落地点。
+CI_DIST_DIR = os.path.join(_GITPORT_DIR, "dist")
+_EXE_CANDIDATES.append(os.path.join(CI_DIST_DIR, "gitport-github.exe"))
 _SITES_TOML = os.path.join(_GITPORT_DIR, "sites.toml")
 _SITES_EXAMPLE = os.path.join(_GITPORT_DIR, "SITES_EXAMPLE.toml")
 
@@ -84,11 +84,78 @@ MIRROR_HOSTS = [
 
 
 def find_exe():
-    """定位 gitport 二进制：环境变量 > 各目标三元组的 release > debug > CI 产物目录。"""
-    for cand in [os.environ.get("GITPORT_EXE")] + _EXE_CANDIDATES:
-        if cand and os.path.isfile(cand):
-            return cand
-    return None
+    """定位 gitport 二进制：环境变量优先，其余候选按修改时间取最新。
+
+    为什么按 mtime 而不是写死顺序：本机可能同时躺着一个旧的 gnu 产物和一个
+    刚从 CI 拉下来的 msvc 产物。写死顺序会让「明明下了新的却还在跑旧的」，
+    这种 bug 不报错，只表现为「改了代码没生效」，最难查。
+    """
+    override = (os.environ.get("GITPORT_EXE") or "").strip()
+    if override and os.path.isfile(override):
+        return override
+    best, best_m = None, -1.0
+    for cand in _EXE_CANDIDATES:
+        try:
+            m = os.path.getmtime(cand)
+        except OSError:
+            continue
+        if m > best_m:
+            best, best_m = cand, m
+    return best
+
+
+_REPO_ROOT = os.path.normpath(os.path.join(_GITPORT_DIR, "..", ".."))
+
+
+def ci_fetch(run_id=None, timeout=300):
+    """从 GitHub Actions 拉 build-gitport 最新的成功产物，落到 dist/。
+
+    2026-10-31 定调：编译一律交给 runner。runner 上 2~5 分钟出活，本机要十几分钟
+    还得看 E 盘脸色（Rust home / libclang / MinGW 头文件三条外部依赖），
+    「验证代码编得过」这件事本机没有任何优势。既然这样，「把产物拿回来」
+    就必须是一条命令，不能让「exe 在哪」再变成一次踩坑。
+
+    返回 (ok, 说明)；ok=False 时说明是给人看的失败原因。
+    """
+    from shutil import which
+
+    if not which("gh"):
+        return False, "没找到 gh（GitHub CLI）。要么装 gh，要么网页手动下 artifact"
+    if not run_id:
+        rc, out, _ = _safe_run(
+            ["gh", "run", "list", "--workflow=build-gitport.yml",
+             "--status=success", "--limit", "1",
+             "--json", "databaseId,headSha,createdAt"],
+            timeout=60, cwd=_REPO_ROOT)
+        try:
+            rows = json.loads(out or "[]")
+        except ValueError:
+            return False, f"查 CI 运行记录失败（rc={rc}）：{(out or '')[:200]}"
+        if not rows:
+            return False, "build-gitport 还没有一次成功运行——先让它绿，再来拿"
+        run_id = str(rows[0]["databaseId"])
+    os.makedirs(CI_DIST_DIR, exist_ok=True)
+    # 只清 exe/dll，不整个删目录（万一里面有人放的 sites.toml 之类）
+    for name in os.listdir(CI_DIST_DIR):
+        if name.lower().endswith((".exe", ".dll")):
+            try:
+                os.remove(os.path.join(CI_DIST_DIR, name))
+            except OSError:
+                pass
+    rc, out, err = _safe_run(
+        ["gh", "run", "download", str(run_id), "-n", "build-gitport-windows",
+         "-D", CI_DIST_DIR],
+        timeout=timeout, cwd=_REPO_ROOT)
+    if rc != 0:
+        return False, f"下载 artifact 失败（run {run_id}）：{((out or '') + (err or '')).strip()[:300]}"
+    exe = os.path.join(CI_DIST_DIR, "gitport-github.exe")
+    if not os.path.isfile(exe):
+        got = []
+        for root, _dirs, files in os.walk(CI_DIST_DIR):
+            got += files
+        return False, f"产物里没有 gitport-github.exe，实际解出：{got[:10]}"
+    mb = os.path.getsize(exe) / 1048576
+    return True, f"run {run_id} 已落地 {exe}（{mb:.2f} MB）"
 
 
 def is_running():
@@ -100,10 +167,10 @@ def is_running():
         return False
 
 
-def _safe_run(cmd, timeout=10):
+def _safe_run(cmd, timeout=10, cwd=None):
     """跑命令，安全解码输出（中文 Windows 的 netstat/taskkill 是 GBK，不能 text=True 硬解）。"""
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=cwd)
     except Exception as e:
         return -1, "", str(e)
     out = ""
@@ -498,7 +565,11 @@ def _selftest():
     # ⑤ 系统代理关路径不炸
     ok, msg = system_proxy(False)
     assert isinstance(ok, bool), (ok, msg)
-    print(f"netaccel 自检：5 项全过（受管域名 {len(doms)} 个，exe={exe or '未编译'}）")
+    # ⑥ CI 产物通道：dist 必须在候选里，否则 ci-fetch 下完了也用不上（静默失效）
+    assert os.path.normpath(os.path.join(CI_DIST_DIR, "gitport-github.exe")) in [
+        os.path.normpath(c) for c in _EXE_CANDIDATES
+    ], "ci-fetch 的落地目录不在 find_exe 候选里"
+    print(f"netaccel 自检：6 项全过（受管域名 {len(doms)} 个，exe={exe or '未编译'}）")
 
 
 def main(argv=None):
@@ -557,6 +628,13 @@ def main(argv=None):
         print(f"  网卡地址    : {ip or '未找到（热点没开？）'}")
         print(f"  运行中      : {'是 ' + str(ip or '0.0.0.0') + ':' + str(LAN_PORT) if lan_running() else '否'}")
         return 0
+    if cmd in ("ci-fetch", "ci_fetch"):
+        run_id = argv[1] if len(argv) > 1 else None
+        ok, msg = ci_fetch(run_id)
+        print(("  ✓ " if ok else "  ✗ ") + msg)
+        if ok:
+            print("  提示：gateway 在跑的话，先 gateway-stop 再 gateway 才会用上新二进制")
+        return 0 if ok else 1
     if cmd == "pac":
         sys.stdout.write(pac_script())
         return 0
