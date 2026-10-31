@@ -15,6 +15,8 @@ from .core import Capability, Param, Registry
 from .vendored_rea import REA_CAPABILITIES, ENGINE_OF
 from .vendored_crawler import CRAWLER_CAPABILITIES
 from .vendored_pentest import PENTEST_CAPABILITIES
+from .vendored_llmgw import LLMGW_CAPABILITIES
+from .vendored_devfix import DEVFIX_CAPABILITIES
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
@@ -36,6 +38,8 @@ from .kinds.reverse import Reverse
 from .kinds.rea_device import ReaDevice
 from .kinds.crawler_device import CrawlerDevice
 from .kinds.pentest_device import PentestDevice
+from .kinds.llmgw_device import LlmGwDevice
+from .kinds.devfix_device import DevFixDevice
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -944,6 +948,8 @@ CAPABILITIES = [
 CAPABILITIES.extend(REA_CAPABILITIES)
 CAPABILITIES.extend(CRAWLER_CAPABILITIES)
 CAPABILITIES.extend(PENTEST_CAPABILITIES)
+CAPABILITIES.extend(LLMGW_CAPABILITIES)
+CAPABILITIES.extend(DEVFIX_CAPABILITIES)
 
 
 def build(path=None, gate=None, ttl=5.0, with_nodes=True):
@@ -966,6 +972,8 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(ReaDevice())
     reg.add(CrawlerDevice())
     reg.add(PentestDevice())
+    reg.add(LlmGwDevice())
+    reg.add(DevFixDevice())
     reg.add(Internet())
     reg.add(AI())
     reg.add(Host())
