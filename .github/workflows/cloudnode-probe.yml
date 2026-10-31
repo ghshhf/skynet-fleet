@@ -52,12 +52,17 @@ jobs:
             echo '```'
             python3 tools/cloudnode/proxy.py --selftest
             echo '--- 经代理访问 YouTube ---'
-            python3 tools/cloudnode/proxy.py --port 1080 &
-            sleep 1
+            # 后台进程必须重定向 stdout，否则它一直占着 step 的日志管道，step 永不退出
+            python3 tools/cloudnode/proxy.py --port 1080 > /tmp/proxy.log 2>&1 &
+            PROXY_PID=$!
+            sleep 2
             curl -sS --max-time 20 -x http://127.0.0.1:1080 -o /dev/null \
               -w 'proxy->youtube  code=%{http_code}  time=%{time_total}s\n' https://www.youtube.com
             curl -sS --max-time 20 -x socks5h://127.0.0.1:1080 -o /dev/null \
               -w 'proxy->google   code=%{http_code}  time=%{time_total}s\n' https://www.google.com
+            echo '--- 代理日志 ---'
+            cat /tmp/proxy.log
+            kill $PROXY_PID 2>/dev/null || true
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
