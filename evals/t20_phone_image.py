@@ -119,6 +119,11 @@ def find_bash():
         r"C:/Users/*/.workbuddy/binaries/PortableGit/versions/*/usr/bin/bash.exe",
         r"C:/Program Files/Git/usr/bin/bash.exe",
         r"C:/Git/usr/bin/bash.exe",
+        # 本机 MinGit（2026-11-01 安装）：cmd/git.exe 在 D:\DevTools\MinGit，
+        # 真 MSYS2 bash 在 usr/bin/ 下。
+        r"D:/DevTools/MinGit/usr/bin/bash.exe",
+        r"D:/DevTools/Git/usr/bin/bash.exe",
+        r"D:/Git/usr/bin/bash.exe",
     ]:
         cands += glob.glob(pat)
     for c in cands:
@@ -178,11 +183,26 @@ def wpjoin(work, *parts):
 # 这里把临时路径统一转成 posix 形式（真实 Termux 上本来就是 /data/... 正斜杠）。
 def posix(p):
     try:
-        r = subprocess.run(["cygpath", "-u", p], capture_output=True, text=True)
+        r = subprocess.run(["cygpath", "-u", p], capture_output=True,
+                           encoding="utf-8", errors="replace")
         s = r.stdout.strip()
-        return s or p
+        if r.returncode == 0 and s:
+            return s
     except Exception:
-        return p
+        pass
+    # cygpath 不在 PATH：MinGit/Git 自带一个，跟 BASH_EXE 同目录，兜底用
+    if os.path.isfile(BASH_EXE):
+        cy = os.path.join(os.path.dirname(BASH_EXE), "cygpath.exe")
+        if os.path.isfile(cy):
+            try:
+                r = subprocess.run([cy, "-u", p], capture_output=True,
+                                   encoding="utf-8", errors="replace")
+                s = r.stdout.strip()
+                if r.returncode == 0 and s:
+                    return s
+            except Exception:
+                pass
+    return p
 
 
 TMPD = posix(tempfile.gettempdir())
@@ -190,6 +210,23 @@ TMPD = posix(tempfile.gettempdir())
 
 def t_worker():
     section("② worker 行为（假 sd + 假 sysfs）")
+    # 🔴 退化到 PATH 里的 "bash" 时必须验证它是 MSYS 系（有 cygpath）：
+    # Windows 的 System32\bash.exe 是 **WSL 入口**，路径语义完全不同——
+    # 2026-11-01 实测：Windows 反斜杠路径混进 worker 的 JSON 输出，
+    # json.loads 报 Invalid \escape，门禁红得很冤。没真 bash 就明说 SKIP。
+    if not os.path.isfile(BASH_EXE):
+        try:
+            probe = subprocess.run([BASH_EXE, "-c", "command -v cygpath"],
+                                   capture_output=True, timeout=15)
+            if probe.returncode != 0:
+                print("  [skip] PATH 里的 bash 不是 MSYS 系（无 cygpath，多半是 WSL）"
+                      " ⇒ worker 行为门禁跳过（不是通过）。装法：装 Git for Windows / MinGit", flush=True)
+                print("t20_phone_image: SKIP", flush=True)
+                return 0
+        except (OSError, subprocess.SubprocessError):
+            print("  [skip] bash 不可用 ⇒ worker 行为门禁跳过（不是通过）", flush=True)
+            print("t20_phone_image: SKIP", flush=True)
+            return 0
     work = tempfile.mkdtemp(prefix="t20_")     # 原生 Windows 路径，Python 建文件用
     try:
         write_fake_sd(os.path.join(work, "fake_sd.sh"))

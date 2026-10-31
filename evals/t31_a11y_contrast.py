@@ -46,7 +46,8 @@ def has_playwright():
 def main():
     check(os.path.exists(A11Y), "找到 tools/uicheck/a11y.js")
     try:
-        v = subprocess.run([node_bin(), "--version"], capture_output=True, text=True, timeout=20)
+        v = subprocess.run([node_bin(), "--version"], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=20)
         node_ok = v.returncode == 0
     except (OSError, subprocess.SubprocessError):
         node_ok = False
@@ -65,9 +66,13 @@ def main():
     env = dict(os.environ)
     env["FLEET_PY"] = sys.executable          # UI 起的后端用当前解释器，不猜路径
 
+    # 🔴 text=True 不带 encoding 时按本机 locale（中文 Windows = GBK）解码，
+    # node/axe 输出是 UTF-8，遇到 0x80+ 字节直接 UnicodeDecodeError 把门禁打崩
+    # （2026-11-01 实测）。与 run_selftests 的 GBK 修复同根：显式 UTF-8 + replace。
     for theme in ("light", "dark"):
         r = subprocess.run([node_bin(), A11Y, "--theme", theme],
-                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=360)
+                           cwd=ROOT, env=env, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=360)
         out = (r.stdout or "") + (r.stderr or "")
         tail = "\n".join(out.strip().splitlines()[-6:])
         check(r.returncode == 0, "%s 主题 a11y 全过（rc=%d）" % (theme, r.returncode))

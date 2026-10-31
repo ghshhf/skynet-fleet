@@ -217,6 +217,15 @@ class MCPServer:
         """
         sin = stdin if stdin is not None else sys.stdin
         sout = stdout if stdout is not None else sys.stdout
+        # 🔴 stdio 传输的规约就是 UTF-8（MCP 官方定义）。中文 Windows 的
+        # stdout 默认 GBK：tools/list 的描述里一个 `⇒` 就能把 server 写崩
+        # （2026-11-01 实测，UnicodeEncodeError at 21551 字符）。这里强制
+        # 重配两条流——宁可字符糊掉，stdio server 不许因编码死。
+        for s in (sin, sout):
+            try:
+                s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
         for line in sin:
             line = line.strip()
             if not line:

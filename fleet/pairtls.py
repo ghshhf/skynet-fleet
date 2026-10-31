@@ -17,10 +17,28 @@ import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
 
 
 class PairTlsError(RuntimeError):
     """证书相关失败。err 必须是人能照着做的话（缺什么、去哪找）。"""
+
+
+def _openssl_env():
+    """openssl CLI 一启动就读 OPENSSL_CONF；没设时落到它**编译期内嵌**的
+    OPENSSLDIR——那可能是构建机的盘符（2026-11-01 实测：Strawberry 的
+    openssl 3.6.1 内嵌 Z:/extlib/...，本机没 Z 盘 ⇒ 任何命令都先
+    fopen(Z:...) 失败）。对策：备一份最小 conf（req 要的
+    distinguished_name 空段），只在「用户没设」或「设的文件不存在」时
+    接管；用户自己的合法配置优先。返回要注入的路径或 None。"""
+    cur = os.environ.get("OPENSSL_CONF")
+    if cur and os.path.isfile(cur):
+        return None
+    path = os.path.join(tempfile.gettempdir(), "fleet-openssl-min.cnf")
+    if not os.path.isfile(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[req]\ndistinguished_name = dn\n[dn]\n")
+    return path
 
 
 #: openssl 相对怎么摆。**不写盘符**：盘符由 fleet/locate.py 运行时枚举，
@@ -59,7 +77,9 @@ def _msys_openssl():
 
 
 def _run(argv):
-    r = subprocess.run(argv, capture_output=True, timeout=30)
+    conf = _openssl_env()
+    env = dict(os.environ, OPENSSL_CONF=conf) if conf else None
+    r = subprocess.run(argv, capture_output=True, timeout=30, env=env)
     if r.returncode != 0:
         raise PairTlsError("openssl 失败（rc=%d）：%s"
                            % (r.returncode,

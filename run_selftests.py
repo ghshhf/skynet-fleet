@@ -20,6 +20,16 @@ import subprocess
 import sys
 import time
 
+# 🔴 本机是 GBK 控制台：不只是子进程会死（run_case 里已注入 PYTHONIOENCODING），
+# 门禁**自己**打印子进程输出 tail 时同样会死（tail 里有 `✓`/`⇒` 就整个门禁崩）。
+# 2026-11-01 实测：三项被 GBK 打倒后，点名重跑时死在门禁自己的 print(tail) 上。
+# 统一 UTF-8 + replace：宁可字符糊掉，门禁不许因编码退出。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 
@@ -404,9 +414,14 @@ SLOW = {"eval_t32_deadlink"}
 
 def run_case(name, args, cwd, timeout):
     cmd = [PY] + args
+    # 🔴 中文 Windows 控制台是 GBK，子进程 print 一个 `⇒`/`✓`/`R²` 就直接
+    # UnicodeEncodeError 退出（2026-11-01 实测打倒 commander / poster_runner /
+    # proximity 三项——它们在 CI 的 UTF-8 环境里是绿的，一到本机就红）。
+    # 门禁跑在谁的机器上都不该被控制台代码页决定生死：统一强制子进程 UTF-8。
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
         p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
+                             stderr=subprocess.PIPE, env=env)
     except FileNotFoundError as e:
         return False, "", f"找不到: {e}", -1
     try:
