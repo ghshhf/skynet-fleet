@@ -363,6 +363,14 @@ CASES = [
     # [A] 段盯的是最容易悄悄退化的那处：pystray 不进 requirements →
     # 包里 import 失败 → 托盘静默失效，代码全对能力没了（与 edge_tts 同形）。
     ("eval_t49_desktop_shell", ["evals/t49_desktop_shell.py"], HERE, 120),
+    # t51/t52：「有连接即入网」这一层的两半（2026-11-01）。
+    # t51 是"能不能传"：不 mock 协议、真发真文件比对 sha256，并钉住四道写盘闸
+    #     （路径逃逸 / 字节数不符 / 数量上限 / 窗口寿命）。这里最容易的失败不是
+    #     传不动，是**传歪了还报成功**。
+    # t52 是"连上了能干什么"：可达 ≠ 可执行。可达层的设备不注册成 Device，
+    #     所以执行类能力结构上够不着它们。这条破了就是局域网里谁都能下令。
+    ("eval_t51_lan_transfer", ["evals/t51_lan_transfer.py"], HERE, 180),
+    ("eval_t52_reach_layer", ["evals/t52_reach_layer.py"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

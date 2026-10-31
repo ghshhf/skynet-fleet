@@ -24,6 +24,8 @@ from .kinds.internet import Internet
 from .kinds.job_board import JobBoard
 from .kinds.phone_node import PhoneNode
 from .kinds.lan_scanner import LanScanner
+from .kinds.lan_transfer import LanTransfer
+from .kinds.reach_layer import ReachLayer
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.reverse import Reverse
@@ -374,6 +376,53 @@ CAPABILITIES = [
     Capability("net.nearby", "身边全景（IP + 无线 + 蓝牙三层）",
                params=(Param("no_lan", "bool"), Param("no_wifi", "bool"),
                        Param("no_bt", "bool"))),
+    # ---- 这张网：不入网也能传（2026-11-01，LocalSend v2 协议接入）----
+    # 与 file.push 的差别不是「功能」，是**门槛**：push 要求对端已经是节点
+    # （有记录、有 PSK、控制面在线）；这里什么都不要求，同网段即达。
+    # 手机上一个现成的 LocalSend App 就是合法对端，我们这边不用装任何东西。
+    Capability("lan.links", "同一网段里有哪些能直传的设备（LocalSend 协议）",
+               params=(Param("secs", "float", doc="听多久，默认 3"),
+                       Param("alias", "str", doc="用哪个名字对外介绍自己"))),
+    Capability("lan.probe", "问一个地址要名片，确认它是不是 LocalSend 对端",
+               params=(Param("host", "str", True, "IP"),
+                       Param("port", "int"), Param("protocol", "str", doc="http/https"))),
+    Capability("lan.send", "把文件直接丢给同网段的设备（不等它入网）",
+               params=(Param("host", "str", True, "对端 IP（先用 lan.links 看有谁）"),
+                       Param("paths", "list", True, "本地文件路径，可多条"),
+                       Param("port", "int"), Param("protocol", "str", doc="http/https"),
+                       Param("pin", "str", doc="对端要求 PIN 时填"),
+                       Param("alias", "str")),
+               side_effect=True, approval="ask",
+               note="对端是人：会弹窗要他自己点接受，所以这不是「发出去就成」，"
+                    "最长要等两分钟。PIN 只走 query 不落日志。"
+                    "部分接受是正常的——对方只收其中几个时，结果里会分开列"),
+    Capability("lan.recv", "开一个接收窗口（限时 + 限目录 + 限数量/字节）",
+               params=(Param("dir", "str", doc="落盘目录，默认 ~/Downloads/fleet-inbox"),
+                       Param("secs", "int", doc="窗口寿命，默认 300"),
+                       Param("max_files", "int", doc="最多收几个，默认 32"),
+                       Param("max_bytes", "int", doc="总字节上限，默认 2 GiB"),
+                       Param("max_file_bytes", "int", doc="单文件上限，默认 1 GiB"),
+                       Param("pin", "str", doc="要求对端出示 PIN"),
+                       Param("alias", "str")),
+               side_effect=True, approval="ask",
+               note="**这是往本机写文件的通行证**，所以四道硬闸缺一不可，"
+                    "窗口到点自动关、不通知。不做「装完就一直收」那种常开后门"),
+    Capability("lan.recv.stop", "关掉接收窗口，返回这一窗收了什么",
+               params=(), side_effect=True,
+               note="只是关门，不会再写任何东西"),
+    # ---- 外圈：可达层（2026-11-01）----
+    # 天网过去是「先入网才有网」；这一层是「只要连得上就已在网里」。
+    # 🔴 边界写在 kinds/reach_layer.py：外圈设备不注册成设备 ⇒ 结构上够不着执行权。
+    # 这里能做的只有「看见」和「忘记」，不能「让它做事」。
+    Capability("reach.list", "现在这张网里有谁（连得上就算，不必入网）",
+               params=(Param("all", "bool", doc="连断过的一起列，默认只给通的"),)),
+    Capability("reach.at", "一台可达设备的全貌：几条通道、哪条最好、什么时候见过",
+               params=(Param("id", "str", True, "指纹前缀 / 名字")), ),
+    Capability("reach.forget", "从可达层删掉一台设备（真删，含通道历史）",
+               params=(Param("id", "str", True, "指纹前缀 / 名字")),
+               side_effect=True,
+               note="只删本机账本里的一行，不碰对端任何东西；"
+                    "对方下次再 announce 还会回来——这是观察层不是黑名单"),
     # ---- 编队节点（远程机器）----
     # D1 真代发（2026-10-25）：控制面已加对外协议（common.CLIENT*），
     # 非 commander 进程可经 fleet.ctrl_client 让节点执行命令/推取文件。
@@ -868,6 +917,8 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(WindowsPC())
     reg.add(AndroidPhone())
     reg.add(LanScanner())
+    reg.add(LanTransfer())
+    reg.add(ReachLayer())
     reg.add(Osint())
     reg.add(Reverse())
     reg.add(Internet())
