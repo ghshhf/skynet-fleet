@@ -41,6 +41,17 @@ from urllib.parse import parse_qs, urlparse
 # 让脚本直接 `python fleet/agent_server.py` 也能 import 同包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 🔴 中文 Windows 控制台是 GBK，print 里一个 `⇒` 就能让整个服务起不来。
+# 2026-11-01 真事故：闸门那行提示文案带 `⇒`，`python -m fleet.agent_server`
+# 直接 UnicodeEncodeError 退出，手机端所有 API 全断（表现为「手机连不上」，
+# 而真因只是一行字）。这里统一把 stdout/stderr 换成 UTF-8 + replace：
+# 宁可字符糊掉，也不许提示文案打死服务。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from fleet import providers as P        # noqa: E402
 from fleet import agentloop             # noqa: E402
 from fleet import catalog               # noqa: E402
