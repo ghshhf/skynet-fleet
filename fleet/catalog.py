@@ -26,6 +26,7 @@ from .kinds.phone_node import PhoneNode
 from .kinds.lan_scanner import LanScanner
 from .kinds.lan_transfer import LanTransfer
 from .kinds.reach_layer import ReachLayer
+from .kinds.nat_traversal import NatTraversal, SESSION_TTL
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.reverse import Reverse
@@ -423,6 +424,36 @@ CAPABILITIES = [
                side_effect=True,
                note="只删本机账本里的一行，不碰对端任何东西；"
                     "对方下次再 announce 还会回来——这是观察层不是黑名单"),
+    # ---- 跨 NAT 打洞（2026-11-01）----
+    # 上面这些能力都假设「本来就在一张网里」。隔着 NAT 时，要么打洞，要么走中继。
+    # 打洞的价值是流量不过第三方服务器：快、便宜、不被别人看见。
+    # 协议是「双向同时发」——只有一边打不通，这是 NAT 规则不是实现偷懒。
+    Capability("nat.profile", "我在什么网里：映射行为、过滤行为、能跟谁打通（约 3 秒）",
+               params=(Param("local_port", "int", doc="指定本地端口，0 为随机"),),
+               note="测不出会如实报「测不出」，不拿猜测当结论"),
+    Capability("nat.map", "跟网关要一个固定对外端口（UPnP / NAT-PMP）",
+               params=(Param("port", "int", True, "要映射的本地端口"),
+                       Param("protocol", "str", doc="udp / tcp，默认 udp"),
+                       Param("lifetime", "int", doc="租期秒数，默认 3600")),
+               side_effect=True,
+               note="会改网关配置项。上层还有 CGNAT 时映射成功也不等于能连上"),
+    Capability("nat.open", "开一个打洞会话，拿到本端候选地址（含公网映射）",
+               params=(Param("local_port", "int", doc="0 为随机"),
+                       Param("nonce", "str", doc="会话 token（hex），两侧须一致")),
+               side_effect=True,
+               note=f"占一个 UDP 端口，{SESSION_TTL} 秒不活动自动回收"),
+    Capability("nat.punch", "朝对端候选地址猛发，同时收对方的（双方都要调）",
+               params=(Param("id", "str", True, "nat.open 返回的会话 id"),
+                       Param("peer", "json", True, "对端的 candidates 数组"),
+                       Param("burst", "int", doc="每轮每目标发包数，默认 20"),
+                       Param("seconds", "int", doc="最多打多久，默认 6")),
+               side_effect=True,
+               note="只往你显式给的对端地址发；不带 nonce 的包不当对端"),
+    Capability("nat.sessions", "现在开着哪些打洞会话", params=()),
+    Capability("nat.close", "关掉打洞会话（关端口）",
+               params=(Param("id", "str", doc="不给就关最早那个")),
+               side_effect=True,
+               note="只关本端端口，不通知对端；对端下次发包会失败"),
     # ---- 编队节点（远程机器）----
     # D1 真代发（2026-10-25）：控制面已加对外协议（common.CLIENT*），
     # 非 commander 进程可经 fleet.ctrl_client 让节点执行命令/推取文件。
@@ -919,6 +950,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(LanScanner())
     reg.add(LanTransfer())
     reg.add(ReachLayer())
+    reg.add(NatTraversal())
     reg.add(Osint())
     reg.add(Reverse())
     reg.add(Internet())
