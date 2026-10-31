@@ -59,13 +59,21 @@ def app_build():
 
 def capability_count():
     """catalog.py 里登记的 Capability(...) 条数（AST 计数，不 import 设备）。"""
-    path = os.path.join(ROOT, "fleet", "catalog.py")
-    tree = ast.parse(_read(path), filename=path)
-    n = 0
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Capability":
-            n += 1
-    return n
+    total = 0
+    fleet_dir = os.path.join(ROOT, "fleet")
+    for dirpath, _, files in os.walk(fleet_dir):
+        for fn in files:
+            if not fn.endswith(".py") or fn.startswith("."):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                tree = ast.parse(_read(path), filename=path)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Capability":
+                    total += 1
+    return total
 
 
 def collect():

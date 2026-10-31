@@ -12,6 +12,9 @@ import os
 from . import netrunner as NR
 from . import netforce_skynet as NS
 from .core import Capability, Param, Registry
+from .vendored_rea import REA_CAPABILITIES, ENGINE_OF
+from .vendored_crawler import CRAWLER_CAPABILITIES
+from .vendored_pentest import PENTEST_CAPABILITIES
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
@@ -27,6 +30,9 @@ from .kinds.lan_scanner import LanScanner
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.reverse import Reverse
+from .kinds.rea_device import ReaDevice
+from .kinds.crawler_device import CrawlerDevice
+from .kinds.pentest_device import PentestDevice
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -855,6 +861,10 @@ CAPABILITIES = [
                note="占用手机算力。同一份权重要换人格，只换 pack，不用重启服务"),
 ]
 
+CAPABILITIES.extend(REA_CAPABILITIES)
+CAPABILITIES.extend(CRAWLER_CAPABILITIES)
+CAPABILITIES.extend(PENTEST_CAPABILITIES)
+
 
 def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     """组装注册表。设备按「先能验证的」顺序加：本机 → 手机 → 扫描器 → 编队节点 → 万维网。
@@ -870,6 +880,9 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(LanScanner())
     reg.add(Osint())
     reg.add(Reverse())
+    reg.add(ReaDevice())
+    reg.add(CrawlerDevice())
+    reg.add(PentestDevice())
     reg.add(Internet())
     reg.add(AI())
     reg.add(Host())

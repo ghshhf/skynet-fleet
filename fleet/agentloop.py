@@ -460,12 +460,15 @@ def _selftest():
     ck(seen == [("pc.state", {"clip": False})], "执行层收到的参数不对：%r" % seen)
     # 关键：第二轮请求必须带 assistant 的 tool_calls + tool 结果，否则协议不认
     ck(len(posts) == 2, "应是两轮，实得 %d" % len(posts))
-    ck(posts[0]["tools"] and len(posts[0]["tools"]) == 85,
-       "第一轮要带工具表（默认只读 85），实得 %r" % (
-           len(posts[0]["tools"]) if posts[0]["tools"] else None))
-    ck(posts[1]["tools"] and len(posts[1]["tools"]) == 85,
-       "循环内继续带工具表（模型可能要连着调几个），实得 %r" % (
-           len(posts[1]["tools"]) if posts[1]["tools"] else None))
+    # 工具表数量按 caps 现算，不写死。
+    # 写死必过期：85 -> 178，逆向/爬虫/渗透三批能力加进来后当场炸。
+    n_readonly = len(TS.tools_for(TS.FLAVOR_OPENAI, caps))
+    ck(posts[0]["tools"] and len(posts[0]["tools"]) == n_readonly,
+       "第一轮要带工具表（默认只读 %d），实得 %r" % (
+           n_readonly, len(posts[0]["tools"]) if posts[0]["tools"] else None))
+    ck(posts[1]["tools"] and len(posts[1]["tools"]) == n_readonly,
+       "循环内继续带工具表（模型可能要连着调几个，应为 %d），实得 %r" % (
+           n_readonly, len(posts[1]["tools"]) if posts[1]["tools"] else None))
     ck(posts[1]["last"]["role"] == "tool", "回填消息必须是 role=tool")
     ck(posts[1]["last"]["tool_call_id"] == "c0", "tool_call_id 必须对上")
 
@@ -636,7 +639,7 @@ def _selftest():
     ck(r7["ok"] is False and "没有可用 provider" in r7["err"],
        "上游失败要如实透传，实得 %r" % r7.get("err"))
 
-    # ---- 自定义能力表（小模型撑不住 85 个工具时要能收窄） ----
+    # ---- 自定义能力表（小模型撑不住全量工具时要能收窄） ----
     small = [Capability("demo.echo", "回声",
                         params=(Param("text", "str", True, "要说的话"),))]
     P.chat = fake_chat
