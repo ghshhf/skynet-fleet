@@ -137,3 +137,9 @@ tianwang_app/build/
 # 入库只会造成无意义的大 diff（几百行 JSON），也会让「映射过期」变成隐性问题。
 tools/.gate_map.json
 tools/.gate_times.json
+
+# 云端节点凭据与扫描快照（2026-10-31）：凭据绝不入库；
+# 扫描结果是本机实测快照，换网/换时段即失效，入库只会变成过期事实。
+tools/.cloudnode.env
+tools/.cloudnode_probe.json
+tools/.egress_scan.json
