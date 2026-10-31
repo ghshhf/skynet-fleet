@@ -201,6 +201,32 @@ def _edges(path, resolver):
     return deps
 
 
+def _gate_covers(path):
+    """入口文件里显式声明的「额外覆盖文件」（GATE_COVERS）。
+
+    import 闭包只能表达 .py 之间的依赖。有些自测项确实读数据文件
+    （比如 `docs/_stats.json` 这种生成物），这类依赖靠 import 表达不出来，
+    于是改它永远判成「无自测覆盖」。让 case 自己声明，映射就诚实了。
+    """
+    out = []
+    tree = _parse(path) if os.path.isfile(path) else None
+    if tree is None:
+        return out
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "GATE_COVERS" not in names:
+            continue
+        val = node.value
+        if not isinstance(val, (ast.Tuple, ast.List)):
+            continue
+        for elt in val.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                out.append(os.path.abspath(os.path.join(ROOT, elt.value)))
+    return out
+
+
 def closure(entry_file, resolver, max_files=400):
     """入口文件的 import 闭包。返回 {绝对路径: 依赖距离}。
 
@@ -221,6 +247,10 @@ def closure(entry_file, resolver, max_files=400):
         dist[cur] = d
         for f in _edges(cur, resolver):
             queue.append((f, d + 1))
+    # case 自己声明的额外覆盖文件（数据文件等 import 表达不了的依赖）
+    for f in _gate_covers(entry_file):
+        if f not in dist or dist[f] > 1:
+            dist[f] = 1
     return dist
 
 
