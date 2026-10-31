@@ -18,10 +18,16 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
+  # 全量门禁单独一个 job，与打包**并行**，互不阻塞。
+  #
+  # 为什么必须拆：原先这两步串在同一个 job 里，门禁红一项（2026-10-31 实测
+  # 108/117，红 8 项）打包就不执行 —— 结果是"从来没有产出过 exe"，
+  # 而 CI 只显示"红了"，看不出到底包能不能打出来。
+  # 门禁红 ≠ 包打不出来，这是两件事，不该串成一条命。
+  # 拆开后：门禁红照实报红（不 continue-on-error，不掩盖），产物照样出。
+  selftests:
     runs-on: windows-latest
     env:
-      # Windows runner 控制台默认 charmap，中文打印会 UnicodeEncodeError——全局锁 UTF-8
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
     steps:
@@ -38,7 +44,6 @@ jobs:
       - name: 装依赖
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller
           python -m pip install -r requirements.txt
 
       # 两条活线门禁（eval_t31 对比度 / eval_t32 死链）要有真浏览器才跑得起来。
@@ -50,16 +55,35 @@ jobs:
           npx playwright install chromium
         working-directory: tools/uicheck
 
-      - name: 冒烟（先证明后端自己能起，再谈打包）
-        # 控制台的 cp1252 中文打印会 UnicodeEncodeError，必须挡构建；
-        # --smoke 只起服务探 /api/health，不开窗、不依赖 webview，无显示器也能跑。
-        run: python fleet_gui.py --smoke
-
       - name: 自测（全量门禁，数字见 docs/_stats.json）
         # 不写具体条数：手填必然过期（历史上出现过 52/58/67/74 四个版本并存）。
         env:
           FLEET_PY: python
         run: python run_selftests.py
+
+  build-windows:
+    runs-on: windows-latest
+    env:
+      # Windows runner 控制台默认 charmap，中文打印会 UnicodeEncodeError——全局锁 UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: 冒烟（先证明后端自己能起，再谈打包）
+        # 控制台的 cp1252 中文打印会 UnicodeEncodeError，必须挡构建；
+        # --smoke 只起服务探 /api/health，不开窗、不依赖 webview，无显示器也能跑。
+        run: python fleet_gui.py --smoke
 
       - name: 打包 fleet-gui.exe
         run: python tools/build_gui.py
