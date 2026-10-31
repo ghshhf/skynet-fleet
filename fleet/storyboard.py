@@ -382,10 +382,10 @@ def tts_local(text, out_wav, voice=None, engine=None, ref=None, ref_text=None,
     为什么统一 24k：后面的混音/拼接路径全是按 edge-tts 的输出（24k 单声道）
     写的，本地 TTS 出的是 44.1k。不归一化的话拼接点会变调、时长也会错。
 
-    engine / ref / ref_text 透传给 tts_runner：
-      · engine="matcha"（默认）高质量单人旁白，不吞字
-      · engine="zipv" + ref="新闻女" + ref_text=... 克隆任意音色（角色对话用）
-      · engine="zhll" + sid=N 多说话人（16kHz，电话音质）
+    engine / ref / ref_text 透传给 tts_runner（三档质量梯度，见 tts_runner.ENGINES）：
+      · engine="matcha"（默认）快档单人旁白，RTF 0.12，不吞字
+      · engine="zipv" + ref="新闻女" + ref_text=... 克隆任意音色，24kHz（RTF 1.37）
+      · engine="indextts2" 精品档（RTF 33，必须配合 voicebank.prewarm 批量预合成）
     """
     try:
         from fleet import tts_runner

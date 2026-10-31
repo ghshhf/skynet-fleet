@@ -84,15 +84,21 @@ def _in_proot(path):
 # ---- 引擎表：加一个新模型只改这里，不用再抄一遍拼参字符串 --------------
 # kind 决定 CLI 参数怎么拼；phone_dir 是手机上的模型目录；
 # refs/ref_dir 给「克隆类」引擎（zipv）用 —— 给一段参考音频 + 参考文本即可换音色。
+#
+# ---- 为什么只有三个引擎（2026-10-31 主人定：砍到 ≤3，砍谁要有数字）----
+# 原来五个，同一句「1947年那个夏天，海上起了雾。」在真机上各跑一遍（backend 均为
+# phone_sherpa，没有走云兜底）：
+#     melo    音频 2.113s  RTF 0.482
+#     matcha  音频 3.576s  RTF 0.119
+#     zhll    音频 3.327s  RTF 0.314
+#     zipv    音频 2.855s  RTF 1.366
+#   · melo 砍：同样 15 个字只出 2.1 秒（7.1 字/秒），快的部分是**把「1947」吞了**；
+#     而且 RTF 0.482 比 matcha 还慢 4 倍——吞字又慢，一项都不占优。
+#   · zhll 砍：16kHz 电话音质（>8kHz 能量≈0），RTF 0.314 也没比 matcha 快，
+#     唯一卖点是多说话人，但角色音色用 zipv 克隆更划算。
+# 留下的是**质量梯度**而不是并列选项：0.12（快档）→ 1.37（自然/克隆）→ 33（精品）。
+# 要恢复某个引擎：从 git 历史取回它的 ENGINES 条目，并按 selftest 第 ⑦ 条改期望列表。
 ENGINES = {
-    "melo": {
-        "kind": "vits",
-        "phone_dir": "/data/local/tmp/melo",
-        "pc_dir": "vits-melo-tts-zh_en",
-        "sr": 44100,
-        "note": "中英双语 VITS，最快；缺点：会吞数字/年份（'1947' 静默丢字）",
-        "default_sid": 0,
-    },
     "matcha": {
         "kind": "matcha",
         "phone_dir": "/data/local/tmp/matcha",
@@ -101,15 +107,6 @@ ENGINES = {
         "sr": 22050,
         "rule_fsts": ["number.fst", "date.fst", "phone.fst"],
         "note": "中文 Baker 女声，不吞字；需外挂声码器",
-        "default_sid": 0,
-    },
-    "zhll": {
-        "kind": "vits",
-        "phone_dir": "/data/local/tmp/zhll",
-        "pc_dir": "sherpa-onnx-vits-zh-ll",
-        "sr": 16000,
-        "rule_fsts": ["number.fst", "date.fst", "phone.fst", "new_heteronym.fst"],
-        "note": "16kHz 多说话人，电话音质（>8kHz 能量≈0），仅角色对话合适",
         "default_sid": 0,
     },
     "zipv": {
@@ -164,12 +161,8 @@ def _tts_dir():
     return cands[0]
 
 
-PC_MODEL_CANDIDATES = [
-    os.path.join(_tts_dir(), "vits-melo-tts-zh_en"),
-    os.path.expanduser("~/.fleet/tts/vits-melo-tts-zh_en"),
-]
-
-# 手机端 s6 默认音色 0 = 中文女声；1 = 英文（MeloTTS zh_en 双语模型）
+# 手机端默认音色 0 = 中文女声（matcha 是单说话人 Baker 女声；
+# zipv 的说话人由 ref 决定，不看 sid）。
 DEFAULT_SID = 0
 
 
@@ -232,7 +225,7 @@ def _q(text):
 def _phone_args(e, out_wav, sid=0, speed=1.0, ref=None, ref_text=None, threads=4):
     """按引擎 kind 拼出 sherpa-onnx-offline-tts 的参数列表（不含文本）。
 
-    之所以提成函数，是因为 melo/matcha/zipv 三种模型的 CLI 参数长得完全不同：
+    之所以提成函数，是因为三种模型的 CLI 参数长得完全不同：
     vits 用 --vits-* + --speed；matcha 用 --matcha-* + --matcha-length-scale；
     zipv 用 --zipvoice-* 还要 --reference-audio/--reference-text。写死在脚本里
     每加一个模型就得抄一遍。
@@ -454,7 +447,7 @@ def phone_batch(items, engine=DEFAULT_ENGINE, threads=4, timeout=900):
     返回 [(ok, path, sec, err), ...]，顺序与 items 一致。
 
     价值在哪：每条 sherpa 合成前都要重新加载模型（实测加载占单句墙钟 ~85%，
-    8 Gen 1 上 melo 一句真正合成 0.6s、墙钟 4.6s）。批量**省不掉加载**，但能把
+    8 Gen 1 上真正合成 0.6s、墙钟 4.6s）。批量**省不掉加载**，但能把
     N 次「push 脚本 + shell + pull 音频」的 adb 往返压成 1 次往返 + 1 次整目录
     拉回。模型越慢越划算 —— zipv 一条几十秒，批量几乎零额外开销。
     """
@@ -530,19 +523,12 @@ def phone_batch(items, engine=DEFAULT_ENGINE, threads=4, timeout=900):
 
 def phone_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4,
                  timeout=180):
-    """向后兼容：默认用 melo 引擎（原先的 baseline）。新代码请用 phone_synth。"""
-    return phone_synth(text, out_path, engine="melo", sid=sid, speed=speed,
+    """向后兼容：默认 matcha（melo 已于 2026-10-31 砍掉，见 ENGINES 上方注释）。"""
+    return phone_synth(text, out_path, engine="matcha", sid=sid, speed=speed,
                        threads=threads, timeout=timeout)
 
 
-def pc_model_dir():
-    for d in PC_MODEL_CANDIDATES:
-        if os.path.isfile(os.path.join(d, "model.onnx")):
-            return d
-    return None
-
-
-def _pc_synth(text, out_path=None, engine="melo", sid=0, speed=1.0, ref=None,
+def _pc_synth(text, out_path=None, engine="matcha", sid=0, speed=1.0, ref=None,
               ref_text=None, threads=4):
     """PC 端用 Python 版 sherpa_onnx 合成（引擎无关）。没有模型/库就抛 RuntimeError。
 
@@ -640,8 +626,8 @@ def _pc_synth(text, out_path=None, engine="melo", sid=0, speed=1.0, ref=None,
 
 
 def pc_sherpa(text, out_path=None, sid=DEFAULT_SID, speed=1.0, threads=4):
-    """向后兼容：默认 melo 引擎。新代码请用 _pc_synth。"""
-    return _pc_synth(text, out_path, engine="melo", sid=sid, speed=speed,
+    """向后兼容：默认 matcha。新代码请用 _pc_synth。"""
+    return _pc_synth(text, out_path, engine="matcha", sid=sid, speed=speed,
                      threads=threads)
 
 
@@ -696,7 +682,9 @@ def parse_stats(log):
 
 def _default_backend():
     """手机 > PC > 云。手机上只要有任意已部署引擎就先用手机。"""
-    for eng in ("matcha", "melo", "zhll", "zipv"):
+    # 按 ENGINES 的定义顺序试：matcha（快档，最可能已部署）排第一，
+    # 不要写死引擎名清单——那正是「砍了引擎却忘了改这里」的来源。
+    for eng in ENGINES:
         ok, _ = phone_ready(eng)
         if ok:
             return "phone_sherpa"
@@ -759,7 +747,7 @@ def run(text, out_path=None, voice=None, speed=1.0, backend=None, sid=None,
 
 # ---------------------------------------------------------------- 部署
 
-def deploy(engine="melo", bin_path=None, model_dir=None, libcxx=None, force=False):
+def deploy(engine="matcha", bin_path=None, model_dir=None, libcxx=None, force=False):
     """把二进制 + libc++_shared + 某引擎的模型推到手机。幂等，已存在就跳过。
 
     三个文件从哪来（都写在返回值里，方便查）：
@@ -771,10 +759,9 @@ def deploy(engine="melo", bin_path=None, model_dir=None, libcxx=None, force=Fals
                       （zipv）会额外把外挂声码器、参考音频一起补推上去。
 
     用法：
-        tts_runner.deploy("melo")      # 默认
-        tts_runner.deploy("matcha")    # 不吞字，比 melo 自然
-        tts_runner.deploy("zipv")      # flow-matching 克隆音色，24kHz
-        tts_runner.deploy("zhll")      # 16kHz 多说话人
+        tts_runner.deploy("matcha")    # 默认，快档（RTF 0.12，不吞字）
+        tts_runner.deploy("zipv")      # flow-matching 克隆音色，24kHz（RTF 1.37）
+        tts_runner.deploy("indextts2") # 精品档，proot+torch（RTF 33，只建议配合 prewarm）
     每个引擎都有一套独立模型目录，互不冲突，可以全推。
     """
     e = ENGINES.get(engine)
@@ -894,6 +881,20 @@ def _selftest():
         b in ("phone_sherpa", "pc_sherpa", "edge"), b)
     if not ok:
         chk("手机不可用时不会选 phone_sherpa", b != "phone_sherpa", b)
+
+    print("-- 引擎面：只留三档质量梯度（2026-10-31 定：砍到 ≤3）")
+    chk("引擎正好三个", set(ENGINES) == {"matcha", "zipv", "indextts2"}, sorted(ENGINES))
+    chk("默认引擎是快档 matcha", DEFAULT_ENGINE == "matcha", DEFAULT_ENGINE)
+    for gone in ("melo", "zhll"):
+        chk("%s 已下线" % gone, gone not in ENGINES, sorted(ENGINES))
+    # 砍引擎最典型的连带事故：字典删了，音色库还指着它 —— 要到跑某句台词才炸。
+    try:
+        from fleet import voicebank as _vb
+    except ImportError:
+        import voicebank as _vb
+    bad = {k: v["engine"] for k, v in _vb.VOICE_REGISTRY.items()
+           if v["engine"] not in ENGINES}
+    chk("音色库没有指向已下线引擎", not bad, bad)
 
     print("\n%d/%d 通过" % (n[0] - len(fails), n[0]))
     return 0 if not fails else 1
