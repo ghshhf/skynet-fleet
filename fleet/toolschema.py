@@ -386,9 +386,13 @@ def _selftest():
 
     # ---- 全仓真能力表都能投影，且名字合规 ----
     assert len(caps) >= 149, f"能力数变少了（{len(caps)}），catalog 是不是没加载全"
+    # 只读可导出数量由 catalog 现算，不写死。
+    # 写死过一次就过期一次：85 -> 178，逆向/爬虫/渗透三批能力加进来后当场炸。
+    expected = sum(1 for c in caps if _visible(c, False, None))
     for flavor in FLAVORS:
         tools = tools_for(flavor, caps)
-        assert len(tools) == 85, f"{flavor} 默认只该导出只读能力，实得 {len(tools)}"
+        assert len(tools) == expected, \
+            f"{flavor} 默认只该导出只读能力，实得 {len(tools)}（按 catalog 应为 {expected}）"
         for t in tools:
             n = t["function"]["name"] if flavor == FLAVOR_OPENAI else t["name"]
             assert is_valid_mcp_name(n), f"{flavor} 工具名不合规：{n}"

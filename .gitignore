@@ -160,3 +160,7 @@ tools/cloudnode/cloudnode_up.py
 # libclang 本地副本（2026-10-31）：boringssl 的 bindgen 需要，20MB 级二进制。
 # 用 build_windows.sh 时自动找；缺了按脚本提示 pip 装一份即可，不入库。
 tools/.libclang/
+
+# crawlee 运行时目录（2026-11-01 爬虫能力实测时生成）：key_value_stores / request_queues
+# 属运行期产物，不是资产，不入库。
+storage/
