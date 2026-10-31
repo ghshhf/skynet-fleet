@@ -62,9 +62,11 @@ jobs:
           # 缓存键带上目标三元组，换目标不会误用旧缓存
           key: msvc
 
-      # 先跑测试：编不过/测试红就直接失败，别浪费后面几分钟打 release
+      # 先跑测试：编不过/测试红就直接失败，别浪费后面几分钟打 release。
+      # 注意不能写 --lib：这个 crate 是纯 bin 目标（没有 src/lib.rs），
+      # 限 lib 会报 "no library targets found in package"。测试都在 main.rs 里。
       - name: 单元测试
-        run: cargo test --target x86_64-pc-windows-msvc --lib
+        run: cargo test --target x86_64-pc-windows-msvc
 
       - name: Release 构建
         run: cargo build --target x86_64-pc-windows-msvc --release

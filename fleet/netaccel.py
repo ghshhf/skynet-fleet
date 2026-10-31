@@ -234,7 +234,12 @@ def lan_running():
 
 
 def gateway_start(wait=8):
-    """启动热点网关。gitport 没跑就先拉起来。返回 (ok, 说明)。"""
+    """启动热点网关。gitport 没跑就先拉起来。返回 (ok, 说明)。
+
+    如果设了环境变量 ``FLEET_WSRELAY``（形如 ``wss://xxx.onrender.com/tunnel``），
+    网关会把 WS 隧道当作最优先上游——那是唯一能覆盖墙外站点的通路，
+    因为本机 IP 池只救得动「换 IP 就通」的站（GitHub 这类）。
+    """
     if not os.path.isfile(_GATEWAY_PY):
         return False, f"找不到 {_GATEWAY_PY}"
     if lan_running():
@@ -249,6 +254,9 @@ def gateway_start(wait=8):
         "--host", "0.0.0.0", "--port", str(LAN_PORT),
         "--upstream", PROXY_ADDR,
     ]
+    wsrelay = os.environ.get("FLEET_WSRELAY", "").strip()
+    if wsrelay:
+        args += ["--upstream-ws", wsrelay]
     try:
         if IS_WIN:
             creation = 0x00000200 | 0x00001000  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
@@ -532,7 +540,12 @@ def main(argv=None):
                 print(f"  热点设备设置：HTTP/SOCKS 代理 {ip}:{LAN_PORT}")
             else:
                 print("  提示：热点网卡没找到，先开「移动热点」再跑一次")
-            print("  覆盖范围：GitHub 全系 / PyPI / arXiv；模型走 hf-mirror、ModelScope")
+            ws = os.environ.get("FLEET_WSRELAY", "").strip()
+            if ws:
+                print(f"  覆盖范围：经 WS 隧道 {ws}（可到墙外站）")
+            else:
+                print("  覆盖范围：GitHub 全系 / PyPI / arXiv；模型走 hf-mirror、ModelScope")
+                print("  要覆盖 YouTube 这类需设 FLEET_WSRELAY=wss://<你的中转>/tunnel")
         return 0 if ok else 1
     if cmd in ("gateway-stop", "gateway_stop"):
         ok, msg = gateway_stop()

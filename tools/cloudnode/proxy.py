@@ -47,6 +47,10 @@ IP_MAP: dict[str, list[str]] = {}
 # 上游失败时自动回落到 IP 覆写/直连，不会因为上游挂了就整体不可用。
 UPSTREAM: tuple[str, int] | None = None
 
+# WebSocket TCP 隧道（见 wsrelay.py）。这是「免费 PaaS 当出口」的唯一通路：
+# PaaS 只给 HTTP/WS，不给裸 TCP，所以把小 TCP 装进 WebSocket 送出去。
+UPSTREAM_WS: str | None = None
+
 
 CRLF = chr(13) + chr(10)
 CRLF2 = (chr(13) + chr(10)).encode() * 2
@@ -80,12 +84,23 @@ def _dial_upstream(host: str, port: int) -> socket.socket:
     return up
 
 
-def _dial(host: str, port: int) -> socket.socket:
+def _dial(host: str, port: int):
+    # ① WS 隧道优先：它通向一台墙外机器，覆盖面最广（PaaS 只给 HTTP，
+    #    所以把 TCP 装进 WebSocket，见 wsrelay.py）
+    if UPSTREAM_WS:
+        try:
+            from wsrelay import connect_via_ws
+            return connect_via_ws(UPSTREAM_WS, host, port)
+        except Exception as e:
+            # 隧道挂了就往下回落，不让热点设备整体断网
+            print(f"[cloudnode] WS 隧道失败({host}:{port}): {type(e).__name__}: {e}", flush=True)
+    # ② HTTP CONNECT 级联（本机已有代理客户端时用）
     if UPSTREAM is not None:
         try:
             return _dial_upstream(host, port)
         except Exception:
-            pass  # 上游不可用 → 回落，不让热点设备整体断网
+            pass
+    # ③ IP 覆写 / 直连
     ips = IP_MAP.get(host.lower())
     if not ips:
         return socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
@@ -341,10 +356,15 @@ def main() -> int:
     ap.add_argument("--map", action="append", default=[], metavar="DOMAIN=IP",
                     help="域名到 IP 的覆写，逗号分隔多个候选；可重复，例如 --map github.com=1.2.3.4,5.6.7.8")
     ap.add_argument("--upstream", metavar="HOST:PORT",
-                    help="级联到一个上游代理，例如 127.0.0.1:3067；失败自动回落")
+                    help="级联到一个上游 HTTP 代理，例如 127.0.0.1:3067；失败自动回落")
+    ap.add_argument("--upstream-ws", metavar="WSURL",
+                    help="级联到一个 WebSocket TCP 隧道，例如 wss://xxx.onrender.com/tunnel")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
-    global UPSTREAM
+    global UPSTREAM, UPSTREAM_WS
+    if a.upstream_ws:
+        UPSTREAM_WS = a.upstream_ws
+        print(f"[cloudnode] WS 隧道上游 -> {UPSTREAM_WS}", flush=True)
     if a.upstream:
         uh, up_ = a.upstream.rsplit(":", 1)
         UPSTREAM = (uh, int(up_))
