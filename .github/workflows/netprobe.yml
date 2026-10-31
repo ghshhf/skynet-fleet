@@ -1,0 +1,87 @@
+name: netprobe
+
+# 一次探测回答一个反复纠缠的问题：**这台 runner 在墙外吗？目标站认它吗？**
+#
+# 为什么要这个：本地判断"某站封不封"要试 DNS、试 IP、试 SNI、试分片，一圈下来
+# 半小时还不一定定论（2026-10-31 在 Google 段上就耗了一整晚）。而 runner 是
+# 干净的公网出口，一条 curl 就能把"出口在墙外"和"目标站认不认机房 IP"分开——
+# 这两个是不同的问题，混在一起才叫死胡同。
+#
+# 用法：Actions 页面点 Run workflow，urls 填空格分隔的地址。纯只读探测，
+# 不下载、不中转、不落任何东西（不拿 Actions 当代理使，只是问一句"通不通"）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "空格分隔的 URL 列表"
+        required: false
+        default: "https://www.youtube.com https://www.google.com https://github.com"
+      method:
+        description: "HEAD 更快；GET 更接近真实请求"
+        required: false
+        default: "GET"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 出口身份
+        run: |
+          echo "## 出口" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          curl -s -m 10 https://api.ipify.org || echo "(ipify 不通)"
+          echo
+          curl -s -m 10 "http://ip-api.com/line/?fields=country,regionName,isp,as" || echo "(ip-api 不通)"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 逐个探测
+        env:
+          URLS: ${{ inputs.urls }}
+          METHOD: ${{ inputs.method }}
+        run: |
+          echo "## 探测结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 目标 | HTTP | 耗时 | 备注 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for u in $URLS; do
+            # -w 里带 %{http_code}，000 就是压根没连上（DNS/连接/TLS 任一环节死）
+            out=$(curl -s -o /dev/null -m 25 -X "$METHOD" \
+                  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                  -w '%{http_code}|%{time_total}|%{remote_ip}' "$u" 2>&1) || out="000|0|curl-fail"
+            code=${out%%|*}; rest=${out#*|}; tt=${rest%%|*}; ip=${rest##*|}
+            note=""
+            case "$code" in
+              000) note="**没连上**（DNS/连接/TLS 死）" ;;
+              200|301|302|303) note="通" ;;
+              403) note="被拒（可能是机房 IP 风控）" ;;
+              429) note="限流" ;;
+              *) note="" ;;
+            esac
+            echo "| \`$u\` | $code | ${tt}s | $ip $note |" >> "$GITHUB_STEP_SUMMARY"
+            printf '%-45s %s %ss %s %s\n' "$u" "$code" "$tt" "$ip" "$note"
+          done
+
+      - name: YouTube 专项（不下载，只看能不能拿到播放页）
+        run: |
+          # 200 只说明网页能开；真正决定能不能下的是 yt-dlp 能不能解出格式。
+          # 这里只做第一层：播放页通不通、返回体里有没有 "Sign in to confirm"。
+          body=$(mktemp)
+          code=$(curl -s -m 25 -o "$body" -w '%{http_code}' \
+                 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ" || echo 000)
+          echo "## YouTube 播放页" >> "$GITHUB_STEP_SUMMARY"
+          echo "- HTTP: $code" >> "$GITHUB_STEP_SUMMARY"
+          if grep -qi "Sign in to confirm" "$body"; then
+            echo "- ⚠️ 返回体里有 \`Sign in to confirm you're not a bot\` —— 机房 IP 被风控，yt-dlp 也会卡这里" >> "$GITHUB_STEP_SUMMARY"
+          elif grep -qi "ytInitialPlayerResponse" "$body"; then
+            echo "- ✅ 返回体含 \`ytInitialPlayerResponse\`（正常播放页），可尝试 yt-dlp" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- 返回体既无风控标记也无播放器数据，前 300 字节：" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -c 300 "$body" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
