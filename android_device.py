@@ -739,40 +739,104 @@ def svc_listed(txt, svc=BRIDGE_SVC):
     return False
 
 
-def bridge_ensure(serial, wait=1.6):
-    """把无障碍服务写回系统设置（幂等）。返回是否「本来就在」。
+def bridge_probe(serial, timeout=4):
+    """三层探活：端口通没通 / 令牌对不对 / 无障碍连没连上。
 
-    只写设置、不弹 UI：shell 有 WRITE_SECURE_SETTINGS 时一步到位，
-    不需要人去「设置 → 无障碍」里点。
+    为什么要分三层（2026-11-01 改）：
+      以前只有一句「桥不在线（桥被系统杀了，或 adb forward 没建）」，
+      可这三种坏法修法完全不同：
+        · 端口不通        → 进程没了，`am start` 能拉回来
+        · 端口通但令牌错  → 桥活着，是本地令牌文件丢了，能从 APK 里捞
+        · 端口通但 no-a11y → 进程活着，无障碍授权被撤，**只能人去设置里点**
+      挤成一句话的结果是：每次出事都得从头手工二分一遍。
 
-    🔴 但这**不是总能成**（2026-10-26 实测）：HyperOS 在「USB 调试（安全设置）」
-    没开时会直接拒 ——
-        SecurityException: Permission denial, must have one of:
-        [android.permission.WRITE_SECURE_SETTINGS]
-    连 `pm grant` 也被 `GRANT_RUNTIME_PERMISSIONS` 挡住。这时候**没有任何 adb 通路**，
-    只能人手在手机上开一次。
-
-    所以失败信息必须写成「人照着能做完的一句话」，而不是把 `raw` 里的
-    `null` 甩出去 —— 那既没说是权限、也没说该点哪儿，等于把问题丢回给用户。
+    实现上借 A11Y 这条指令当探针：它要求「连得上 + 令牌对」才会拿到回话，
+    拿到 `OK a11y ready` 才算第三层也通。PING 只问到第二层为止，别拿它当探针。
     """
-    h = bridge_health(serial)
-    if h.get("enabled"):
+    r = _bridge_once(serial, "A11Y", timeout)
+    out = (r.get("out") or "").strip()
+    if out:                                    # 有回话 = 端口通、令牌对
+        return {"port": True, "auth": True, "a11y": out.startswith("OK"),
+                "out": out}
+    return {"port": False, "auth": False, "a11y": False,
+            "out": "", "why": r.get("err") or "无应答"}
+
+
+def bridge_wake(serial, settle=2.2):
+    """把桥的进程拉回来：`am start` 权限页，页面 onCreate 第一件事就拉起前台服务。
+
+    🔴 这是进程被回收后**唯一**能走的路（2026-11-01 真机验证）：
+         `settings put secure enabled_accessibility_services` → SecurityException
+             （WRITE_SECURE_SETTINGS 被拒，这代 ROM 收走了）
+         `startservice` 直接起无障碍服务               → 系统拒
+             （要 BIND_ACCESSIBILITY_SERVICE，那是系统签名才有的）
+         `am start`                                    → 过
+             （shell 有 START_ACTIVITIES；Activity 无关权限要求）
+       绕这一圈不是绕远：桥被 MIUI 杀是常态，而这台机器上没有 SIM 卡，
+       「USB 调试（安全设置）」那个开关打不开，所以人工兜底也不存在。
+
+    副作用：屏幕会闪一下那页（权限都给了就立刻 finish）。可以接受——
+    与「桥死了没人知道」相比，闪一下是最好的提醒。
+    """
+    rc, out = shell(serial, "am start -n app.fleet.bridge/.BridgeSetupActivity", timeout=20)
+    time.sleep(settle)
+    return {"ok": rc == 0, "out": (out or "").strip()[:160]}
+
+
+def bridge_ensure(serial, wait=1.6):
+    """把桥弄回可用状态（幂等）。返回 {"ok": 现在能不能用, "healed": 有没有动手}。
+
+    🔴 顺序是有讲究的（2026-11-01 重排）：先探端口，再谈写设置。
+      原先第一步就读 `settings get secure enabled_accessibility_services`，
+      只要那行还在就 return「本来就在」—— 可那行**在进程被回收之后照样在**。
+      于是最坏的情况被判定成最好的情况：明明桥死了，自愈直接放弃。
+      现在改成端口说了算，设置只是辅助证据。
+    """
+    p = bridge_probe(serial)
+
+    # ① 第三层也通：什么都别动
+    if p.get("port") and p.get("a11y"):
         return {"ok": True, "healed": False, "why": "本来就在"}
-    rc1, out1 = shell(serial, f"settings put secure enabled_accessibility_services {BRIDGE_SVC}")
-    rc2, out2 = shell(serial, "settings put secure accessibility_enabled 1")
-    time.sleep(wait)
-    h2 = bridge_health(serial)
-    if h2.get("enabled"):
-        return {"ok": True, "healed": True, "why": "已写回"}
-    denied = "WRITE_SECURE_SETTINGS" in (out1 or "") or "WRITE_SECURE_SETTINGS" in (out2 or "")
-    if denied:
-        why = ("这台 ROM 不让 adb 改无障碍设置（WRITE_SECURE_SETTINGS 被拒，"
-               "通常要开「开发者选项 → USB 调试（安全设置）」且要插卡）。"
-               "只能手开一次：设置 → 无障碍 → 已下载的服务 → 「编队桥」→ 打开。")
-    else:
-        why = ("写了但没生效（当前值 %r）。手开一次：设置 → 无障碍 → 已下载的服务 → "
-               "「编队桥」→ 打开。" % (h2.get("raw") or "空")[:40])
-    return {"ok": False, "healed": True, "why": why}
+
+    # ② 端口通、令牌对，但无障碍没连上 —— 进程活着，授权掉了
+    if p.get("port") and p.get("auth"):
+        return {"ok": False, "healed": False,
+                "why": "桥进程活着，但无障碍没连上（授权被撤或正在重绑）。"
+                       "手开一次：设置 → 无障碍 → 已下载的服务 → 「编队桥」→ 打开。"}
+
+    # ③ 端口不通 —— 进程没了，拉活再说
+    wake = bridge_wake(serial)
+    p2 = bridge_probe(serial)
+    if p2.get("port"):
+        if p2.get("a11y"):
+            return {"ok": True, "healed": True, "why": "已用 am start 拉活"}
+        return {"ok": False, "healed": True,
+                "why": "进程已拉活（端口回来了），但无障碍没连上。"
+                       "手开一次：设置 → 无障碍 → 已下载的服务 → 「编队桥」→ 打开。"}
+
+    # ④ 拉活也失败 —— 兜底写设置，把路试完再说人话
+    h = bridge_health(serial)
+    if not h.get("enabled"):
+        rc1, out1 = shell(serial, f"settings put secure enabled_accessibility_services {BRIDGE_SVC}")
+        rc2, out2 = shell(serial, "settings put secure accessibility_enabled 1")
+        time.sleep(wait)
+        h2 = bridge_health(serial)
+        if h2.get("enabled"):
+            p3 = bridge_probe(serial)
+            return {"ok": p3.get("a11y", False), "healed": True,
+                    "why": "已写回无障碍设置" if p3.get("a11y") else "设置已写回，服务还没连上（等系统绑一次）"}
+        denied = "WRITE_SECURE_SETTINGS" in (out1 or "") or "WRITE_SECURE_SETTINGS" in (out2 or "")
+        if denied:
+            return {"ok": False, "healed": True,
+                    "why": "这台 ROM 不让 adb 改无障碍设置（WRITE_SECURE_SETTINGS 被拒），"
+                           "am start 也没救回来。只能手开一次：设置 → 无障碍 → 已下载的服务 → 「编队桥」→ 打开。"}
+
+    return {"ok": False, "healed": bool(wake.get("ok")),
+            "why": "桥拉不起来：%s / %s" % (wake.get("out") or "am start 无输出",
+                                            p2.get("why") or "端口仍不通")}
+
+
+
 
 
 
@@ -789,7 +853,8 @@ def bridge_cmd(serial, cmd, timeout=8):
         return r
     heal = bridge_ensure(serial)
     if not heal.get("ok"):
-        r["err"] = f"{r.get('err','')}（无障碍服务没开，自动写回也失败：{heal.get('why')}）"
+        r["err"] = f"{r.get('err','')}（自愈没成功：{heal.get('why')}）"
+        r["heal"] = heal
         return r
     if not heal.get("healed"):
         time.sleep(0.6)          # 服务在但不是没响应，给一次喘息再问

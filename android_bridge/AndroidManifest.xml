@@ -12,6 +12,14 @@
     <!-- 红外发射：普通权限，安装即得，不需要 root 也不需要无障碍 -->
     <uses-permission android:name="android.permission.TRANSMIT_IR" />
 
+    <!-- 保活壳（2026-11-01）：普通前台服务，只为把进程优先级抬起来。
+         不用 dataSync：Android 14+ 给它按了「每 24 小时 6 小时」的配额，
+         跑满就再也起不来。specialUse 没有时长配额，才撑得住「一直在」。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ 通知权限：没它前台服务的通知不显示，桥被杀了用户看不见 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- 蓝牙扫描：只扫不连。BLUETOOTH_SCAN 带 neverForLocation，
          这样不申请定位权限也能扫到设备（不拿它推位置）。 -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
@@ -45,6 +53,18 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 保活壳：不干活，只让进程以前台服务身份活着。
+             exported=false —— 它没有对外入口，只能由本应用（或 am start 拉起的
+             BridgeSetupActivity）触发。START_STICKY 由代码里的 onStartCommand 给。 -->
+        <service
+            android:name=".BridgeKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="local accessibility control bridge" />
         </service>
     </application>
 </manifest>
