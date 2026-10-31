@@ -48,7 +48,9 @@ def main():
     from fleet import voicebank as vb
 
     # ---------- ① 引擎表：每个引擎都能拼出合法参数 ----------
-    for eng in ("melo", "matcha", "zhll", "zipv"):
+    # 从 ENGINES 派生而不是写死引擎名：写死过一版（melo/matcha/zhll/zipv），
+    # 砍引擎时这里就成了"漏改的第四处"。引擎表变，门禁自动跟着变。
+    for eng in tr.ENGINES:
         e = tr.ENGINES[eng]
         ref = list(e.get("refs", {}))[0] if e.get("refs") else None
         rtxt = list(e.get("refs", {}).values())[0] if e.get("refs") else None
@@ -108,17 +110,17 @@ def main():
 
     # ---------- ④ 真实合成（PC 端，模型在 _contrib/tts 时生效；否则跳过）----------
     tmp = tempfile.mkdtemp(prefix="fleet-t50-")
-    pc_melo = os.path.join(tr._tts_dir(), "vits-melo-tts-zh_en")
-    if os.path.isdir(pc_melo):
+    pc_matcha = os.path.join(tr._tts_dir(), "matcha-icefall-zh-baker")
+    if os.path.isdir(pc_matcha):
         try:
             out = os.path.join(tmp, "m.wav")
-            p, sec, _ = tr._pc_synth("测试一句话。", out, engine="melo", threads=4)
+            p, sec, _ = tr._pc_synth("测试一句话。", out, engine="matcha", threads=4)
             with wave.open(p, "rb") as w:
                 ok_fmt = (w.getnchannels() == 1 and w.getsampwidth() == 2
                           and w.getnframes() > 0)
-            check(ok_fmt, "PC 端 melo 真合成出 16bit 单声道 WAV（%.2fs）" % sec)
+            check(ok_fmt, "PC 端 matcha 真合成出 16bit 单声道 WAV（%.2fs）" % sec)
         except Exception as ex:
-            check(False, "PC 端 melo 合成失败: %s" % ex)
+            check(False, "PC 端 matcha 合成失败: %s" % ex)
     else:
         skip("PC 无 melo 模型（_contrib/tts/vits-melo-tts-zh_en），跳过真实合成")
 

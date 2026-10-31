@@ -25,7 +25,12 @@ voicebank 把常用音色登记成名字（旁白-女 / 新闻女 / 雷军…）
 import hashlib
 import os
 
-from fleet import tts_runner as tr
+try:
+    from fleet import tts_runner as tr
+except ImportError:
+    # 直接跑 fleet/ 下的脚本时 sys.path[0] 是 fleet/ 本身、没有仓根，
+    # `from fleet import ...` 会 ModuleNotFoundError。补一条同级导入。
+    import tts_runner as tr
 
 CACHE = os.path.join(os.path.expanduser("~/.fleet"), "voicebank")
 
@@ -34,7 +39,10 @@ CACHE = os.path.join(os.path.expanduser("~/.fleet"), "voicebank")
 ZIPV_REFS = tr.ENGINES["zipv"]["refs"]
 VOICE_REGISTRY = {
     "旁白-女": dict(engine="matcha", sid=0, speed=1.0),
-    "男-中":   dict(engine="melo", sid=0, speed=1.0),
+    # 男声目前只有 zipv 的 leijun-1（特定人物音色），没有通用男声——原来那个
+    # "男-中" 挂在 melo sid=0 上，而 melo 的 sid=0 是**中文女声**，名不副实，
+    # 2026-10-31 随 melo 一起砍掉。要通用男声：录 3~5 秒人声推到
+    # /data/local/tmp/zipv/test_wavs/<名字>.wav，再 vb.register("<名字>", ...)。
     "新闻女":  dict(engine="zipv", ref="news-female",
                   ref_text=ZIPV_REFS["news-female"], speed=1.0),
     "新闻女2": dict(engine="zipv", ref="news-female-2",
