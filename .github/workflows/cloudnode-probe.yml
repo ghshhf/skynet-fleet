@@ -1,0 +1,84 @@
+name: cloudnode-probe
+
+# 目的：验证 GitHub Actions runner 能否充当「境外出口节点」。
+# 三问一次性回答：
+#   1) runner 出网到 YouTube / Google / X 正常吗？
+#   2) 本仓库的代理脚本在 runner 上能跑通吗（自连自测）？
+#   3) 免费 TCP 隧道（serveo / pinggy）在 runner 上能建起来吗？
+# 只做探测，不长期驻留；结果直接写进 job summary，国内用 gh api 读。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: runner 出口 IP 与目标站可达性
+        run: |
+          set +e
+          {
+            echo "## runner 出网实测"
+            echo ""
+            echo '```'
+            echo -n "出口 IP: "
+            curl -sS --max-time 10 https://api.ipify.org || echo "(ipify 不可达)"
+            echo
+            echo -n "出口 ASN: "
+            curl -sS --max-time 10 "https://ipinfo.io/org" || echo "(ipinfo 不可达)"
+            echo
+            echo "--- 目标站 ---"
+            for u in https://www.youtube.com https://www.google.com https://x.com https://huggingface.co https://github.com; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 12 "$u" 2>/dev/null)
+              [ -z "$code" ] && code="ERR"
+              printf '%-32s %s\n' "$u" "$code"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 起代理并自连自测
+        run: |
+          set +e
+          {
+            echo ""
+            echo "## 代理自测（runner 内部）"
+            echo ""
+            echo '```'
+            python3 tools/cloudnode/proxy.py --selftest
+            echo '--- 经代理访问 YouTube ---'
+            python3 tools/cloudnode/proxy.py --port 1080 &
+            sleep 1
+            curl -sS --max-time 20 -x http://127.0.0.1:1080 -o /dev/null \
+              -w 'proxy->youtube  code=%{http_code}  time=%{time_total}s\n' https://www.youtube.com
+            curl -sS --max-time 20 -x socks5h://127.0.0.1:1080 -o /dev/null \
+              -w 'proxy->google   code=%{http_code}  time=%{time_total}s\n' https://www.google.com
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 试探免费 TCP 隧道
+        run: |
+          set +e
+          {
+            echo ""
+            echo "## TCP 隧道探测"
+            echo ""
+            echo '```'
+            echo "=== serveo.net (ssh -R) ==="
+            timeout 30 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=15 -R 0:localhost:1080 serveo.net 2>&1 | head -15
+            echo
+            echo "=== pinggy.io (ssh -p 443 -R0) ==="
+            timeout 30 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=15 -p 443 -R0:localhost:1080 a.pinggy.io 2>&1 | head -15
+            echo
+            echo "=== localhost.run ==="
+            timeout 30 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=15 -R 80:localhost:1080 nokey@localhost.run 2>&1 | head -15
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
