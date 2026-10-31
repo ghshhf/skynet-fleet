@@ -381,6 +381,7 @@ CASES = [
     #     所以执行类能力结构上够不着它们。这条破了就是局域网里谁都能下令。
     ("eval_t51_lan_transfer", ["evals/t51_lan_transfer.py"], HERE, 180),
     ("eval_t52_reach_layer", ["evals/t52_reach_layer.py"], HERE, 120),
+    ("eval_t53_nat_traversal", ["evals/t53_nat_traversal.py"], HERE, 240),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
