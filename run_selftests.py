@@ -382,6 +382,9 @@ CASES = [
     ("eval_t51_lan_transfer", ["evals/t51_lan_transfer.py"], HERE, 180),
     ("eval_t52_reach_layer", ["evals/t52_reach_layer.py"], HERE, 120),
     ("eval_t53_nat_traversal", ["evals/t53_nat_traversal.py"], HERE, 240),
+    # t54 是「数字不许漂移」：docs/_stats.json 必须等于 tools/gen_stats.py 现算的值。
+    #     天网文档里的进度数字漂过四个门禁数并存，根子是数字与真源之间没有断言。
+    ("eval_t54_stats_sync", ["evals/t54_stats_sync.py"], HERE, 60),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
