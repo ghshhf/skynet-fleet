@@ -70,7 +70,9 @@ groups = ["cdn.example.com", "*.example.com"]
 "api.example.com" = "154"   # 复用 Fastly .154 段 -> 现有 FAMILY_WL_154 自动认领
 ```
 
-### 3.2 改造点（需改的两处，均在工具链就绪后实施）
+### 3.2 改造点（两处）
+
+> 实施状态（2026-10-31）：① `config.rs` 改造**已完成**——新增 `src/sites.rs` 运行时加载层 + `sites.toml` 合并，GitHub 默认逐字保留，新增站点纯配置；② `route.rs` 动态生成 `FAMILY_WL_*` **尚未做**，当前 GitHub 默认段号（154/153/133/4.249）已被硬编码族覆盖，不影响 GitHub，只影响"全新 IP 段新站点"的纯配置化（需补一行族闭包）。
 
 1. **`src/config.rs`**：`GROUPS` / `WHITELIST_HOSTS` / `DIRECT_HOSTS` 三个 `&'static` 常量
    改为 `OnceLock<Vec<...>>` 运行时加载；`pool_for` / `is_whitelist` / `whitelist_seg` /
@@ -86,12 +88,18 @@ groups = ["cdn.example.com", "*.example.com"]
 
 ## 四、天网集成步骤
 
-1. **编译**（需 Rust stable + cargo + C 编译器；`boring`/`ring` 还需 perl/make/yasm）：
+1. **编译**（本机已装好工具链，改造版编译验证中）：
+   - 目标 `x86_64-pc-windows-gnu`，链接器用 Strawberry MinGW 的 `gcc`（本机无 MSVC 链接器，
+     且**关键**：`rustup` 默认工具链必须设成 `stable-x86_64-pc-windows-gnu`，否则 build scripts
+     会用 msvc host 去找 `link.exe` 而失败——见第六节）。
+   - `boring`/`ring` 需要 perl/nasm/cmake（Strawberry 自带）；BoringSSL 代码生成需要 Go（`GOROOT=D:\tools\go`）。
+   - 国内镜像：`RUSTUP_DIST_SERVER=https://rsproxy.cn` + `.cargo/config.toml` 的 crates 镜像，全程不走代理。
    ```bash
-   cd device-fleet/vendor/gitport-accel && cargo build --release
-   # 产物 target/release/gitport-github(.exe)
+   # 直接用封装好的脚本（本机双击即编，环境变量已固化）
+   D:\tools\build_gitport.bat            # release 构建
+   D:\tools\build_gitport.bat debug      # 快速验证编译链
+   # 产物: target\x86_64-pc-windows-gnu\release\gitport-github.exe
    ```
-   > 本机（停车场岗机）**未装 Rust 工具链**（无 cargo），此步未在此机验证；需在装有工具链的环境编译。
 2. **常驻**：作为天网桌面端（`tools/build_gui.py`）的子进程随桌面端启动，或独立系统托盘常驻
    （gitport 自带 tray）。监听 `127.0.0.1:7810`（代理）+ `:7811`（管理页）。
 3. **开发环境接入**：天网所有项目的 git / cargo / npm / pip 设
@@ -102,7 +110,7 @@ groups = ["cdn.example.com", "*.example.com"]
 
 ## 五、本机现状与限制
 
-- 本机（天网桌面端开发机）**无 Rust 工具链**，`cargo build` 未在此验证；代码与资产已落地，编译待工具链就绪。
+- 本机（天网桌面端开发机）**Rust 工具链已修复并常用化**：rustup 默认 `stable-x86_64-pc-windows-gnu`（rustc 1.99.1），链接器用 Strawberry MinGW 的 `gcc`；Go 1.27.3（`D:\tools\go`）。原版与改造版均经此链编译验证（改造版首次编译进行中）。构建封装见 `D:\tools\build_gitport.bat`。
 - git 联网本机现走 `karing` 代理（`127.0.0.1:3067` 监听）；WorkBuddy 沙箱默认拦截 git 直连联网，
   git 类操作需 `dangerouslyDisableSandbox` 或走代理。**gitport 解决的是 GFW 对 GitHub 的干扰，不是替代翻墙。**
 - 数据资产 `seeds.json`（IP 表）随仓库走，上游消失也能重建。
