@@ -1,0 +1,91 @@
+# ============================================================================
+# gitport-accel · 站点注册表（配置驱动蓝本）
+# ----------------------------------------------------------------------------
+# 这是本路线相对上游的核心改动：把 src/config.rs 写死的 GROUPS / WHITELIST_HOSTS
+# / DIRECT_HOSTS 抽成此文件。新增一个国外网站 = 在此加一个 [[sites]] 条目，
+# 大部分工作量是「加配置」而非改代码（详见 README.skynet.md 第三节）。
+#
+# 字段语义（与上游源码一一对应）：
+#   groups[].pool      = 进池分组名（core / api / edge，对应 route::POOL_ROUTES）
+#   groups[].patterns  = 域名模式；"*.x" 通配子域，否则全等（config::pattern_match）
+#   whitelist[host]    = 真名 SNI + ClientHello 分片腿；值 = IP 段号
+#                        Fastly 末段 "154"/"153"/"133"，Azure 前缀 "4.249"
+#                        对应 route::FAMILY_WL_*（改造后由 seg 动态生成）
+#   direct[host]       = 不归任何池、不经代理，交系统 DNS 直连（config::is_direct）
+#   mirrors[host]      = 内容域镜像链（大/小文件分治，源码 CONTENT_HOSTS 表约束）
+# ============================================================================
+
+# ---- 内置站点 1：GitHub（上游默认全量照搬）---------------------------------
+[[sites]]
+name = "github"
+
+[[sites.groups]]
+pool = "core"
+patterns = ["github.com", "*.github.com"]
+
+[[sites.groups]]
+pool = "api"
+patterns = ["api.github.com"]
+
+[[sites.groups]]
+pool = "edge"
+patterns = [
+    "githubapp.com", "*.githubapp.com",
+    "*.githubassets.com",
+    "github.io", "*.github.io",
+    "*.githubusercontent.com",
+]
+
+[whitelist]
+"docs.github.com"                         = "154"
+"support.github.com"                      = "133"
+"resources.github.com"                    = "133"
+"desktop.github.com"                      = "153"
+"pages.github.com"                        = "153"
+"skills.github.com"                       = "153"
+"archiveprogram.github.com"               = "153"
+"socialimpact.github.com"                 = "153"
+"raw.github.com"                          = "133"
+"copilot-proxy.githubusercontent.com"     = "4.249"
+
+[direct]
+"objects-origin.githubusercontent.com"    = ""
+"uploads.github.com"                       = ""
+"viewscreen.githubusercontent.com"        = ""
+"api.mcp.github.com"                       = ""
+
+[mirrors]
+"raw.githubusercontent.com"               = ["https://v4.gh-proxy.org"]
+"gist.githubusercontent.com"              = ["https://v4.gh-proxy.org"]
+"avatars.githubusercontent.com"           = ["https://v4.gh-proxy.org"]
+"codeload.github.com"                     = ["https://v4.gh-proxy.org"]
+"objects.githubusercontent.com"           = ["https://v4.gh-proxy.org"]
+"release-assets.githubusercontent.com"   = ["https://v4.gh-proxy.org"]
+
+# ---- 范式：加一个「同 Fastly 边缘」的新站点（纯配置，复用现有段族）------------
+# 只要新站点也落在 Fastly .154/.153/.133 或 Azure 4.249 段，route.rs 现有
+# FAMILY_WL_* 自动认领，无需改代码。下面是企业 GitHub Enterprise 或 Fastly 系 CDN 的占位：
+#
+# [[sites]]
+# name = "my-fastly-cdn"
+# [[sites.groups]]
+# pool = "edge"
+# patterns = ["cdn.example.com", "*.example.com"]
+# [whitelist]
+# "api.example.com" = "154"      # 复用 Fastly .154 -> FAMILY_WL_154 自动认领
+# [direct]
+# "uploads.example.com" = ""
+# [mirrors]
+# "raw.example.com" = ["https://v4.gh-proxy.org"]
+
+# ---- 范式：加一个「全新 IP 段」的站点（需 route.rs 补一行族）-----------------
+# 若新站点不用 GitHub 的段，route.rs 需新增一个 FAMILY_WL_XXX 条目（一行闭包，
+# serves = |p| fastly_last_octet(&p.ip) == Some("NEW")）。这是唯一需要动代码之处。
+#
+# [[sites]]
+# name = "novel-edge"
+# [[sites.groups]]
+# pool = "edge"
+# patterns = ["*.novelcdn.com"]
+# [whitelist]
+# "api.novelcdn.com" = "777"      # 新段 -> route.rs 补 FAMILY_WL_777
