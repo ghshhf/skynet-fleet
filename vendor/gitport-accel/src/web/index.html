@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitPort GitHub 工作台</title>
+<link rel="stylesheet" href="/style.css">
+<script>
+// 渲染自愈看门狗(治两类"整块内容消失"):
+// 1) DOM 截断: WebView2 网络栈随系统代理刷新重启时可能把正在浏览的页面
+//    拦腰截断半截重载, 断处之后的 DOM 整块丢失。body 尾部的 app.js 不会执行,
+//    所以看门狗放 head —— 截断后仍会跑, 发现哨兵元素缺失就整页重载。
+// 2) 合成器停帧(2026-10-10 CDP 实锤): 窗口隐藏到托盘再恢复后, 合成器卡在旧画面
+//    不再重绘 —— DOM 完整但下半截永远是旧画面。药方: 轻推布局(zoom 1.0001 再
+//    复原)强制全量失效重绘。加载/恢复可见/获得焦点时各查一次, 60s 内最多重载 3 次。
+(function () {
+  var KEY = "fp_dom_heal", N = 3, WIN = 60000;
+  function nudgePaint() {
+    var d = document.documentElement;
+    d.style.zoom = "1.0001";
+    void d.offsetHeight; // 强制同步 reflow, 全量失效合成器帧
+    d.style.zoom = "";
+    void d.offsetHeight;
+  }
+  function heal() {
+    if (!document.getElementById("toast") || !document.getElementById("view-logs")) {
+      var now = Date.now(), arr = [];
+      try { arr = JSON.parse(sessionStorage.getItem(KEY) || "[]"); } catch (e) {}
+      arr = arr.filter(function (t) { return now - t < WIN; });
+      if (arr.length < N) { arr.push(now); sessionStorage.setItem(KEY, JSON.stringify(arr)); location.reload(); }
+    } else {
+      nudgePaint(); // DOM 完整但画面可能停帧: 轻推合成器
+    }
+  }
+  document.addEventListener("DOMContentLoaded", function () {
+    // 滚动确定性: 页面每次加载一律从顶部开始(会话恢复曾把位置带回半中央)。
+    try { history.scrollRestoration = "manual"; } catch (e) {}
+    requestAnimationFrame(function () { scrollTo(0, 0); });
+    setTimeout(heal, 800);
+  });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) setTimeout(heal, 300); });
+  window.addEventListener("focus", function () { setTimeout(heal, 300); });
+})();
+</script>
+</head>
+<body>
+  <aside class="side">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 9a8 8 0 0 1 16 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <path d="M7.5 11a4.5 4.5 0 0 1 9 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".5"/>
+        <circle cx="12" cy="16.5" r="3" fill="currentColor"/>
+      </svg>
+      <div class="brand-txt">
+        <div class="name">GitPort GitHub</div>
+        <div class="sub">跨站加速工作台</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-group">监控</div>
+      <a href="#overview" class="item" data-view="overview">概览</a>
+      <a href="#logs"     class="item" data-view="logs">运行日志</a>
+      <div class="nav-group">控制</div>
+      <a href="#mirrors"  class="item" data-view="mirrors">自定义镜像</a>
+      <a href="#settings" class="item" data-view="settings">设置</a>
+    </nav>
+
+    <div class="side-foot">
+      <span class="run-dot" id="dot"></span>
+      <div class="foot-txt">
+        <div class="foot-state" id="footState">已停止</div>
+        <div class="foot-sub"><span id="footPort">127.0.0.1:7810</span> · <span id="footVer">v?</span></div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="top-txt">
+        <h1 id="pageTitle">概览</h1>
+        <p class="top-sub" id="pageSub">代理状态与 GitHub 连通性一览</p>
+      </div>
+    </header>
+
+    <div class="views">
+      <!-- 概览 -->
+      <section id="view-overview" class="view active">
+        <div class="panel hero-addr">
+          <span class="label">代理地址</span>
+          <div class="addr-row" onclick="copyText(document.getElementById('addr').textContent)" title="点击复制">
+            <code class="addr" id="addr">127.0.0.1:7810</code>
+          </div>
+          <span class="hint">浏览器扩展(SwitchyOmega 等)/ git / 命令行把代理指向这里</span>
+        </div>
+
+        <div class="grid3">
+          <div class="statcard">
+            <span class="label">代理服务</span>
+            <span class="value" id="sRun">已停止</span>
+            <span class="meta" id="sPortMeta">127.0.0.1:7810</span>
+          </div>
+          <div class="statcard">
+            <span class="label">接入与加速</span>
+            <span class="badges">
+              <span class="badge" id="bMitm">MITM 关</span>
+            </span>
+            <span class="meta" id="sDomains">分流域名 20 个</span>
+          </div>
+          <div class="statcard">
+            <span class="label">串发候选</span>
+            <span class="value"><span id="sPoolCount">0</span> 条</span>
+            <span class="meta">按表逐个重试 · 通者置顶</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 自定义镜像 -->
+      <section id="view-mirrors" class="view">
+        <div class="panel">
+          <h2>我的镜像</h2>
+          <div id="mirrorRows"></div>
+          <button class="btn primary" id="mirrorAdd" style="margin-top:12px">＋ 添加镜像</button>
+        </div>
+
+        <div class="panel">
+          <h2>Cloudflare Worker 部署教程（约 3 分钟，全程免费）</h2>
+          <pre id="workercode" class="code">export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    let rest = decodeURIComponent(url.pathname.slice(1)) + url.search;
+    if (rest.startsWith("https:/") && !rest.startsWith("https://")) rest = "https:/" + rest;
+    if (!/^https:\/\/([\w.-]+\.)*(github\.com|githubusercontent\.com|githubassets\.com|github\.io|githubapp\.com|build\.nvidia\.com|google\.com|google\.com\.hk|googleapis\.com|googleapis\.cn|gstatic\.com|gstatic\.cn|googleusercontent\.com|ggpht\.com)(\/|$)/.test(rest)) {
+      return new Response("usage: /https://github.com/...", { status: 400 });
+    }
+    const headers = new Headers(request.headers);
+    headers.delete("host"); headers.delete("cf-connecting-ip");
+    headers.delete("cf-ipcity"); headers.delete("cf-ipcountry");
+    headers.delete("cf-ray"); headers.delete("cf-visitor");
+    headers.delete("cdn-loop"); headers.delete("x-forwarded-for");
+    headers.delete("x-forwarded-proto"); headers.delete("x-real-ip");
+    const target = new URL(rest);
+    // GET/HEAD 无 Range 的请求走 CF 边缘缓存：命中即免回源，未命中回源一次后入缓存。
+    // 带凭据的请求绝不入缓存(私有响应以公共 URL 为键会被任何人取走)；也不读缓存
+    // (他人可能以同 URL 存过脏数据)。带 Range 的下载流直通(缓存副本无法 206 切片)。
+    const hasCreds = request.headers.has("authorization") || request.headers.has("cookie");
+    const cacheable = !hasCreds && (request.method === "GET" || request.method === "HEAD")
+      && !request.headers.get("range");
+    if (cacheable) {
+      const cached = await caches.default.match(request.method + " " + target.toString());
+      if (cached) return cached;
+    }
+    const upstream = await fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
+    if (cacheable && upstream.ok && upstream.status === 200) {
+      // put 对 206/304/Vary:* 会 reject, 限 200 且 catch 掉防未处理拒绝刷屏。
+      ctx.waitUntil(
+        caches.default.put(request.method + " " + target.toString(), upstream.clone())
+          .catch(() => {})
+      );
+    }
+    return upstream;
+  }
+}</pre>
+          <div class="row">
+            <button class="btn sm" onclick="copyText(document.getElementById('workercode').textContent)">复制 Worker 代码</button>
+          <div class="guide-step"><img src="/guide/step1.jpg" alt="创建应用程序" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step2.jpg" alt="从 Hello World 开始" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step3.jpg" alt="起名并部署" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step4.jpg" alt="贴入反代代码" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step5.jpg" alt="拿 Worker 地址" loading="lazy"></div>
+
+          </div>
+          <p class="hint" style="margin-top:6px;line-height:1.9">
+            ① Cloudflare 控制台 → Workers & Pages → Create → 选「Hello World」模板 → 起名并 Deploy；<br>
+            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy（已内置 CF 边缘缓存 + 凭据防护；2026-10-29 前部署的老代码请重新粘贴覆盖一次）；<br>
+            ③ 回到概览页，你的 Worker 地址 = <code>https://名字.你的子域.workers.dev</code>；<br>
+            ④ 把地址粘贴到上方「我的镜像」→ 点「启动」。之后「启动/关闭」只增删 plans.json 链成员，地址注册表原位保留；<br>
+            ⑤ 建议绑定自有域名（Worker 设置 → 域和路由），抗 workers.dev 域名干扰；GitHub 看到的将全是 Cloudflare 的 IP。
+          </p>
+        </div>
+      </section>
+
+      <!-- 设置 -->
+      <section id="view-settings" class="view">
+        <div class="panel">
+          <div class="set-row">
+            <div class="set-info">
+              <h2>开机自启动</h2>
+              <p>登录 Windows 后自动启动，驻留托盘</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="swAutostart"><span class="track"></span></label>
+          </div>
+          <div class="set-row">
+            <div class="set-info">
+              <h2>关闭窗口时缩到系统托盘</h2>
+              <p>点 ✕ 只隐藏窗口，代理继续运行；托盘左键显示、右键退出</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="swTray"><span class="track"></span></label>
+          </div>
+        </div>
+        <div class="panel">
+          <p class="hint" style="margin:0 0 6px">开启且代理运行时，以 PAC 接管系统代理：仅 GitHub 系走本代理，其余直连；退出或停代理时自动还原。</p>
+          <div class="set-row">
+            <div class="set-info">
+              <h2>GitHub 分流接管</h2>
+              <p>GitHub 系站点自动走本代理，无需插件</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="swGh" checked><span class="track"></span></label>
+          </div>
+        </div>
+        <div class="feature-card">
+          <div class="feature-info">
+            <h2>MITM 模式</h2>
+            <p class="hint" style="margin-top:5px">启用伪装 SNI、拦截页化解与流式直通；首次开启需安装本地证书</p>
+          </div>
+          <button class="btn primary" id="mitmBtn">开启</button>
+        </div>
+        <div class="feature-card">
+          <div class="feature-info">
+            <h2>镜像链校准</h2>
+            <p class="hint" style="margin-top:5px">按实测响应头耗时重排图片链顺序，后台任务（关窗进托盘也会跑完，结果见「运行日志」）。<br>• <strong>图片链</strong>：响应头测速，约 1 分钟<br>• <strong>大文件链</strong>：无需校准，代理按实时下载速度自动分流到最快镜像</p>
+            <pre id="calResult"></pre>
+          </div>
+          <div class="cal-actions">
+            <button class="btn primary" id="calImgBtn">校准图片链（响应头）</button>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- 运行日志 -->
+      <section id="view-logs" class="view">
+        <!-- 2026-10-18：去掉外层 panel —— 页面标题已有“运行日志”，再套一个同名
+             外框 + 内层日志框是三层框套框。工具栏单列一行，日志框直接填满。 -->
+        <div class="view-toolbar">
+          <label class="check"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+          <div class="row head-row">
+            <button class="btn sm" onclick="copyText(document.getElementById('logsBox').textContent)">复制全部</button>
+            <button class="btn sm" onclick="document.getElementById('logsBox').textContent=''">清空</button>
+          </div>
+        </div>
+        <div id="logsBox"></div>
+      </section>
+    </div>
+  </main>
+
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
