@@ -75,13 +75,19 @@ jobs:
                  "https://www.youtube.com/watch?v=dQw4w9WgXcQ" || echo 000)
           echo "## YouTube 播放页" >> "$GITHUB_STEP_SUMMARY"
           echo "- HTTP: $code" >> "$GITHUB_STEP_SUMMARY"
+          # 同一个结论要同时进日志和 summary：summary 只有网页上看得见，
+          # 用 gh run view --log 抓不到，第一版就是这样白跑了一轮。
+          printf 'YouTube watch HTTP=%s size=%s\n' "$code" "$(wc -c < "$body" | tr -d ' ')"
           if grep -qi "Sign in to confirm" "$body"; then
             echo "- ⚠️ 返回体里有 \`Sign in to confirm you're not a bot\` —— 机房 IP 被风控，yt-dlp 也会卡这里" >> "$GITHUB_STEP_SUMMARY"
+            printf 'risktag=SignInToConfirm\n'
           elif grep -qi "ytInitialPlayerResponse" "$body"; then
             echo "- ✅ 返回体含 \`ytInitialPlayerResponse\`（正常播放页），可尝试 yt-dlp" >> "$GITHUB_STEP_SUMMARY"
+            printf 'risktag=none (ytInitialPlayerResponse present)\n'
           else
             echo "- 返回体既无风控标记也无播放器数据，前 300 字节：" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             head -c 300 "$body" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
+            printf 'risktag=unknown, head='; head -c 200 "$body"; printf '\n'
           fi
