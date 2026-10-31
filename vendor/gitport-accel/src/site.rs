@@ -232,13 +232,14 @@ fn default_profiles() -> Vec<SiteProfile> {
                 "googleapis.com".into(),
                 "*.googleapis.com".into(),
             ],
-            seeds: vec![
-                IpSeed { ip: "142.250.1.14".into(), sni: "www.youtube.com".into() },
-                IpSeed { ip: "142.251.1.14".into(), sni: "www.youtube.com".into() },
-                IpSeed { ip: "216.58.209.14".into(), sni: "www.youtube.com".into() },
-                IpSeed { ip: "172.217.1.14".into(), sni: "www.youtube.com".into() },
-                IpSeed { ip: "142.250.72.14".into(), sni: "www.youtube.com".into() },
-            ],
+            // ⚠️ 实测 (2026-10-31)：Google 系 IP 段在国内是**黑洞级封锁**，不是 SNI 封锁。
+            //    随机采样 133 个 IP（142.250/142.251/172.217/216.58/74.125）测 :443，
+            //    结果 0/133 可通（8.8.8.8:53 通，说明不是本机问题，是 Google 443/80 被整段掐）。
+            //    ⇒ 分片、SNI 伪装、串发 IP 池**全部无效**，这条路物理不通。
+            //    seeds 故意留空：避免串发去试一堆死 IP，让用户白等二十几秒才失败。
+            //    要走 YouTube 只能靠远端节点（clash/sing-box + 机场），不是本工具的活。
+            //    domains 保留：将来接上远端节点时，这层识别可直接当路由标记用。
+            seeds: vec![],
             sni_disguise: "www.google.com".into(),
             split_hello: true,
             direct: vec![],
@@ -255,12 +256,11 @@ fn default_profiles() -> Vec<SiteProfile> {
                 "twimg.com".into(),
                 "*.twimg.com".into(),
             ],
-            seeds: vec![
-                IpSeed { ip: "104.244.42.1".into(), sni: "twitter.com".into() },
-                IpSeed { ip: "104.244.42.129".into(), sni: "twitter.com".into() },
-                IpSeed { ip: "104.244.42.193".into(), sni: "twitter.com".into() },
-                IpSeed { ip: "104.244.42.65".into(), sni: "twitter.com".into() },
-            ],
+            // ⚠️ 实测 (2026-10-31)：X/Twitter 同样是 IP 段黑洞。
+            //    6 个 IP（104.244.42.1/65/129/193、199.16.156.20、162.159.140.229）测 :443
+            //    全部 TimeoutError，连 TCP 都建不起来，根本走不到 TLS 那一层。
+            //    ⇒ 与 YouTube 同理，seeds 留空，只保留域名识别能力。
+            seeds: vec![],
             sni_disguise: "abs.twimg.com".into(),
             split_hello: true,
             direct: vec![],
@@ -275,12 +275,21 @@ fn default_profiles() -> Vec<SiteProfile> {
                 "hf.co".into(),
                 "*.hf.co".into(),
             ],
-            seeds: vec![
-                IpSeed { ip: "104.18.6.65".into(), sni: "huggingface.co".into() },
-                IpSeed { ip: "104.18.7.65".into(), sni: "huggingface.co".into() },
-                IpSeed { ip: "172.67.171.182".into(), sni: "huggingface.co".into() },
-                IpSeed { ip: "104.18.34.65".into(), sni: "huggingface.co".into() },
-            ],
+            // ⚠️ 实测 (2026-10-31，多轮对抗测试)：HF 是「DNS 污染 + SNI 封锁 + 有状态 DPI」三重。
+            //    证据链：
+            //    ① IP 本身可达：cdn-lfs-us-1.hf.co / cas-bridge.xethub.hf.co 直连建 TLS 返 403。
+            //    ② 同 IP 换 SNI 结果不同：3.170.19.119 + SNI=huggingface.co → RST；
+            //       同 IP + SNI=baidu.com → TLS-Alert（握手层通）⇒ 确系 SNI 判定。
+            //    ③ 但分片**全部无效**：首刀 1B/5B/16B、切 SNI 中段、三段式、gap 5/30/100ms
+            //       —— 无一例外 RST；乱序发送则全部超时（被丢弃）。
+            //    ④ 决定性证据：首刀 1B 后**等 3 秒**再发余下 —— 仍 RST。
+            //       ⇒ 对端做完整 TCP 流重组，重组窗口 >3s，分片/乱序/延时全绕不过。
+            //    ⇒ 本工具对 HF 无解。seeds 留空避免串发撞死 IP 白等。
+            //    正解：国内镜像 hf-mirror.com（实测 API 200/0.58s、小文件 200/1.15s、
+            //    大文件 1.63MB/s 波动大）或 ModelScope（实测 0.27s）。
+            //    设置 HF_ENDPOINT=https://hf-mirror.com 即可，详见 fleet/netaccel.py。
+            //    domains 保留：将来接远端节点时可直接当路由标记。
+            seeds: vec![],
             sni_disguise: "".into(),
             split_hello: false,
             direct: vec![],
@@ -293,11 +302,17 @@ fn default_profiles() -> Vec<SiteProfile> {
                 "arxiv.org".into(),
             ],
             seeds: vec![
-                IpSeed { ip: "131.243.4.146".into(), sni: "arxiv.org".into() },
-                IpSeed { ip: "131.243.2.120".into(), sni: "arxiv.org".into() },
-                IpSeed { ip: "131.243.4.130".into(), sni: "arxiv.org".into() },
+                // 实测 (2026-10-31)：arXiv 早已从 Berkeley(131.243.x) 迁到 Fastly。
+                // 这 4 个 IP 全部 TCP:443 可达（197~228ms）。
+                // 且 arXiv 本身**国内直连就通**（实测 https://arxiv.org/ 200 / 37KB / 1.7s），
+                // 画像存在的意义只是「偶尔 DNS 抖动时走 IP 池兜底」，不是必需。
+                IpSeed { ip: "151.101.2.132".into(), sni: "arxiv.org".into() },
+                IpSeed { ip: "151.101.66.132".into(), sni: "arxiv.org".into() },
+                IpSeed { ip: "151.101.130.132".into(), sni: "arxiv.org".into() },
+                IpSeed { ip: "151.101.194.132".into(), sni: "arxiv.org".into() },
             ],
             sni_disguise: "".into(),
+            // 直连就通，无需分片（分片只在被 SNI RST 时才有意义）。
             split_hello: false,
             direct: vec![],
         },
@@ -352,13 +367,33 @@ mod tests {
         assert!(pattern_match("www.youtube.com", "*.youtube.com"));
     }
 
+    /// YouTube/Twitter 是 IP 黑洞（实测 0/133、0/6），seeds **故意为空**。
+    /// 别「顺手修成非空」——那只会让串发去撞一堆死 IP，用户白等二十几秒。
     #[test]
-    fn site_seeds_youtube() {
+    fn site_seeds_youtube_intentionally_empty() {
         let p = site_for_host("www.youtube.com").unwrap();
-        assert!(!p.seeds.is_empty());
-        assert!(p.seeds.iter().all(|s| !s.ip.is_empty()));
-        assert!(p.split_hello);
+        assert!(p.seeds.is_empty(), "YouTube 是 IP 黑洞，seeds 必须为空");
         assert_eq!(p.sni_disguise, "www.google.com");
+        assert!(p.split_hello);
+    }
+
+    /// HuggingFace 是「DNS 污染 + SNI 封锁 + 有状态 DPI 重组」三重封锁。
+    /// 分片/乱序/延时全实测无效（首刀 1B 等 3s 仍 RST），seeds **故意为空**。
+    /// 正解走 hf-mirror / ModelScope，别把种子加回来。
+    #[test]
+    fn site_seeds_huggingface_intentionally_empty() {
+        let p = site_for_host("huggingface.co").unwrap();
+        assert!(p.seeds.is_empty(), "HF 分片无效，seeds 必须为空");
+        assert!(!p.split_hello, "HF 分片已被实测证伪，不应再开");
+        assert_eq!(p.name, "huggingface");
+    }
+
+    /// arXiv 直连就通，种子只作 DNS 抖动时兜底。
+    #[test]
+    fn site_seeds_arxiv_present_no_split() {
+        let p = site_for_host("arxiv.org").unwrap();
+        assert!(!p.seeds.is_empty());
+        assert!(!p.split_hello, "arXiv 直连就通，不需要分片");
     }
 
     #[test]
