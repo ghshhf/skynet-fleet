@@ -77,9 +77,18 @@ direct = ["status.example.com"] # 直连白名单（不经代理，交系统 DNS
 
 ### 3.3 内置默认站点（见 `src/site.rs` `default_profiles`）
 
-`github`（由旧系统管，此处 only 兜底 direct）、`youtube`、`twitter`、`huggingface`、`arxiv`。
-YouTube/Twitter 默认 `split_hello=true`（对抗 SNI-RST）；HuggingFace/arXiv 默认 `split_hello=false`（直连稳）。
-IP 种子是写死的「已知好 IP」，需随目标站点边缘 IP 变动而更新——这是该类工具的天花板，无自动发现。
+| 站点 | 现状 | 依据（2026-10-31 实测） |
+|---|---|---|
+| `github` | **主战场，可救** | 换 IP 即通：`20.27.177.113` + 真名 SNI → 200 / 0.29s |
+| `arxiv` | 直连可用 | 登记只为必要时可代理 |
+| `youtube` | **seeds 已清空，救不动** | DNS 污染 + 25 个 IP 只有 4 个 TCP 通 + 这 4 个换任意 SNI 全 RST |
+| `twitter` | **seeds 已清空，救不动** | 同 Google 段，按 IP 段整段切断 |
+| `huggingface` | **seeds 已清空，走镜像** | IP 可达但 SNI 封 + DPI 流重组窗口 >3s，分片/乱序/1B 首刀全无效 |
+
+**为什么要写死这张表**：不同站点的封锁层级不同，药不能混用。
+分片只对「按域名点名」有效，对「按 IP 段切断」和「DPI 流重组」完全无效。
+留一堆死种子只会让串发引擎在冷却和重试里空转。模型下载请走
+`hf-mirror.com` / ModelScope / ollama registry。
 
 ---
 
@@ -94,6 +103,8 @@ gitport 启动参数：`-headless`（无窗常驻）/ `-tray`（托盘）/ `-por
 python fleet/netaccel.py status            # 看 gitport 在不在、代理开没开
 python fleet/netaccel.py start             # 启动 gitport(headless) + 接管 git 代理
 python fleet/netaccel.py stop              # 停 gitport + 清 git 代理
+python fleet/netaccel.py gateway           # 把本机做成热点网关（7822 → 7810）
+python fleet/netaccel.py gateway-stop      # 只停网关，不动 gitport
 python fleet/netaccel.py pac > gitport.pac # 导出 PAC（仅受管域名走 7810）
 python fleet/netaccel.py system-proxy on gitport.pac   # 系统代理指向 PAC
 python fleet/netaccel.py system-proxy off  # 关系统代理
@@ -105,31 +116,59 @@ python fleet/netaccel.py --selftest        # 5 项自测（域名/PAC/端口/系
 - **系统代理**：写 `HKCU\...\Internet Settings` 的 `AutoConfigURL` 指向 PAC 文件，**不改防火墙**（防火墙是系统级动作，单独走 netpath）。
 - **无依赖**：零第三方库，Windows 用 `winreg`/`taskkill`，非 Win 退化为提示手动配置。
 - **启停健壮**：按端口找 PID 杀，失败按 exe 名兜底；启动轮询 7810 监听才算成功。
+- **热点网关**：`gateway` 在 0.0.0.0:7822 起 `tools/cloudnode/proxy.py`，级联到 127.0.0.1:7810。
+  热点下的设备只要把代理填成 `192.168.137.1:7822`，不用装任何东西。
+  设了 `FLEET_WSRELAY=wss://<你的中转>/tunnel` 时会优先走 WS 隧道（见下），
+  那才覆盖墙外站点；不设就只有 GitHub/PyPI/arXiv 这层。
 
 ---
 
 ## 五、编译与部署
 
+**两条路，优先用 CI。**
+
 ```bash
-# 封装好的脚本（环境变量已固化：gnu 目标/MinGW gcc/Go/LLVM/BINDGEN/rsproxy 镜像）
-D:\tools\build_gitport.bat            # release 构建
-D:\tools\build_gitport.bat debug      # 快速验证编译链
-# 产物: target\x86_64-pc-windows-gnu\release\gitport-github.exe
+# ① 本地编（需要 Rust + libclang + MinGW，脚本会把三条依赖都自适应找一遍）
+./build_windows.sh          # release
+./build_windows.sh debug    # 快速验证编译链
+# 产物: target/x86_64-pc-windows-gnu/release/gitport-github.exe
 ```
+
+```text
+# ② CI 编（推荐）：push 后 GitHub Actions 的 build-gitport 会产出
+#    build-gitport-windows artifact，下载解压即得 exe。
+#    本机工具链三条外部依赖（Rust home / libclang / MinGW 头文件）
+#    任何一条崩了都编不出来，2026-10-31 E 盘拔掉就全崩过一次，
+#    最后卡在链接器 0xc0000142（环境问题，非代码）。
+```
+
 产物目录需带齐运行时：`WebView2Loader.dll`（从 `target/.../build/webview2-com-sys-*/out/x64/` 复制）+ 4 个 MinGW 运行时 DLL。
 （参考 `D:/.workbuddy/memory/2026-10-31-gitport编译与工具链修复.md` 的完整踩坑记录。）
 
 依赖链：`boring=4`/`tokio-boring`（BoringSSL，需 Go 代码生成 + libclang bindgen）、`ring`（需 NASM）、
-`wry`/`tao`/`tray-icon`（WebView2 管理页）。目标 `x86_64-pc-windows-gnu`，链接器用 Strawberry MinGW 的 `gcc`。
+`wry`/`tao`/`tray-icon`（WebView2 管理页）。本机用 `x86_64-pc-windows-gnu` + Strawberry MinGW 的 `gcc`；
+CI 用 `x86_64-pc-windows-msvc`（runner 自带工具链，省掉整个 MinGW 依赖）。
+`netaccel.find_exe()` 两个目标的产物都能找到。
 
 ---
 
 ## 六、本机现状与限制
 
-- 本机 Rust 工具链已修复并常用化：rustup 默认 `stable-x86_64-pc-windows-gnu`（rustc 1.99.1），链接器 MinGW `gcc`；Go 1.27.3（`D:\tools\go`）；LLVM 18.1.8 libclang（bindgen）。
-- **gitport 解决的是 GFW 对"能直连站点"的干扰，不是替代翻墙。** 真正被墙的站点需远端节点（clash/sing-box/v2ray 路线），不在此工具职责内。
-- 多站点扩展经 129 个单元测试验证（路由/站点/串发全部通过）；调试期偶发的 certgen MITM 握手崩溃为沙箱环境问题，与本次改动无关。
-- 数据资产 `seeds.json` + `site.rs` 内置种子随仓库走，上游消失也能重建。
+- 本机 Rust 工具链：`stable-x86_64-pc-windows-gnu`（rustc 1.99.1），链接器 MinGW `gcc`（Strawberry）；Go 1.27.3；libclang 18（借用 pip 的 `projects/.libclang`）。
+- **gitport 解决的是「能直连但被 DPI 掐」的站点，不是替代翻墙。**
+  2026-10-31 把封锁拆成四层后，边界很清楚了：
+
+| 层 | 判据 | gitport 有没有用 |
+|---|---|---|
+| ① DNS 污染 | 域名解析出别人的 IP | 有用：自建 IP 池，不查系统 DNS |
+| ② 按域名点名 | 换 IP 就通（GitHub） | **有用，这是主战场** |
+| ③ 按 IP 段切断 | 同批 IP 换任意 SNI 全 RST（Google） | **无用** |
+| ④ DPI 流重组 | 分片/乱序/1B 首刀全 RST（HuggingFace） | **无用** |
+
+- 判 ②③ 只能靠交叉实验：**在同一批 IP 上换不同 SNI**，全 RST 就是 ③。
+- 真正需要 ③④ 类站点的场景（YouTube），唯一通路是一台**墙外机器**。
+  免费方案见 `tools/cloudnode/README.relay.md`（自己的随机子域名 + WS 隧道）。
+- 多站点扩展经 CI 130+ 单元测试验证（路由/站点/串发全部通过）。
 
 ---
 
