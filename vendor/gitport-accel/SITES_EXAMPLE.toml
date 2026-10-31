@@ -108,7 +108,19 @@ patterns = [
 # 注意：seeds 里的 IP 是写死的「已知好 IP」，需随目标站点的边缘 IP 变动而更新。
 # ============================================================================
 
-# ---- 内置站点 2：YouTube（IP 串发 + 首包分片对抗 SNI RST）-------------------
+# ---- 内置站点 2：YouTube（2026-10-31 实测判定：救不动，种子已清空）----------
+#
+# 实测三层，全部失败：
+#   ① DNS 污染：www.youtube.com 解析到 31.13.92.37（Facebook 的 IP）、
+#      youtube.com 解析到 104.244.42.197（Twitter 的 IP）；
+#   ② 绕过 DNS 直打 25 个真实 Google IP，只有 4 个 TCP 能建连（16%）；
+#   ③ 对这 4 个 IP 换 4 种 SNI（google / youtube / pypi / cloudflare）握手，
+#      全部 ConnectionResetError —— 说明是「TLS 阶段按 IP 段整段切断」，
+#      根本不看 SNI。
+#
+# 因此分片、伪装 SNI、换 IP 三条路全部无效（这三招都是针对「按域名封」的）。
+# 保留 domains 只为让路由层认得这些域名（可走隧道兜底/将来接远端节点），
+# seeds 必须留空：留一堆死 IP 只会让串发引擎在冷却和重试里空转。
 [[sites]]
 name = "youtube"
 domains = [
@@ -118,16 +130,11 @@ domains = [
     "ggpht.com", "*.ggpht.com",
     "googleapis.com", "*.googleapis.com",
 ]
-seeds = [
-    { ip = "142.250.1.14",    sni = "www.youtube.com" },
-    { ip = "216.58.209.14",   sni = "www.youtube.com" },
-    { ip = "172.217.1.14",    sni = "www.youtube.com" },
-    { ip = "142.250.72.14",   sni = "www.youtube.com" },
-]
+seeds = []
 sni_disguise = "www.google.com"
 split_hello = true
 
-# ---- 内置站点 3：Twitter / X（同款 IP 串发 + 分片）--------------------------
+# ---- 内置站点 3：Twitter / X（同款结论：Google/Meta 之外的整段封锁）---------
 [[sites]]
 name = "twitter"
 domains = [
@@ -136,16 +143,19 @@ domains = [
     "t.co", "*.t.co",
     "twimg.com", "*.twimg.com",
 ]
-seeds = [
-    { ip = "104.244.42.1",    sni = "twitter.com" },
-    { ip = "104.244.42.129",  sni = "twitter.com" },
-    { ip = "104.244.42.193",  sni = "twitter.com" },
-    { ip = "104.244.42.65",   sni = "twitter.com" },
-]
+seeds = []
 sni_disguise = "abs.twimg.com"
 split_hello = true
 
-# ---- 内置站点 4：HuggingFace（Cloudflare 系，不分片更稳）--------------------
+# ---- 内置站点 4：HuggingFace（2026-10-31 实测判定：分片无效，走镜像）--------
+#
+# IP 可达但 SNI 被封，且 DPI 有「流重组窗口」：
+#   - 整包、2/3/6 段分片、1 字节首刀、乱序分片，全部 RST；
+#   - 首刀只发 1 字节并等 3 秒再发余下部分，照样 RST
+#     → 说明设备会缓存到足够判定为止，3 秒都不够，分片这条路物理上死掉。
+#
+# 正确姿势不是硬穿，是换源：hf-mirror.com（实测 1.63MB/s）、ModelScope、
+# ollama registry 都能直连。seeds 清空，不浪费冷却时间。
 [[sites]]
 name = "huggingface"
 domains = [
@@ -153,12 +163,7 @@ domains = [
     "cdn-us.huggingface.co", "*.cdn-us.huggingface.co",
     "hf.co", "*.hf.co",
 ]
-seeds = [
-    { ip = "104.18.6.65",  sni = "huggingface.co" },
-    { ip = "104.18.7.65",  sni = "huggingface.co" },
-    { ip = "172.67.171.182", sni = "huggingface.co" },
-    { ip = "104.18.34.65", sni = "huggingface.co" },
-]
+seeds = []
 sni_disguise = ""
 split_hello = false
 

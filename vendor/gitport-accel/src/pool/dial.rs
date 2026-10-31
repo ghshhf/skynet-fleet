@@ -462,6 +462,15 @@ pub async fn dial_one(
         return Ok(Dialed::TlsSplit(tls));
     }
 
+    // 站点画像 split_hello=true：同样真名 + ClientHello 分片。
+    // 针对的是「IP 可达、但带真名 SNI 就被 RST」的站点（实测 huggingface.co：
+    // 强指真实 IP 后 0.13~0.49s 快失败 = TLS 首包被掐，而非 IP 黑洞）。
+    // 注意真名 SNI 是必须的：这类站点证书按真名校验，伪装名会被判非法。
+    if crate::config::site_split_hello(host).unwrap_or(false) {
+        let tls = tls_connect_split(host, tcp).await?;
+        return Ok(Dialed::TlsSplit(tls));
+    }
+
     let tls = tls_connect(host, mode, tcp).await?;
     Ok(Dialed::Tls(tls))
 }

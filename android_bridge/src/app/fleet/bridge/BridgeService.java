@@ -29,48 +29,66 @@ import android.os.Looper;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 public class BridgeService extends AccessibilityService {
 
-    private static final String TOKEN = "__TOKEN__";
-    private static final int PORT = 8765;
+    /**
+     * 当前活着的那一个实例。控制端口在 BridgeKeepAliveService 里，
+     * 需要"能注入"的动作都从这里要人。
+     *
+     * 为什么用静态引用而不是自己监听端口（2026-11-01 改）：
+     *   原先端口开在这个服务里，于是「端口通不通」同时承载了两个意思——
+     *   进程活没活 + 无障碍开没开。可它们坏起来完全不是一回事：
+     *     · 进程被回收    → 端口消失，但设置里还写着"已启用"，看着像没事
+     *     · 无障碍被关闭  → 进程还在，端口还在，但 dispatchGesture 什么都点不动
+     *   两者混在一起，报出来的话只能是"桥被系统杀了，或 adb forward 没建"，
+     *   等于没说。分开之后：端口通 = 进程活着；动作报 no-a11y = 无障碍没开。
+     *   每种故障都有各自的修法，也就有各自的说法。
+     */
+    private static volatile BridgeService INSTANCE;
 
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ExecutorService pool = Executors.newCachedThreadPool();
-    private volatile boolean running = true;
-    private ServerSocket server;
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
-        running = true;
-        Thread t = new Thread(this::acceptLoop, "fleet-bridge-accept");
-        t.setDaemon(true);
-        t.start();
+        INSTANCE = this;
+        // 先把自己挂到一个前台服务上（2026-11-01）：
+        // 光靠无障碍身份活不长 —— HyperOS 会在设置里还写着"已启用"的情况下
+        // 直接回收进程，届时端口没了、也没有任何人能把它拉回来。
+        // 前台服务保的是**进程**，进程不死，无障碍的 binding 就不会丢。
+        BridgeKeepAliveService.ensure(this);
     }
 
     @Override
     public void onDestroy() {
-        running = false;
-        try {
-            if (server != null) server.close();
-        } catch (Exception ignored) {
-        }
+        if (INSTANCE == this) INSTANCE = null;
         super.onDestroy();
+    }
+
+    /** 无障碍是连着的吗。控制端据此决定能不能注入。 */
+    public static boolean ready() {
+        return INSTANCE != null;
+    }
+
+    /**
+     * 给控制端口用：把一行指令交给当前实例执行。
+     * 没连上就直接说清楚，不去假装执行、也不偷偷降级成 input 命令。
+     */
+    public static String dispatch(String line) {
+        BridgeService s = INSTANCE;
+        if (s == null) {
+            return "ERR no-a11y 无障碍服务未连接（手机上 设置 → 无障碍 → 编队桥 打开），"
+                    + "端口活着但没有注入能力";
+        }
+        return s.exec(line);
     }
 
     @Override
@@ -83,42 +101,6 @@ public class BridgeService extends AccessibilityService {
     }
 
     // ------------------------------------------------------------ 控制通道
-
-    private void acceptLoop() {
-        try {
-            server = new ServerSocket(PORT, 8, java.net.InetAddress.getByName("127.0.0.1"));
-            while (running) {
-                Socket s = server.accept();
-                pool.execute(() -> handle(s));
-            }
-        } catch (Exception e) {
-            // 端口被占或服务被解绑：静默退出，不打扰用户
-        }
-    }
-
-    private void handle(Socket sock) {
-        try (Socket s = sock;
-             BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
-             PrintWriter out = new PrintWriter(new OutputStreamWriter(s.getOutputStream(), "UTF-8"), true)) {
-            boolean authed = false;
-            String line;
-            while ((line = in.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                if (!authed) {
-                    if (line.startsWith("AUTH ") && TOKEN.equals(line.substring(5).trim())) {
-                        authed = true;
-                        out.println("OK auth");
-                    } else {
-                        out.println("ERR auth");
-                    }
-                    continue;
-                }
-                out.println(exec(line));
-            }
-        } catch (Exception ignored) {
-        }
-    }
 
     private String exec(String line) {
         String[] parts = line.split("\\s+", 2);

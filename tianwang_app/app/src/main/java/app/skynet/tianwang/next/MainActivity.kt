@@ -78,6 +78,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         App.bind(this)
         Net.init(applicationContext)
+        // 出声（总纲第 1 条空白）。默认关，界面上那个喇叭点了才念。
+        Speech.init(applicationContext)
         // 云侧连接可由 adb 一次性注入，免得每次装机都要在手机上手动敲一遍：
         //   adb shell am start -n app.skynet.tianwang.next/.MainActivity \
         //       --es agentUrl http://127.0.0.1:9124 --es agentToken <token>
@@ -93,6 +95,16 @@ class MainActivity : ComponentActivity() {
         Log.i("TianwangModels", "扫描到 ${found.size} 个 GGUF")
         found.forEach { Log.i("TianwangModels", "${it.label} ${it.sizeMb}MB ${it.target}") }
         enableEdgeToEdge()
+        // 出声自检：HyperOS 把 `adb shell input` 封了（INJECT_EVENTS），
+        // 点不了界面上那个喇叭，所以给一条命令让 App 自己开开关 + 念一句。
+        //   adb shell am start -n app.skynet.tianwang.next/.MainActivity --ez speaktest true
+        // 结果全进 logcat，TAG=TianwangSpeech：init / lang / speak rc 各一行。
+        if (intent?.getBooleanExtra("speaktest", false) == true) {
+            Speech.setEnabled(true)   // 自检会顺手把开关打开（持久化），验完记得再关
+            Speech.speak("这是一句测试。天网手机端第一次开口，能听到就说明链路通了。")
+            Log.i("TianwangSpeech",
+                "speaktest 已触发 enabled=${Speech.enabled()} status=${Speech.status()}")
+        }
         setContent {
             TianwangTheme {
                 App()
@@ -201,6 +213,11 @@ private fun App() {
     var sheet by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState()
     val scope = rememberCoroutineScope()
+    // 她出不出声。初值从存储读——上次开过的这次还开着，不是每次启动都重置。
+    var speakOn by remember { mutableStateOf(Speech.enabled()) }
+    // LocalContext 只能在 composable 上下文取，不能挪进 onToggleSpeak 那种普通 lambda
+    // （踩过：@Composable invocations can only happen from the context of a @Composable function）
+    val ctx = androidx.compose.ui.platform.LocalContext.current
 
     LaunchedEffect(Unit) {
         val local = ModelCatalog.local()
@@ -212,7 +229,15 @@ private fun App() {
             ?: local.minByOrNull { it.sizeMb }
         if (Net.hasConfig()) {
             runCatching { Net.getProviders() }.onSuccess { gws ->
-                models.addAll(ModelCatalog.cloud(gws, Net.loadConfig().token))
+                val cloud = ModelCatalog.cloud(gws, Net.loadConfig().token)
+                models.addAll(cloud)
+                // 🔴 2026-10-31：只有云侧、没装本地 GGUF 的手机会永远卡在「未选模型」。
+                //    上面那句 current 只从 local 里挑，local 为空就是 null；云端模型虽然
+                //    进了列表，却没人把它设成当前项。实测这台手机就是这样：配置注入成功、
+                //    /api/agent 链路也通，顶栏还写着「未选模型 点这里去挑一个」，纯 UI 假故障。
+                if (current == null && cloud.isNotEmpty()) {
+                    current = cloud.firstOrNull { it.id == remembered } ?: cloud.first()
+                }
             }
         }
     }
@@ -293,6 +318,8 @@ private fun App() {
                 }).onSuccess { full ->
                     val st = LlamaNative.lastStats()
                     val cost = System.currentTimeMillis() - started
+                    // 念的是"最终落下那句"：full 为空时答案是流式期间攒的 text
+                    val said = full.ifEmpty { msgs.firstOrNull { it.id == replyId }?.text ?: "" }
                     update(msgs, replyId) {
                         it.copy(
                             text = full.ifEmpty { it.text },
@@ -303,6 +330,7 @@ private fun App() {
                     }
                     busy = false
                     persist()
+                    Speech.speak(said)
                 }.onFailure { e ->
                     update(msgs, replyId) {
                         it.copy(failed = e.message ?: "本地推理失败", streaming = false)
@@ -326,6 +354,7 @@ private fun App() {
                         update(msgs, replyId) { it.copy(text = ans, tools = finalSteps, streaming = false) }
                         busy = false
                         persist()
+                        Speech.speak(ans)
                     },
                     onError = { e ->
                         update(msgs, replyId) { it.copy(failed = e, streaming = false) }
@@ -449,6 +478,16 @@ private fun App() {
                     onSend = { send(it) },
                     onStop = { LocalBackend.abort() },
                     onOpenSettings = { tab = Tab.SETTINGS },
+                    speakOn = speakOn,
+                    onToggleSpeak = {
+                        speakOn = Speech.toggle()
+                        // 开了却两条路都不通：当场弹出来。否则「开关是开的、就是没声」
+                        // 会被当成 bug 查半天。判据用 isUsable() 而不是比对状态字符串——
+                        // 状态里带「开 · 云端合成」这类后缀，字符串比较会一直判真。
+                        if (speakOn && !Speech.isUsable()) {
+                            android.widget.Toast.makeText(ctx, Speech.status(), android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    },
                 )
                 Tab.MODELS -> ModelsScreen(models, current?.id ?: "",
                     onPick = {

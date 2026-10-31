@@ -39,6 +39,32 @@ object Net {
 
     fun hasConfig(): Boolean = loadConfig().valid()
 
+    /**
+     * 取一段合成好的语音（wav 字节）。失败返回 null —— 出声失败不该搞崩对话。
+     *
+     * 为什么合成放 PC 不放手机：这台真机的系统 TTS 是废的。
+     * 2026-11-01 实测 `TextToSpeech` 初始化直接回 -1，连系统设置页自带的
+     * 『播放』按钮都不产生任何音频轨道（`dumpsys media.audio_flinger` 恒为 0）。
+     * 所以手机只负责播，嘴长在 PC 上。
+     */
+    suspend fun fetchSpeech(text: String, voice: String = "xiaoxiao"): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (text.isBlank() || !hasConfig()) return@withContext null
+            val url = Api.endpoint(loadConfig().url, "/api/tts") +
+                "?text=" + URLEncoder.encode(text, "UTF-8") +
+                "&voice=" + URLEncoder.encode(voice, "UTF-8")
+            try {
+                val c = auth(url)
+                c.readTimeout = 30_000
+                try {
+                    if (c.responseCode != 200) return@withContext null
+                    c.inputStream.readBytes()
+                } finally { c.disconnect() }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
     private fun auth(url: String): HttpURLConnection {
         val c = URL(url).openConnection() as HttpURLConnection
         c.setRequestProperty("X-Fleet-Token", loadConfig().token)

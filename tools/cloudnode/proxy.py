@@ -31,6 +31,87 @@ BUFSIZE = 65536
 CONNECT_TIMEOUT = 15
 IDLE_TIMEOUT = 180
 
+# 域名 → IP 覆写表。
+# 实测依据（2026-10-31）：github.com 的 DNS 结果 20.205.243.166 被掐（TCP 超时），
+# 但 20.27.177.113 / 20.200.245.247 / 140.82.121.3 都能直接 200。
+# 也就是说这一层是「按 IP 封」，不是「按 SNI 封」——换 IP 即可，不需要分片对抗。
+# 注意：只换目标 IP，TLS 的 SNI 与证书校验仍由客户端按真实域名做，所以不会被降级。
+# 一个域名可对应多个候选 IP，按顺序试——实测 41 个 GitHub IP 只有 3 个同时可用，
+# 且十分钟内就会变，单 IP 必然失败。这里只做 TCP 层重试：
+# 一旦握手交给客户端，TLS 失败的连接就补不回来了（客户端已经看到断流）。
+IP_MAP: dict[str, list[str]] = {}
+
+# 上游级联代理。这就是「双重」那一层：
+# 本机代理对外监听热点网卡，内部把连接交给另一个只绑 127.0.0.1 的代理（如机场客户端）。
+# 这样热点下的设备不用装任何东西，也能用上本机已有的通道。
+# 上游失败时自动回落到 IP 覆写/直连，不会因为上游挂了就整体不可用。
+UPSTREAM: tuple[str, int] | None = None
+
+# WebSocket TCP 隧道（见 wsrelay.py）。这是「免费 PaaS 当出口」的唯一通路：
+# PaaS 只给 HTTP/WS，不给裸 TCP，所以把小 TCP 装进 WebSocket 送出去。
+UPSTREAM_WS: str | None = None
+
+
+CRLF = chr(13) + chr(10)
+CRLF2 = (chr(13) + chr(10)).encode() * 2
+
+
+def _dial_upstream(host: str, port: int) -> socket.socket:
+    """向上游代理发 CONNECT，成功后把裸 TCP 交回来。"""
+    if UPSTREAM is None:
+        raise ConnectionError("no upstream")
+    up = socket.create_connection(UPSTREAM, timeout=CONNECT_TIMEOUT)
+    req = (
+        "CONNECT " + host + ":" + str(port) + " HTTP/1.1" + CRLF
+        + "Host: " + host + ":" + str(port) + CRLF
+        + "Proxy-Connection: keep-alive" + CRLF + CRLF
+    )
+    up.sendall(req.encode())
+    buf = b""
+    while CRLF2 not in buf:
+        d = up.recv(4096)
+        if not d:
+            up.close()
+            raise ConnectionError("upstream closed")
+        buf += d
+        if len(buf) > 16384:
+            up.close()
+            raise ConnectionError("upstream header too large")
+    status = buf.split((chr(13) + chr(10)).encode(), 1)[0]
+    if b" 200" not in status:
+        up.close()
+        raise ConnectionError("upstream refused: " + repr(status[:60]))
+    return up
+
+
+def _dial(host: str, port: int):
+    # ① WS 隧道优先：它通向一台墙外机器，覆盖面最广（PaaS 只给 HTTP，
+    #    所以把 TCP 装进 WebSocket，见 wsrelay.py）
+    if UPSTREAM_WS:
+        try:
+            from wsrelay import connect_via_ws
+            return connect_via_ws(UPSTREAM_WS, host, port)
+        except Exception as e:
+            # 隧道挂了就往下回落，不让热点设备整体断网
+            print(f"[cloudnode] WS 隧道失败({host}:{port}): {type(e).__name__}: {e}", flush=True)
+    # ② HTTP CONNECT 级联（本机已有代理客户端时用）
+    if UPSTREAM is not None:
+        try:
+            return _dial_upstream(host, port)
+        except Exception:
+            pass
+    # ③ IP 覆写 / 直连
+    ips = IP_MAP.get(host.lower())
+    if not ips:
+        return socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+    last: Exception | None = None
+    for ip in ips:
+        try:
+            return socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
+        except Exception as e:
+            last = e
+    raise last or OSError("no candidate ip")
+
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = b""
@@ -122,7 +203,7 @@ def _socks5(conn: socket.socket, head: bytes) -> None:
         conn.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)
         return
     try:
-        up = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+        up = _dial(host, port)
     except Exception:
         conn.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)
         return
@@ -160,7 +241,7 @@ def _http_connect(conn: socket.socket, head: bytes) -> None:
         conn.sendall(b"HTTP/1.1 400 Bad Target\r\n\r\n")
         return
     try:
-        up = socket.create_connection((host.strip("[]"), port), timeout=CONNECT_TIMEOUT)
+        up = _dial(host.strip("[]"), port)
     except Exception:
         conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         return
@@ -272,8 +353,29 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=1080)
+    ap.add_argument("--map", action="append", default=[], metavar="DOMAIN=IP",
+                    help="域名到 IP 的覆写，逗号分隔多个候选；可重复，例如 --map github.com=1.2.3.4,5.6.7.8")
+    ap.add_argument("--upstream", metavar="HOST:PORT",
+                    help="级联到一个上游 HTTP 代理，例如 127.0.0.1:3067；失败自动回落")
+    ap.add_argument("--upstream-ws", metavar="WSURL",
+                    help="级联到一个 WebSocket TCP 隧道，例如 wss://xxx.onrender.com/tunnel")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
+    global UPSTREAM, UPSTREAM_WS
+    if a.upstream_ws:
+        UPSTREAM_WS = a.upstream_ws
+        print(f"[cloudnode] WS 隧道上游 -> {UPSTREAM_WS}", flush=True)
+    if a.upstream:
+        uh, up_ = a.upstream.rsplit(":", 1)
+        UPSTREAM = (uh, int(up_))
+        print(f"[cloudnode] 上游级联 -> {UPSTREAM[0]}:{UPSTREAM[1]}", flush=True)
+    for item in a.map:
+        if "=" not in item:
+            raise SystemExit(f"--map 格式应为 DOMAIN=IP，收到：{item}")
+        dom, ips = item.split("=", 1)
+        IP_MAP[dom.strip().lower()] = [x.strip() for x in ips.split(",") if x.strip()]
+    if IP_MAP:
+        print(f"[cloudnode] IP 覆写 {len(IP_MAP)} 条: {IP_MAP}", flush=True)
     if a.selftest:
         return _selftest()
     try:

@@ -36,10 +36,21 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 # 让脚本直接 `python fleet/agent_server.py` 也能 import 同包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 🔴 中文 Windows 控制台是 GBK，print 里一个 `⇒` 就能让整个服务起不来。
+# 2026-11-01 真事故：闸门那行提示文案带 `⇒`，`python -m fleet.agent_server`
+# 直接 UnicodeEncodeError 退出，手机端所有 API 全断（表现为「手机连不上」，
+# 而真因只是一行字）。这里统一把 stdout/stderr 换成 UTF-8 + replace：
+# 宁可字符糊掉，也不许提示文案打死服务。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from fleet import providers as P        # noqa: E402
 from fleet import agentloop             # noqa: E402
@@ -93,6 +104,33 @@ GATE_PROMPT = (
 
 def _need(value, default):
     return (os.environ.get(value) or "").strip() or default
+
+
+# 音色短名 → edge-tts 全名。手机端只传 `xiaoxiao` 这种短名，
+# 因为全名 `zh-CN-XiaoxiaoNeural` 在 App 里写一次就得同步一次，容易漂。
+_VOICE_SHORT = {
+    "xiaoxiao": "zh-CN-XiaoxiaoNeural",
+    "xiaoyi": "zh-CN-XiaoyiNeural",
+    "xiaochen": "zh-CN-XiaochenNeural",
+    "yunxi": "zh-CN-YunxiNeural",
+    "yunjian": "zh-CN-YunjianNeural",
+    "yunyang": "zh-CN-YunyangNeural",
+    "yunxia": "zh-CN-YunxiaNeural",
+}
+_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+
+
+def _voice_full(name):
+    """短名补全；已经是全名（带 `-Neural`）就原样用；空则默认。
+
+    不做白名单校验 —— 新音色上线时不该改这里。全名猜错由 edge-tts 自己报错。
+    """
+    n = (name or "").strip()
+    if not n:
+        return _DEFAULT_VOICE
+    if n.endswith("Neural") or "-" in n:
+        return n
+    return _VOICE_SHORT.get(n.lower(), _DEFAULT_VOICE)
 
 
 class FleetAgentServer:
@@ -477,15 +515,77 @@ class FleetAgentServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _send_bytes(self, code, body, ctype):
+                """二进制响应（音频）。和 _send 分开是因为它多一步 json 序列化。
+
+                ctype 必须是纯 ASCII —— `send_header` 里塞中文会半路抛异常，
+                客户端只看到 `unexpected end of stream`（这条踩过）。
+                """
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
             def _auth(self):
                 ok, code, msg = server._authorized(self.headers)
                 if not ok:
                     self._send(code, {"ok": False, "err": msg})
                 return ok
 
+            def _tts(self):
+                """GET /api/tts?text=...&voice=xiaoxiao&engine=cloud → audio/wav
+
+                为什么网关要出这个接口：**手机自带的系统 TTS 在真机上是废的**。
+                2026-11-01 实测，HyperOS 上 `TextToSpeech` 初始化直接回 -1，
+                连系统设置页自带的『播放』按钮都不产生任何音频轨道
+                （`dumpsys media.audio_flinger` 的 active tracks 恒为 0）。
+                所以手机出声不能靠系统引擎，得由 PC 合成好、手机只负责播。
+
+                默认 engine=cloud（edge-tts）：手机就在手上，走本地要
+                PC→adb→手机合成→传回 PC→再传回手机，绕两圈没意义。
+                """
+                q = parse_qs(urlparse(self.path).query)
+                text = (q.get("text") or [""])[0].strip()
+                if not text:
+                    self._send(400, {"ok": False, "err": "缺 text"})
+                    return
+                voice = (q.get("voice") or [""])[0].strip()
+                engine = (q.get("engine") or ["cloud"])[0].strip().lower()
+                tmp = None
+                try:
+                    import tempfile
+                    from fleet import storyboard as SB
+                    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="fleet-tts-")
+                    os.close(fd)
+                    if engine == "local":
+                        SB.tts_local(text, tmp)
+                    else:
+                        SB._edge_tts(text, tmp, voice=_voice_full(voice))
+                    with open(tmp, "rb") as fh:
+                        data = fh.read()
+                    if not data:
+                        self._send(500, {"ok": False, "err": "合成结果为空"})
+                        return
+                    self._send_bytes(200, data, "audio/wav")
+                except Exception as e:
+                    self._send(500, {"ok": False,
+                                     "err": "%s: %s" % (type(e).__name__, e)})
+                finally:
+                    if tmp:
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+
             def do_GET(self):
                 path = urlparse(self.path).path
-                if path == "/api/health":
+                if path == "/api/tts":
+                    if not self._auth():
+                        return
+                    self._tts()
+                elif path == "/api/health":
                     if not self._auth():
                         return
                     self._send(200, server.health())

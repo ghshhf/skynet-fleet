@@ -87,7 +87,8 @@ def _run():
     check(os.path.exists(AUDIT), "找到 tools/uicheck/clickaudit.js")
     node = os.environ.get("NODE_BIN") or "node"
     try:
-        v = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=20)
+        v = subprocess.run([node, "--version"], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=20)
         node_ok = v.returncode == 0
     except (OSError, subprocess.SubprocessError):
         node_ok = False
@@ -110,7 +111,8 @@ def _run():
     env["FLEET_PY"] = sys.executable
     print("  跑：" + " ".join(cmd[-4:]), flush=True)
 
-    r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=900)
+    r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True,
+                       encoding="utf-8", errors="replace", timeout=900)
     out = (r.stdout or "") + (r.stderr or "")
     tail = "\n".join(out.strip().splitlines()[-10:])
 
