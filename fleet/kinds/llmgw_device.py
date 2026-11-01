@@ -21,7 +21,7 @@
 实时可用性图谱 + bandit 路由 + hedge 并发 —— 目标是「模型随时可用」：
 无论哪个上游挂/限流，自动切到其他健康上游，用户无感。
 
-能力（10 项）：
+能力（11 项）：
   llmgw.endpoints   — 列出所有可用网关（OFM/zen-gate/匿名）+ 健康探测
   llmgw.models      — 按网关列出模型清单（含 family 分类）
   llmgw.chat        — OpenAI 兼容 chat，跨网关·跨模型 fallback + cooldown + bandit 路由 + hedge 并发
@@ -31,6 +31,7 @@
   llmgw.sticky      — 查看/清除粘性会话
   llmgw.compress    — 网关层上下文压缩（省 token、少撞上下文上限）
   llmgw.health      — 可用性图谱（各端点模型实时健康状态，坏的降权/过滤 → 模型随时可用）
+  llmgw.quota       — 额度总览（借用 OFM/zen-gate 自己探上游的结论 + 自建健康图谱，零配额成本）
   llmgw.egress      — 网络出口状态（免费端点直连即可用；环境若设了 HTTPS_PROXY 则透明走，非必需）
 """
 import json
@@ -66,6 +67,9 @@ except Exception:
 # ---------- 端点发现 ----------
 OFM_SETTINGS = os.path.join(os.path.expanduser("~"), ".our-free-model", "settings.json")
 ZENGATE_CONFIG = os.path.join(os.environ.get("APPDATA") or "", "zen-gate", "config.json")
+# 这两家自己探上游后落下的结论（只读，不发请求）→ 见「外部额度快照」
+OFM_AVAILABILITY = os.path.join(os.path.expanduser("~"), ".our-free-model", "availability.json")
+ZENGATE_QUOTA = os.path.join(os.environ.get("APPDATA") or "", "zen-gate", "quota.json")
 
 # 匿名端点（FreeLLMAPI 设计：no key，直接打）。全部经实测（DNS+TCP+chat 探测）确认可用。
 # 不同软件绑定不同上游 → 不同免费模型；天网把这些免 key 直连上游全聚合，加自家 OFM/zen-gate，
@@ -420,6 +424,93 @@ def _is_health_filtered(gw, model):
         return False
     # unhealthy：仅当近期也无成功（已自愈恢复的情况 _health_state 已返回 healthy）
     return not healthy
+
+
+# ---------- 外部额度快照（借用 OFM / zen-gate 自己探过的结论，零配额成本） ----------
+# 这两家软件都在主动探上游、并把结论写在本地：
+#   OFM      `availability.json` → {results: {model: {state, detail, latencyMs, at}}}
+#   zen-gate `quota.json`        → {model: {throttledAt, cooldownUntil, lastOk, episodes}}
+# 免费层每打一次就是实打实烧配额，既然它们已经探过「这个模型现在额度尽 / 国家封」，
+# 我们就直接用，不必再撞一次必败的墙。只读文件、不发任何请求；缓存 20s。
+_EXT_CACHE = {"at": {}, "ts": 0.0, "ttl": 20.0}
+# 这些 state 表示「现在打必败」，可安全重度降权
+_EXT_DEAD = {"throttled", "region-blocked", "unavailable", "deprecated"}
+# 外部记录可能很久不更新（OFM 不是常探），超过这个时长就不拿它拦路
+EXT_STALE_S = 1800
+
+
+def _ext_snapshot(force=False):
+    """返回 {模型身份: {state, src, until, at, detail}}，身份用 `_model_identity` 归一。
+
+    归一是关键：OFM/zen-gate 记的是裸名（`glm-5.3-flash-free`），候选里可能带厂商前缀
+    （`opencode/glm-5.3-flash-free`）——同一把尺归一后才能对上。
+    """
+    now = _now()
+    c = _EXT_CACHE
+    if not force and c["ts"] and (now - c["ts"]) < c["ttl"]:
+        return c["at"]
+    at = {}
+    avail = _load_json(OFM_AVAILABILITY)
+    if isinstance(avail, dict):
+        for mid, v in (avail.get("results") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            ident = _model_identity(mid)
+            if not ident:
+                continue
+            at[ident] = {"state": (v.get("state") or "unknown"),
+                         "src": "ofm",
+                         "at": (v.get("at") or 0) / 1000.0,
+                         "detail": str(v.get("detail") or "")[:200]}
+    q = _load_json(ZENGATE_QUOTA)
+    if isinstance(q, dict):
+        for mid, v in q.items():
+            if not isinstance(v, dict):
+                continue
+            ident = _model_identity(mid)
+            if not ident:
+                continue
+            until = (v.get("cooldownUntil") or 0) / 1000.0
+            last_ok = (v.get("lastOk") or 0) / 1000.0
+            prev = at.get(ident)
+            if until > now:
+                # zen-gate 的冷却时间是它自己算的，比 OFM 的 state 更有时效性 → 覆盖
+                at[ident] = {"state": "throttled", "src": "zen-gate", "until": until,
+                             "at": last_ok or now,
+                             "detail": "zen-gate 记录：冷却中，还需 %.0f 分钟"
+                                       % ((until - now) / 60.0)}
+            elif prev is None:
+                at[ident] = {"state": "ok" if last_ok else "unknown",
+                             "src": "zen-gate", "at": last_ok,
+                             "detail": "zen-gate 有成功记录" if last_ok else ""}
+    c["at"] = at
+    c["ts"] = now
+    return at
+
+
+def _ext_verdict(model):
+    """外部快照对单个模型的判定 → (dead, weight, src, detail)。
+
+    dead=True：按已有记录现在打它大概率白烧预算（额度尽/国家封/已下架），但**不完全丢弃**
+    （weight 降到 0.02 仍留在候选尾部兜底，免得外部记录本身出错时无路可走）。
+    """
+    rec = _ext_snapshot().get(_model_identity(model))
+    if not rec:
+        return False, 1.0, None, ""
+    st = rec.get("state")
+    now = _now()
+    born = rec.get("at") or 0
+    stale = bool(born) and (now - born) > EXT_STALE_S
+    if st in _EXT_DEAD:
+        until = rec.get("until") or 0
+        if until and until <= now:          # 冷却已过 → 让它自己自证，不再拦
+            return False, 1.0, rec.get("src"), ""
+        if stale:                            # 记录太老 → 只轻微倾向，别拿旧结论压坏活路
+            return False, 0.9, rec.get("src"), rec.get("detail") or st
+        return True, 0.02, rec.get("src"), rec.get("detail") or st
+    if st == "unknown":
+        return False, 0.5, rec.get("src"), rec.get("detail") or "unknown"
+    return False, 1.0, rec.get("src"), ""
 
 
 # ---------- 错误体自学习限制（FreeLLMAPI parseProviderLimit / learnLimitFromError） ----------
@@ -994,7 +1085,7 @@ def _compress_messages(messages, level=1, cap=16000):
 # 不同写法（`glm-5.3-flash-free` vs `opencode/glm-5.3-flash-free`）会被当成两个独立候选，
 # 于是一次 hedge 三个名额全打在同源上 —— 上游一挂同时挂，降权也救不回来。
 # 解法：按模型身份归一，同源候选只让分最高的那一个进并发，其余留作串行备位。
-_IDENTITY_TAIL = re.compile(r"(:free|:latest|-free|-latest)+$", re.I)
+_IDENTITY_TAIL = re.compile(r"((?::|/|-)(?:free|latest))+$", re.I)
 
 
 def _model_identity(model):
@@ -1069,9 +1160,16 @@ def _build_candidates(gws, models, session=None, sticky_pref=None):
             healthy = not _is_health_filtered(g["name"], m)
             if not healthy:
                 score *= 0.001
+            # 外部额度快照：OFM/zen-gate 已经探过「额度尽/国家封」，直接用它的结论降权，
+            # 免得我们再打一次必败的请求把免费配额烧掉。
+            ext_dead, ext_w, ext_src, ext_detail = _ext_verdict(m)
+            if ext_w != 1.0:
+                score *= ext_w
             candidates.append({
                 "gw": g, "model": m, "score": score, "origin": origin,
                 "cooldown_source": source, "healthy": healthy,
+                "ext_dead": ext_dead, "ext_src": ext_src,
+                "ext_detail": ext_detail,
             })
     # 先按 local 标志升序（非本地在前），再按 bandit 分降序（稳定排序：同分时本地仍压最后）
     candidates.sort(key=lambda c: c["gw"].get("local", False))
@@ -1628,9 +1726,61 @@ def _h_health(cap, args, dev):
     })
 
 
+def _h_quota(cap, args, dev):
+    """额度总览：外部快照（OFM / zen-gate 自己探过的结论）+ 自建健康图谱，合并成一张表。
+
+    `refresh=True` 时强制重读外部文件（但**依然不发网络请求**）。
+    """
+    if args.get("refresh"):
+        _ext_snapshot(force=True)
+    ext = _ext_snapshot()
+    now = _now()
+    items = []
+    dead_n = stale_n = ok_n = 0
+    for ident, rec in sorted(ext.items()):
+        st = rec.get("state")
+        until = rec.get("until") or 0
+        born = rec.get("at") or 0
+        stale = bool(born) and (now - born) > EXT_STALE_S
+        cd_s = max(0, int(round(until - now))) if until > now else 0
+        is_dead = (st in _EXT_DEAD) and (cd_s > 0 or not until) and not stale
+        if is_dead:
+            dead_n += 1
+        elif stale:
+            stale_n += 1
+        elif st == "ok":
+            ok_n += 1
+        items.append({
+            "model": ident, "state": st, "source": rec.get("src"),
+            "dead": bool(is_dead), "cooldown_s": cd_s, "stale": bool(stale),
+            "detail": rec.get("detail") or "",
+        })
+    with _LOCK:
+        health = [{
+            "gateway": g, "model": (None if m == "*" else m),
+            "healthy": bool(st.get("healthy", True))
+                       or (st.get("ok") and (now - st["ok"]) < HEALTH_RECOVER_S),
+            "consecutive_fail": st.get("consecutive", 0),
+        } for (g, m), st in list(_HEALTH.items())]
+    return R.success(cap, dev.name, via=dev.via, data={
+        "external": {
+            "items": items, "count": len(items),
+            "dead": dead_n, "ok": ok_n, "stale": stale_n,
+            "sources": {
+                "ofm": {"path": OFM_AVAILABILITY, "readable": os.path.isfile(OFM_AVAILABILITY)},
+                "zen_gate": {"path": ZENGATE_QUOTA, "readable": os.path.isfile(ZENGATE_QUOTA)},
+            },
+            "stale_s": EXT_STALE_S,
+        },
+        "local_health": {"items": health[:500], "count": len(health),
+                         "healthy": sum(1 for x in health if x["healthy"])},
+        "note": "external = OFM/zen-gate 自己探上游后落下的结论（只读，零配额成本）；"
+                "dead 的模型在候选里被降到 0.02 权重而非丢弃（外部记录可能过期）。",
+    })
+
+
 _HANDLERS = {
-    "llmgw.endpoints": _h_endpoints,
-    "llmgw.models": _h_models,
+    "llmgw.endpoints": _h_endpoints,    "llmgw.models": _h_models,
     "llmgw.chat": _h_chat,
     "llmgw.embeddings": _h_embeddings,
     "llmgw.probe": _h_probe,
@@ -1639,6 +1789,7 @@ _HANDLERS = {
     "llmgw.compress": _h_compress,
     "llmgw.egress": _h_egress,
     "llmgw.health": _h_health,
+    "llmgw.quota": _h_quota,
 }
 
 
@@ -1884,7 +2035,60 @@ def _selftest():
             == ["kilo-auto/free", "nvidia/x:free"]
         assert only(kilo_gw, ["gpt-4o"]) == ["gpt-4o"], "全付费时不许把列表清空"
         assert only({}, ["gpt-4o"]) == ["gpt-4o"], "非 free_only 端点不过滤"
-        print("llmgw_device 自测：14 组全过")
+
+        # 同源归并：同一模型的两种写法（带厂商前缀 / 带 :free 后缀）必须归一成同一 origin；
+        # 但不能把「不同上游的 free 池」也归并成一个 —— `kilo-auto/free` 与
+        # `openrouter/free` 砍掉尾缀后剩 `kilo-auto` / `openrouter`，不许都变成 `free`。
+        assert g0["_model_identity"]("kilo-auto/free") == "kilo-auto", g0["_model_identity"]("kilo-auto/free")
+        assert g0["_model_identity"]("openrouter/free") == "openrouter"
+        assert g0["_model_identity"]("kilo-auto/free") != g0["_model_identity"]("openrouter/free"), \
+            "不同 free 池不许撞成同一身份"
+        # ⑮ 外部额度快照（借 OFM/zen-gate 的结论，零配额成本）
+        real_load = g0["_load_json"]
+        now_ms = int(g0["_now"]() * 1000)
+        fake_files = {}
+        def _fake_load(path):
+            return fake_files.get(os.path.basename(str(path)))
+        g0["_load_json"] = _fake_load
+        try:
+            fake_files["availability.json"] = {"results": {
+                # 裸名 throttled → 应能匹配带前缀的候选写法（归一后才对得上）
+                "glm-5.3-flash-free": {"state": "throttled", "at": now_ms,
+                                       "detail": "Free usage limit reached."},
+                "beam-free": {"state": "region-blocked", "at": now_ms,
+                              "detail": "not available in your country"},
+                "mimo-v2.5-free": {"state": "unknown", "at": now_ms,
+                                   "detail": "deprecated"},
+                # 很久以前探的（超过 EXT_STALE_S）→ 不该拦路
+                "old-model-free": {"state": "throttled",
+                                   "at": now_ms - 3 * 3600 * 1000, "detail": "old"},
+            }}
+            fake_files["quota.json"] = {
+                "cooldown-model": {"cooldownUntil": now_ms + 600 * 1000, "lastOk": now_ms},
+                "expired-model": {"cooldownUntil": now_ms - 60 * 1000, "lastOk": now_ms},
+            }
+            g0["_EXT_CACHE"].update(at={}, ts=0.0)
+            dead, w, src, _ = g0["_ext_verdict"]("opencode/glm-5.3-flash-free")
+            assert dead and w < 0.05 and src == "ofm", (dead, w, src)
+            assert g0["_ext_verdict"]("nvidia/glm-5.3-flash:free")[0], "不同写法也要命中"
+            assert g0["_ext_verdict"]("beam-free")[0], "region-blocked 也算死"
+            assert not g0["_ext_verdict"]("mimo-v2.5-free")[0], "unknown 只降权不判死"
+            assert g0["_ext_verdict"]("mimo-v2.5-free")[1] < 1.0
+            assert not g0["_ext_verdict"]("old-model-free")[0], "陈旧记录不该拦路"
+            assert g0["_ext_verdict"]("cooldown-model")[0], "zen-gate 未过冷却要拦"
+            assert not g0["_ext_verdict"]("expired-model")[0], "冷却已过不该拦"
+            assert g0["_ext_verdict"]("never-seen-model") == (False, 1.0, None, "")
+            # 能力：llmgw.quota 汇总（外部 + 自建），数量与死/活计数要自洽
+            rq = d.invoke("llmgw.quota", {"refresh": True})
+            qd = rq.as_dict()["data"]
+            assert rq.ok and qd["external"]["count"] == 6, qd["external"]["count"]
+            assert qd["external"]["dead"] == 3, qd["external"]["dead"]
+            assert qd["external"]["stale"] == 1, qd["external"]["stale"]
+            assert qd["external"]["sources"]["ofm"]["readable"] in (True, False)
+        finally:
+            g0["_load_json"] = real_load
+            g0["_EXT_CACHE"].update(at={}, ts=0.0)
+        print("llmgw_device 自测：15 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
