@@ -31,6 +31,13 @@ import socket
 import subprocess
 import sys
 
+# GBK 防线（2026-11-01 铁律）：本文件输出含 ✓ ✗ 【】→ 等 GBK 外字符，
+# 中文 Windows 控制台默认 cp936，一个编码不到的字符就把整个命令炸死。
+# 统一在入口重配为 UTF-8，替换模式兜底，永不因打印字符崩。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 IS_WIN = sys.platform.startswith("win")
 
 PROXY_PORT = 7810
@@ -572,94 +579,144 @@ def _selftest():
     print(f"netaccel 自检：6 项全过（受管域名 {len(doms)} 个，exe={exe or '未编译'}）")
 
 
+def _cmd_status(_args):
+    s = status()
+    print("【gitport 状态】")
+    print(f"  二进制      : {s['exe'] or '未找到（先编译）'}")
+    print(f"  运行中      : {'是 ' + s['proxy_addr'] if s['running'] else '否'}")
+    print(f"  git 代理    : {s['git_proxy'] or '未设'}")
+    print(f"  受管域名    : {s['managed_domains']} 个（见 pac 命令）")
+    return 0
+
+
+def _cmd_start(_args):
+    ok, msg = start()
+    print(("  ✓ " if ok else "  ✗ ") + msg)
+    if ok:
+        ok2, msg2 = git_proxy(True)
+        print(("  ✓ " if ok2 else "  ✗ ") + msg2)
+    return 0 if ok else 1
+
+
+def _cmd_stop(_args):
+    ok, msg = stop()
+    print(("  ✓ " if ok else "  ✗ ") + msg)
+    ok2, msg2 = git_proxy(False)
+    print(("  ✓ " if ok2 else "  ✗ ") + msg2)
+    return 0 if ok else 1
+
+
+def _cmd_gateway(_args):
+    ok, msg = gateway_start()
+    print(("  ✓ " if ok else "  ✗ ") + msg)
+    if ok:
+        ip = hotspot_ip()
+        if ip:
+            print(f"  热点设备设置：HTTP/SOCKS 代理 {ip}:{LAN_PORT}")
+        else:
+            print("  提示：热点网卡没找到，先开「移动热点」再跑一次")
+        ws = os.environ.get("FLEET_WSRELAY", "").strip()
+        if ws:
+            print(f"  覆盖范围：经 WS 隧道 {ws}（可到墙外站）")
+        else:
+            print("  覆盖范围：GitHub 全系 / PyPI / arXiv；模型走 hf-mirror、ModelScope")
+            print("  要覆盖 YouTube 这类需设 FLEET_WSRELAY=wss://<你的中转>/tunnel")
+    return 0 if ok else 1
+
+
+def _cmd_gateway_stop(_args):
+    ok, msg = gateway_stop()
+    print(("  ✓ " if ok else "  ✗ ") + msg)
+    return 0 if ok else 1
+
+
+def _cmd_gateway_status(_args):
+    ip = hotspot_ip()
+    print("【热点网关】")
+    print(f"  网卡地址    : {ip or '未找到（热点没开？）'}")
+    print(f"  运行中      : {'是 ' + str(ip or '0.0.0.0') + ':' + str(LAN_PORT) if lan_running() else '否'}")
+    return 0
+
+
+def _cmd_ci_fetch(args):
+    run_id = args[0] if args else None
+    ok, msg = ci_fetch(run_id)
+    print(("  ✓ " if ok else "  ✗ ") + msg)
+    if ok:
+        print("  提示：gateway 在跑的话，先 gateway-stop 再 gateway 才会用上新二进制")
+    return 0 if ok else 1
+
+
+def _cmd_pac(_args):
+    sys.stdout.write(pac_script())
+    return 0
+
+
+def _cmd_system_proxy(args):
+    if len(args) < 2 or args[0] not in ("on", "off"):
+        print("  用法：netaccel.py system-proxy on <pac路径> | off")
+        return 2
+    if args[0] == "on":
+        if len(args) < 2:
+            print("  用法：netaccel.py system-proxy on <pac路径>")
+            return 2
+        ok, msg = system_proxy(True, args[1])
+    else:
+        ok, msg = system_proxy(False)
+    print(("  ✓ " if ok else "  ✗ ") + msg)
+    return 0 if ok else 1
+
+
+def _cmd_git_proxy(args):
+    if len(args) < 1 or args[0] not in ("on", "off"):
+        print("  用法：netaccel.py git-proxy on | off")
+        return 2
+    ok, msg = git_proxy(args[0] == "on")
+    print(("  ✓ " if ok else "  ✗ ") + msg)
+    return 0 if ok else 1
+
+
+def _cmd_help(_args):
+    print(__doc__.strip())
+    return 0
+
+
+# 命令表：别名 -> (handler, 是否吃剩余参数)。新命令只动这张表。
+_COMMANDS = {
+    "status":         (_cmd_status, False),
+    "start":          (_cmd_start, False),
+    "stop":           (_cmd_stop, False),
+    "gateway":        (_cmd_gateway, False),
+    "gateway-stop":   (_cmd_gateway_stop, False),
+    "gateway_stop":   (_cmd_gateway_stop, False),
+    "gateway-status": (_cmd_gateway_status, False),
+    "gateway_status": (_cmd_gateway_status, False),
+    "ci-fetch":       (_cmd_ci_fetch, True),
+    "ci_fetch":       (_cmd_ci_fetch, True),
+    "pac":            (_cmd_pac, False),
+    "system-proxy":   (_cmd_system_proxy, True),
+    "system_proxy":   (_cmd_system_proxy, True),
+    "git-proxy":      (_cmd_git_proxy, True),
+    "git_proxy":      (_cmd_git_proxy, True),
+    "help":           (_cmd_help, False),
+}
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if "--selftest" in argv:
+    if "--selftest" in argv or argv[:1] == ["selftest"]:
         _selftest()
         return 0
-    if not argv:
-        argv = ["status"]
+    if "--help" in argv or "-h" in argv or not argv:
+        return _cmd_help(argv)
 
     cmd = argv[0]
-    if cmd == "status":
-        s = status()
-        print("【gitport 状态】")
-        print(f"  二进制      : {s['exe'] or '未找到（先编译）'}")
-        print(f"  运行中      : {'是 ' + s['proxy_addr'] if s['running'] else '否'}")
-        print(f"  git 代理    : {s['git_proxy'] or '未设'}")
-        print(f"  受管域名    : {s['managed_domains']} 个（见 pac 命令）")
-        return 0
-    if cmd == "start":
-        ok, msg = start()
-        print(("  ✓ " if ok else "  ✗ ") + msg)
-        if ok:
-            ok2, msg2 = git_proxy(True)
-            print(("  ✓ " if ok2 else "  ✗ ") + msg2)
-        return 0 if ok else 1
-    if cmd == "stop":
-        ok, msg = stop()
-        print(("  ✓ " if ok else "  ✗ ") + msg)
-        ok2, msg2 = git_proxy(False)
-        print(("  ✓ " if ok2 else "  ✗ ") + msg2)
-        return 0 if ok else 1
-    if cmd == "gateway":
-        ok, msg = gateway_start()
-        print(("  ✓ " if ok else "  ✗ ") + msg)
-        if ok:
-            ip = hotspot_ip()
-            if ip:
-                print(f"  热点设备设置：HTTP/SOCKS 代理 {ip}:{LAN_PORT}")
-            else:
-                print("  提示：热点网卡没找到，先开「移动热点」再跑一次")
-            ws = os.environ.get("FLEET_WSRELAY", "").strip()
-            if ws:
-                print(f"  覆盖范围：经 WS 隧道 {ws}（可到墙外站）")
-            else:
-                print("  覆盖范围：GitHub 全系 / PyPI / arXiv；模型走 hf-mirror、ModelScope")
-                print("  要覆盖 YouTube 这类需设 FLEET_WSRELAY=wss://<你的中转>/tunnel")
-        return 0 if ok else 1
-    if cmd in ("gateway-stop", "gateway_stop"):
-        ok, msg = gateway_stop()
-        print(("  ✓ " if ok else "  ✗ ") + msg)
-        return 0 if ok else 1
-    if cmd in ("gateway-status", "gateway_status"):
-        ip = hotspot_ip()
-        print("【热点网关】")
-        print(f"  网卡地址    : {ip or '未找到（热点没开？）'}")
-        print(f"  运行中      : {'是 ' + str(ip or '0.0.0.0') + ':' + str(LAN_PORT) if lan_running() else '否'}")
-        return 0
-    if cmd in ("ci-fetch", "ci_fetch"):
-        run_id = argv[1] if len(argv) > 1 else None
-        ok, msg = ci_fetch(run_id)
-        print(("  ✓ " if ok else "  ✗ ") + msg)
-        if ok:
-            print("  提示：gateway 在跑的话，先 gateway-stop 再 gateway 才会用上新二进制")
-        return 0 if ok else 1
-    if cmd == "pac":
-        sys.stdout.write(pac_script())
-        return 0
-    if cmd == "system-proxy":
-        if len(argv) < 2 or argv[1] not in ("on", "off"):
-            print("  用法：netaccel.py system-proxy on <pac路径> | off")
-            return 2
-        if argv[1] == "on":
-            if len(argv) < 3:
-                print("  用法：netaccel.py system-proxy on <pac路径>")
-                return 2
-            ok, msg = system_proxy(True, argv[2])
-        else:
-            ok, msg = system_proxy(False)
-        print(("  ✓ " if ok else "  ✗ ") + msg)
-        return 0 if ok else 1
-    if cmd in ("git-proxy", "git_proxy"):
-        if len(argv) < 2 or argv[1] not in ("on", "off"):
-            print("  用法：netaccel.py git-proxy on | off")
-            return 2
-        ok, msg = git_proxy(argv[1] == "on")
-        print(("  ✓ " if ok else "  ✗ ") + msg)
-        return 0 if ok else 1
-    print(f"  未知命令：{cmd}")
-    return 2
+    entry = _COMMANDS.get(cmd)
+    if not entry:
+        print(f"  未知命令：{cmd}（netaccel.py help 看用法）")
+        return 2
+    fn, takes_rest = entry
+    return fn(argv[1:] if takes_rest else [])
 
 
 if __name__ == "__main__":
