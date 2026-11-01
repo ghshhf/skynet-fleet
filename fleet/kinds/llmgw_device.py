@@ -44,6 +44,7 @@ import random
 import re
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse as _urlparse
 import urllib.request
@@ -1687,6 +1688,7 @@ def _sse_once(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
                                  headers=headers, method="POST")
 
     parts, reasoning, chunks = [], [], 0
+    tool_acc = {}          # index -> 累积中的 tool_call（见下方「流式工具调用」注释）
     ttft = None
     t0 = _now()
     usage = {}
@@ -1746,6 +1748,35 @@ def _sse_once(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
                                 pass
                     if d.get("reasoning_content"):
                         reasoning.append(d["reasoning_content"])
+                    # 流式工具调用：arguments 是**分片**下发的（`{"pa` + `th": "x"}`），
+                    # 必须按 index 累积拼接，不能把每个 chunk 当独立的 tool_call。
+                    # 11-01 接 Pi 时实测踩到：上游只回 tool_calls、正文为空，
+                    # 而这里只认 content → parts 为空 → 被判「上游返回空流」，
+                    # 于是「智能体真的能用工具」这件事在流式路径上完全失效
+                    # （非流式路径一直是对的，所以之前没发现）。
+                    for tc in (d.get("tool_calls") or []):
+                        if not isinstance(tc, dict):
+                            continue
+                        _ix = tc.get("index", 0)
+                        _slot = tool_acc.setdefault(_ix, {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            _slot["id"] = tc["id"]
+                        _fn = tc.get("function") or {}
+                        if _fn.get("name"):
+                            _slot["function"]["name"] = _fn["name"]
+                        if _fn.get("arguments"):
+                            _slot["function"]["arguments"] += _fn["arguments"]
+                        if first:
+                            # 工具调用也是「上游活着」的证据，同样要放宽首字节闸
+                            ttft = round(_now() - t0, 3)
+                            first = False
+                            if _sock is not None:
+                                try:
+                                    _sock.settimeout(timeout)
+                                except Exception:
+                                    pass
                 # responses 风格
                 typ = ev.get("type") or ""
                 if typ.endswith("output_text.delta"):
@@ -1789,18 +1820,21 @@ def _sse_once(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
                                              "partial": bool(parts)})
     except Exception as e:
         # 首字节前挂 = 普通失败（可换上游）；首字节后挂 = 保住 partial，不重试
-        if not parts:
+        if not parts and not tool_acc:
             return (None, str(e)[:200], None, 0, "transport", "timeout", None,
                     {"ttft_s": ttft, "chunks": 0, "partial": False})
-        return (_sse_body(parts, reasoning, usage, gw, payload), None, gw["name"], 0,
-                "ok", "ok", None,
+        return (_sse_body(parts, reasoning, usage, gw, payload,
+                          [_tool_slot(tool_acc[k]) for k in sorted(tool_acc)]),
+                None, gw["name"], 0, "ok", "ok", None,
                 {"ttft_s": ttft, "chunks": chunks, "partial": True,
                  "err": str(e)[:200]})
 
-    if not parts:
-        return (None, "流结束但没有内容（上游返回空流）", None, 0, "server", "5xx", None,
+    _tcs = [_tool_slot(tool_acc[k]) for k in sorted(tool_acc)]
+    if not parts and not _tcs:
+        return (None, "流结束但没有内容（上游返回空流，也没有工具调用）", None, 0,
+                "server", "5xx", None,
                 {"ttft_s": ttft, "chunks": 0, "partial": False})
-    body = _sse_body(parts, reasoning, usage, gw, payload)
+    body = _sse_body(parts, reasoning, usage, gw, payload, _tcs)
     tk = int((usage or {}).get("total_tokens") or 0)
     return (body, None, gw["name"], tk, "ok", "ok", None,
             {"ttft_s": ttft, "chunks": chunks, "partial": False})
@@ -1814,17 +1848,37 @@ def _retry_after_of(headers):
         return None
 
 
-def _sse_body(parts, reasoning, usage, gw, payload):
+def _tool_slot(slot):
+    """收尾一条累积中的 tool_call：补 id（有的上游压根不给）、丢掉空壳。
+
+    空壳必须丢 —— 只回 name 没 arguments 的条目会让客户端发起一次「参数为空」的调用，
+    那比不给工具更糟（等于让模型瞎猜）。
+    """
+    sid = slot.get("id") or "call_%s" % uuid.uuid4().hex[:12]
+    fn = slot.get("function") or {}
+    if not fn.get("name"):
+        return None
+    return {"id": sid, "type": slot.get("type") or "function",
+            "function": {"name": fn["name"],
+                         "arguments": fn.get("arguments") or "{}"}}
+
+
+def _sse_body(parts, reasoning, usage, gw, payload, tool_calls=None):
     """把流式碎片拼成 chat 风格 body（与 _chat_once 成功返回同构，上层无感）。"""
     u = usage or {}
     pt = int(u.get("input_tokens") or u.get("prompt_tokens") or 0)
     ct = int(u.get("output_tokens") or u.get("completion_tokens") or 0)
+    tcs = [t for t in (tool_calls or []) if t]
+    msg = {"role": "assistant", "content": "".join(parts)}
+    if tcs:
+        # 有工具调用时正文按 OpenAI 规范置空（模型这一轮没「说话」，只是要动手）
+        msg["content"] = "".join(parts) or None
+        msg["tool_calls"] = tcs
     out = {
         "id": "stream-" + str(int(_now())), "object": "chat.completion",
         "model": payload.get("model"), "_style": gw.get("api_style") or "chat",
-        "choices": [{"index": 0,
-                     "message": {"role": "assistant", "content": "".join(parts)},
-                     "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": msg,
+                     "finish_reason": "tool_calls" if tcs else "stop"}],
         "usage": {"prompt_tokens": pt, "completion_tokens": ct,
                   "total_tokens": int(u.get("total_tokens") or (pt + ct))},
     }
@@ -4281,7 +4335,30 @@ def _selftest():
             g0["EP_CONCURRENCY"].pop("gate-ep", None)
             g0["_EP_SEM"].pop("gate-ep", None)
 
-        print("llmgw_device 自测：31 组全过")
+        # ㉜ 流式工具调用：智能体的主力形态，之前完全没接。
+        #    11-01 接 Pi（earendil-works/pi）时一打就现原形：上游只回 tool_calls、正文为空，
+        #    而 _sse_once 只认 content → parts 为空 → 判「上游返回空流」→ 代理一次工具都用不了。
+        #    （非流式路径一直是对的，所以从没暴露。）
+        #    这里钉三件事：① 只有 tool_calls 也算成功；② 输出形状对；③ 空壳必须丢。
+        _tcs = [{"id": "call_1", "type": "function",
+                 "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}]
+        b1 = g0["_sse_body"]([], [], {}, {"name": "t", "api_style": "chat"},
+                             {"model": "m"}, _tcs)
+        ch0 = b1["choices"][0]
+        assert ch0["finish_reason"] == "tool_calls", ch0
+        assert ch0["message"]["tool_calls"][0]["function"]["name"] == "bash", ch0
+        assert ch0["message"]["content"] is None, "有工具调用时正文按规范置空"
+        # 空壳：没有 name 的必须丢掉（否则模型会发起一次「参数为空」的调用，比没有更糟）
+        assert g0["_tool_slot"]({"function": {"name": ""}}) is None
+        # 上游不给 id：补一个，别让客户端拿到空 id
+        sq = g0["_tool_slot"]({"function": {"name": "read"}})
+        assert sq["id"].startswith("call_") and sq["function"]["arguments"] == "{}", sq
+        # 没有工具调用时 finish_reason 仍是 stop（老行为一字不变）
+        b2 = g0["_sse_body"](["你好"], [], {}, {"name": "t"}, {"model": "m"}, [])
+        assert b2["choices"][0]["finish_reason"] == "stop"
+        assert b2["choices"][0]["message"]["content"] == "你好"
+
+        print("llmgw_device 自测：32 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover

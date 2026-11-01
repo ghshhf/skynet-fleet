@@ -222,9 +222,35 @@ class Handler(BaseHTTPRequestHandler):
             err = repr(e)[:200]
             data = None
         if not started["ok"]:
-            # 一个字节都没发出去：干净地报错，客户端能正常重试
-            return self._send(502, {"error": {"message": err or "上游无输出",
-                                              "type": "upstream_error"}})
+            # 走到这里两种可能，必须分开处理：
+            #   ① 真失败（err 非空 / 没数据）→ 干净 502，客户端能重试；
+            #   ② **成功但一个文本增量都没有** —— 典型是「这一轮只回工具调用」：
+            #      智能体的 tool_calls 轮次本来就没有正文，on_delta 一次都不会触发。
+            #      11-01 Pi 接入实测踩到：把它当失败会 502，于是「代理能用工具」直接失效。
+            #      正解是整段补发一帧（含 tool_calls），流式语义照样成立。
+            if err or not data:
+                return self._send(502, {"error": {"message": err or "上游无输出",
+                                                  "type": "upstream_error"}})
+            body = _as_completion(data, model_name)
+            msg = (body.get("choices") or [{}])[0].get("message") or {}
+            delta = {"role": "assistant", "content": msg.get("content") or ""}
+            if msg.get("tool_calls"):
+                delta["tool_calls"] = msg["tool_calls"]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self._chunk(frame(delta, "tool_calls" if msg.get("tool_calls") else "stop",
+                              {"_tianwang": body.get("_tianwang")}))
+            self._chunk(b"data: [DONE]\n\n")
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
         if dead["ok"]:
             return
         meta = {
