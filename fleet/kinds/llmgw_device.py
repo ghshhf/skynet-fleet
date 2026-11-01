@@ -1526,9 +1526,34 @@ def _to_resp_input(messages):
         "role": "user", "content": [{"type": "input_text", "text": ""}]}])
 
 
+def _to_resp_tools(tools):
+    """chat 风格的 tools → Responses 协议的 tools。
+
+    两种形状不一样，这是**必须转**而不是能省的一步：
+      chat      : {"type":"function","function":{"name","description","parameters"}}
+      responses : {"type":"function","name","description","parameters"}   ← 平铺，没有 function 包一层
+    直接透传会让上游 400（或者更糟：静默忽略，模型根本不知道有工具）。
+    11-01 实测踩到：agentloop 走 llmgw 的 gpt 类（agentrouter 的 Responses 后端）时，
+    模型回「当前会话没有可调用的工具」——因为这条路上 tools 压根没发出去。
+    """
+    out = []
+    for t in (tools or []):
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name")
+        if not name:
+            continue
+        out.append({"type": "function", "name": name,
+                    "description": fn.get("description") or "",
+                    "parameters": fn.get("parameters") or
+                    {"type": "object", "properties": {}}})
+    return out
+
+
 def _from_resp_body(d):
     """Responses 返回 → chat 风格 body（让上层完全无感）。"""
-    texts, reasoning = [], []
+    texts, reasoning, calls = [], [], []
     for it in (d.get("output") or []):
         if not isinstance(it, dict):
             continue
@@ -1536,6 +1561,15 @@ def _from_resp_body(d):
             for sm in (it.get("summary") or []):
                 if isinstance(sm, dict) and sm.get("text"):
                     reasoning.append(sm["text"])
+            continue
+        if it.get("type") == "function_call":
+            # 工具调用在 Responses 里是 output 数组里的独立条目，不是 message 的一部分。
+            # 漏收它的后果很隐蔽：模型「说了要做」，我们却当成它只是聊天 ——
+            # agent 循环于是当场结束，表现是「代理什么也没干还理直气壮」（11-01 实测）。
+            calls.append({"id": it.get("call_id") or it.get("id") or "",
+                          "type": "function",
+                          "function": {"name": it.get("name") or "",
+                                       "arguments": it.get("arguments") or "{}"}})
             continue
         if it.get("type") != "message":
             continue
@@ -1548,12 +1582,18 @@ def _from_resp_body(d):
     u = d.get("usage") or {}
     pt = int(u.get("input_tokens") or 0)
     ct = int(u.get("output_tokens") or 0)
+    msg = {"role": "assistant", "content": text}
+    if calls:
+        msg["content"] = text or None
+        msg["tool_calls"] = calls
     out = {
         "id": d.get("id"), "object": "chat.completion", "model": d.get("model"),
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop" if d.get("status") in (None, "completed") else str(d.get("status")),
+            "message": msg,
+            "finish_reason": ("tool_calls" if calls else
+                              ("stop" if d.get("status") in (None, "completed")
+                               else str(d.get("status")))),
         }],
         "usage": {"prompt_tokens": pt, "completion_tokens": ct,
                   "total_tokens": int(u.get("total_tokens") or (pt + ct))},
@@ -1587,6 +1627,12 @@ def _responses_once(gw, payload, timeout):
         req_body["temperature"] = payload["temperature"]
     if payload.get("stream"):
         req_body["stream"] = True
+    # tools 必须转成 Responses 的平铺形状再发（见 _to_resp_tools 的说明）
+    _rt = _to_resp_tools(payload.get("tools"))
+    if _rt:
+        req_body["tools"] = _rt
+        if payload.get("tool_choice") is not None:
+            req_body["tool_choice"] = payload["tool_choice"]
     hdrs = {"Accept": "application/json"}
     key = gw.get("key")
     if codex:
@@ -1657,6 +1703,11 @@ def _sse_once(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
             req_body["instructions"] = instructions
         if payload.get("temperature") is not None:
             req_body["temperature"] = payload["temperature"]
+        _rt2 = _to_resp_tools(payload.get("tools"))
+        if _rt2:
+            req_body["tools"] = _rt2
+            if payload.get("tool_choice") is not None:
+                req_body["tool_choice"] = payload["tool_choice"]
         path = "/v1/responses"
     else:
         req_body = dict(payload)
@@ -4358,7 +4409,40 @@ def _selftest():
         assert b2["choices"][0]["finish_reason"] == "stop"
         assert b2["choices"][0]["message"]["content"] == "你好"
 
-        print("llmgw_device 自测：32 组全过")
+        # ㉝ Responses 协议的工具透传（agent 走 gpt/claude 类时的唯一通道）。
+        #    11-01 实测：这条路以前**完全没发 tools** —— 模型只好回「当前会话没有可调用的
+        #    工具」；回程的 function_call 也被丢掉，于是「它说要动手」变成「它只是聊天」，
+        #    agent 循环当场结束，表现是「代理什么也没干还理直气壮」。
+        chat_tools = [{"type": "function", "function": {
+            "name": "pc_state", "description": "看本机状态",
+            "parameters": {"type": "object",
+                           "properties": {"clip": {"type": "boolean"}}}}}]
+        rt = g0["_to_resp_tools"](chat_tools)
+        assert rt == [{"type": "function", "name": "pc_state", "description": "看本机状态",
+                       "parameters": {"type": "object",
+                                      "properties": {"clip": {"type": "boolean"}}}}], rt
+        # 已经是平铺形状的（有的调用方直接给 Responses 原样）也要能过，不许包成两层
+        rt2 = g0["_to_resp_tools"]([{"type": "function", "name": "echo",
+                                     "parameters": {"type": "object", "properties": {}}}])
+        assert rt2[0]["name"] == "echo" and "function" not in rt2[0], rt2
+        # 回程：function_call → chat tool_calls（正文与工具调用可以共存）
+        body_rc = g0["_from_resp_body"]({
+            "id": "resp_t", "status": "completed", "model": "gpt-x",
+            "output": [
+                {"type": "function_call", "call_id": "call_9", "name": "pc_state",
+                 "arguments": "{\"clip\": false}"},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "我查一下"}]},
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        })
+        ch = body_rc["choices"][0]
+        assert ch["finish_reason"] == "tool_calls", ch
+        assert ch["message"]["tool_calls"][0]["id"] == "call_9", ch
+        assert ch["message"]["tool_calls"][0]["function"]["name"] == "pc_state", ch
+        assert ch["message"]["content"] == "我查一下", ch
+
+        print("llmgw_device 自测：33 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
