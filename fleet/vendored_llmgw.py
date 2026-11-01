@@ -98,4 +98,13 @@ LLMGW_CAPABILITIES = [
                side_effect=False, check=_discover_ok,
                note="[LLMGW] 只读公开的 /api/status 与 /api/pricing，不碰账号与 key；"
                     "公告里的投放窗口会被解析成小时列表，喂给 quota 冷却"),
+    Capability("llmgw.codex_login",
+               "ChatGPT 订阅号 device-code 授权：无浏览器，一条能力走完 OAuth。"
+               "连上后 codex 后端（chatgpt.com/backend-api/codex）自动进路由池",
+               params=(Param("action", "str", doc="start（拿 user_code）/ poll（换 token，可带 wait 秒）"
+                                               "/ status / logout；默认 status"),
+                       Param("wait", "int", doc="poll 时阻塞等待秒数，默认 0（只探一次）")),
+               side_effect=True, check=_discover_ok,
+               note="[LLMGW] 凭据只落 ~/.fleet/codex_auth.json，能力输出永不回显 token。"
+                    "auth.openai.com 按出口 IP 判地区，受限地区会 403，需换出口再试"),
 ]
