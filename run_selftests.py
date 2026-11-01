@@ -114,6 +114,12 @@ CASES = [
     # 交互式逐个试码（2026-10-24 P1）：全离线——红外发射打桩（只数脉冲不真发），
     # 会话生命周期/候选排序/派生键/短语解析/晋升码库都覆盖，自测会自清理。
     ("fleet_ir_trial", ["-m", "fleet.ir_trial"], HERE, 30),
+    # ---- LLM 网关协议栈（llmgw.*）：全离线，monkeypatch 网关与 HTTP ----
+    # 10 组断言覆盖成功路径 / sticky / 429+Retry-After→authoritative 冷却 /
+    # 无 Retry-After→heuristic 冷却 / 冷却候选跳过 / embeddings 家族内 /
+    # endpoints·models 盘点 / probe 计速 / sticky clear。
+    # 真联网的活（打 OFM·zen-gate·匿名端点）不进门禁——门禁不许依赖外网。
+    ("fleet_llmgw", ["-m", "fleet.kinds.llmgw_device"], HERE, 30),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
