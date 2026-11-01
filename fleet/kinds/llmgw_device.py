@@ -118,8 +118,13 @@ ANON_ENDPOINTS = [
      "key": "", "anon": True, "default_model": "openai-fast",
      "note": "自建开源权重 GPT-OSS 20B，匿名可用（实测 chat OK）"},
     {"name": "llm7", "base": "https://api.llm7.io/v1",
-     "key": "", "anon": True, "default_model": "gpt-oss-20b",
-     "note": "100 req/hr 匿名，聚合多上游（偶发超时，靠冷却兜底）"},
+     "key": "", "anon": True, "default_model": "gpt-oss:20b",
+     "models": ["gpt-oss:20b", "codestral-latest", "mistral-Nemo-Instruct-2407"],
+     "note": "100 req/hr 匿名。**这是真自建**：/v1/models 里有 gemma4:31b / gpt-oss:20b / "
+             "mistral-large-3:675b / nemotron-3-nano:30b 这种 Ollama tag 语法（冒号+参数），"
+             "外加 Inkling-Small / L3-8B-Lunaris-v1-Turbo / dark-beast-krea2 这类社区微调名 —— "
+             "官方 API 永远不会这么命名。匿名层实测只有 3 个能打（其余 401 Missing API key），"
+             "已声明成白名单，别按 67 个全集合集上报。冒号是 Ollama 语法，别写成连字符。"},
     {"name": "kilo", "base": "https://api.kilo.ai/api/gateway/v1",
      "key": "", "anon": True, "default_model": "kilo-auto/free", "free_only": True,
      "note": "kilo 免费池；/v1/models 会吐 384 个（绝大多数要付费/需 key），"
@@ -248,6 +253,9 @@ def discover_gateways():
         gws.append({"name": a["name"], "base": a["base"],
                     "key": a["key"], "anon": True,
                     "default_model": a.get("default_model"),
+                    # 声明白名单必须带过去，否则匿名端点的 models 落到这里就被丢了，
+                    # 上层只能看到 /v1/models 的全集（llm7 报 67，匿名真能打只有 3 个）
+                    "models": list(a.get("models") or []),
                     "free_only": bool(a.get("free_only")),
                     "cost": float(a.get("cost") or 0.0),
                     "note": a.get("note", "")})
@@ -1735,13 +1743,16 @@ def _h_endpoints(cap, args, dev):
         if st == 200 and isinstance(body, dict):
             raw_ids = [m.get("id") for m in (body.get("data") or body.get("models") or []) if m.get("id")]
         raw_ids = _only_free(g, raw_ids)
-        ids = list(raw_ids)
-        via = "models-endpoint" if raw_ids else "none"
-        if not ids and g.get("models"):
-            # 声明式模型表（带 key 的额度型上游）：/v1/models 若不可读，按声明的清单报，
-            # 但 via 标 declared —— 清单不等于可用性承诺，可用性由 chat/健康图谱负责
-            ids = list(g["models"])
+        if g.get("models"):
+            # 声明白名单优先于上游 /v1/models —— 上游报的是「全集」，匿名/免费层往往只是子集。
+            # 实测 llm7 的 /v1/models 报 67 个，匿名实际只有 3 个能打（其余 401 Missing API key），
+            # 照全集上报等于往路由池里塞 64 条死链接。
+            # via 标 declared：清单是「声明」，不等于可用性承诺，可用性由 chat + 健康图谱负责。
+            ids = _only_free(g, list(g["models"]))
             via = "declared"
+        else:
+            ids = list(raw_ids)
+            via = "models-endpoint" if raw_ids else "none"
         if not ids and g.get("default_model"):
             # /v1/models 未实现或返回空（如 pollinations 在 openai 基址下返回 200 空列表）
             # → 用已知默认模型兜底，仍可用
@@ -1776,6 +1787,11 @@ def _h_models(cap, args, dev):
             for mid in mids:
                 ids.append({"id": mid, "family": _family(mid)})
                 raw_ids.append(mid)
+        if g.get("models"):
+            # 声明白名单优先：上游 /v1/models 是全集合集，匿名层通常只是其中一小撮
+            # （llm7：报 67 → 匿名 3）。照全集合集上报会把大量 401 死链当成可用模型。
+            _decl = _only_free(g, list(g["models"]))
+            ids = [{"id": mid, "family": _family(mid), "via": "declared"} for mid in _decl]
         if not ids and g.get("default_model"):
             ids = [{"id": g["default_model"], "family": _family(g["default_model"]),
                     "via": "default_model"}]
@@ -3081,7 +3097,37 @@ def _selftest():
             ca.AUTH_PATH, ca.PENDING_PATH, ca._req = old_auth, old_pending, old_req
             _sh.rmtree(_td, ignore_errors=True)
 
-        print("llmgw_device 自测：25 组全过")
+        # ㉖ 声明白名单必须赢过上游 /v1/models 的全集。
+        #    真机教训：llm7 的 /v1/models 报 67 个模型，匿名层实测只有 3 个能打
+        #    （其余 401 Missing API key），照全集上报 = 往路由池里塞 64 条死链接，
+        #    而且 default_model 还写成了「gpt-oss-20b」（连字符），实际 id 是
+        #    「gpt-oss:20b」（Ollama 的冒号 tag 语法）—— 这个端点因此一直是 400 死的。
+        g0["discover_gateways"] = real_discover  # 前面几组留了 lambda 替换，先归位
+        gws_l = real_discover()  # 用自测开头存的原始引用，避开残留的 lambda 替换
+        l7 = [g for g in gws_l if g["name"] == "llm7"][0]
+        assert l7.get("models"), "ANON_ENDPOINTS 的 models 声明没带进 discover_gateways"
+        assert "gpt-oss:20b" in l7["models"], l7["models"]
+        assert l7["default_model"] == "gpt-oss:20b", l7["default_model"]
+        assert "gpt-oss-20b" != l7["default_model"], "写连字符会 400，Ollama 用冒号"
+
+        def _fake_models(base, path, key, timeout=15, method="GET", body=None,
+                         extra_headers=None):
+            if path == "/v1/models":
+                return 200, {}, {"data": [{"id": i} for i in
+                                          ("gpt-oss:20b", "a1", "a2", "a3", "a4")]}, None
+            return 200, {}, {}, None
+
+        _real_m = g0["_req_json"]
+        g0["_req_json"] = _fake_models
+        try:
+            rr = g0["_h_models"]("llmgw.models", {}, type("D", (), {"name": "t", "via": "t"})())
+            l7m = rr.as_dict()["data"]["endpoints"]["llm7"]
+            assert l7m["count"] == 3, ("上游报 5 个、声明 3 个，应报 3 个", l7m["count"])
+            assert l7m["models"][0].get("via") == "declared", l7m["models"][0]
+        finally:
+            g0["_req_json"] = _real_m
+
+        print("llmgw_device 自测：26 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
