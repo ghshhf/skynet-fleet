@@ -52,6 +52,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..core import BaseDevice, DeviceResult as R
 from ..vendored_llmgw import LLMGW_CAPABILITIES
 from .. import codex_auth as _codex
+from .. import kiro_auth as _kiro
 
 
 def _codex_access(force_refresh=False):
@@ -87,6 +88,38 @@ def _codex_gateway():
             "default_model": None,
             "note": "ChatGPT 订阅号直连（chatgpt.com/backend-api/codex，Responses 协议）。"
                     "凭据是自己账号的 device-code OAuth，走 llmgw.codex_login 授权。"}
+
+
+# Kiro 免费层里真正有价值的模型（官方 --list-models 实读，括号是 credit 倍率）
+KIRO_MODELS = [
+    ("claude-sonnet-4.5", "1.30x"),
+    ("claude-haiku-4.5", "0.40x"),
+    ("glm-5", "0.50x"),
+    ("deepseek-3.2", "0.25x"),
+    ("minimax-m2.5", "0.25x"),
+    ("qwen3-coder-next", "0.05x"),
+]
+
+
+def _kiro_gateway():
+    """Kiro（AWS 官方）只在本机装过 CLI 且已登录时才挂进池子。"""
+    try:
+        stt = _kiro.status()
+    except Exception:
+        return None
+    if not stt.get("connected"):
+        return None
+    return {"name": "kiro", "base": "", "key": "", "anon": False,
+            # 走 Kiro 私有协议（AWS Event Stream），不是 OpenAI chat，需要专门分支
+            "auth": "kiro", "api_style": "kiro",
+            "models": [m for m, _ in KIRO_MODELS],
+            "default_model": "claude-sonnet-4.5",
+            # 免费层有每周配额，但不是包月固定成本 → 排在真·匿名端点之后、
+            # 付费额度型之前：能用免费的就先用免费的。
+            "cost": 0.2,
+            "note": "Kiro 免费层（AWS 官方，Amazon 是 Anthropic 最大股东，原生 Claude）。"
+                    "免费额度含 claude-sonnet-4.5 / claude-haiku-4.5 / glm-5 / deepseek-3.2 等，"
+                    "不用信用卡、不用 AWS 账号，device-code 授权一次即可，token 走 AWS SSO OIDC 自动续。"}
 
 # ---------- 路径 / 编码 ----------
 try:
@@ -320,6 +353,10 @@ def discover_gateways():
     cg = _codex_gateway()
     if cg:
         gws.append(cg)
+    # Kiro 免费层（AWS 官方，带原生 Claude；只有本机装过并登录才加）
+    kg = _kiro_gateway()
+    if kg:
+        gws.append(kg)
     # 本地离线兜底（Ollama 兼容）——永远排最后，远程免费层优先
     lg = _local_gw()
     if lg:
@@ -1568,6 +1605,219 @@ def _sse_body(parts, reasoning, usage, gw, payload):
     return out
 
 
+# ---------- Kiro（AWS 官方）私有协议 ----------
+# 上游：POST https://q.{region}.amazonaws.com/
+#       X-Amz-Target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse
+#       Content-Type: application/x-amz-json-1.0
+# 响应是 AWS Event Stream（二进制帧），但帧里的 payload 是明文 JSON，
+# 所以按前缀 + 括号配平取值即可，不需要引 vnd.amazon.eventstream 解码器。
+_KIRO_PREFIXES = ('{"content":', '{"name":', '{"input":', '{"stop":',
+                  '{"followupPrompt":', '{"usage":', '{"unit":',
+                  '{"contextUsagePercentage":', '{"messageMetadataEvent"')
+
+
+def _kiro_payload(messages, model):
+    """OpenAI messages → Kiro conversationState。
+
+    Kiro 不认 system 角色，官方做法是把它伪装成一对 user/assistant 历史；
+    相邻同角色要合并、且必须以 user 开头，否则上游直接拒。
+    """
+    import uuid as _uuid
+    sys_parts, turns = [], []
+    for m in (messages or []):
+        role = (m.get("role") or "").lower()
+        c = m.get("content")
+        if isinstance(c, list):
+            c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
+        c = c if isinstance(c, str) else ("" if c is None else str(c))
+        if role == "system":
+            if c.strip():
+                sys_parts.append(c.strip())
+            continue
+        if role not in ("user", "assistant"):
+            continue
+        if turns and turns[-1][0] == role:
+            turns[-1][1] = (turns[-1][1] + "\n" + c).strip()
+        else:
+            turns.append([role, c])
+    if not turns or turns[0][0] != "user":
+        turns.insert(0, ["user", "Hi"])
+
+    history = []
+    if sys_parts:
+        history.append({"userInputMessage": {
+            "content": "Follow this instruction:\n" + "\n".join(sys_parts),
+            "origin": "AI_EDITOR"}})
+        history.append({"assistantResponseMessage": {"content": "好的，我会按照你的要求来回复。"}})
+
+    tail = turns[-1]
+    for role, text in turns[:-1]:
+        if role == "user":
+            history.append({"userInputMessage": {"content": text or "继续", "origin": "AI_EDITOR"}})
+        else:
+            history.append({"assistantResponseMessage": {"content": text or "继续"}})
+
+    if tail[0] == "assistant":
+        # current 必须是 user；把最后的 assistant 挪进 history，再补一句 user
+        history.append({"assistantResponseMessage": {"content": tail[1] or "继续"}})
+        cur = "继续"
+    else:
+        cur = tail[1] or "继续"
+
+    state = {
+        "chatTriggerType": "MANUAL",
+        "conversationId": str(_uuid.uuid4()),
+        "currentMessage": {"userInputMessage": {
+            "content": cur, "modelId": model, "origin": "AI_EDITOR"}},
+    }
+    if history:
+        state["history"] = history
+    return {"conversationState": state}
+
+
+def _kiro_extract(raw):
+    """从 Event Stream 里捞出明文 JSON 事件，拼出正文、统计 credit 与 reasoning。"""
+    text = raw.decode("utf-8", errors="ignore")
+    events = []
+    for prefix in _KIRO_PREFIXES:
+        idx = 0
+        while True:
+            p = text.find(prefix, idx)
+            if p < 0:
+                break
+            depth = 0
+            in_str = False
+            esc = False
+            end = -1
+            for i in range(p, len(text)):
+                ch = text[i]
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\" and in_str:
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if not in_str:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+            if end < 0:
+                break
+            try:
+                events.append(json.loads(text[p:end + 1]))
+            except Exception:
+                pass
+            idx = end + 1
+
+    parts, reasoning, credit, err_msg = [], [], 0.0, ""
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        if isinstance(e.get("content"), str) and e["content"]:
+            parts.append(e["content"])
+        if e.get("unit") in ("credit", "credits"):
+            try:
+                credit = max(credit, float(e.get("usage") or 0))
+            except (TypeError, ValueError):
+                pass
+        for k in ("errorMessage", "message"):
+            if isinstance(e.get(k), str) and ("error" in k.lower() or e.get("type") == "error"):
+                err_msg = e[k]
+        if isinstance(e.get("reasoningContent"), str):
+            reasoning.append(e["reasoningContent"])
+    return "".join(parts), "".join(reasoning), credit, err_msg
+
+
+def _kiro_once(gw, payload, timeout):
+    """Kiro 单次调用，返回与 _chat_once 相同的 7 元组（body 是 chat 结构）。"""
+    import uuid as _uuid
+
+    tok, cred, err = _kiro.access_token()
+    if not tok:
+        return None, err or "kiro 未授权", None, 0, "auth", "auth", None
+    region = (cred or {}).get("region") or "us-east-1"
+    model = (payload.get("model") or gw.get("default_model") or "claude-sonnet-4.5").strip()
+    req_body = _kiro_payload(payload.get("messages"), model)
+    url = "https://q.%s.amazonaws.com/" % region
+
+    def _hdrs(access):
+        return {
+            "Authorization": "Bearer " + access,
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target":
+                "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+            "User-Agent": "aws-sdk-js/1.0.27 KiroIDE-0.7.45-gateway",
+            "x-amz-user-agent": "aws-sdk-js/1.0.27 KiroIDE-0.7.45-gateway",
+            "x-amzn-codewhisperer-optout": "true",
+            "x-amzn-kiro-agent-mode": "vibe",
+            "amz-sdk-invocation-id": str(_uuid.uuid4()),
+            "amz-sdk-request": "attempt=1; max=3",
+        }
+
+    def _send(access):
+        req = urllib.request.Request(
+            url, data=json.dumps(req_body).encode("utf-8"),
+            method="POST", headers=_hdrs(access))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+
+    try:
+        raw = _send(tok)
+    except urllib.error.HTTPError as e:
+        msg = e.read()[:400].decode("utf-8", "replace")
+        if e.code in (401, 403):
+            # access_token 被提前作废：强刷一次再打，成功就当没事
+            tok2, cred2, err2 = _kiro.access_token(force=True)
+            if tok2 and tok2 != tok:
+                try:
+                    raw = _send(tok2)
+                except Exception as e2:
+                    m2 = getattr(e2, "read", lambda: b"")()[:300].decode("utf-8", "replace")
+                    cls = _classify_error(getattr(e2, "code", 0) or 0, m2)
+                    return None, m2 or str(e2)[:160], None, 0, cls, _reason_for(cls), None
+            else:
+                cls = _classify_error(e.code, msg)
+                return None, msg or err2 or "kiro 鉴权失败", None, 0, cls, _reason_for(cls), None
+        else:
+            cls = _classify_error(e.code, msg)
+            return None, msg or ("HTTP %s" % e.code), None, 0, cls, _reason_for(cls), None
+    except Exception as e:
+        return None, str(e)[:200], None, 0, "transport", "timeout", None
+
+    text, reasoning, credit, err_msg = _kiro_extract(raw)
+    if not text and err_msg:
+        return None, err_msg[:300], None, 0, "server", "5xx", None
+    if not text:
+        return None, "Kiro 返回空正文（raw %d 字节）" % len(raw), None, 0, "server", "5xx", None
+
+    # Kiro 不返回 token 数，只返回 credit。按字符估个 token（中文偏保守），
+    # 只用来喂 bandit 的打分，不是账务数字。
+    pt = max(1, int(sum(len(str(m.get("content") or "")) for m in (payload.get("messages") or [])) * 0.7))
+    ct = max(1, int(len(text) * 0.7))
+    out = {
+        "id": "kiro-" + str(int(_now())),
+        "object": "chat.completion",
+        "model": model,
+        "_style": "kiro",
+        "_credit": round(credit, 6),
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant", "content": text},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                  "total_tokens": pt + ct},
+    }
+    if reasoning:
+        out["_reasoning"] = reasoning[:2000]
+    return out, None, gw["name"], pt + ct, "ok", "ok", None
+
+
 # ---------- chat 单次尝试 ----------
 def _chat_once(gw, payload, timeout):
     """统一返回 7 元组：(body|None, err, via, tokens, cls, reason, retry_after_s)。
@@ -1578,6 +1828,8 @@ def _chat_once(gw, payload, timeout):
     """
     if gw.get("api_style") == "responses":
         return _responses_once(gw, payload, timeout)
+    if gw.get("api_style") == "kiro":
+        return _kiro_once(gw, payload, timeout)
     st, hdrs, body, err0 = _req_json(
         gw["base"], "/v1/chat/completions", gw["key"],
         timeout=timeout, method="POST", body=payload)
@@ -1847,7 +2099,12 @@ def _h_models(cap, args, dev):
     gws = discover_gateways()
     result = {}
     for g in gws:
-        st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=10)
+        # 私有协议端点（kiro：走 AWS Event Stream，没有 /v1/models）不联网探测，
+        # 直接用声明的模型清单。否则空 base 拼出 "/v1/models" 会抛 unknown url type。
+        if g.get("base"):
+            st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=10)
+        else:
+            st, body, err = 0, None, "私有协议端点，模型清单以本地声明为准"
         ids = []
         raw_ids = []
         if st == 200 and isinstance(body, dict):
@@ -2146,6 +2403,8 @@ def _chat_once_simple(gw, payload, timeout):
     """
     if gw.get("api_style") == "responses":
         return _responses_once(gw, payload, timeout)
+    if gw.get("api_style") == "kiro":
+        return _kiro_once(gw, payload, timeout)
     st, hdrs, body, err0 = _req_json(
         gw["base"], "/v1/chat/completions", gw["key"],
         timeout=timeout, method="POST", body=payload)
