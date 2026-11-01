@@ -21,7 +21,7 @@
 实时可用性图谱 + bandit 路由 + hedge 并发 —— 目标是「模型随时可用」：
 无论哪个上游挂/限流，自动切到其他健康上游，用户无感。
 
-能力（11 项）：
+能力（12 项）：
   llmgw.endpoints   — 列出所有可用网关（OFM/zen-gate/匿名）+ 健康探测
   llmgw.models      — 按网关列出模型清单（含 family 分类）
   llmgw.chat        — OpenAI 兼容 chat，跨网关·跨模型 fallback + cooldown + bandit 路由 + hedge 并发
@@ -32,6 +32,7 @@
   llmgw.compress    — 网关层上下文压缩（省 token、少撞上下文上限）
   llmgw.health      — 可用性图谱（各端点模型实时健康状态，坏的降权/过滤 → 模型随时可用）
   llmgw.quota       — 额度总览（借用 OFM/zen-gate 自己探上游的结论 + 自建健康图谱，零配额成本）
+  llmgw.discover    — new-api 系公益站公开元数据（模型/倍率/赠送额度/投放窗口，零登录零额度）
   llmgw.egress      — 网络出口状态（免费端点直连即可用；环境若设了 HTTPS_PROXY 则透明走，非必需）
 """
 import json
@@ -90,6 +91,23 @@ ANON_ENDPOINTS = [
      "note": "OVH AI Endpoints 免费开源权重，匿名可用（22 模型，修正域名后实测 OK）"},
 ]
 
+# 带 key 的额度型上游（new-api / one-api 系聚合站）。额度来自账号（注册赠送 + 每日签到 +
+# 邀请返利），不是匿名免费。用完会返回 402 "Budget pool quota has been exhausted." ——
+# 那是「这一窗的额度用完了」，**不是**「上游死了」，所以下面给它独立的 quota 语义：
+# 冷却到下一个投放窗口，且不进 model bench（模型本身没问题，明天照用）。
+KEYED_ENDPOINTS = [
+    {"name": "agentrouter", "base": "https://agentrouter.org/v1",
+     "env": "LLMW_AGENTROUTER_KEY", "secret": "agentrouter",
+     "default_model": "gpt-6.1-sol", "cost": 1.0,
+     "models": ["gpt-6.1-sol", "gpt-5.6-sol", "gpt-6-astra", "claude-opus-5-5"],
+     "note": "AgentRouter：new-api 部署的公益站（响应头 X-Oneapi-Request-Id 可证）。"
+             "注册 $50、邀请再 $100、每日签到约 $20、官方明示无在线充值（enable_online_topup=false）。"
+             "只有 4 个模型，全是 GPT 订阅号池 / Claude 号池转出来的，不是官方按量 API："
+             "gpt-6.1-sol(倍率2) gpt-5.6-sol(2) gpt-6-astra(4) claude-opus-5-5(3, 仅 test/svip 分组)。"},
+]
+# 密钥来源：环境变量 → ~/.fleet/upstreams.json（不进 git、不进日志、不进能力输出）
+UPSTREAMS_SECRET = os.path.join(os.path.expanduser("~"), ".fleet", "upstreams.json")
+
 
 def _load_json(path):
     try:
@@ -97,6 +115,18 @@ def _load_json(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def _keyed_key(ep):
+    """取带 key 上游的凭据：环境变量优先，其次 ~/.fleet/upstreams.json。
+    没配置就返回空串 → 该上游不进候选（不占 hedge 名额，也不假装能用）。"""
+    v = (os.environ.get(ep.get("env") or "", "") or "").strip()
+    if v:
+        return v
+    f = _load_json(UPSTREAMS_SECRET)
+    if isinstance(f, dict):
+        return str(f.get(ep.get("secret") or ep.get("name")) or "").strip()
+    return ""
 
 
 # 免费模型 id 标记：`:free` / `-free` / `/free` 结尾（`kilo-auto/free`、`nvidia/x:free`、
@@ -169,7 +199,19 @@ def discover_gateways():
                     "key": a["key"], "anon": True,
                     "default_model": a.get("default_model"),
                     "free_only": bool(a.get("free_only")),
+                    "cost": float(a.get("cost") or 0.0),
                     "note": a.get("note", "")})
+    # 带 key 的额度型上游：只有真拿到凭据才加入（没 key 就静默跳过，不假装可用）
+    for e in KEYED_ENDPOINTS:
+        k = _keyed_key(e)
+        if not k:
+            continue
+        gws.append({"name": e["name"], "base": e["base"], "key": k, "anon": False,
+                    "default_model": e.get("default_model"),
+                    "models": list(e.get("models") or []),
+                    "cost": float(e.get("cost") or 0.0),
+                    "keyed": True,
+                    "note": e.get("note", "")})
     # 本地离线兜底（Ollama 兼容）——永远排最后，远程免费层优先
     lg = _local_gw()
     if lg:
@@ -242,7 +284,11 @@ HEDGE_FANOUT = 3
 # fanout 单次尝试超时上限：一个抖动的网关不能拖死整次调用（默认 chat timeout=120s）
 HEDGE_ATTEMPT_TIMEOUT = 40
 
-# cooldown-probe：只探测 heuristic cooldown，不碰 authoritative/credit/tier
+# 成本权重：路由偏好「不烧额度 / 不烧钱的先上」。cost=0 的匿名端点因子恒为 1（老排序一字不变），
+# 只有显式声明成本的上游（cost>0，例如 AgentRouter 这类额度型聚合站）才被折价。
+COST_WEIGHT = 0.5
+
+# cooldown-probe：只探测 heuristic cooldown，不碰 authoritative/quota/credit/tier
 COOLDOWN_PROBE_MIN_ELAPSED_FRACTION = 0.5
 COOLDOWN_PROBE_MIN_REMAINING_S = 60
 
@@ -357,13 +403,33 @@ def _extract_err(body):
 
 
 # ---------- 错误体分类（Free-GPT4-WEB-API 模式） ----------
+# 「额度窗用尽」标记：这类错误说明的是**这一窗的预算没了**，不是端点坏了。
+#   AgentRouter(new-api) 402 → "Budget pool quota has been exhausted."
+#   OFM 免费通道 → "Free usage limit reached. Free models work in OpenCode"
+# 混成 rate 会走 2m→10m→1h→1d 的阶梯（越撞越久，但明天额度回来了还得等 1 天）；
+# 混成 5xx 会进 model bench（把好模型当坏模型关 10 分钟）。两者都是误伤。
+_QUOTA_MARKERS = (
+    "quota has been exhausted", "insufficient_quota", "insufficient quota",
+    "exceeded your current quota", "free usage limit reached", "budget pool",
+    "quota exhausted", "no remaining quota", "out of credits", "daily limit reached",
+    "额度已用完", "额度不足", "余额不足", "配额已",
+)
+
+
+def _looks_like_quota_window(low):
+    return any(m in low for m in _QUOTA_MARKERS)
+
+
 def _classify_error(status_code, err_text):
-    """把 HTTP 状态 + 错误体分类为：auth / rate / forbidden / server / timeout / context / transport / other"""
+    """把 HTTP 状态 + 错误体分类为：
+    auth / credit / quota / forbidden / rate / server / timeout / context / transport / other"""
     low = (err_text or "").lower()
     if status_code == 0:
         if "timeout" in low or "timed out" in low:
             return "timeout"
         return "transport"
+    if status_code == 402:
+        return "quota"
     if status_code in (401, 403):
         if "credit" in low or "balance" in low or "quota" in low or "payment" in low:
             return "credit"
@@ -371,6 +437,8 @@ def _classify_error(status_code, err_text):
             return "forbidden"
         return "auth"
     if status_code == 429 or "rate" in low or "quota" in low:
+        if status_code == 429 and _looks_like_quota_window(low):
+            return "quota"
         return "rate"
     if status_code == 413 or "too large" in low or "context" in low or "maximum context" in low:
         return "context"
@@ -381,6 +449,14 @@ def _classify_error(status_code, err_text):
     if "timeout" in low:
         return "timeout"
     return "other"
+
+
+def _reason_for(cls):
+    """错误分类 → cooldown 原因。chat / embeddings / probe 三处共用一份映射，免得漂移。"""
+    return {"auth": "auth", "credit": "credit", "quota": "quota",
+            "forbidden": "forbidden", "tier": "tier", "rate": "429",
+            "server": "5xx", "context": "context", "timeout": "timeout",
+            "transport": "timeout", "client": "429", "other": "5xx"}.get(cls, "5xx")
 
 
 # ---------- 可用性图谱（实时流量驱动；freellmapi model_probe_status 的轻量版） ----------
@@ -571,10 +647,35 @@ def _learn_limit(gw, model, err_text):
 
 
 # ---------- cooldown 决策（FreeLLMAPI getCooldownDecisionForLimit） ----------
+# 额度投放窗口：new-api 系公益站的额度是**按窗重置**的。AgentRouter 官方公告明示
+# 每天北京时间 9:00 / 10:00 / 19:00 分批投放、用完即止，另有 0 点自然日重置。
+# 所以撞到「额度尽」时不该按 429 阶梯（2m→10m→1h→1d）熬，而是「等到下一个窗口」。
+QUOTA_WINDOWS_HOURS = (0, 9, 10, 19)
+
+
+def _next_quota_window(now=None):
+    """下一个额度投放窗口的时间戳（本地时区；本机 = 北京时间）。"""
+    t = now if now is not None else _now()
+    lt = time.localtime(t)
+    base = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    for h in QUOTA_WINDOWS_HOURS:
+        cand = base + h * 3600
+        if cand > t + 60:
+            return cand
+    return base + 24 * 3600
+
+
+def _quota_window_seconds():
+    """到下一个投放窗口还有多久（夹在 5 分钟 ~ 12 小时之间）。"""
+    now = _now()
+    return int(max(300, min(_next_quota_window(now) - now, 12 * 3600)))
+
+
 def _cooldown_decision(gw, model, reason, retry_after_s=None):
     """按原因分派 cooldown 时长 + source 标记。
     source: heuristic（可被 cooldown-probe 早期恢复）/ authoritative（供应商 Retry-After，不碰）
-            / credit（402 欠费，不碰）/ tier（403 模型不在该层，不碰）
+            / credit（402 欠费，不碰）/ quota（额度窗用尽，等到下个投放窗口，不碰）
+            / tier（403 模型不在该层，不碰）
     """
     now = _now()
     k = _ckey(gw, model)
@@ -585,6 +686,9 @@ def _cooldown_decision(gw, model, reason, retry_after_s=None):
 
     if reason == "auth":
         return {"seconds": 300, "source": "authoritative"}
+    if reason == "quota":
+        # 额度窗用尽：等到下一个投放窗口，不升级、不 bench（不是模型坏，是预算空）
+        return {"seconds": _quota_window_seconds(), "source": "quota"}
     if reason == "credit":
         return {"seconds": 24 * 3600, "source": "credit"}
     if reason == "forbidden" or reason == "tier":
@@ -1031,10 +1135,7 @@ def _chat_once(gw, payload, timeout):
     if not err:
         err = "HTTP %s" % st
     cls = _classify_error(st, err)
-    reason = {"auth": "auth", "credit": "credit", "forbidden": "forbidden",
-              "tier": "tier", "rate": "429", "server": "5xx",
-              "context": "context", "timeout": "timeout",
-              "transport": "timeout", "client": "429", "other": "5xx"}.get(cls, "5xx")
+    reason = _reason_for(cls)
     retry_after_s = None
     if st == 429:
         ra = (hdrs or {}).get("Retry-After") or (hdrs or {}).get("retry-after")
@@ -1165,11 +1266,16 @@ def _build_candidates(gws, models, session=None, sticky_pref=None):
             ext_dead, ext_w, ext_src, ext_detail = _ext_verdict(m)
             if ext_w != 1.0:
                 score *= ext_w
+            # 成本折价：免费匿名端点 cost=0 → 不折；额度/付费型上游按 cost 打折，
+            # 同分情况下免费的先上（额度留给真正没别的路的时刻）
+            cost = float(g.get("cost") or 0.0)
+            if cost > 0:
+                score *= 1.0 / (1.0 + COST_WEIGHT * cost)
             candidates.append({
                 "gw": g, "model": m, "score": score, "origin": origin,
                 "cooldown_source": source, "healthy": healthy,
                 "ext_dead": ext_dead, "ext_src": ext_src,
-                "ext_detail": ext_detail,
+                "ext_detail": ext_detail, "cost": cost,
             })
     # 先按 local 标志升序（非本地在前），再按 bandit 分降序（稳定排序：同分时本地仍压最后）
     candidates.sort(key=lambda c: c["gw"].get("local", False))
@@ -1256,11 +1362,17 @@ def _h_endpoints(cap, args, dev):
             raw_ids = [m.get("id") for m in (body.get("data") or body.get("models") or []) if m.get("id")]
         raw_ids = _only_free(g, raw_ids)
         ids = list(raw_ids)
+        via = "models-endpoint" if raw_ids else "none"
+        if not ids and g.get("models"):
+            # 声明式模型表（带 key 的额度型上游）：/v1/models 若不可读，按声明的清单报，
+            # 但 via 标 declared —— 清单不等于可用性承诺，可用性由 chat/健康图谱负责
+            ids = list(g["models"])
+            via = "declared"
         if not ids and g.get("default_model"):
             # /v1/models 未实现或返回空（如 pollinations 在 openai 基址下返回 200 空列表）
             # → 用已知默认模型兜底，仍可用
             ids = [g["default_model"]]
-        via = "models-endpoint" if raw_ids else ("default_model" if ids else "none")
+            via = "default_model"
         out.append({"name": g["name"], "base": g["base"],
                     "anon": g.get("anon", False),
                     "ok": bool(ids),
@@ -1553,12 +1665,14 @@ def _h_embeddings(cap, args, dev):
         err = _extract_err(body)
         attempts.append({"gateway": g["name"], "err": (err or "HTTP %s" % st)[:150]})
         cls = _classify_error(st, err)
-        reason = {"429": "429", "rate": "429", "server": "5xx"}.get(cls, "5xx")
+        reason = _reason_for(cls)
         record_failure(g["name"], model, err_text=err, reason=reason)
-        if st == 429:
-            set_cooldown(g["name"], model, "429")
-        elif st >= 500:
-            set_cooldown(g["name"], model, "5xx")
+        # 二次冷却只为把 429/5xx 标成阶梯；quota 已经由 record_failure 设成窗口冷却，别再覆盖
+        if cls != "quota":
+            if st == 429:
+                set_cooldown(g["name"], model, "429")
+            elif st >= 500:
+                set_cooldown(g["name"], model, "5xx")
     return R.error(cap, "全部候选失败：%s" % attempts, device=dev.name, via=dev.via)
 
 
@@ -1603,9 +1717,9 @@ def _h_probe(cap, args, dev):
                            tok_per_sec=tok_per_sec, ttfb_ms=ttfb)
         else:
             cls = _classify_error(st, str(body)[:120])
-            reason = {"429": "429", "rate": "429", "server": "5xx"}.get(cls, "5xx")
+            reason = _reason_for(cls)
             record_failure(g["name"], model, err_text=str(body)[:120], reason=reason)
-            if st in (429, 500, 502, 503):
+            if cls != "quota" and st in (429, 500, 502, 503):
                 set_cooldown(g["name"], model, "429" if st == 429 else "5xx")
     return R.success(cap, dev.name, via=dev.via, data={"model": model, "probes": out})
 
@@ -1774,8 +1888,121 @@ def _h_quota(cap, args, dev):
         },
         "local_health": {"items": health[:500], "count": len(health),
                          "healthy": sum(1 for x in health if x["healthy"])},
+        # 额度型上游：报「配没配 key」「声明的模型」「成本系数」，绝不回显 key 本身
+        "keyed_upstreams": [{
+            "name": e["name"], "base": e["base"], "configured": bool(_keyed_key(e)),
+            "models": list(e.get("models") or []), "cost": float(e.get("cost") or 0.0),
+            "env": e.get("env"), "secret_file": UPSTREAMS_SECRET,
+        } for e in KEYED_ENDPOINTS],
+        # 额度投放窗口：撞到 402 的冷却时长就是「到下一个窗口」
+        "quota_window": {
+            "hours_local": list(QUOTA_WINDOWS_HOURS),
+            "next_reset": time.strftime("%Y-%m-%d %H:%M",
+                                        time.localtime(_next_quota_window())),
+            "reset_in_s": _quota_window_seconds(),
+        },
         "note": "external = OFM/zen-gate 自己探上游后落下的结论（只读，零配额成本）；"
-                "dead 的模型在候选里被降到 0.02 权重而非丢弃（外部记录可能过期）。",
+                "dead 的模型在候选里被降到 0.02 权重而非丢弃（外部记录可能过期）。"
+                "quota 类错误（402 / 额度窗用尽）不是死亡：冷却到下一个投放窗口，不进 model bench。",
+    })
+
+
+# ---------- new-api 系公益站：公开元数据抓取（零登录、零额度） ----------
+# new-api / one-api 有两张**无需鉴权**的接口，站点自己挂在公网上：
+#   /api/status  → 站点名、版本、quota_per_unit、注册赠送(quota_for_invitee)、
+#                  邀请返利(quota_for_inviter)、有没有在线充值、可用 OAuth、公告全文
+#   /api/pricing → 每个模型的名字 + 倍率(model_ratio) + 补全倍率 + 可见分组
+# 公告里还常写死投放窗口（AgentRouter 明示北京时间 9:00 / 10:00 / 19:00 分批投放），
+# 正则扒出来就能喂给 quota 冷却，不用自己猜。
+# 拿这些不花一分额度、不碰任何账号 —— 比自己注册一个个试更省，也比抄别人的清单更及时。
+DEFAULT_NEWAPI_SITES = ["agentrouter.org"]
+# 公告里两种写法都出现过：「北京时间 9:00」和「（对应 UTC 1:00）」，还有「北京时间10:00和19:00」。
+# 所以按「同一段里以北京时间为准」来切：先把 UTC 那半截切掉再抓所有时刻；
+# 只有通篇没提北京时间时才按 UTC+8 折算。实测乱抓会把 [9,10,19] 读成 [1,9,10]。
+_TIME_RE = re.compile(r"(\d{1,2})\s*[:：]\s*(\d{2})")
+
+
+def _extract_windows(text):
+    t = text or ""
+    if "北京时间" in t:
+        head = t.split("UTC")[0]
+        return {int(h) for h, _m in _TIME_RE.findall(head) if 0 <= int(h) <= 23}
+    if "UTC" in t:
+        tail = t.split("UTC", 1)[1]
+        return {(int(h) + 8) % 24 for h, _m in _TIME_RE.findall(tail) if 0 <= int(h) <= 23}
+    return set()
+
+
+def _newapi_site(host, timeout=10):
+    base = host if host.startswith("http") else "https://" + host
+    base = base.rstrip("/")
+    info, models, errs = {}, [], []
+    st, _, body, err = _req_json(base, "/api/status", None, timeout=timeout)
+    d = (body or {}).get("data") if isinstance(body, dict) else None
+    if st == 200 and isinstance(d, dict):
+        try:
+            qpu = float(d.get("quota_per_unit") or 500000)
+        except Exception:
+            qpu = 500000.0
+
+        def _usd(q):
+            try:
+                return round(float(q or 0) / qpu, 2)
+            except Exception:
+                return None
+
+        anns = [str(a.get("content") or "") for a in (d.get("announcements") or [])
+                if isinstance(a, dict)]
+        windows = set()
+        for t in anns:
+            windows |= _extract_windows(t)
+        windows = sorted(windows)
+        info = {
+            "system_name": d.get("system_name"),
+            "version": d.get("version"),
+            "quota_per_unit": qpu,
+            "price_cny_per_usd": d.get("price"),
+            "signup_usd": _usd(d.get("quota_for_invitee")),
+            "inviter_usd": _usd(d.get("quota_for_inviter")),
+            "topup_enabled": bool(d.get("enable_online_topup") or d.get("enable_stripe_topup")),
+            "oauth": [k[:-len("_oauth")] if k.endswith("_oauth") else k
+                      for k in ("github_oauth", "linuxdo_oauth", "wechat_login",
+                                "oidc_enabled", "telegram_oauth") if d.get(k)],
+            "quota_drop_windows_h": windows,
+            "announcements": [a[:240] for a in anns[:3]],
+        }
+    else:
+        errs.append("status: %s" % (err or ("HTTP %s" % st)))
+    st2, _, body2, err2 = _req_json(base, "/api/pricing", None, timeout=timeout)
+    rows = (body2 or {}).get("data") if isinstance(body2, dict) else None
+    if st2 == 200 and isinstance(rows, list):
+        for m in rows:
+            if not isinstance(m, dict):
+                continue
+            models.append({"model": m.get("model_name"),
+                           "ratio": m.get("model_ratio"),
+                           "completion_ratio": m.get("completion_ratio"),
+                           "groups": m.get("enable_groups") or []})
+    else:
+        errs.append("pricing: %s" % (err2 or ("HTTP %s" % st2)))
+    return {"site": base, "ok": bool(info or models), "info": info,
+            "models": models, "model_count": len(models), "errors": errs}
+
+
+def _h_discover(cap, args, dev):
+    """扫 new-api 系站点的公开元数据：模型清单、倍率、赠送额度、有无充值、投放窗口。
+
+    只读公开接口，不需要账号也需要 key —— 用来「先看清楚再决定要不要注册」。
+    """
+    sites = args.get("sites") or DEFAULT_NEWAPI_SITES
+    if isinstance(sites, str):
+        sites = [sites]
+    tmo = int(args.get("timeout") or 10)
+    out = [_newapi_site(s, timeout=tmo) for s in sites]
+    return R.success(cap, dev.name, via=dev.via, data={
+        "sites": out, "count": len(out), "ok": sum(1 for x in out if x["ok"]),
+        "note": "new-api 的 /api/status 与 /api/pricing 无需鉴权 → 零登录、零额度即可拿到"
+                "模型/倍率/赠送额度/有无充值/投放窗口。这里只读公开元数据，不碰账号与 key。",
     })
 
 
@@ -1790,6 +2017,7 @@ _HANDLERS = {
     "llmgw.egress": _h_egress,
     "llmgw.health": _h_health,
     "llmgw.quota": _h_quota,
+    "llmgw.discover": _h_discover,
 }
 
 
@@ -2088,7 +2316,119 @@ def _selftest():
         finally:
             g0["_load_json"] = real_load
             g0["_EXT_CACHE"].update(at={}, ts=0.0)
-        print("llmgw_device 自测：15 组全过")
+
+        # ⑯ 额度窗用尽（402 / "budget pool quota has been exhausted"）必须和「模型坏了」分开：
+        # 分类独立、冷却到下一个投放窗口、绝不进 model bench、不可被早期恢复。
+        clf = g0["_classify_error"]
+        assert clf(402, "Budget pool quota has been exhausted.") == "quota"
+        assert clf(429, "You exceeded your current quota, please check your plan") == "quota"
+        assert clf(429, "Rate limit reached for requests") == "rate", "普通限流还是 rate"
+        assert clf(401, "invalid api key") == "auth"
+        assert clf(403, "model not allowed in this tier") == "forbidden"
+        assert clf(0, "timed out") == "timeout"
+        assert g0["_reason_for"]("quota") == "quota"
+        assert g0["_reason_for"]("rate") == "429"
+        dec = g0["_cooldown_decision"]("agentrouter", "gpt-6.1-sol", "quota")
+        assert dec["source"] == "quota" and 300 <= dec["seconds"] <= 12 * 3600, dec
+        nw = g0["_next_quota_window"]()
+        assert 0 < nw - g0["_now"]() <= 24 * 3600, nw
+        # 窗口必须落在 0/9/10/19 点之一
+        assert time.localtime(nw).tm_hour in g0["QUOTA_WINDOWS_HOURS"], time.localtime(nw).tm_hour
+        bench_before = list(g0["_MODEL_FAILURES"].get("gpt-6.1-sol", []))
+        g0["record_failure"]("agentrouter", "gpt-6.1-sol", err_text="budget pool", reason="quota")
+        assert g0["_MODEL_FAILURES"].get("gpt-6.1-sol", []) == bench_before, "quota 不该 bench 模型"
+        cooled, rem, src = g0["is_cooled"]("agentrouter", "gpt-6.1-sol")
+        assert cooled and src == "quota" and rem > 60, (cooled, rem, src)
+        assert not g0["clear_cooldown_early"]("agentrouter", "gpt-6.1-sol"), "quota 不可早期恢复"
+        g0["_COOLDOWN"].pop(("agentrouter", "gpt-6.1-sol"), None)
+
+        # ⑰ 带 key 的额度型上游：有凭据才进候选（没 key 不假装可用），凭据不许出现在能力输出里
+        real_secret = g0["UPSTREAMS_SECRET"]
+        tmpf = os.path.join(os.environ.get("TEMP") or "/tmp", "llmgw_selftest_upstreams.json")
+        try:
+            if os.path.isfile(tmpf):
+                os.remove(tmpf)
+            g0["UPSTREAMS_SECRET"] = tmpf
+            assert "agentrouter" not in [x["name"] for x in real_discover()], \
+                "没 key 不该出现在端点清单"
+            with open(tmpf, "w", encoding="utf-8") as f:
+                json.dump({"agentrouter": "sk-selftest"}, f)
+            assert g0["_keyed_key"](g0["KEYED_ENDPOINTS"][0]) == "sk-selftest"
+            gws = real_discover()
+            ag = [x for x in gws if x["name"] == "agentrouter"]
+            assert ag and ag[0]["key"] == "sk-selftest", ag
+            assert ag[0]["cost"] == 1.0 and ag[0].get("keyed") is True
+            assert ag[0]["models"] == g0["KEYED_ENDPOINTS"][0]["models"]
+            # 环境变量优先于密钥文件
+            os.environ["LLMW_AGENTROUTER_KEY"] = "sk-env"
+            assert g0["_keyed_key"](g0["KEYED_ENDPOINTS"][0]) == "sk-env"
+            # 能力输出里只有「配没配」，没有凭据本身
+            qd2 = d.invoke("llmgw.quota", {}).as_dict()["data"]
+            ku = {x["name"]: x for x in qd2["keyed_upstreams"]}
+            assert ku["agentrouter"]["configured"] is True
+            assert "sk-env" not in json.dumps(qd2) and "sk-selftest" not in json.dumps(qd2)
+            assert qd2["quota_window"]["next_reset"], qd2["quota_window"]
+        finally:
+            os.environ.pop("LLMW_AGENTROUTER_KEY", None)
+            g0["UPSTREAMS_SECRET"] = real_secret
+            if os.path.isfile(tmpf):
+                os.remove(tmpf)
+
+        # ⑱ 成本折价只压「真花额度」的上游：免费端点因子恒为 1（老排序一字不变），
+        # 同分时免费的先上，额度型上游留到没有免费路可走的时刻。
+        real_disc2 = g0["discover_gateways"]
+        g0["discover_gateways"] = lambda: [
+            {"name": "freeep", "base": "http://127.0.0.1:1/v1", "key": "k", "cost": 0.0},
+            {"name": "paidep", "base": "http://127.0.0.1:2/v1", "key": "k", "cost": 1.0},
+        ]
+        try:
+            cs = g0["_build_candidates"](g0["discover_gateways"](), ["m-x"])
+            by = {c["gw"]["name"]: c for c in cs}
+            assert by["freeep"]["cost"] == 0.0 and by["paidep"]["cost"] == 1.0, by
+            expect = by["paidep"]["score"] * (1.0 + g0["COST_WEIGHT"] * 1.0)
+            assert abs(by["freeep"]["score"] - expect) < 1e-9, (by["freeep"]["score"], expect)
+            assert cs[0]["gw"]["name"] == "freeep", "同分时免费端点应排前"
+        finally:
+            g0["discover_gateways"] = real_disc2
+
+        # ⑲ new-api 公开元数据（零登录、零额度）：/api/status + /api/pricing 两张公开接口
+        #    要能解析出模型倍率、赠送额度换算、有无充值、以及公告里的投放窗口；站点挂了要如实报错。
+        def fake_req2(base, path, key, timeout=15, method="GET", body=None, extra_headers=None):
+            if "nope.invalid" in base:
+                return 404, {}, {"error": "x"}, None
+            if path == "/api/status":
+                return 200, {}, {"data": {
+                    "system_name": "Agent Router", "version": "init-test",
+                    "quota_per_unit": 500000, "quota_for_invitee": 25000000,
+                    "quota_for_inviter": 50000000,
+                    "enable_online_topup": False, "enable_stripe_topup": False,
+                    "github_oauth": True, "price": 7.3,
+                    "announcements": [
+                        {"content": "每日于北京时间 9:00（对应 UTC 1:00）投放额度，用完即止"},
+                        {"content": "投放到北京时间10:00和19:00（对应UTC时间02:00和11:00）"}]}}, None
+            if path == "/api/pricing":
+                return 200, {}, {"data": [{"model_name": "gpt-6.1-sol", "model_ratio": 2,
+                                           "completion_ratio": 5,
+                                           "enable_groups": ["default"]}]}, None
+            return 404, {}, {"error": "x"}, None
+        g0["_req_json"] = fake_req2
+        try:
+            rd = d.invoke("llmgw.discover", {"sites": ["agentrouter.org"]}).as_dict()["data"]
+            assert rd["ok"] == 1 and rd["count"] == 1, rd
+            s0 = rd["sites"][0]
+            assert s0["info"]["signup_usd"] == 50.0, s0["info"]
+            assert s0["info"]["inviter_usd"] == 100.0
+            assert s0["info"]["topup_enabled"] is False
+            assert s0["info"]["quota_drop_windows_h"] == [9, 10, 19], \
+                s0["info"]["quota_drop_windows_h"]
+            assert s0["model_count"] == 1 and s0["models"][0]["ratio"] == 2, s0["models"]
+            assert "github" in s0["info"]["oauth"], s0["info"]["oauth"]
+            rbad = d.invoke("llmgw.discover", {"sites": ["nope.invalid"]}).as_dict()["data"]
+            assert rbad["ok"] == 0 and len(rbad["sites"][0]["errors"]) == 2, rbad
+        finally:
+            g0["_req_json"] = fake_req
+
+        print("llmgw_device 自测：19 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
