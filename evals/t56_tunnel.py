@@ -246,13 +246,17 @@ def main():
 
     tun_caps = [c.name for c in CAPABILITIES
                 if getattr(c, "name", "").startswith("tun.")]
-    check(len(tun_caps) == 9, f"catalog 里登记了 9 条 tun.* 能力（实际 {len(tun_caps)}）")
+    check(len(tun_caps) == 12,
+          f"catalog 里登记了 12 条 tun.* 能力（实际 {len(tun_caps)}）："
+          "9 条隧道 + 3 条 pinhole（tun.pinhole / .open / .close）")
     check("tun.plan" in tun_caps and "tun.open" in tun_caps,
           "关键的 plan / open 都在能力表里")
     dev = TunnelLayer()
     caps = dev.caps()
     for c in ("tun.ipv6", "tun.plan", "tun.offer", "tun.accept",
-              "tun.open", "tun.upgrade", "tun.status", "tun.sessions", "tun.close"):
+              "tun.open", "tun.upgrade", "tun.status",
+              "tun.pinhole", "tun.pinhole.open", "tun.pinhole.close",
+              "tun.sessions", "tun.close"):
         check(c in caps, f"{c} 已声明")
 
     okp, _msg = dev.probe()

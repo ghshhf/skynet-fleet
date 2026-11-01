@@ -31,6 +31,23 @@
 ================
 照 `sentinel.watch` 的做法：每轮都写一条「还是原样」的日志，会把真正的事件埋掉。
 本层只在**状态迁移**和**地址集合变化**时记事件，其余轮次只更新计数。
+
+最后一步：入站放行（pinhole）
+=============================
+地址报上去、墙外一验，如果结果是 `blind`，卡住的地方**几乎总是同一个**：
+v6 没有 NAT，主机防火墙对 v6 入站的默认策略是全拦。
+所以本层在墙外自检之前会自动补这一步（`tun.pinhole` 那三条能力做实际动作）。
+
+三条边界写死在这里，不许放宽：
+  ① 只放**当前在用的那个端口**，不批量、不开范围
+  ② 只对 **v6 源**生效（靠地址前缀收敛），v4 侧端口不受影响
+  ③ 失败**不改变上报结论** —— 放行不了 ≠ 地址没报上去，
+     把它写成 down 会让人去查中继，而问题在防火墙
+
+门禁纪律：`AutoLink` 现在会改防火墙。任何门禁只要带**真端口**构造它，
+就必须注入 `pinhole_fn` 假实现或 `auto_pinhole=False`，
+否则跑一次门禁就在用户机器上留下一条放行规则 —— 而它长得像正常配置，
+事后没人会想到去删。`evals/t59_pinhole.py` 第 11 组会静态扫这处疏漏。
 """
 
 import json
@@ -56,6 +73,9 @@ DEFAULT_DEEP_EVERY = 1800.0
 DEFAULT_REPUBLISH_EVERY = 1800.0
 #: 连续失败后的退避上限。
 BACKOFF_CAP = 300.0
+#: 开 pinhole 失败后的重试间隔。改防火墙要起一个 PowerShell（1~2 秒），
+#: 而且每次失败几乎都是「没提权」这种不会自己好的原因，所以隔 5 分钟再说。
+PINHOLE_RETRY = 300.0
 
 STATE_PATH = os.path.join(os.path.expanduser("~"), ".skynet", "rdv_auto.json")
 
@@ -101,7 +121,8 @@ class AutoLink:
     def __init__(self, rdv=None, origin="", secret="", interval=DEFAULT_INTERVAL,
                  verify_every=DEFAULT_VERIFY_EVERY, deep_every=DEFAULT_DEEP_EVERY,
                  republish_every=DEFAULT_REPUBLISH_EVERY, state_path=STATE_PATH,
-                 publish_fn=None, verify_fn=None, clock=None, port=0):
+                 publish_fn=None, verify_fn=None, clock=None, port=0,
+                 auto_pinhole=None, pinhole_fn=None):
         self.rdv = rdv or rdv_mod.Rendezvous()
         self.origin = (origin or os.environ.get("FLEET_WSRELAY") or "").strip()
         self.secret = (secret or os.environ.get("FLEET_WSRELAY_SECRET") or "").strip()
@@ -111,6 +132,16 @@ class AutoLink:
         self.republish_every = float(republish_every)
         self.state_path = state_path
         self.port = int(port or 0)
+        # 入站放行是否自动补：默认开。理由——不自动就还是「地址报上去了，
+        # 但墙外一个都进不来」，而那个状态的下一步提示本来就是「开 pinhole」，
+        # 让人拿着提示去手动开，等于把自动化做到最后一步停住。
+        # 但它是**可关**的（FLEET_PINHOLE_AUTO=0），因为改防火墙属于系统状态变更，
+        # 得留一个「别动我的机器」的开关。
+        if auto_pinhole is None:
+            auto_pinhole = os.environ.get("FLEET_PINHOLE_AUTO", "1") not in ("0", "false", "no", "")
+        self.auto_pinhole = bool(auto_pinhole)
+        # 注入点：门禁用假实现，一条防火墙都不碰
+        self.pinhole_fn = pinhole_fn
         # 注入点：门禁用假 publish/verify 验状态机，一个网络包都不发
         self.publish_fn = publish_fn
         self.verify_fn = verify_fn
@@ -147,6 +178,8 @@ class AutoLink:
             "backoff_until": st.get("backoff_until") or 0,
             "backoff_left": round(max(0.0, (st.get("backoff_until") or 0) - now), 1),
             "verify": st.get("verify") or {},
+            "pinhole": st.get("pinhole") or {},
+            "auto_pinhole": self.auto_pinhole,
             "runs": st.get("runs", 0),
             "running": bool(self._thread and self._thread.is_alive()),
             "events": (st.get("events") or [])[-10:],
@@ -244,6 +277,10 @@ class AutoLink:
                            "changed": changed})
 
         # ---- ③ 墙外自检
+        # 自检之前先补入站放行：不然自检连的是「一个被防火墙挡住的端口」，
+        # 得出的 blind 是防火墙造成的，不是网络造成的 —— 而这两者的处置完全不同。
+        pinhole = self._ensure_pinhole(now, events)
+
         verify = st.get("verify") or {}
         if self._due("verify_ts", self.verify_every, now):
             if self.configured() and len(cands) > 0:
@@ -273,12 +310,75 @@ class AutoLink:
                            "from": prev, "to": status, "why": note})
         st["status"] = status
         return self._finish(now, ok=True, status=status, events=events,
-                            published=published, verify=verify, note=note)
+                            published=published, verify=verify, note=note,
+                            pinhole=pinhole)
 
     # ---- 内部
     def _due(self, key, every, now):
         last = float(self._st.get(key) or 0)
         return now - last >= every
+
+    def _ensure_pinhole(self, now, events):
+        """确保「对端要连进来的那个端口」在防火墙上是通的。
+
+        为什么这件事必须由本层做，而不是等用户看提示手动开：
+        上一轮实测的状态就是 `unverified`，原因是「没有可探测端口」。
+        修好端口以后，下一个拦路的**一定**是防火墙 —— v6 没有 NAT，
+        主机防火墙对 v6 入站默认全拦。让人在「地址已上报、就差一个洞」的
+        状态上停住，等于把自动化做到 99% 然后放手。
+
+        三条硬约束：
+          ① **只放当前真正在用的端口**，不批量、不开范围
+          ② **只对 v6 源生效**（pinhole_open 里靠地址前缀收敛），v4 侧不受影响
+          ③ **失败不改变上报结论**：放行失败 ≠ 地址没报上去，
+             所以这里只记事件、只回填状态，绝不把它变成 status=down
+        """
+        st = self._st
+        prev = st.get("pinhole") or {}
+
+        if not self.auto_pinhole:
+            return {"ok": False, "skipped": "auto_pinhole=0（关掉了，不动防火墙）"}
+        if self.port <= 0:
+            # 没有端口 = 对端不知道该连哪 —— 这跟防火墙一点关系都没有，
+            # 报「需要开 pinhole」会把人引到错误的方向上。
+            return prev or {"ok": False, "skipped": "没有可放行端口（port=0）"}
+
+        sig = str(self.port)
+        if prev.get("sig") == sig and prev.get("ok"):
+            return prev                        # 已经放行过，端口没变
+        if prev.get("sig") == sig and now - float(prev.get("ts") or 0) < PINHOLE_RETRY:
+            return prev                        # 刚失败过，别每轮都去撞
+
+        try:
+            if self.pinhole_fn is not None:
+                r = self.pinhole_fn([self.port], ["TCP"])
+            else:
+                from . import tunnel as tun_mod
+                r = tun_mod.pinhole_open([self.port], ["TCP"])
+        except Exception as e:
+            # 拿不到隧道层（例如被裁剪安装）也不该让整轮失败：
+            # 入站放行是本层的一个**加分项**，不是它存在的理由。
+            r = {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}
+
+        cur = {"ts": round(now, 1), "sig": sig, "port": self.port,
+               "ok": bool(r.get("ok")),
+               "need_admin": bool(r.get("need_admin")),
+               "created": r.get("created") or [],
+               "existed": r.get("existed") or [],
+               "err": r.get("err") or "",
+               "note": ("已放行 TCP/%d 的 v6 入站" % self.port if r.get("ok") else
+                        "改防火墙要管理员权限：当前进程没提权，入站可能仍被拦"
+                        if r.get("need_admin") else
+                        "入站放行没成功（%s）：自检结论会偏向 blind，但不代表网络不通"
+                        % (r.get("err") or "未知原因"))}
+        st["pinhole"] = cur
+        # 只在**结果变化**时记事件：每轮都写一条「还是原样」会把真事件埋掉
+        if (cur["ok"] != prev.get("ok")) or (cur["ok"] and prev.get("sig") != sig):
+            events.append({"ts": cur["ts"], "kind": "pinhole",
+                           "ok": cur["ok"], "port": self.port,
+                           "need_admin": cur["need_admin"],
+                           "why": cur["note"]})
+        return cur
 
     def _do_publish(self):
         if self.publish_fn is not None:
@@ -293,7 +393,7 @@ class AutoLink:
         return self.rdv.verify(self.origin, self.secret, port=self.port)
 
     def _finish(self, now, ok, status, err="", events=None, published=None,
-                verify=None, note="", err_kind=""):
+                verify=None, note="", err_kind="", pinhole=None):
         st = self._st
         st["status"] = status
         if not ok:
@@ -314,6 +414,8 @@ class AutoLink:
             out["published"] = published
         if verify is not None:
             out["verify"] = verify
+        if pinhole is not None:
+            out["pinhole"] = pinhole
         if note:
             out["note"] = note
         return out
@@ -394,8 +496,9 @@ def _advice(status, configured):
         "never": "还没跑过；rdv.auto.start 起来，或先 rdv.self 看一眼",
         "unverified": "等一个自检周期（默认 5 分钟），或手动 rdv.verify",
         "linked": "不用管：地址是最新的，且确认能进得来",
-        "blind": "开 pinhole（放行入站）或检查路由侧 v6 防火墙；"
-                 "在此期间对外只走中继",
+        "blind": "先用 tun.pinhole 看这道墙，再用 tun.pinhole.open 放行端口；"
+                 "已经放行还进不来，那就是路由侧的 v6 防火墙。"
+                 "此期间对外只走中继",
         "down": "先看中继是否可达、密钥是否正确",
     }.get(status, "")
 
@@ -621,6 +724,56 @@ def _selftest():
 
         print("\n【10】配置不全会说清缺什么，而不是「失败」了事")
         chk("FLEET_WSRELAY" in e.status_dict["advice"], "advice 直指环境变量名")
+
+        print("\n【11】入站放行自动化：只开在用端口，失败不改上报结论")
+        calls = []
+
+        def ph_ok(ports, protos):
+            calls.append((list(ports), list(protos)))
+            return {"ok": True, "created": ["skynet.pinhole.TCP.45990"], "existed": []}
+
+        z = AutoLink(rdv=FakeRdv(), origin="http://relay.example/pair", secret="s",
+                     state_path=os.path.join(d, "z.json"), clock=clock,
+                     publish_fn=fake_pub, verify_fn=fake_ver, port=0,
+                     pinhole_fn=ph_ok)
+        z.tick()
+        chk(not calls, "没有端口时不去动防火墙（那跟防火墙无关）")
+
+        z.port = 45990
+        rz = z.tick()
+        chk(len(calls) == 1 and calls[0] == ([45990], ["TCP"]),
+            "有端口时只放行这一个端口、且只放 TCP（打洞要的 UDP 不替人开会）")
+        chk(rz.get("pinhole", {}).get("ok") is True, "放行结果回填到这一轮的返回里")
+        z.tick()
+        chk(len(calls) == 1, "已放行且端口没变 → 不再重复改防火墙")
+
+        off = AutoLink(rdv=FakeRdv(), origin="http://relay.example/pair", secret="s",
+                       state_path=os.path.join(d, "off.json"), clock=clock,
+                       publish_fn=fake_pub, verify_fn=fake_ver, port=8080,
+                       auto_pinhole=False, pinhole_fn=ph_ok)
+        n0 = len(calls)
+        off.tick()
+        chk(len(calls) == n0, "auto_pinhole=0 时一条规则都不碰（留一个别动我机器的开关）")
+
+        na = AutoLink(rdv=FakeRdv(), origin="http://relay.example/pair", secret="s",
+                      state_path=os.path.join(d, "na.json"), clock=clock,
+                      publish_fn=fake_pub, verify_fn=fake_ver, port=8080,
+                      pinhole_fn=lambda p, q: {"ok": False, "need_admin": True,
+                                               "err": "没提权"})
+        rna = na.tick()
+        chk(rna.get("pinhole", {}).get("need_admin") is True,
+            "没权限时如实标 need_admin，不写成「开失败」")
+        chk(rna.get("ok") is True, "放行失败不影响这一轮 ok：地址确实报上去了")
+
+        def ph_boom(p, q):
+            raise RuntimeError("没有隧道层")
+
+        bo = AutoLink(rdv=FakeRdv(), origin="http://relay.example/pair", secret="s",
+                      state_path=os.path.join(d, "bo.json"), clock=clock,
+                      publish_fn=fake_pub, verify_fn=fake_ver, port=8080,
+                      pinhole_fn=ph_boom)
+        rbo = bo.tick()
+        chk(rbo.get("ok") is True, "放行抛异常也不把整轮弄死（它是加分项不是主线）")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

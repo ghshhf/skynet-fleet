@@ -257,15 +257,23 @@ def main():
     except Exception as e:
         print("    （本机 v6 监听不可用，跳过正向验证：%s）" % e)
     if p6:
+        # pinhole_fn 必须注入假实现：这一段会带着一个**真实的 v6 监听端口**跑
+        # 完整 tick，而 tick 里现在会自动去防火墙开入站放行。
+        # 不注入的话，跑一次门禁就在用户机器上留下一条 skynet.pinhole.TCP.<端口>
+        # 规则 —— 门禁污染真实系统状态，而且它长得像「正常配置」，事后没人会去删。
         loop2 = RA.AutoLink(rdv=RV.Rendezvous(
             state_path=os.path.join(TMP, "rdv2.json"), ttl=0.0),
             origin=origin, secret=SECRET,
             state_path=os.path.join(TMP, "real2.json"),
-            verify_every=0, deep_every=9999, port=p6)
+            verify_every=0, deep_every=9999, port=p6,
+            pinhole_fn=lambda ports, protos: {"ok": True, "created": [],
+                                              "existed": [], "ports": list(ports)})
         rp = loop2.tick()
         vp = rp.get("verify") or {}
         check(vp.get("confident") is True, "这次自检结论可信（有端口）")
         check(rp["status"] in ("linked", "blind"), "有端口时能给出明确结论")
+        check((rp.get("pinhole") or {}).get("ok") is True,
+              "有端口时走了一次入站放行（注入的假实现，不碰真防火墙）")
         # 打一个必然拒绝的端口，验证 hint 翻译
         pr2 = WSR.probe_from_relay(origin, "127.0.0.1", 1, SECRET)
         check(bool(pr2.get("hint")) or pr2.get("ok") is False,
