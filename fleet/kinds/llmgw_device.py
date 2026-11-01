@@ -1954,11 +1954,14 @@ def _sse_once(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
                                              "partial": bool(parts)})
     except Exception as e:
         # 首字节前挂 = 普通失败（可换上游）；首字节后挂 = 保住 partial，不重试
-        if not parts and not tool_acc:
+        _tcs_p = [_tool_slot(tool_acc[k]) for k in sorted(tool_acc)]
+        if not parts and not _tcs_p:
+            # 注意 _tcs_p 不只是「有没有」，它还承担修参数/丢坏件的职责：
+            # 半截 JSON 被丢掉之后这里可能是空，那说明这轮真的什么都没拿到，
+            # 必须当失败让上层换上游，而不是回一个空 body 假装成功。
             return (None, str(e)[:200], None, 0, "transport", "timeout", None,
                     {"ttft_s": ttft, "chunks": 0, "partial": False})
-        return (_sse_body(parts, reasoning, usage, gw, payload,
-                          [_tool_slot(tool_acc[k]) for k in sorted(tool_acc)]),
+        return (_sse_body(parts, reasoning, usage, gw, payload, _tcs_p),
                 None, gw["name"], 0, "ok", "ok", None,
                 {"ttft_s": ttft, "chunks": chunks, "partial": True,
                  "err": str(e)[:200]})
@@ -1982,19 +1985,118 @@ def _retry_after_of(headers):
         return None
 
 
+def _scan_json(text):
+    """扫一遍，返回 (待闭合栈, 是否停在字符串里, 安全回退点)。
+
+    安全回退点 = 不在字符串里的 `,` `{` `[` 的位置 —— 从这些地方截断，
+    剩下的部分还是一个语法上完整的前缀，才能补出合法 JSON。
+    """
+    stack, bounds = [], []
+    in_str = esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+            bounds.append(i)
+        elif ch in "}]":
+            if not stack or stack[-1] != ch:
+                return None                      # 括号乱序 = 这串彻底废了
+            stack.pop()
+        elif ch == ",":
+            bounds.append(i)
+    return stack, in_str, bounds
+
+
+def _close_json(text):
+    """只补尾部闭合符号。修不出合法 JSON 就返回 None。"""
+    probe = _scan_json(text)
+    if probe is None:
+        return None
+    stack, in_str, _ = probe
+    if in_str:
+        return None                              # 断在字符串里，不猜它本来要说什么
+    out = text.rstrip()
+    while out and out[-1] in ",:":
+        out = out[:-1].rstrip()                  # 悬空的逗号/冒号
+    if not out or out[-1] in "{[":
+        return None                              # 只剩个壳，没东西
+    out += "".join(reversed(stack))
+    try:
+        json.loads(out)
+        return out
+    except Exception:
+        return None
+
+
+def _repair_args(raw):
+    """修被截断的工具参数，返回修好的字符串；修不出来返回 None。
+
+    11-01 派代理实测撞到：上游流中途断开，arguments 停在
+    `{"query":"...","wiki_tag` 这种半截状态，客户端直接报「不是合法 JSON」，
+    整个工具调用作废 —— 而且它是**随机**的（取决于上游断在第几个 chunk），
+    表现为「代理有时候能干活、有时候莫名其妙失败」，最难查的那一类。
+
+    三层：① 本来合法 → 原样；② 只差闭合 → 补齐；③ 断在半路 → 回退到最近的
+    结构边界再补（最多 24 个，别在大 payload 上退化成 O(n²)）。
+    都修不出来返回 None —— 宁可让上层判「这轮没拿到东西」去换上游重试，
+    也绝不能把半截 JSON 交给客户端：那会变成一次参数残缺的真实操作。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "{}"
+    try:
+        json.loads(s)
+        return s
+    except Exception:
+        pass
+    probe = _scan_json(s)
+    if probe is None:
+        return None
+    stack, in_str, bounds = probe
+    if not in_str:
+        fixed = _close_json(s)
+        if fixed:
+            return fixed
+    for pos in reversed(bounds[-24:]):
+        fixed = _close_json(s[:pos])
+        if fixed:
+            return fixed
+    return None
+
+
 def _tool_slot(slot):
     """收尾一条累积中的 tool_call：补 id（有的上游压根不给）、丢掉空壳。
 
     空壳必须丢 —— 只回 name 没 arguments 的条目会让客户端发起一次「参数为空」的调用，
     那比不给工具更糟（等于让模型瞎猜）。
+
+    参数是半截 JSON 的也丢（见 _repair_args）。丢了之后上层会看到「没有工具调用、
+    也没有正文」，于是判这轮失败、换上游重试 —— 那是正确行为；
+    留一条修不好的调用给客户端，等于让它拿残缺参数去动真东西。
     """
     sid = slot.get("id") or "call_%s" % uuid.uuid4().hex[:12]
     fn = slot.get("function") or {}
     if not fn.get("name"):
         return None
+    args = _repair_args(fn.get("arguments"))
+    if args is None:
+        try:
+            print("[llmgw] 工具参数截断且修不回来，已丢弃：%s %s"
+                  % (fn["name"], str(fn.get("arguments"))[:80]), file=sys.stderr)
+        except Exception:
+            pass
+        return None
     return {"id": sid, "type": slot.get("type") or "function",
-            "function": {"name": fn["name"],
-                         "arguments": fn.get("arguments") or "{}"}}
+            "function": {"name": fn["name"], "arguments": args}}
 
 
 def _sse_body(parts, reasoning, usage, gw, payload, tool_calls=None):
@@ -4507,6 +4609,25 @@ def _selftest():
         b2 = g0["_sse_body"](["你好"], [], {}, {"name": "t"}, {"model": "m"}, [])
         assert b2["choices"][0]["finish_reason"] == "stop"
         assert b2["choices"][0]["message"]["content"] == "你好"
+
+        # ㉞ 流被上游掐断 → 工具参数是半截 JSON，必须修好或丢掉，不能原样交给客户端。
+        #    11-01 派代理实测：`{"query":"...","wiki_tag` 这种残尾让客户端直接报
+        #    「不是合法 JSON」，工具调用随机失效 —— 随机的故障最难查。
+        rep = g0["_repair_args"]
+        assert rep('{"query": "hi"}') == '{"query": "hi"}', "本来就合法的不动"
+        # 只差闭合：补齐
+        assert json.loads(rep('{"query": "hi"')) == {"query": "hi"}, "缺右括号要补"
+        # 断在半路：回退到最后一个逗号边界，保住能保的字段
+        got = json.loads(rep('{"query": "hi", "wiki_tag'))
+        assert got == {"query": "hi"}, got
+        # 断在字符串里又退不回来（没有边界可退）→ 宁可返回 None 让上层换上游
+        assert rep('"just a broken string') is None
+        assert rep("{{{{") is None, "结构乱掉的直接放弃"
+        # 半截参数整条丢掉，别让客户端拿残参去动真东西
+        assert g0["_tool_slot"]({"function": {
+            "name": "web_fetch", "arguments": '{"query":"x","wiki_tag'}}) is not None
+        assert g0["_tool_slot"]({"function": {
+            "name": "web_fetch", "arguments": '{{{'}}) is None
 
         # ㉝ Responses 协议的工具透传（agent 走 gpt/claude 类时的唯一通道）。
         #    11-01 实测：这条路以前**完全没发 tools** —— 模型只好回「当前会话没有可调用的
