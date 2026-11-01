@@ -39,8 +39,10 @@
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import os
+import queue
 import socket
 import ssl
 import struct
@@ -125,14 +127,229 @@ class FrameReader:
         return opcode, payload
 
 
+# ---------------------------------------------------------------- 中继配对
+#
+# 上面那一整套是「WS → 某个 host:port」，本质是**出口代理**：
+# 客户端说自己要去哪，服务端替它连。
+#
+# 对等中继要的是另一件事：**两台机器各自接进来，由中继转发彼此的字节**。
+# 谁都不指定目标，目标是「另一个也连进来的人」。
+#
+# 这两件事不能用同一套参数凑：出口代理的语义里压根没有「对端」这个概念。
+# 所以 /pair 是一条独立路径，不是 /tunnel 加个 flag。
+#
+# 协议（/pair）：
+#   1. WS 握手后第一条文本帧：{"room": "<id>", "token": "<hmac>"}
+#   2. 房间空 → 回 {"ok":true,"waiting":true}，等第二个到
+#   3. 房间有人 → 双方各收 {"ok":true,"paired":true}，此后二进制帧双向透传
+#   4. 任一方断 → 另一方收 close
+#
+# 威胁模型（写清楚，免得高估它的安全性）：
+#   token = HMAC(secret, room)[:32]，secret 由 WSRELAY_SECRET 下发、客户端共享。
+#   它挡的是「扫到 /pair 端点就来占房间」这类被动/随机攻击；
+#   **挡不住已经拿到 secret 的人**。要防内部人，得换成非对称签名或一次性票据。
+#   房间号本身是 16 hex 随机（会话 id），这是第二道。
+
+PAIR_WAIT = 30.0     # 第一个端点最多等多久
+PAIR_PING = 20.0     # 保活间隔：PaaS 空闲超时通常 30~60s，20s 留足余量
+
+
+def pair_token(room, secret):
+    """房间令牌。room 与 secret 一起进 HMAC，改任一个都算不出来。"""
+    return hmac.new(str(secret).encode("utf-8"), str(room).encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+class PairHub:
+    """房间 → 正在等待的端点。第二个到齐时把两个端点互指，配成一对。"""
+
+    def __init__(self):
+        self._waiting = {}
+        self._lock = threading.Lock()
+        self.stats = {"paired": 0, "expired": 0, "rejected": 0}
+
+    def put(self, room, ep):
+        """放一个端点进房间。返回已在等的那一个（配对成功），或 None（自己成为等待者）。"""
+        with self._lock:
+            other = self._waiting.pop(room, None)
+            if other is None:
+                self._waiting[room] = ep
+                return None
+            self.stats["paired"] += 1
+            return other
+
+    def drop(self, room, ep):
+        """撤销等待。只撤自己，别把后来者踢了。"""
+        with self._lock:
+            if self._waiting.get(room) is ep:
+                self._waiting.pop(room, None)
+
+
+class _PairEnd:
+    """一个中继端点。
+
+    每个端点只有一个读线程，它负责把收到的字节**转给对方**；
+    两个端点各一个读线程，双向管道就成形了 —— 不需要额外的转发线程。
+    """
+
+    def __init__(self, f, reader, addr=""):
+        self.f = f
+        self.reader = reader
+        self.addr = addr
+        self.peer = None
+        self.stop = threading.Event()
+        self._send_lock = threading.Lock()   # 读线程和 ping 线程都会写，必须串行
+        self._closed = False
+
+    def send(self, payload, opcode=OP_BIN):
+        if self._closed:
+            return False
+        try:
+            with self._send_lock:
+                ws_send(self.f, payload, opcode)
+            return True
+        except Exception:
+            self._closed = True
+            return False
+
+    def close(self):
+        self._closed = True
+        self.stop.set()
+        try:
+            with self._send_lock:
+                ws_send(self.f, b"", OP_CLOSE)
+        except Exception:
+            pass
+
+    def pump(self):
+        """把本端点收到的字节转给对方；任一方向断掉就收摊。"""
+        try:
+            while not self.stop.is_set():
+                op, payload = self.reader.read_frame()
+                if op == OP_CLOSE:
+                    break
+                if op == OP_PING:
+                    self.send(payload, OP_PONG)
+                    continue
+                if op in (OP_BIN, OP_CONT) and payload:
+                    if self.peer is None or not self.peer.send(payload):
+                        break
+        except Exception:
+            pass
+        finally:
+            self.stop.set()
+            # 一端走了，另一端必须收到 close —— 否则它会在那儿傻等，
+            # 上层看到的是「连着的」，实际对端早就没了。
+            if self.peer is not None:
+                self.peer.close()
+
+
+def _keepalive(ep, interval=PAIR_PING):
+    """定期发 WS ping。PaaS 会掐空闲连接，不保活的话「已连接」几分钟后静默失效。"""
+    while not ep.stop.wait(interval):
+        if not ep.send(b"", OP_PING):
+            return
+
+
+# ---------------------------------------------------------------- 地址簿
+class _AddrBook:
+    """设备指纹 → 当前地址。
+
+    为什么需要它：IPv6 地址会轮换（RFC 4941 临时地址按小时变，家宽重新拨号
+    前缀也会变）。如果对端把上次看到的地址存进配置，第二天必然连不上，
+    而且现象看起来像「网络坏了」而不是「地址变了」。
+
+    正确做法不是「只留稳定地址」，而是**把变化本身当作常态**：
+    本机定期上报当前地址，对端按指纹查最新值。这样临时地址也能用，
+    而且比只押一个稳定地址更抗变化。
+
+    有效期刻意给 7 天而不是几分钟：设备关机再开机、路上断网几小时都正常，
+    一过期就删会让「回家再连」变成「找不到设备」。
+    """
+
+    def __init__(self, ttl=7 * 86400, cap=2000):
+        self._d = {}
+        self._lock = threading.Lock()
+        self.ttl = ttl
+        self.cap = cap
+        self.stats = {"put": 0, "hit": 0, "miss": 0}
+
+    def put(self, fp, addrs, ts=None, meta=None):
+        fp = str(fp or "").strip()[:80]
+        if not fp:
+            return {"ok": False, "err": "fingerprint 不能为空"}
+        clean = []
+        for c in (addrs or [])[:16]:
+            if isinstance(c, dict) and c.get("ip"):
+                clean.append({"ip": str(c["ip"])[:64],
+                              "port": int(c.get("port") or 0),
+                              "temporary": c.get("temporary")})
+            elif isinstance(c, str) and c:
+                clean.append({"ip": c[:64], "port": 0, "temporary": None})
+        if not clean:
+            return {"ok": False, "err": "没有可用地址"}
+
+        now = time.time()
+        rec = {"fp": fp, "addrs": clean, "ts": float(ts or now),
+               "seen": now, "meta": (meta or {}) if isinstance(meta, dict) else {}}
+        with self._lock:
+            self._d[fp] = rec
+            self.stats["put"] += 1
+            self._sweep_locked(now)
+        return {"ok": True, "fp": fp, "addrs": len(clean)}
+
+    def get(self, fp):
+        with self._lock:
+            rec = self._d.get(str(fp or "").strip())
+            if rec is None:
+                self.stats["miss"] += 1
+                return None
+            self.stats["hit"] += 1
+            out = dict(rec)
+        out["age"] = round(time.time() - out["seen"], 1)
+        return out
+
+    def list(self, limit=200):
+        now = time.time()
+        with self._lock:
+            items = sorted(self._d.values(), key=lambda r: -r["seen"])[:limit]
+        return [{"fp": r["fp"], "addrs": len(r["addrs"]),
+                 "age": round(now - r["seen"], 1)} for r in items]
+
+    def sweep(self):
+        with self._lock:
+            return self._sweep_locked(time.time())
+
+    def _sweep_locked(self, now):
+        dead = [k for k, v in self._d.items() if now - v["seen"] > self.ttl]
+        for k in dead:
+            self._d.pop(k, None)
+        # 上限保护：地址簿是内存里的，被灌爆会把中继一起拖死
+        if len(self._d) > self.cap:
+            for k, _ in sorted(self._d.items(), key=lambda kv: kv[1]["seen"])[:len(self._d) - self.cap]:
+                self._d.pop(k, None)
+        return len(dead)
+
+
 # ---------------------------------------------------------------- 服务端
 class WsTunnelServer:
-    """把 WS 连接变成一条 TCP 隧道。零依赖，跑在任意能监听 $PORT 的 PaaS 上。"""
+    """把 WS 连接变成一条 TCP 隧道。零依赖，跑在任意能监听 $PORT 的 PaaS 上。
 
-    def __init__(self, port: int, host: str = "0.0.0.0", verbose: bool = True):
+    同一个进程里还挂了两件事，因为它们必须共用一份 secret 和同一个公网门牌：
+      /pair  对等中继（两台机器配对后互相转发字节）
+      /addr  地址簿（IPv6 地址会轮换，对端要按设备指纹查「现在在哪」）
+    """
+
+    def __init__(self, port: int, host: str = "0.0.0.0", verbose: bool = True,
+                 secret: str = ""):
         self.port = port
         self.host = host
         self.verbose = verbose
+        # secret 为空时 /pair 与 /addr 一律拒绝 —— 开放的无鉴权中继等于给全网
+        # 提供一个免费跳板，既危险也会被滥用。宁可不提供服务。
+        self.secret = secret or os.environ.get("WSRELAY_SECRET", "")
+        self.hub = PairHub()
+        self.addrbook = _AddrBook()
 
     def log(self, *a):
         if self.verbose:
@@ -178,16 +395,29 @@ class WsTunnelServer:
     def _serve_conn(self, conn, addr):
         head, rest = self._read_http_head(conn)
         lines = head.split("\r\n")
-        path = lines[0].split()[1] if len(lines[0].split()) > 1 else "/"
+        parts = lines[0].split()
+        method = parts[0] if parts else "GET"
+        raw_path = parts[1] if len(parts) > 1 else "/"
         hdrs = {}
         for ln in lines[1:]:
             if ":" in ln:
                 k, v = ln.split(":", 1)
                 hdrs[k.strip().lower()] = v.strip()
 
+        u = urllib.parse.urlsplit(raw_path)
+        route = (u.path or "/").rstrip("/") or "/"
+        q = urllib.parse.parse_qs(u.query)
+        is_ws = hdrs.get("upgrade", "").lower() == "websocket"
+
+        # ---- 地址簿与外部回连检查：一次性小请求，开 WS 没意义，走普通 HTTP
+        if route in ("/addr", "/probe") and not is_ws:
+            self._serve_addr(conn, method, route, q, hdrs, rest)
+            return
+
         # 健康检查：PaaS 会来要 200，不能因为没 WS 头就拒绝
-        if hdrs.get("upgrade", "").lower() != "websocket":
-            body = b'{"ok":true,"service":"skynet-wsrelay"}'
+        if not is_ws:
+            body = b'{"ok":true,"service":"skynet-wsrelay",' \
+                   b'"routes":["/tunnel","/pair","/addr","/probe"]}'
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                 b"Content-Length: " + str(len(body)).encode() + b"\r\n"
@@ -210,13 +440,86 @@ class WsTunnelServer:
             f = _PreloadedFile(rest, f)
         reader = FrameReader(f)
 
-        # 第一条文本帧：目标地址
+        # 第一条文本帧：路由参数
         op, payload = reader.read_frame()
         if op != OP_TEXT:
             ws_send(f, b'{"ok":false,"err":"first frame must be text"}', OP_TEXT)
             return
         try:
             req = json.loads(payload.decode())
+        except Exception as e:
+            ws_send(f, json.dumps({"ok": False, "err": f"bad request: {e}"}).encode(), OP_TEXT)
+            return
+        if not isinstance(req, dict):
+            ws_send(f, b'{"ok":false,"err":"first frame must be an object"}', OP_TEXT)
+            return
+
+        if route == "/pair":
+            self._serve_pair(f, reader, req, addr)
+        else:
+            self._serve_tunnel(f, reader, req, addr)
+
+    # ---- /pair：对等中继
+    def _serve_pair(self, f, reader, req, addr):
+        if not self.secret:
+            ws_send(f, b'{"ok":false,"err":"relay has no secret (set WSRELAY_SECRET)"}',
+                    OP_TEXT)
+            return
+
+        room = str(req.get("room") or "").strip()[:64]
+        token = str(req.get("token") or "")
+        if not room or not token:
+            ws_send(f, b'{"ok":false,"err":"room and token required"}', OP_TEXT)
+            return
+        if not hmac.compare_digest(pair_token(room, self.secret), token):
+            self.hub.stats["rejected"] += 1
+            self.log(f"{addr[0]} pair 拒绝：token 不对（room={room[:8]}）")
+            ws_send(f, b'{"ok":false,"err":"bad token"}', OP_TEXT)
+            return
+
+        ep = _PairEnd(f, reader, addr=addr[0])
+        other = self.hub.put(room, ep)
+
+        if other is None:
+            # 我是第一个：先告诉它「在等」，再阻塞等对端。
+            # 等待期间必须保活，否则 PaaS 会在第 30 秒把这条连接掐掉，
+            # 而配对超时恰好也是 30 秒 —— 会变成「永远差一点点」。
+            ws_send(f, b'{"ok":true,"waiting":true}', OP_TEXT)
+            threading.Thread(target=_keepalive, args=(ep,), daemon=True).start()
+
+            deadline = time.time() + PAIR_WAIT
+            while time.time() < deadline and ep.peer is None and not ep.stop.is_set():
+                time.sleep(0.05)
+            if ep.peer is None:
+                self.hub.drop(room, ep)
+                self.hub.stats["expired"] += 1
+                ep.send(b'{"ok":false,"err":"no peer in time"}', OP_TEXT)
+                ep.close()
+                self.log(f"pair 超时 room={room[:8]}")
+                return
+            # 对端到了。**每个端点各自跑自己的 pump**，谁都不替别人起线程 ——
+            # 因为本连接的 socket 生命周期归本线程管（_handle 的 finally 会在
+            # 本函数返回后才关，替别人跑的话线程一放出去就被掐断）。
+            self.log(f"pair 成对 room={room[:8]} {addr[0]}（等待侧）")
+            ep.pump()
+            return
+
+        # 我是第二个到：把两边互指，通知双方，然后跑自己的 pump
+        other.peer = ep
+        ep.peer = other
+        self.log(f"pair 成对 room={room[:8]} {other.addr} <-> {addr[0]}")
+        if not other.send(b'{"ok":true,"paired":true}', OP_TEXT):
+            ep.close()
+            return
+        if not ep.send(b'{"ok":true,"paired":true}', OP_TEXT):
+            other.close()
+            return
+        threading.Thread(target=_keepalive, args=(ep,), daemon=True).start()
+        ep.pump()
+
+    # ---- /tunnel：出口代理（原逻辑）
+    def _serve_tunnel(self, f, reader, req, addr):
+        try:
             thost, tport = req["host"], int(req.get("port", 443))
         except Exception as e:
             ws_send(f, json.dumps({"ok": False, "err": f"bad request: {e}"}).encode(), OP_TEXT)
@@ -233,6 +536,87 @@ class WsTunnelServer:
         self.log(f"{addr[0]} → {thost}:{tport}")
         ws_send(f, b'{"ok":true}', OP_TEXT)
         self._pump(reader, f, up)
+
+    # ---- /addr 与 /probe：地址簿 + 外部回连检查
+    def _serve_addr(self, conn, method, route, q, hdrs, rest):
+        """地址簿读写 + **从外部反向连回来**的入站自检。
+
+        `/probe` 是本文件里唯一能回答「对端到底能不能连进来」的地方。
+        本机自己测入站是测不出来的：本机往自己的公网地址发包走的是
+        hairpin，很多 NAT 根本不支持，通不通都不代表外网能连。
+        只有站在墙外的人来试才算数 —— 中继正好就在墙外。
+        """
+        body = rest
+        try:
+            clen = int(hdrs.get("content-length") or 0)
+        except ValueError:
+            clen = 0
+        while len(body) < clen:
+            d = conn.recv(65536)
+            if not d:
+                break
+            body += d
+
+        def reply(obj, code=200):
+            b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            conn.sendall(
+                (f"HTTP/1.1 {code} OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+                 f"Content-Length: {len(b)}\r\nConnection: close\r\n\r\n").encode() + b
+            )
+
+        if not self.secret:
+            reply({"ok": False, "err": "relay has no secret (set WSRELAY_SECRET)"}, 503)
+            return
+
+        one = lambda k, d="": (q.get(k) or [d])[0]  # noqa: E731
+
+        # ---- 入站自检：从现在这台（墙外的）机器去连客户端的地址
+        if route == "/probe":
+            target = one("target")
+            token = one("token")
+            if not target:
+                reply({"ok": False, "err": "target required"}, 400)
+                return
+            if not hmac.compare_digest(pair_token(f"probe:{target}", self.secret), token):
+                reply({"ok": False, "err": "bad token"}, 403)
+                return
+            try:
+                t0 = time.time()
+                s = socket.create_connection((target, int(one("port", "0") or 0)),
+                                             timeout=5)
+                s.close()
+                reply({"ok": True, "target": target,
+                       "ms": round((time.time() - t0) * 1000)})
+            except Exception as e:
+                reply({"ok": False, "target": target,
+                       "err": f"{type(e).__name__}: {e}"})
+            return
+
+        # ---- 地址簿：GET 查、POST 写
+        if method.upper() == "POST":
+            try:
+                req = json.loads(body.decode("utf-8") or "{}")
+            except Exception as e:
+                reply({"ok": False, "err": f"bad json: {e}"}, 400)
+                return
+            fp = str(req.get("fp") or "")
+            if not hmac.compare_digest(pair_token(f"put:{fp}", self.secret),
+                                       str(req.get("token") or "")):
+                reply({"ok": False, "err": "bad token"}, 403)
+                return
+            reply(self.addrbook.put(fp, req.get("addrs"),
+                                    ts=req.get("ts"), meta=req.get("meta")))
+            return
+
+        fp = one("fp")
+        if not fp:
+            reply({"ok": True, "devices": self.addrbook.list()})
+            return
+        rec = self.addrbook.get(fp)
+        if rec is None:
+            reply({"ok": False, "err": "unknown fingerprint", "fp": fp}, 404)
+            return
+        reply({"ok": True, **rec})
 
     def _pump(self, reader, f, up):
         """双向泵：WS 二进制帧 ↔ TCP。任一侧断开就收摊。"""
@@ -393,9 +777,262 @@ def connect_via_ws(url: str, host: str, port: int, timeout: float = 20.0) -> WsS
     return WsSock(raw, f, reader)
 
 
+def _open_ws(url: str, timeout: float = 20.0):
+    """握手到 101，返回 (raw, f, reader)。connect_via_ws 与 connect_pair 共用。"""
+    u = urllib.parse.urlsplit(url)
+    tls = u.scheme in ("wss", "https")
+    thost = u.hostname
+    tport = u.port or (443 if tls else 80)
+    path = u.path or "/"
+
+    raw = socket.create_connection((thost, tport), timeout=timeout)
+    if tls:
+        ctx = ssl.create_default_context()
+        raw = ctx.wrap_socket(raw, server_hostname=thost)
+    raw.settimeout(timeout)
+
+    key = base64.b64encode(os.urandom(16)).decode()
+    raw.sendall(
+        f"GET {path} HTTP/1.1\r\nHost: {thost}\r\n"
+        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+        f"User-Agent: skynet-wsrelay/2\r\n\r\n".encode()
+    )
+
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = raw.recv(4096)
+        if not d:
+            raise ConnectionError("handshake closed")
+        buf += d
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    first = head.split(b"\r\n", 1)[0]
+    if b" 101 " not in first:
+        raise ConnectionError(f"upgrade refused: {first[:80]!r}")
+
+    f = raw.makefile("rwb", buffering=0)
+    if rest:
+        f = _PreloadedFile(rest, f)
+    return raw, f, FrameReader(f)
+
+
+class PairedSock:
+    """对等中继端点，形状和 socket 一样（sendall / recv / close）。
+
+    与 `WsSock` 的区别是「谁在对端」：
+      WsSock      —— 对端是中继替我们连上的某个 host:port（出口代理）
+      PairedSock  —— 对端是**另一个也连进同一房间的人**，中继只转发不看内容
+
+    收数据必须用后台线程 + 队列：隧道层会随时 `recv`，而 WS 帧是异步到达的。
+    没有队列就得让调用方精确掌握收发节奏，任何一处节奏错位都会变成「卡住」。
+    """
+
+    def __init__(self, sock, f, reader, room=""):
+        self.sock = sock
+        self.f = f
+        self.reader = reader
+        self.room = room
+        self.q = queue.Queue()
+        self.closed = False
+        self.err = ""
+        self._stop = threading.Event()
+        self._send_lock = threading.Lock()
+        self._pending = b""
+        threading.Thread(target=self._reader_loop, daemon=True).start()
+
+    def _reader_loop(self):
+        try:
+            while not self._stop.is_set():
+                op, payload = self.reader.read_frame()
+                if op == OP_CLOSE:
+                    break
+                if op == OP_PING:
+                    self._raw_send(payload, OP_PONG)
+                    continue
+                if op in (OP_BIN, OP_CONT) and payload:
+                    # 队列满说明下游读得比上游发得慢太多。**不能丢数据**——
+                    # 文件传输丢一块就是 sha256 对不上。这里阻塞等，由 stop 兜底。
+                    while not self._stop.is_set():
+                        try:
+                            self.q.put(payload, timeout=1.0)
+                            break
+                        except queue.Full:
+                            continue
+        except Exception as e:
+            self.err = f"{type(e).__name__}: {e}"
+        finally:
+            self.closed = True
+            self.q.put(None)      # 唤醒还在 recv 里的调用方
+
+    def _raw_send(self, data, opcode=OP_BIN):
+        if self.closed:
+            return False
+        try:
+            with self._send_lock:
+                ws_send(self.f, data, opcode, mask=True)
+            return True
+        except Exception as e:
+            self.err = f"{type(e).__name__}: {e}"
+            self.closed = True
+            return False
+
+    # ---- socket 形状
+    def sendall(self, data: bytes):
+        if not self._raw_send(data):
+            raise ConnectionError(self.err or "pair closed")
+
+    def send(self, data: bytes):
+        """隧道层只要 send 返回「发出去多少」。发不出去返回 0，不抛。"""
+        return len(data) if self._raw_send(data) else 0
+
+    def recv(self, n: int = 65536) -> bytes:
+        if self._pending:
+            out, self._pending = self._pending[:n], self._pending[n:]
+            return out
+        item = self.q.get()
+        if item is None:
+            return b""
+        if len(item) > n:
+            self._pending = item[n:]
+            return item[:n]
+        return item
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                with self._send_lock:
+                    ws_send(self.f, b"", OP_CLOSE, mask=True)
+            except Exception:
+                pass
+        self._stop.set()
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def connect_pair(url: str, room: str, secret: str, timeout: float = 30.0) -> PairedSock:
+    """连中继的 /pair，等对端到齐，返回可双向读写的端点。
+
+    会阻塞到配对成功（或超时）。`timeout` 默认与服务端 PAIR_WAIT 对齐：
+    短了对端还没连上来就放弃，长了要白占一条 PaaS 连接。
+    """
+    raw, f, reader = _open_ws(url, timeout=timeout)
+    ws_send(f, json.dumps({"room": room, "token": pair_token(room, secret)}).encode(),
+            OP_TEXT, mask=True)
+
+    op, payload = reader.read_frame()
+    if op != OP_TEXT:
+        raise ConnectionError(f"expected text reply, got op={op}")
+    resp = json.loads(payload.decode())
+    if not resp.get("ok"):
+        raise ConnectionError(f"pair refused: {resp.get('err')}")
+
+    if resp.get("waiting"):
+        deadline = time.time() + timeout
+        paired = False
+        while time.time() < deadline:
+            op, payload = reader.read_frame()
+            if op == OP_PING:
+                ws_send(f, payload, OP_PONG, mask=True)
+                continue
+            if op != OP_TEXT:
+                continue
+            r2 = json.loads(payload.decode())
+            if r2.get("paired"):
+                paired = True
+                break
+            if not r2.get("ok"):
+                raise ConnectionError(f"pair lost: {r2.get('err')}")
+        if not paired:
+            raise ConnectionError("pair timeout: 对端在等待窗口内没有连上来")
+
+    return PairedSock(raw, f, reader, room=room)
+
+
+# ---------------------------------------------------------------- 地址簿客户端
+#
+# 这三个函数只做一件事：让「地址会变」不再是问题。
+# 设备指纹不变，地址随时上报 —— 对端永远只问指纹，不问 IP。
+# 这就是主人口里那句「另类的固态」：对外是固定标识，对内随便漂。
+
+def addr_put(origin: str, fp: str, addrs, secret: str, meta=None, timeout: float = 8.0):
+    """把「我现在在哪」写进中继的地址簿。地址变了就再写一次。"""
+    body = json.dumps({"fp": fp, "addrs": addrs, "ts": time.time(),
+                       "meta": meta or {},
+                       "token": pair_token(f"put:{fp}", secret)}).encode("utf-8")
+    return _http_json(origin, "/addr", "POST", body, timeout=timeout)
+
+
+def addr_get(origin: str, fp: str, timeout: float = 8.0):
+    """按设备指纹查「它现在在哪」。查不到如实返回 ok:false，不编一个地址出来。"""
+    return _http_json(origin, "/addr?" + urllib.parse.urlencode({"fp": fp}),
+                      "GET", b"", timeout=timeout)
+
+
+def addr_list(origin: str, timeout: float = 8.0):
+    return _http_json(origin, "/addr", "GET", b"", timeout=timeout)
+
+
+def probe_from_relay(origin: str, target: str, port: int, secret: str,
+                     timeout: float = 8.0):
+    """**从墙外回连我自己**，验证入站到底通不通。
+
+    这是整套方案里唯一可信的入站判据：本机往自己的公网地址发包走 hairpin，
+    很多 NAT 根本不支持 hairpin，通不通都不代表外网能连进来。
+    只有站在墙外的机器来试才算数 —— 中继正好在墙外。
+    """
+    qs = urllib.parse.urlencode({
+        "target": target, "port": port,
+        "token": pair_token(f"probe:{target}", secret)})
+    return _http_json(origin, "/probe?" + qs, "GET", b"", timeout=timeout)
+
+
+def _http_json(origin: str, route: str, method: str, body: bytes = b"",
+               timeout: float = 8.0):
+    """一次性 HTTP 请求，只返回解析后的 JSON。
+
+    `origin` 只要 scheme://host:port，路径全由 route 决定 ——
+    不让调用方拼路径，是避免「base 带了没带尾斜杠」这类低级不一致
+    （上一版就是靠字符串包含判断，既绕又容易错）。
+    """
+    u = urllib.parse.urlsplit(origin)
+    tls = u.scheme in ("wss", "https")
+    thost = u.hostname
+    tport = u.port or (443 if tls else 80)
+    path = route if route.startswith("/") else "/" + route
+
+    raw = socket.create_connection((thost, tport), timeout=timeout)
+    if tls:
+        raw = ssl.create_default_context().wrap_socket(raw, server_hostname=thost)
+    try:
+        raw.sendall(
+            (f"{method} {path} HTTP/1.1\r\nHost: {thost}\r\n"
+             f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+             f"Connection: close\r\nUser-Agent: skynet-wsrelay/2\r\n\r\n").encode() + body
+        )
+        buf = b""
+        while True:
+            d = raw.recv(65536)
+            if not d:
+                break
+            buf += d
+    finally:
+        raw.close()
+
+    _, _, payload = buf.partition(b"\r\n\r\n")
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "err": f"响应不是 JSON：{e}",
+                "raw": payload[:200].decode("utf-8", "replace")}
+
+
 # ---------------------------------------------------------------- 自测
 def _selftest() -> int:
-    print("[1/3] 起一个本地 echo 服务 …", end=" ")
+    ok = 0
+    print("[1/5] 起一个本地 echo 服务 …", end=" ")
     echo_srv = socket.socket()
     echo_srv.bind(("127.0.0.1", 0))
     echo_srv.listen(4)
@@ -412,8 +1049,9 @@ def _selftest() -> int:
     threading.Thread(target=echo, daemon=True).start()
     print(f"OK (port {echo_port})")
 
-    print("[2/3] 起隧道服务端 …", end=" ")
-    srv = WsTunnelServer(0, verbose=False)
+    print("[2/5] 起隧道服务端 …", end=" ")
+    selftest_secret = "wsrelay-selftest"
+    srv = WsTunnelServer(0, verbose=False, secret=selftest_secret)
     box = {}
     t = threading.Thread(
         target=srv.serve_forever, kwargs={"ready_cb": lambda p: box.update(port=p)}, daemon=True
@@ -427,7 +1065,7 @@ def _selftest() -> int:
     srv_port = box["port"]
     print(f"OK (port {srv_port})")
 
-    print("[3/3] 经 WS 隧道打 echo …", end=" ")
+    print("[3/5] 经 WS 隧道打 echo …", end=" ")
     tun = connect_via_ws(f"ws://127.0.0.1:{srv_port}/tunnel", "127.0.0.1", echo_port)
     payload = b"skynet-wsrelay-selftest-" + os.urandom(8).hex().encode()
     tun.sendall(payload)
@@ -437,11 +1075,54 @@ def _selftest() -> int:
         got += tun.recv(65536)
     tun.close()
     assert got == payload, f"回显不一致: 发 {payload!r} 收 {got!r}"
+    ok += 1
     print(f"OK ({len(payload)}B 完整往返)")
 
-    print("\n自测结果：3 过 / 0 败")
-    print("说明：这只验证 WS↔TCP 的搬运没问题。")
-    print("      能不能到 YouTube 取决于部署在墙外的那台机器，本机测不了。")
+    # ---- /pair：这一条才是「对等中继」的验收。部署到 PaaS 之后先跑它，
+    #      验不过就说明两端根本凑不到一起，后面什么都白搭。
+    print("[4/5] 对等配对（/pair 双向）…", end=" ")
+    pair_url = f"ws://127.0.0.1:{srv_port}/pair"
+    box2 = queue.Queue()
+
+    def _one(tag, first):
+        try:
+            s = connect_pair(pair_url, "selftest-room", selftest_secret, timeout=8)
+            if first:
+                s.sendall(first)
+            data = s.recv(65536)
+            box2.put((tag, True, data))
+            s.close()
+        except Exception as e:
+            box2.put((tag, False, f"{type(e).__name__}: {e}"))
+
+    threading.Thread(target=_one, args=("A", b"pair-ping"), daemon=True).start()
+    time.sleep(0.2)          # 先让 A 进等待态，覆盖「先到者等待」这条路径
+    threading.Thread(target=_one, args=("B", None), daemon=True).start()
+    res = {}
+    for _ in range(2):
+        tag, fine, val = box2.get(timeout=15)
+        res[tag] = (fine, val)
+    assert res.get("A", (False, ""))[0], f"A 没配成: {res.get('A')}"
+    assert res.get("B", (False, b""))[1] == b"pair-ping", f"数据没到 B: {res.get('B')}"
+    ok += 1
+    print("OK (两端配对，字节双向透传)")
+
+    print("[5/5] 地址簿（/addr 读写 + 鉴权）…", end=" ")
+    origin = f"http://127.0.0.1:{srv_port}"
+    r1 = addr_put(origin, "selftest-fp", [{"ip": "240e::1", "port": 9,
+                                          "temporary": True}], selftest_secret)
+    assert r1.get("ok"), f"写地址簿失败: {r1}"
+    r2 = addr_get(origin, "selftest-fp")
+    assert r2.get("ok") and r2["addrs"][0]["ip"] == "240e::1", f"读回不一致: {r2}"
+    r3 = addr_put(origin, "selftest-fp", [{"ip": "1::1"}], "wrong-secret")
+    assert r3.get("ok") is False, "错 secret 竟然写进去了"
+    ok += 1
+    print("OK (读写通、错 token 被拒)")
+
+    print(f"\n自测结果：5 步全过（其中 {ok} 项带断言）")
+    print("说明：这只验证搬运机制没问题，不验证能不能到墙外目标 ——")
+    print("      那取决于部署在墙外的那台机器，本机测不了。")
+    print("      部署到 PaaS 后务必先跑一遍：python wsrelay.py --selftest")
     return 0
 
 
