@@ -69,6 +69,33 @@ def _accept_key(key: str) -> str:
     ).decode()
 
 
+def _errno_of(exc):
+    """取系统错误码。跨平台：Windows 是 winerror，类 Unix 是 errno。"""
+    return (getattr(exc, "winerror", None)
+            or getattr(exc, "errno", None) or 0)
+
+
+def _probe_hint(code):
+    """把裸错误码翻成人话。
+
+    为什么必须翻：`WinError 10049` 这种字串对调用方毫无用处，而它和
+    `10061（连接被拒绝）`在处置上完全不同 —— 前者是「测不了」，后者是
+    「真的进不来」。不区分就会把「参数没给对」当成「防火墙拦了」。
+    """
+    return {
+        10049: "地址无效：多半是端口为 0 或本机没有这个地址（属于测不了，不是进不来）",
+        10061: "连接被拒绝：对端没在监听，或被防火墙 REJECT",
+        10060: "连接超时：包被丢弃，多半是防火墙 DROP 或地址不可达",
+        10065: "无法到达主机：没有到该地址的路由",
+        10013: "权限被拒：目标端口被策略禁止",
+        11001: "域名解析失败",
+        111: "连接被拒绝：对端没在监听",
+        113: "无法到达主机：没有到该地址的路由",
+        101: "网络不可达",
+        60: "连接超时：包被丢弃（多半防火墙 DROP）",
+    }.get(int(code or 0), "")
+
+
 def ws_send(f, payload: bytes, opcode: int = OP_BIN, mask: bool = False):
     """发一帧。客户端必须加掩码（RFC 6455 6.1），服务端不许加。"""
     n = len(payload)
@@ -267,12 +294,109 @@ class _AddrBook:
     一过期就删会让「回家再连」变成「找不到设备」。
     """
 
-    def __init__(self, ttl=7 * 86400, cap=2000):
+    def __init__(self, ttl=7 * 86400, cap=2000, path=None):
         self._d = {}
         self._lock = threading.Lock()
         self.ttl = ttl
         self.cap = cap
-        self.stats = {"put": 0, "hit": 0, "miss": 0}
+        # 落盘路径。空 = 纯内存（旧行为）。PaaS 重启会把纯内存地址簿清空，
+        # 而「自动上报」恰恰依赖地址簿活着 —— 所以默认要落盘。
+        self.path = (path if path is not None
+                     else os.environ.get("SKYNET_ADDR_STORE", "")).strip()
+        self.persist = False          # 真的写成功过才算 True，不按「有路径」推断
+        self.last_save_err = ""
+        self._save_min = 2.0          # 写盘节流：地址每轮都在变，不能每轮都 fsync
+        self._last_save = 0.0
+        self.stats = {"put": 0, "hit": 0, "miss": 0,
+                      "load": 0, "save": 0, "save_err": 0}
+        if self.path:
+            self._load()
+
+    # ---- 落盘：内存为主，磁盘只做「重启后还在」这一件事
+    def _load(self):
+        """启动时读回。**任何异常都只降级、不阻断启动**：
+        地址簿读不出来最多是「设备暂时找不到」，而中继起不来是全网不可用，
+        两者不是一个量级，不能因为一个坏 JSON 让中继罢工。"""
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            self.last_save_err = f"加载失败：{type(e).__name__}: {e}"
+            self.stats["save_err"] += 1
+            return
+
+        items = raw.get("devices") if isinstance(raw, dict) else None
+        now = time.time()
+        n = 0
+        for rec in items or []:
+            if not isinstance(rec, dict):
+                continue
+            fp = str(rec.get("fp") or "").strip()[:80]
+            addrs = rec.get("addrs")
+            if not fp or not isinstance(addrs, list) or not addrs:
+                continue
+            try:
+                seen = float(rec.get("seen") or 0)
+            except (TypeError, ValueError):
+                continue
+            if now - seen > self.ttl:      # 落盘期间可能已经过期，读回来照样要清
+                continue
+            self._d[fp] = {"fp": fp, "addrs": addrs[:16], "ts": rec.get("ts") or seen,
+                           "seen": seen,
+                           "meta": rec.get("meta") if isinstance(rec.get("meta"), dict) else {}}
+            n += 1
+        self.stats["load"] = n
+        self.persist = True               # 文件在且读得动 ⇒ 上次写得进去
+
+    def _save_locked(self, force=False):
+        """原子写：先写 .tmp 再 replace，避免断电留下半个 JSON。"""
+        if not self.path:
+            return False
+        now = time.time()
+        if not force and now - self._last_save < self._save_min:
+            return False
+        items = [{"fp": r["fp"], "addrs": r["addrs"], "ts": r["ts"],
+                  "seen": r["seen"], "meta": r["meta"]} for r in self._d.values()]
+        tmp = self.path + ".tmp"
+        try:
+            d = os.path.dirname(os.path.abspath(self.path))
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "saved": now, "devices": items},
+                          f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.replace(tmp, self.path)
+            except OSError:
+                # Windows 上目标被占用时 replace 会失败，重试一次通常就过了
+                time.sleep(0.05)
+                os.replace(tmp, self.path)
+            self.persist = True
+            self.last_save_err = ""
+            self._last_save = now
+            self.stats["save"] += 1
+            return True
+        except Exception as e:
+            # 只读磁盘（部分 PaaS）会走到这里。**不抛、不假装成功**：
+            # 置 persist=False，状态接口里能看见「地址簿其实只在内存」。
+            self.persist = False
+            self.last_save_err = f"{type(e).__name__}: {e}"
+            self.stats["save_err"] += 1
+            return False
+
+    def flush(self):
+        with self._lock:
+            return self._save_locked(force=True)
+
+    def store_info(self):
+        return {"path": self.path, "persist": self.persist,
+                "devices": len(self._d), "ttl": self.ttl,
+                "last_save_err": self.last_save_err,
+                "saves": self.stats["save"], "save_err": self.stats["save_err"]}
 
     def put(self, fp, addrs, ts=None, meta=None):
         fp = str(fp or "").strip()[:80]
@@ -296,6 +420,7 @@ class _AddrBook:
             self._d[fp] = rec
             self.stats["put"] += 1
             self._sweep_locked(now)
+            self._save_locked()
         return {"ok": True, "fp": fp, "addrs": len(clean)}
 
     def get(self, fp):
@@ -318,16 +443,23 @@ class _AddrBook:
 
     def sweep(self):
         with self._lock:
-            return self._sweep_locked(time.time())
+            n = self._sweep_locked(time.time())
+            if n:
+                self._save_locked(force=True)
+            return n
 
     def _sweep_locked(self, now):
         dead = [k for k, v in self._d.items() if now - v["seen"] > self.ttl]
         for k in dead:
             self._d.pop(k, None)
         # 上限保护：地址簿是内存里的，被灌爆会把中继一起拖死
+        n = len(dead)
         if len(self._d) > self.cap:
-            for k, _ in sorted(self._d.items(), key=lambda kv: kv[1]["seen"])[:len(self._d) - self.cap]:
+            extra = sorted(self._d.items(), key=lambda kv: kv[1]["seen"])[:len(self._d) - self.cap]
+            for k, _ in extra:
                 self._d.pop(k, None)
+            n += len(extra)
+        return n
         return len(dead)
 
 
@@ -341,7 +473,7 @@ class WsTunnelServer:
     """
 
     def __init__(self, port: int, host: str = "0.0.0.0", verbose: bool = True,
-                 secret: str = ""):
+                 secret: str = "", addr_path: str = ""):
         self.port = port
         self.host = host
         self.verbose = verbose
@@ -349,7 +481,9 @@ class WsTunnelServer:
         # 提供一个免费跳板，既危险也会被滥用。宁可不提供服务。
         self.secret = secret or os.environ.get("WSRELAY_SECRET", "")
         self.hub = PairHub()
-        self.addrbook = _AddrBook()
+        # 默认落盘到工作目录：PaaS 重启后地址簿还在，自动上报才有意义
+        self.addrbook = _AddrBook(path=addr_path or os.environ.get("SKYNET_ADDR_STORE")
+                                  or os.path.join(".", "addrbook.json"))
 
     def log(self, *a):
         if self.verbose:
@@ -581,15 +715,27 @@ class WsTunnelServer:
                 reply({"ok": False, "err": "bad token"}, 403)
                 return
             try:
+                tport = int(one("port", "0") or 0)
+            except ValueError:
+                tport = 0
+            # 端口 0 不是「一个连不上的端口」，而是**根本不是一个端口**：
+            # Windows 会回 10049「请求的地址在其上下文中无效」。若把它当成
+            # 「不可达」，就会把「还没开监听」误报成「被防火墙拦了」，
+            # 让人去改一通根本没问题的防火墙。所以单独标 invalid，让上层区分。
+            if tport <= 0:
+                reply({"ok": False, "invalid": True, "target": target,
+                       "err": "没有可探测端口（port=0）：先在本机开监听口再验"}, 400)
+                return
+            try:
                 t0 = time.time()
-                s = socket.create_connection((target, int(one("port", "0") or 0)),
-                                             timeout=5)
+                s = socket.create_connection((target, tport), timeout=5)
                 s.close()
                 reply({"ok": True, "target": target,
                        "ms": round((time.time() - t0) * 1000)})
             except Exception as e:
-                reply({"ok": False, "target": target,
-                       "err": f"{type(e).__name__}: {e}"})
+                reply({"ok": False, "target": target, "errno": _errno_of(e),
+                       "err": "%s: %s" % (type(e).__name__, e),
+                       "hint": _probe_hint(_errno_of(e))})
             return
 
         # ---- 地址簿：GET 查、POST 写
@@ -610,7 +756,11 @@ class WsTunnelServer:
 
         fp = one("fp")
         if not fp:
-            reply({"ok": True, "devices": self.addrbook.list()})
+            # 不给 fp = 列全表。顺带把「到底落没落盘」说清楚：
+            # 只读磁盘的 PaaS 上 persist 会是 False，重启就清空，
+            # 部署方必须能看见这件事，而不是等重启后才发现设备全消失了。
+            reply({"ok": True, "devices": self.addrbook.list(),
+                   "store": self.addrbook.store_info()})
             return
         rec = self.addrbook.get(fp)
         if rec is None:

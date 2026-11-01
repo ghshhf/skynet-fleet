@@ -295,6 +295,16 @@ class FleetServer:
         self._thread = threading.Thread(target=httpd.serve_forever,
                                         kwargs={"poll_interval": 0.2}, daemon=True)
         self._thread.start()
+        # 地址自动化：只在 FLEET_RDV_AUTO=1 时才起（判断在 ensure_started 里）。
+        # 起来之后 /api/health 的 loops 段就能看到 rdv.auto 的心跳，
+        # 卡住会被标 stale —— 这正是 beat 骨架存在的意义（此前没有一个循环用它）。
+        # 失败绝不能拖垮主服务：一个可选的自动化不该让面板起不来。
+        try:
+            from .. import rdv_auto as _rdv_auto
+            _rdv_auto.ensure_started()
+        except Exception as e:
+            print("[fleet] 地址自动化未启动（不影响服务）：%s: %s"
+                  % (type(e).__name__, e), flush=True)
         return self.port
 
     def stop(self):

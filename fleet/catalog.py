@@ -34,6 +34,7 @@ from .kinds.reach_layer import ReachLayer
 from .kinds.nat_traversal import NatTraversal, SESSION_TTL
 from .kinds.tunnel_layer import TunnelLayer
 from .kinds.rendezvous_layer import RendezvousLayer
+from .kinds.rdv_auto_layer import RdvAutoLayer
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.reverse import Reverse
@@ -547,6 +548,23 @@ CAPABILITIES = [
     Capability("rdv.forget", "清掉本地地址记忆（下次 refresh 当作全新）",
                params=(), side_effect=True,
                note="清掉后不再知道「上次在哪」，也就无从判断「变了没有」"),
+    # ---- 地址自动化：把上面几条按周期串起来
+    Capability("rdv.auto.start", "起地址自动循环：变了就上报，定期从墙外自检",
+               params=(Param("relay_url", "str", doc="不给就用 FLEET_WSRELAY"),
+                       Param("relay_secret", "str", doc="不给就用 FLEET_WSRELAY_SECRET"),
+                       Param("interval", "int", doc="一轮多少秒，默认 60"),
+                       Param("verify_every", "int", doc="墙外自检周期，默认 300"),
+                       Param("deep_every", "int", doc="含 STUN 的深检周期，默认 1800"),
+                       Param("port", "int", doc="本机监听口；缺了只能判 unverified")),
+               side_effect=True,
+               note="进程内线程，只在长驻进程里有效；CLI 一次性调用会随进程消失"),
+    Capability("rdv.auto.stop", "停掉地址自动循环（不删状态，可再 start）",
+               params=(), side_effect=True),
+    Capability("rdv.auto.status", "自动循环现在什么状态、下一步该做什么", params=(),
+               note="五个状态：never/unverified/linked/blind/down，各带一句 advices"),
+    Capability("rdv.auto.events", "自动循环的事件流（只在变化时记）",
+               params=(Param("limit", "int")),
+               note="「还是原样」不记：每轮都写会把真正的事件埋掉"),
     # ---- 编队节点（远程机器）----
     # D1 真代发（2026-10-25）：控制面已加对外协议（common.CLIENT*），
     # 非 commander 进程可经 fleet.ctrl_client 让节点执行命令/推取文件。
@@ -1075,6 +1093,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # tunnel 保证「打不通也先能用」，IPv6 直连能连时连 NAT 都不碰。
     reg.add(TunnelLayer())
     reg.add(RendezvousLayer())
+    reg.add(RdvAutoLayer())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:

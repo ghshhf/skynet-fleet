@@ -306,23 +306,28 @@ class Rendezvous:
         return self.refresh(force=force).get("current")
 
     # ---- 上报（动态更新）
-    def publish(self, origin, secret, meta=None, deep=False, force=False):
+    def publish(self, origin, secret, meta=None, deep=False, force=False, port=0):
         """把当前地址集写进中继地址簿。
 
         每次都整份写，不做增量：地址簿里存的是「**现在**在哪」，
         增量合并会让已经消失的地址永远留在里面，对端就会去连一个不存在的地址。
+
+        `port` 是本机实际在监听的那个口。**必须带**：只有 IP 没有端口的记录，
+        对端拿到也用不上，而墙外自检连 port=0 会得到「地址无效」——
+        那既不是可达也不是不可达，纯粹是参数没给对。
         """
         from tools.cloudnode import wsrelay as wsr
 
         r = self.refresh(force=force, deep=deep)
-        addrs = [{"ip": c["ip"], "port": int(c.get("port") or 0),
+        addrs = [{"ip": c["ip"], "port": int(c.get("port") or port or 0),
                   "temporary": c.get("temporary"),
                   "kind": c.get("kind")} for c in r["candidates"]]
         if not addrs:
             return {"ok": False, "err": "本机没有任何可用地址，不写空地址上去"}
 
         res = wsr.addr_put(origin, r["self_id"], addrs, secret,
-                           meta={**(meta or {}), "current": r.get("current")})
+                           meta={**(meta or {}), "current": r.get("current"),
+                                 "port": int(port or 0)})
         res["published"] = addrs
         res["self_id"] = r["self_id"]
         res["changed"] = r["changed"]
@@ -338,25 +343,45 @@ class Rendezvous:
         from tools.cloudnode import wsrelay as wsr
 
         snap = self.snapshot()
+
+        def _p(c):
+            return int(c.get("port") or port or 0)
+
+        # 私网地址让墙外连没有意义；**没有端口的候选则不构成一次可判定实验**：
+        # 连 port=0 得到的是「地址无效」，不是「不可达」。把这种结果算进
+        # 「全部不可达」会让结论从「测不了」变成「进不来」，进而误导人去改防火墙。
         todo = [c for c in snap["candidates"]
                 if (only is None or c["ip"] in only)
-                and c["kind"] != "private4"]      # 私网地址让墙外连没有意义
+                and c["kind"] != "private4"
+                and _p(c) > 0]
+        if not todo:
+            return {"ok": False, "confident": False, "reachable": [], "all": [],
+                    "invalid_port": True,
+                    "note": "没有可探测端口（候选的 port 都是 0）：先在本机开一个监听口"
+                            "（例如 tun.open 之后），再来验入站。"
+                            "这不是「进不来」，是「还没法测」"}
         out = []
         for c in todo:
-            r = wsr.probe_from_relay(origin, c["ip"], int(c.get("port") or port),
+            r = wsr.probe_from_relay(origin, c["ip"], _p(c),
                                      secret, timeout=timeout)
             out.append({"ip": c["ip"], "kind": c["kind"],
                         "reachable": bool(r.get("ok")),
-                        "ms": r.get("ms"), "err": r.get("err") or ""})
+                        "invalid": bool(r.get("invalid")),
+                        "ms": r.get("ms"), "err": r.get("err") or "",
+                        "hint": r.get("hint") or ""})
 
         ok = [x for x in out if x["reachable"]]
+        # 只要有一项是「参数无效」，这次结论整体不算可信
+        confident = not any(x.get("invalid") for x in out)
         st = self.state()
-        st["verified"] = {"ts": round(time.time(), 1), "results": out}
+        st["verified"] = {"ts": round(time.time(), 1), "results": out,
+                          "confident": confident}
         _save(st, self.state_path)
-        return {"ok": bool(ok), "reachable": ok, "all": out,
+        return {"ok": bool(ok), "confident": confident, "reachable": ok, "all": out,
                 "note": ("有地址能被墙外连进来" if ok else
-                         "没有一个地址能被墙外连进来：地址可能在，但入站被拦"
-                         "（主机防火墙 / 路由侧 v6 防火墙默认全拦）")}
+                         ("这次自检有项是参数无效，结论不可信" if not confident else
+                          "没有一个地址能被墙外连进来：地址可能在，但入站被拦"
+                          "（主机防火墙 / 路由侧 v6 防火墙默认全拦）"))}
 
     # ---- 解析（对端按指纹查）
     def resolve(self, origin, fp, timeout=8.0):
