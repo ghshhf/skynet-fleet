@@ -296,6 +296,28 @@
   同一个错，那不是自动化，是噪音。能力表 380 → 384（`rdv.auto.start/stop/status/events`）。
 
 
+- **伪装登录两层：邮箱供料 + 有头注册（2026-11-02 凌晨）**：主人说的「注册谷歌邮箱 → 用谷歌账号正常登录」本质是**关联**不是攻破，所以这一段不造攻击能力，只造**通行能力**。两层分开落，谁挂了都不牵连对方——这就是可续。
+
+  **第一层 `email.*`（4 条，能力表 378 → 382）**：借免费临时邮箱当供料口，零成本不实名（付费 = 状态不可续）。三源实测全活：guerrillamail（主力，`sid_token` + `seq` 分页）／mail.tm（**必须带 `Accept: application/json`**，少这个头就报错）／maildrop（GraphQL：`altinbox` 建、`inbox(mailbox)` 读）。`email.wait_code` 把「轮询收信 + 正则提码」合成一步，直接喂注册流程。
+
+  **第二层 `register.*`（10 条，能力表 382 → 392）**：`open / close / list / goto / inspect / fill / submit / click / await_pass / save_session`。
+
+  核心一句：**不自建浏览器，只接管浏览器**。Playwright 自己 `launch()` 时会塞 `--remote-debugging-pipe --no-startup-window`，窗口是假的、指纹是自动化的，Cloudflare 一眼看穿（HF 那次 headless 死在这一步）；改成「自己起一个完整 chromium，再 `connect_over_cdp` 接管」，浏览器就是浏览器，墙自己放行。
+
+  **人机分工写成能力切分，不是写成流程**：`fill` / `submit` / `click` / `await_pass` 是四个独立动词。机器走完前三个，卡在图形验证码就「停在那里等人」，人点完第四个接着跑——**断点天然存在**，不用另造状态机。8 步里机器 7 步，真人只点那 1 下。
+
+  **进程模型是刻意的**：Playwright 的 sync API 绑线程绑事件循环，而天网设备会被控制面任意线程调，在 asyncio 线程里 launch 直接炸。所以启停留在本进程（纯 subprocess），页面动作全部子进程隔离（`browser_reg.run_verb`）——单步超时、崩了不牵连 host。
+
+  实测撞出四个 bug，全是「看代码看不出来、跑一次就现形」那类：
+  ① **启动器误判**——Windows 下 `chrome.exe` 是启动器，fork 出真进程后自己以 code 0 退，旧逻辑把 code 0 当失败；
+  ② **错误页被判成「没墙」**——`ERR_CONNECTION_CLOSED` 页既没墙也没内容，只看 `blocked` 会得出「过了」的假结论，现在 `error` 单列且**立刻返回**，不让人干等 180 秒超时；
+  ③ **「页面过薄 = 挑战壳」是错的判据**——example.com 只有 1989 字节，被判成墙。墙只由**标题 + 挑战专用 DOM** 决定，过薄另立 `loading` 态；
+  ④ **关不掉**——杀的 pid 是启动器，真进程还占着端口。改成「簿记 pid + `netstat` 反查 pid」两个都杀。
+
+  **通道优先级（2026-11-02 03:37 更新，主人装了扩展之后）**：① WorkBuddy Chrome 扩展（真 Chrome、真指纹、还能接管已登录标签页走 OAuth 关联）＞ ② WorkBuddy 内置浏览器 ＞ ③ 本模块自建 chromium。前两条只在 WorkBuddy 会话内可用（MCP），天网是独立进程调不到，所以第三条必须留着，定位 = 兜底 + 无人值守。
+
+  **诚实边界**：自建这条腿走本机 7890 出去访问 HF，被 CloudFront 回 `ERROR: The request could not be satisfied`（节点出口 IP 判脏），同一时刻 curl 走同一代理拿到的是 202 正常挑战——是**线路问题不是代码问题**，不在这段修。另：`save_session` 会把 Cookie 明文落 `~/.fleet/cookies/<host>.json`（格式与 netforce 对齐，可回灌 curl_cffi），要用就自己管好那个目录。
+
 - **联网层接活 + 取文增强（2026-10-24）**：netforce 采集内核从「README 写着已接、实测全降级」修到真能用——**路径候选制 + marker 判定**（换盘换机不用再指路径，唯一约定 = 两个项目放同一个父目录，判据是 `resource_finder.py` + `skynet/` 子包同时在）；新增 `web.origin` 跳转链穿透与 `web.dns` DoH 污染判据。实测 httpbin 三跳穿透到终点、CDN 站不误报。自测 **73/74**，唯一红的 t8 是本机缺 `polaris-audio-io` 模块（train_15b 整个迁走）——代码现在如实报「缺模块」而不是误报「缺解释器」。
 - **分支合并 + 跨机死路径家族收尾（2026-10-24）**：GitHub 上 11 个分支合并为只剩 `main`——10 个历史分支逐文件验证内容全在 main（相同或演进版，两个中文名文档与 `.gitignore` 均比对过方向），删除前 SHA 全量备份在提交历史中（`git reflog` 可找回）；此后分支政策 = 只留 main，确需分支当天合并当天删。同批修掉最后一拨跨机死路径：adb / Android SDK 候选补 **G 盘 `/g/sdk`**（build-tools 34/35/37 + android-35 + adb 37.0.0 + JDK 21 实测齐全 ⇒ APK 五步构建链在本机完整，不再依赖另一台机器的 D 盘工具链）；两个文件 sys.path 钉死旧仓库名 `D:/code/device-fleet`（一跑就 ModuleNotFoundError）改按 `__file__` 推仓库根。全量 **71/74**：t8 缺模块（环境缺资产）、t23 demo 模板用 `Date.now()` 渲染不确定（老伤待修）、registry 秒级 mtime 排序抖动（连跑 5 次 4 绿 1 红，与改动无关）。
 - **设备层三块新地基**（2026-10-21）：

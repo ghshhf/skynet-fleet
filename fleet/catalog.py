@@ -17,10 +17,13 @@ from .vendored_crawler import CRAWLER_CAPABILITIES
 from .vendored_pentest import PENTEST_CAPABILITIES
 from .vendored_llmgw import LLMGW_CAPABILITIES
 from .vendored_devfix import DEVFIX_CAPABILITIES
+from .vendored_email import EMAIL_CAPABILITIES
+from .vendored_register import REGISTER_CAPABILITIES
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
 from .kinds.audio import AudioSynth
+from .kinds.video_watch import VideoWatch
 from .kinds.adb_wifi import AdbWifi
 from .kinds.card_store import CardStore
 from .kinds.host import Host
@@ -43,11 +46,15 @@ from .kinds.crawler_device import CrawlerDevice
 from .kinds.pentest_device import PentestDevice
 from .kinds.llmgw_device import LlmGwDevice
 from .kinds.devfix_device import DevFixDevice
+from .kinds.email_device import EmailDevice
+from .kinds.register_device import RegisterDevice
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
 from .kinds.ssh_shell import SshShell
 from .kinds.windows_pc import WindowsPC
+from .kinds.proxy_mgr import ProxyMgr
+from .kinds.proxy_core import ProxyCore
 from .transports import get as get_transport
 
 DEVICES_PATH = os.environ.get("FLEET_DEVICES", os.path.join(
@@ -977,7 +984,43 @@ CAPABILITIES = [
                side_effect=True,
                note="纯标准库合成，零第三方依赖，RTF≈0.009。"
                     "写文件 ⇒ 要过闸门。这是**功能性声音**，不是人声（人声走 voice.speak）"),
-    # ---- 渲染（kind=render）：用代码画出新的图与片子 ----
+    # ---- 看视频（kind=video）：把一条时间轴压成一张可寻址的图 ----
+    # 三级按「花多少钱」排：probe 0 token → storyboard 1 张图 → zoom 1 张小图。
+    # probe 必须在最前面：先判断值不值得看，再决定花不花这张图的 token。
+    Capability("video.probe", "看一条视频值不值得看（0 token，不产图）",
+               params=(Param("src", "str", True, "本地路径或 B站链接（BV号）"),),
+               note="只报到时长/分辨率/有无字幕轨/有无平台故事板，以及「大概切几格、要多少 token」。"
+                    "看完再决定要不要 storyboard —— 这一步不花钱"),
+    Capability("video.storyboard", "把视频压成一张分镜图 + 文字清单（落 PNG）",
+               params=(Param("src", "str", True, "本地路径或 B站链接"),
+                       Param("cells", "int", doc="切几格，4–16；不给就按时长约 15 秒一格"),
+                       Param("budget", "int", doc="总像素预算，默认 360000（≈233 token）"),
+                       Param("with_subtitle", "bool", doc="顺带取字幕，默认 true（B站 有效）"),
+                       Param("prefer", "str", doc="auto（默认）/ local（强制本地抽帧）/ platform")),
+               side_effect=True,
+               note="本机算，不把画面外发（B站 那条路取的是平台公开的缩略图，不是你的屏幕）。"
+                    "格子大小按画面变化量分配：长镜头给大格、快切段给小格。"
+                    "格号与时间写在**文字清单**里，没有烧在图上 —— 小模型读图上的数字不可靠。"
+                    "⚠️ 方向与 `video.story` 相反：那边是拿分镜去**生成**漫剧成片，"
+                    "这边是从已有视频里**抽**出分镜给模型看"),
+    Capability("video.zoom", "回原始源取某一格的原分辨率画面",
+               params=(Param("sample_id", "str", True, "video.storyboard 返回的 sample_id"),
+                       Param("cell", "int", True, "格号，从 1 开始"),
+                       Param("width", "int", doc="要多大，默认 960")),
+               side_effect=True,
+               note="样本默认 600 秒有效，过期就拒、不拿旧帧冒充。"
+                    "本地源给原分辨率；平台源只能给平台故事板的原始块，会明说"),
+    Capability("video.ask", "看一条视频并回答一个问题（分镜图 → 视觉模型）",
+               params=(Param("src", "str", True, "本地路径或 B站链接"),
+                       Param("prompt", "str", doc="问什么，不给就问「讲了什么」"),
+                       Param("cells", "int", doc="切几格，默认按时长"),
+                       Param("budget", "int", doc="总像素预算，默认 360000"),
+                       Param("timeout", "int", doc="视觉调用超时，默认 180 秒")),
+               side_effect=True, approval="ask",
+               note="🔴 这一步**画面会出本机**（送视觉模型），按外发对待，不是只读。"
+                    "分镜图仍会落盘；视觉模型不可用时如实报失败，不返回「看起来像答案」的东西"),
+
+
     Capability("render.styles", "列出可用的渲染风格牌（抽签用）",
                note="只读：返回 16 张风格牌的 id 与说明"),
     Capability("render.frame", "渲染某一拍的单帧 PNG",
@@ -1063,6 +1106,63 @@ CAPABILITIES = [
                        Param("temp", "float", doc="温度，默认 0.7")),
                side_effect=True,
                note="占用手机算力。同一份权重要换人格，只换 pack，不用重启服务"),
+    # ---- 代理管理面（kind=proxy）：订阅归一 + 测速选优 + 规则分流 + 深解兜底 ----
+    # 只做「管理」，不做流量转发：产出数据可喂给任意兼容核心（gitport / sing-box）。
+    # 深解兜底走天网协议逆向（proto_reverse），常规解析识别不了时才用。
+    Capability("proxy.subscribe", "解析代理订阅（Clash/V2ray/sing-box/SS）→ 归一节点清单",
+               params=(Param("content", "str", doc="订阅原文"),
+                       Param("file", "str", doc="本地订阅文件路径"),
+                       Param("url", "str", doc="订阅 URL（拉取失败如实报）"),
+                       Param("source", "str", doc="来源标注，默认 subscription")),
+               note="只读·本地：content/file/url 至少给一个。解析不出节点不装成功"),
+    Capability("proxy.test", "代理节点 TCP 测速（server:port 的 RTT 与可达性）",
+               params=(Param("content", "str", doc="订阅原文"),
+                       Param("file", "str", doc="本地订阅文件路径"),
+                       Param("url", "str", doc="订阅 URL"),
+                       Param("timeout", "float", doc="单点超时秒数，默认 3")),
+               note="只读·本地：不可达节点标 ok=False/latency=-1，不假装能连"),
+    Capability("proxy.rules", "查某域名/IP 走直连还是代理（国内直连、其余代理）",
+               params=(Param("host", "str", doc="域名，如 www.baidu.com"),
+                       Param("ip", "str", doc="IP 地址")),
+               note="只读·本地：规则数据引用 karing-ruleset，缺失则用内置精简版"),
+    Capability("proxy.pick", "按延迟选最优节点（先测速再选）",
+               params=(Param("content", "str", doc="订阅原文"),
+                       Param("file", "str", doc="本地订阅文件路径"),
+                       Param("url", "str", doc="订阅 URL"),
+                       Param("timeout", "float", doc="单点超时秒数，默认 3"),
+                       Param("only_ok", "bool", doc="只选可达节点，默认 true")),
+               note="只读·本地：全部不可达时如实报 None，不硬给"),
+    Capability("proxy.deep", "订阅深解兜底：常规解析识别不了时用天网协议逆向拆字节结构",
+               params=(Param("content", "str", doc="要深解的内容"),
+                       Param("file", "str", doc="本地文件路径"),
+                       Param("url", "str", doc="URL")),
+               note="只读·本地：method=standard/reversed/failed 三态如实回"),
+    # ---- 代理数据面（kind=proxycore）：订阅 → 拉起 sing-box → 翻墙 ----
+    # 天网从「管理面」跨到「数据面」的关键：把订阅递进来，天网自己接管流量，
+    # 不再依赖 Karing / Clash 等第三方客户端。控制面自研 + 数据面借 sing-box 核心。
+    Capability("proxy.deploy", "订阅 → 解析 → 生成配置 → 拉起 sing-box → 开系统代理（翻墙）",
+               params=(Param("content", "str", doc="订阅原文"),
+                       Param("file", "str", doc="本地订阅文件路径"),
+                       Param("url", "str", doc="订阅 URL"),
+                       Param("port", "int", doc="本地入站端口，默认 7891（避开妙妙屋 7890）"),
+                       Param("start_core", "bool", doc="是否拉起核心，默认 true"),
+                       Param("enable_proxy", "bool", doc="是否开系统代理，默认 true"),
+                       Param("tun", "bool", doc="是否开 TUN 整机接管（需管理员权限，gvisor 栈免驱动）"),
+                       Param("fakeip", "bool", doc="是否用 FakeIP DNS，默认随 tun 自动")),
+               side_effect=True,
+               note="有副作用：拉起 sing-box 进程 + 改系统代理。国内直连、其余走代理"),
+    Capability("proxy.core_status", "查代理核心进程 / 系统代理状态",
+               note="只读·本地：核心是否在跑、入站端口、系统代理开关"),
+    Capability("proxy.core_stop", "停代理核心 + 关系统代理",
+               params=(Param("port", "int", doc="要停的入站端口，默认 7891")),
+               side_effect=True,
+               note="有副作用：结束 sing-box 进程 + 关系统代理"),
+    Capability("proxy.download_core", "下载 sing-box 二进制到 vendor/sing-box",
+               side_effect=True,
+               note="有副作用：下载约 32MB（curl 可续传）并解压"),
+    Capability("proxy.download_wintun", "下载 wintun.dll 到 vendor/sing-box（TUN system/mixed 栈需要）",
+               side_effect=True,
+               note="有副作用：下载 wintun 驱动（gvisor 栈不需要）"),
 ]
 
 CAPABILITIES.extend(REA_CAPABILITIES)
@@ -1070,6 +1170,8 @@ CAPABILITIES.extend(CRAWLER_CAPABILITIES)
 CAPABILITIES.extend(PENTEST_CAPABILITIES)
 CAPABILITIES.extend(LLMGW_CAPABILITIES)
 CAPABILITIES.extend(DEVFIX_CAPABILITIES)
+CAPABILITIES.extend(EMAIL_CAPABILITIES)
+CAPABILITIES.extend(REGISTER_CAPABILITIES)
 
 
 def build(path=None, gate=None, ttl=5.0, with_nodes=True):
@@ -1094,15 +1196,24 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(PentestDevice())
     reg.add(LlmGwDevice())
     reg.add(DevFixDevice())
+    reg.add(EmailDevice())
+    # 会话层：邮箱解决「拿什么地址」，注册解决「把表单填完过验证码」。两台分开，
+    # 谁挂了都不牵连对方——这就是可续。
+    reg.add(RegisterDevice())
     reg.add(Internet())
     reg.add(AI())
     reg.add(Host())
+    reg.add(ProxyMgr())
+    reg.add(ProxyCore())
     reg.add(AdbWifi())
     reg.add(PcControl())
     reg.add(VoiceDevice())
     reg.add(Render())
     reg.add(CardStore())
     reg.add(AudioSynth())
+    # 看视频：probe(0 token) → storyboard(1 张图) → zoom(1 张小图) 三级。
+    # 放在 audio 后面：它要外部 ffmpeg，是最慢的一台，别拖住本机判断。
+    reg.add(VideoWatch())
     reg.add(JobBoard())
     reg.add(PhoneNode())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
