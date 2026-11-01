@@ -400,6 +400,10 @@ CASES = [
     #     t57 钉对等中继（两端各接进来、中继转发彼此字节）+ 地址簿 + 墙外自检，
     #     以及主人口中那个「另类的固态」—— 指纹不变、地址随便漂。
     ("eval_t57_relay_rdv", ["evals/t57_relay_rdv.py"], HERE, 180),
+    # t58 是「把上面那些手动能力接成一条自己会跑的循环」。
+    #     复用天网已有的 beat（心跳骨架此前没有任何循环在用）+ Rendezvous，
+    #     钉五档状态机、测不了≠进不来、失败退避、地址簿重启不丢、坏文件不阻断启动。
+    ("eval_t58_rdv_auto", ["evals/t58_rdv_auto.py"], HERE, 300),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

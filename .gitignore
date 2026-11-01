@@ -164,3 +164,8 @@ tools/.libclang/
 # crawlee 运行时目录（2026-11-01 爬虫能力实测时生成）：key_value_stores / request_queues
 # 属运行期产物，不是资产，不入库。
 storage/
+
+# 中继地址簿的落盘文件（2026-11-01 地址自动化）：运行期产物，
+# 里面是本机自己的 self_id 与地址，不入库。
+addrbook.json
+addrbook.json.tmp
