@@ -12,8 +12,18 @@ import os
 from ..core import BaseDevice, DeviceResult as R
 from ..vendored_crawler import ENGINE_OF
 
-# 让 playwright 在 D 盘找到 chromium（安装时指定过，子进程需重设）
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "D:/DevTools/crawler/playwright-browsers"
+# playwright 浏览器目录：**存在才用**，不存在就交给 playwright 自己的默认路径
+# （%LOCALAPPDATA%\ms-playwright）。
+#
+# 原来这里无条件写成 D:/DevTools/crawler/playwright-browsers —— 那个目录早就没了，
+# 后果是「谁 import 本模块，谁的进程里 playwright 就集体找不到浏览器」，一 launch 就
+# 报「Looks like Playwright was just installed」。t18 的门禁活线检查就是这么红的
+# （2026-11-02 定位）。环境变量是进程级全局副作用，不能这么随手写。
+_PW_HOME = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "D:/DevTools/crawler/playwright-browsers"
+if os.path.isdir(_PW_HOME):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
+else:
+    os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
 
 _HANDLERS = {}
 
