@@ -149,6 +149,16 @@ KEYED_ENDPOINTS = [
      #     但认不出来就是认不出来，这不是加密，只是约定。
      #  ② 协议只吃 Responses：打 /v1/chat/completions 报 "does not support, please use
      #     /v1/responses" —— 因为上游本来就是 Codex 订阅后端，原生说 Responses。
+     # ③ 2026-11-01 19:45 起**全站被阿里云验证码 2.0（SLIDING）拦住**：
+     #     任何路径都返回 16125 字节 JS 挑战页（HTTP 200，坑），要求过滑块才放行。
+     #     验证码 2.0 是三层判据（设备指纹 deviceToken 54 字段 / 轨迹 mm / 服务端评分），
+     #     实测空白 profile 的自动化浏览器 + 5 种轨迹全 F001；真 Edge 手工一拖能过，
+     #     但 cookie 落库为 v20（App-Bound Encryption），非提权解不开，自动化无法复现。
+     #     ⇒ 主人决定放弃（11-01 19:41）：解锁成本 ≈ 持续对抗，产出只有每天 $20，
+     #       「就算解锁了能得到啥呢」。留 key 不删，只把上游标 disabled，**不再白耗算力去撞墙**。
+     #       恢复条件：若哪天它撤掉验证码，删掉下面 disabled 一行即可，别的不动。
+     "disabled": True,
+     "disabled_note": "阿里云验证码 2.0 滑块墙（三层判据），11-01 放弃；撤墙后删 disabled 即恢复",
      "api_style": "responses",
      "ua": "codex_cli_rs/0.51.0 (Windows 11; x86_64) Windows",
      # 可替代的客户端 UA（同一把钥匙，任选其一即可过①）
@@ -261,6 +271,10 @@ def discover_gateways():
                     "note": a.get("note", "")})
     # 带 key 的额度型上游：只有真拿到凭据才加入（没 key 就静默跳过，不假装可用）
     for e in KEYED_ENDPOINTS:
+        if e.get("disabled"):
+            # 明确标记停用的上游直接跳过：不发请求、不占 hedge 名额、不进冷却统计。
+            # 存在的意义是「留档 + 一行恢复」，不是「假装它还活着」。
+            continue
         k = _keyed_key(e)
         if not k:
             continue
@@ -1838,7 +1852,16 @@ def _h_chat(cap, args, dev):
 
     gws = discover_gateways()
     if endpoint_pref:
-        gws = [g for g in gws if g["name"] == endpoint_pref] or gws
+        matched = [g for g in gws if g["name"] == endpoint_pref]
+        if not matched:
+            # 点名一个「已停用」的上游必须报错，不能静默换一家返回 200：
+            # 否则调用方会以为 agentrouter 在工作（实测踩到：指定 agentrouter 却拿到
+            # pollinations 的 openai-fast 还报 ok）。这就是「HTTP 200 ≠ 发生了一件事」。
+            off = {e["name"]: e.get("disabled_note", "") for e in KEYED_ENDPOINTS if e.get("disabled")}
+            if endpoint_pref in off:
+                return R.error(cap, f"上游 {endpoint_pref} 已停用：{off[endpoint_pref]}",
+                               device=dev.name, via=dev.via)
+        gws = matched or gws
     if not gws:
         return R.unavailable(cap, "无可用网关（OFM/zen-gate 未装且匿名端点不可达）",
                              device=dev.name, via=dev.via)
@@ -2103,7 +2126,16 @@ def _h_embeddings(cap, args, dev):
 
     gws = discover_gateways()
     if endpoint_pref:
-        gws = [g for g in gws if g["name"] == endpoint_pref] or gws
+        matched = [g for g in gws if g["name"] == endpoint_pref]
+        if not matched:
+            # 点名一个「已停用」的上游必须报错，不能静默换一家返回 200：
+            # 否则调用方会以为 agentrouter 在工作（实测踩到：指定 agentrouter 却拿到
+            # pollinations 的 openai-fast 还报 ok）。这就是「HTTP 200 ≠ 发生了一件事」。
+            off = {e["name"]: e.get("disabled_note", "") for e in KEYED_ENDPOINTS if e.get("disabled")}
+            if endpoint_pref in off:
+                return R.error(cap, f"上游 {endpoint_pref} 已停用：{off[endpoint_pref]}",
+                               device=dev.name, via=dev.via)
+        gws = matched or gws
 
     if not model:
         for g in gws:
@@ -2364,6 +2396,9 @@ def _h_quota(cap, args, dev):
             "name": e["name"], "base": e["base"], "configured": bool(_keyed_key(e)),
             "models": list(e.get("models") or []), "cost": float(e.get("cost") or 0.0),
             "env": e.get("env"), "secret_file": UPSTREAMS_SECRET,
+            # 停用的上游要如实报出来，避免「配置了 key 却不进候选」被误当成 bug
+            "enabled": not bool(e.get("disabled")),
+            "disabled_note": e.get("disabled_note", ""),
         } for e in KEYED_ENDPOINTS],
         # 额度投放窗口：撞到 402 的冷却时长就是「到下一个窗口」
         "quota_window": {
@@ -2846,6 +2881,10 @@ def _selftest():
         # ⑰ 带 key 的额度型上游：有凭据才进候选（没 key 不假装可用），凭据不许出现在能力输出里
         real_secret = g0["UPSTREAMS_SECRET"]
         tmpf = os.path.join(os.environ.get("TEMP") or "/tmp", "llmgw_selftest_upstreams.json")
+        # 11-01：agentrouter 因阿里云验证码 2.0 停用。这里把 disabled 暂时摘掉测「key 生效」，
+        # 同时守住「disabled 就算配了 key 也不进候选」——两个行为哪个破了都是回归。
+        e0 = g0["KEYED_ENDPOINTS"][0]
+        saved_flag = {k: e0[k] for k in ("disabled", "disabled_note") if k in e0}
         try:
             if os.path.isfile(tmpf):
                 os.remove(tmpf)
@@ -2854,15 +2893,27 @@ def _selftest():
                 "没 key 不该出现在端点清单"
             with open(tmpf, "w", encoding="utf-8") as f:
                 json.dump({"agentrouter": "sk-selftest"}, f)
-            assert g0["_keyed_key"](g0["KEYED_ENDPOINTS"][0]) == "sk-selftest"
+            assert g0["_keyed_key"](e0) == "sk-selftest"
+            # 停用状态下：配了 key 也不许进候选（否则每次调用白耗一次撞墙）；
+            # 但 quota 输出要如实报「配了 key / 已停用」，别让停用被误读成没配。
+            assert "agentrouter" not in [x["name"] for x in real_discover()], \
+                "disabled 的上游配了 key 也不许进候选"
+            qd0 = d.invoke("llmgw.quota", {}).as_dict()["data"]
+            ku0 = {x["name"]: x for x in qd0["keyed_upstreams"]}
+            assert ku0["agentrouter"]["configured"] is True
+            assert ku0["agentrouter"]["enabled"] is False, ku0["agentrouter"]
+            assert ku0["agentrouter"]["disabled_note"], ku0["agentrouter"]
+            # 解禁后：key 生效，成本 / 模型透传正确
+            e0.pop("disabled", None)
+            e0.pop("disabled_note", None)
             gws = real_discover()
             ag = [x for x in gws if x["name"] == "agentrouter"]
             assert ag and ag[0]["key"] == "sk-selftest", ag
             assert ag[0]["cost"] == 1.0 and ag[0].get("keyed") is True
-            assert ag[0]["models"] == g0["KEYED_ENDPOINTS"][0]["models"]
+            assert ag[0]["models"] == e0["models"]
             # 环境变量优先于密钥文件
             os.environ["LLMW_AGENTROUTER_KEY"] = "sk-env"
-            assert g0["_keyed_key"](g0["KEYED_ENDPOINTS"][0]) == "sk-env"
+            assert g0["_keyed_key"](e0) == "sk-env"
             # 能力输出里只有「配没配」，没有凭据本身
             qd2 = d.invoke("llmgw.quota", {}).as_dict()["data"]
             ku = {x["name"]: x for x in qd2["keyed_upstreams"]}
@@ -2872,8 +2923,21 @@ def _selftest():
         finally:
             os.environ.pop("LLMW_AGENTROUTER_KEY", None)
             g0["UPSTREAMS_SECRET"] = real_secret
+            e0.pop("disabled", None)
+            e0.pop("disabled_note", None)
+            e0.update(saved_flag)
             if os.path.isfile(tmpf):
                 os.remove(tmpf)
+
+        # ⑱ 点名「已停用」的上游必须明确报错，不许静默换一家还报 ok
+        #     实测踩到：指定 endpoint=agentrouter 却拿到 pollinations 的 openai-fast 并报 ok，
+        #     调用方会误以为它在工作。这类「200 但不是那件事」必须变成显式失败。
+        off_name = next((e["name"] for e in g0["KEYED_ENDPOINTS"] if e.get("disabled")), None)
+        if off_name:
+            rq = d.invoke("llmgw.chat", {"messages": [{"role": "user", "content": "x"}],
+                                         "endpoint": off_name, "max_tokens": 32})
+            assert not rq.ok, f"点名停用上游 {off_name} 不该返回成功"
+            assert "已停用" in str(rq.err), rq.err
 
         # ⑱ 成本折价只压「真花额度」的上游：免费端点因子恒为 1（老排序一字不变），
         # 同分时免费的先上，额度型上游留到没有免费路可走的时刻。

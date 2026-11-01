@@ -64,13 +64,16 @@ RE_OPEN_FAMILY = re.compile(
 RE_PANEL = re.compile(r"^(mj_|suno_|kling_|luma_|runway_|pika_)", re.I)
 
 # 推理引擎特征路径：命中 = 能直接看到自建引擎
+# 注意 /health 被刻意排除：它太通用了，实测 sub.geiliapi.com / api.jmds.dev /
+# cheaprouter.cc 三个站都回 {"status":"ok"}，但 /metrics 是 SPA 首页、/props 也是 SPA ——
+# 那是反代或面板加的通用健康检查，不是推理引擎。判据必须能区分「有引擎」和「有个 /health 路由」。
 ENGINE_PATHS = [
     ("/metrics", "vLLM/TGI Prometheus 指标（自建推理引擎最常见暴露面）"),
-    ("/health", "vLLM / TGI / SGLang 健康检查"),
-    ("/props", "llama.cpp server 的 /props"),
+    ("/props", "llama.cpp server 的 /props（专有字段，SPA 假不了）"),
     ("/api/tags", "Ollama 模型清单"),
     ("/v1/completions", "原生 completion（转卖站通常只开 chat）"),
-    ("/openapi.json", "自建 FastAPI 的 schema"),
+    ("/openapi.json", "自建 FastAPI 的 schema（含 vllm/sglang/llama 才算）"),
+    ("/version", "推理引擎版本（含 vllm/tgi 才算）"),
 ]
 
 PORTS = [80, 443, 3000, 3001, 5000, 7860, 8000, 8080, 8443, 8888, 9000,
@@ -184,20 +187,22 @@ def probe_engine(host):
 
     def _one(item):
         path, desc = item
-        st2, _h2, body2 = http_get(host, path, timeout=5)
+        st2, h2, body2 = http_get(host, path, timeout=5)
         if st2 != 200 or not body2:
             return None
+        ct = (h2.get("Content-Type") or h2.get("content-type") or "").lower()
+        if "html" in ct:
+            return None  # SPA 兜底路由会把所有路径都回 index.html，这不是引擎
         low = body2[:800].lower()
-        # 光 200 不算，还要内容像那东西，否则 SPA 会把所有路径都回 200
         if path == "/metrics" and (b"vllm" in low or b"# help" in low or b"tgi" in low):
             return desc
         if path == "/props" and (b"default_generation_settings" in low or b"n_slots" in low):
             return desc
         if path == "/api/tags" and (b'"models"' in low or b"ollama" in low):
             return desc
-        if path == "/health" and len(body2) < 200:
-            return desc
         if path == "/openapi.json" and (b"vllm" in low or b"sglang" in low or b"llama" in low):
+            return desc
+        if path == "/version" and (b"vllm" in low or b"tgi" in low):
             return desc
         return None
 
