@@ -396,6 +396,10 @@ CASES = [
     #     真实网络里打不通是常态。t56 钉的是「先中继可用、后台再升级」这套契约，
     #     以及 IPv6 一票否决整套 NAT 分析的优先级。
     ("eval_t56_tunnel", ["evals/t56_tunnel.py"], HERE, 120),
+    # t57 是「会变的地址不是问题」：t56 把中继当注入替身，数据面并没接通。
+    #     t57 钉对等中继（两端各接进来、中继转发彼此字节）+ 地址簿 + 墙外自检，
+    #     以及主人口中那个「另类的固态」—— 指纹不变、地址随便漂。
+    ("eval_t57_relay_rdv", ["evals/t57_relay_rdv.py"], HERE, 180),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

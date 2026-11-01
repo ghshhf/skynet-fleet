@@ -33,6 +33,7 @@ from .kinds.lan_transfer import LanTransfer
 from .kinds.reach_layer import ReachLayer
 from .kinds.nat_traversal import NatTraversal, SESSION_TTL
 from .kinds.tunnel_layer import TunnelLayer
+from .kinds.rendezvous_layer import RendezvousLayer
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.reverse import Reverse
@@ -518,6 +519,34 @@ CAPABILITIES = [
     Capability("tun.close", "关掉隧道（先停升级线程，再关直连，最后拆中继）",
                params=(Param("sid", "str", doc="不给就什么都不做")),
                side_effect=True, note="收摊有次序，避免留半条连接"),
+    # ---- 地址动态层（rdv）：设备指纹不变，地址随时漂 ----
+    # 主人 2026-11-01：「会变的地址只要给它加一个动态就行了」
+    #                 「动态检测、动态自检、切换，这不本质就是另类的固态吗」
+    # 所以这一层的产物不是「一个地址」，是 `self_id → 当前地址` 这个**持久映射**：
+    # 映射本身稳定，映射的内容易变。IPv6 临时地址因此不再是缺点，只是需要刷新。
+    Capability("rdv.self", "我是谁、现在在哪、变了没有（指纹稳定，地址可漂）",
+               params=(Param("force", "bool", doc="跳过节流，立即重测"),
+                       Param("deep", "bool", doc="连 STUN 一起跑（慢几秒）"))),
+    Capability("rdv.publish", "把「我现在在哪」写进地址簿（整份覆盖，不增量合并）",
+               params=(Param("relay_url", "str", doc="不给就用 FLEET_WSRELAY"),
+                       Param("relay_secret", "str", doc="不给就用 FLEET_WSRELAY_SECRET"),
+                       Param("deep", "bool")),
+               side_effect=True,
+               note="写成整份而不是增量：增量会让已消失的地址永远留着，对端去连空气"),
+    Capability("rdv.verify", "**从墙外**回连我自己，确认到底进不进得来",
+               params=(Param("relay_url", "str"), Param("relay_secret", "str"),
+                       Param("port", "int", doc="候选要试的端口"),
+                       Param("only", "list", doc="只验这几个地址")),
+               side_effect=True,
+               note="本机自连走 hairpin，通不通都不代表外网能连 —— 只有墙外试才算数"),
+    Capability("rdv.resolve", "按设备指纹查对端现在在哪（只认指纹，不认 IP）",
+               params=(Param("fp", "str", True, "对端设备指纹"),
+                       Param("relay_url", "str"), Param("relay_secret", "str"))),
+    Capability("rdv.events", "地址变更历史：什么时候换过、换掉了哪个",
+               params=(Param("limit", "int"))),
+    Capability("rdv.forget", "清掉本地地址记忆（下次 refresh 当作全新）",
+               params=(), side_effect=True,
+               note="清掉后不再知道「上次在哪」，也就无从判断「变了没有」"),
     # ---- 编队节点（远程机器）----
     # D1 真代发（2026-10-25）：控制面已加对外协议（common.CLIENT*），
     # 非 commander 进程可经 fleet.ctrl_client 让节点执行命令/推取文件。
@@ -1045,6 +1074,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # D4 之后：隧道编排层。nat 只会「打通」，打通失败就什么都没有；
     # tunnel 保证「打不通也先能用」，IPv6 直连能连时连 NAT 都不碰。
     reg.add(TunnelLayer())
+    reg.add(RendezvousLayer())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:

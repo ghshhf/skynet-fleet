@@ -80,6 +80,7 @@ class TunnelLayer(BaseDevice):
 
     def __init__(self, name="tunnel:layer", **kw):
         super().__init__(name, via="wan", **kw)
+        self._relay_why = ""
         self.meta.setdefault(
             "note", "先中继可用，再后台升级直连；IPv6 能连就不折腾 NAT")
 
@@ -104,7 +105,7 @@ class TunnelLayer(BaseDevice):
         _sweep()
 
         if cap == "tun.ipv6":
-            return self._ipv6()
+            return self._ipv6(args)
 
         if cap == "tun.plan":
             return self._plan(args)
@@ -134,19 +135,27 @@ class TunnelLayer(BaseDevice):
                              device=self.name, via=self.via)
 
     # ---------------------------------------------------------- IPv6
-    def _ipv6(self):
-        addrs = tun_mod.ipv6_addresses()
+    def _ipv6(self, args=None):
+        """IPv6 实况：**四档，不是「有/没有」两档**。
+
+        「没有 IPv6」这个结论在国内几乎总是错的 —— v6 是设备联网即分配的东西，
+        探不到通常意味着没开、没下发前缀、或缺默认路由。把这三者和真正的
+        「一个地址都没有」混在一起报，等于劝人放弃一条本来能走的路。
+        """
+        args = args or {}
+        d = tun_mod.ipv6_diagnose(deep=bool(args.get("deep")))
+        cands = tun_mod.ipv6_candidates() if d["addresses"] else []
         return R.success("tun.ipv6", self.name, via=self.via, data={
-            "addresses": addrs,
-            "count": len(addrs),
-            "global": bool(addrs),
-            "note": ("有公网 IPv6：与同样有 v6 的对端直连时不需要打洞、不需要 STUN、"
-                     "不需要中继，NAT 判定整段可跳过"
-                     if addrs else
-                     "没有公网 IPv6：隧道只能走 IPv4 打洞或中继"),
-            "caveat": ("IPv6 无 NAT 不等于无墙：主机防火墙默认拦入站，"
-                       "必要时仍要开 pinhole；隐私地址（RFC 4941）会按小时轮换，"
-                       "不宜做长期候选") if addrs else "",
+            "verdict": d["verdict"],
+            "usable": d["usable"],
+            "addresses": d["addresses"],
+            "candidates": cands,
+            "egress": d["egress"],
+            "firewall": d["firewall"],
+            "advice": d["advice"],
+            "note": ("有可用公网 IPv6：与同样有 v6 的对端直连时不需要打洞、"
+                     "不需要 STUN、不需要中继，NAT 判定整段可跳过"
+                     if d["usable"] else "当前不能靠 IPv6 直连，原因见 verdict / advice"),
         })
 
     # ---------------------------------------------------------- 规划
@@ -229,17 +238,23 @@ class TunnelLayer(BaseDevice):
         sid = args.get("sid") or tun_mod.new_session_id()
         relay_factory = self._relay_factory(args)
         if relay_factory is None:
-            # 不硬造一个假中继来「让流程走通」——那会让上层以为连上了
             return R.unavailable(
                 "tun.open",
-                "没有可用中继（本机没有 WS 隧道地址）。隧道的第一要求是"
-                "「无论打洞成不成都能用」，没有中继就不该开，"
-                "先用 tun.plan 看策略、或先部署 tools/cloudnode/wsrelay.py",
+                self._relay_why or ("没有可用中继。隧道的第一要求是「无论打洞成不成"
+                                    "都能用」，没有中继就不该开"),
                 device=self.name, via=self.via)
+
+        # IPv6 状态现场探，别信调用方传的 "none"：
+        # 传 "none" 会让阶梯把直连判成不可行，然后只能走中继 —— 明明有 v6 却不用。
+        v6 = args.get("ipv6")
+        if v6 not in ("both", "one", "none"):
+            v6 = "both" if tun_mod.ipv6_usable().get("usable") else "none"
+            if v6 == "both" and not args.get("theirs_ipv6", True):
+                v6 = "one"
 
         steps = tun_mod.cascade(
             args.get("mine") or "unknown", args.get("theirs") or "unknown",
-            ipv6=args.get("ipv6") or "none",
+            ipv6=v6,
             router_upnp=bool(args.get("upnp")),
             has_relay=True, same_lan=bool(args.get("same_lan")))
 
@@ -255,9 +270,10 @@ class TunnelLayer(BaseDevice):
                               "created": time.time()}
         return R.success("tun.open", self.name, via=self.via, data={
             "sid": sid, "state": t.state, "path": t.path,
+            "ipv6": v6,
             "plan": tun_mod.plan(args.get("mine") or "unknown",
                                  args.get("theirs") or "unknown",
-                                 ipv6=args.get("ipv6") or "none"),
+                                 ipv6=v6),
             "note": "中继已通，此刻就能传数据；要更快再调 tun.upgrade",
         })
 
@@ -317,19 +333,32 @@ class TunnelLayer(BaseDevice):
     def _relay_factory(self, args):
         """把「中继怎么建」收敛成一个**可注入**的函数。
 
-        这里只认 `args["relay_factory"]`（可调用），刻意不内置一个
-        「给个 URL 就假装连上了」的实现：
+        默认实现走 `tools/cloudnode/wsrelay.py` 的 `/pair`：两台机器各自连进
+        同一个房间（房间号 = 会话 id），由中继转发彼此的字节。房间号同时是
+        打洞时刻的种子，一个值办两件事，少一轮信令。
 
-        WS 隧道的数据面（tools/cloudnode/wsrelay.py + 云节点）还没接成
-        「对等中继」的语义——它现在解决的是「把 WS 变成一条到某 host:port 的
-        TCP 隧道」，而隧道层要的是「两台机器各自接进来、由中继转发彼此的字节」。
-        语义没对齐之前塞一个占位对象进去，结果是 open 报成功、
-        send 时才炸，调用方会以为连上了。那比直接说「没有中继」坏得多。
+        三种来源，按优先级：
+          args["relay_factory"]  —— 测试替身 / 自定义实现
+          args["relay_url"]      —— 显式给中继地址
+          FLEET_WSRELAY          —— 与 netaccel.gateway 共用的开关
 
-        所以：接上真中继之前，这里返回 None，由 `_open` 如实报不可用。
+        拿不到就返回 None，由 `_open` 如实报「没有中继」。**不造占位对象**：
+        以前这里塞过一个 send 直接抛错的假中继，结果是 open 报成功、
+        发数据才炸，调用方会以为连上了 —— 那比直接说不可用坏得多。
         """
         f = args.get("relay_factory")
-        return f if callable(f) else None
+        if callable(f):
+            return f
+
+        try:
+            from ..relay_pair import make_factory
+        except Exception:
+            return None
+
+        factory, why = make_factory(args.get("relay_url") or "",
+                                    args.get("relay_secret") or "")
+        self._relay_why = why
+        return factory
 
     def _punch_factory(self, args):
         """真正打洞的实现。默认走 nat.Puncher；测试可注入替身。"""

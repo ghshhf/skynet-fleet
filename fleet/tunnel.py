@@ -32,6 +32,7 @@ import hashlib
 import ipaddress
 import os
 import socket
+import subprocess
 import threading
 import time
 
@@ -146,6 +147,234 @@ def ipv6_state(mine_addrs, theirs_addrs):
     if a or b:
         return "one"
     return "none"
+
+
+# ---------------------------------------------------------- IPv6 诊断（四档）
+#
+# 上面 `ipv6_addresses()` 只回答「有没有地址」，这对隧道是不够的。
+# 地址是运营商下发的，**转发和放通是另外两件事**：
+#
+#   有地址 + 出不去  = 默认路由缺失 / 运营商只给前缀不给转发
+#   出得去 + 入站拦  = 主机防火墙或路由侧 v6 防火墙（默认全拦）
+#
+# 把这两种都归成「没有 IPv6」，后果是运维直接放弃这条路 —— 而这恰恰是
+# 2026-11-01 主人指出的那个认知偏差：v6 是设备联网即分配的东西，
+# 「没有」在国内几乎总是错的，真实情况只有「没开」「没放通」。
+# 所以这里必须把「没有」拆开，每一档给一句能动手的建议。
+
+#: 判「能不能出网」必须用真握手的 TCP 目标。不能用 UDP connect：
+#: UDP connect 只做路由选路、不发包，通不通它根本不知道（最常见误判源）。
+_V6_EGRESS = ("ipv6.baidu.com", 443)
+
+_V6_CACHE = {"t": 0.0, "v": None}
+_V6_TTL = 60.0
+
+
+def ipv6_reach(timeout=4.0, target=_V6_EGRESS):
+    """真发一次 TCP 握手，确认 IPv6 出网通不通。
+
+    只取 AAAA 记录（AF_INET6），否则系统会悄悄回落 A 记录走 v4，
+    测出来的是「v4 通」却被当成「v6 通」——这是最典型的假阳性。
+    """
+    host, port = target
+    t0 = time.time()
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_STREAM)
+    except (socket.gaierror, OSError) as e:
+        return {"ok": False, "target": f"{host}:{port}", "ms": None,
+                "err": f"解析不到 AAAA：{type(e).__name__}: {e}"}
+    if not infos:
+        return {"ok": False, "target": f"{host}:{port}", "ms": None,
+                "err": "目标没有 AAAA 记录"}
+
+    last = ""
+    for fam, typ, proto, _, sa in infos[:3]:
+        s = socket.socket(fam, typ, proto)
+        s.settimeout(timeout)
+        try:
+            s.connect(sa)
+            return {"ok": True, "target": f"[{sa[0]}]:{port}", "addr": sa[0],
+                    "ms": round((time.time() - t0) * 1000), "err": ""}
+        except OSError as e:
+            last = f"{type(e).__name__}: {e}"
+        finally:
+            s.close()
+    return {"ok": False, "target": f"{host}:{port}", "ms": None, "err": last}
+
+
+def _win_firewall_state():
+    """Windows 三个防火墙配置档是否开启。查不到返回 None。
+
+    存在的理由：v6 没有 NAT，全网段可直接寻址 —— 所以路由器和主机防火墙
+    对 v6 入站的默认策略是**全拦**，而不是像 v4 那样「NAT 顺手挡了」。
+    这就是「v6 地址明明有、对端就是连不进来」的头号原因。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.run(
+            ["netsh", "advfirewall", "show", "allprofiles", "state"],
+            capture_output=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return None
+
+    # netsh 的输出编码跟着系统区域走：中文 Windows 是 GBK，英文是 cp1252。
+    # 用 text=True 会让 Python 按当前 locale 猜，在 git-bash 下猜成单字节编码，
+    # 中文全变乱码、一个字段都匹配不上（实测过，返回 None 就是这个原因）。
+    # 所以先拿 bytes，再按候选编码逐个试。
+    raw = out.stdout or b""
+    txt = ""
+    for enc in ("gbk", "utf-8", "cp1252"):
+        try:
+            txt = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    prof, cur = {}, None
+    for ln in txt.splitlines():
+        s = ln.strip()
+        low = s.lower()
+        if not s:
+            continue
+        if "domain" in low or s.startswith("域"):
+            cur = "domain"
+        elif "private" in low or s.startswith("专用"):
+            cur = "private"
+        elif "public" in low or s.startswith("公用"):
+            cur = "public"
+        elif cur and (low.startswith("state") or s.startswith("状态")):
+            # 英文 "State  ON" / 中文 "状态  启用"
+            prof[cur] = "on" if ("on" in low or "启用" in s or "开" in s) else "off"
+    return prof or None
+
+
+def ipv6_diagnose(deep=False, timeout=4.0):
+    """把「有没有 IPv6」拆成四档，每档一句话说清下一步做什么。
+
+    返回 `verdict` 四选一：
+      no-address   一个 v6 地址都没有（网卡禁了 v6 / 系统关掉了）
+      local-only   只有 fe80 或 ULA，没有全球单播（路由器没下发前缀）
+      egress-fail  有全球地址，但出不了网（缺默认路由 / 运营商未放通）
+      ready        出得去。**注意：出得去 ≠ 对端进得来**，入站是另一道墙
+    """
+    glob = ipv6_addresses()
+    all6 = ipv6_addresses(only_global=False)
+
+    if not all6:
+        return {"verdict": "no-address", "addresses": [], "egress": None,
+                "firewall": None, "usable": False,
+                "advice": "本机一个 v6 地址都没有：先看网卡属性里 IPv6 有没有被勾掉，"
+                          "再看路由器有没有开 v6。这不是「国内没有 v6」，是这台机器没开。"}
+
+    if not glob:
+        return {"verdict": "local-only", "addresses": all6, "egress": None,
+                "firewall": None, "usable": False,
+                "advice": "只有链路本地/ULA，没有全球单播地址：路由器没下发 PD 前缀，"
+                          "或运营商侧没给这个宽带开 v6。要问的是路由器，不是本机。"}
+
+    eg = ipv6_reach(timeout=timeout)
+    if not eg.get("ok"):
+        return {"verdict": "egress-fail", "addresses": glob, "egress": eg,
+                "firewall": None, "usable": False,
+                "advice": "有全球地址但出不去：多半是缺默认路由，或运营商只给了前缀"
+                          "没给转发。查 `netsh interface ipv6 show route` 里有没有 ::/0。"}
+
+    fw = _win_firewall_state() if deep else None
+    blocked = bool(fw and any(v == "on" for v in fw.values()))
+    return {
+        "verdict": "ready", "addresses": glob, "egress": eg, "firewall": fw,
+        "usable": True,
+        "advice": ("出网通，可以拿它做直连候选。但**出得去不等于进得来**："
+                   + ("本机防火墙开着，v6 入站默认全拦，对端连进来之前要先开 pinhole。"
+                      if blocked else
+                      "防火墙未拦（或未检出），对端仍可能被路由侧 v6 防火墙挡住。")
+                   + "另外隐私地址（RFC 4941）会按小时轮换，长连接要用稳定地址。"),
+    }
+
+
+def _win_temporary_ipv6():
+    """Windows 上被标为「临时」的 v6 地址集合（RFC 4941 隐私地址）。
+
+    为什么必须知道哪些是临时的：临时地址按小时轮换，**当下可用，明天就没了**。
+    拿它当长期候选，对端存下来第二天连过来必然超时，而且会看起来像「网络坏了」。
+    稳定的那一个（RFC 7217 / EUI-64）才适合做长期入口。
+
+    拿不到就返回空集合 —— 明确「不知道」，而不是假装全都是稳定的。
+    """
+    if os.name != "nt":
+        return set()
+    try:
+        out = subprocess.run(["ipconfig", "/all"], capture_output=True, timeout=8,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return set()
+
+    raw = out.stdout or b""
+    txt = ""
+    for enc in ("gbk", "utf-8", "cp1252"):
+        try:
+            txt = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    tmp = set()
+    for ln in txt.splitlines():
+        low = ln.lower()
+        if "temporary" not in low and "临时" not in ln:
+            continue
+        for tok in ln.split():
+            # ipconfig 会在地址后面缀状态标记，中文是「(首选)」、英文是「(Preferred)」，
+            # 不剥掉它，下面那条字符白名单会把整个 token 判成非地址。
+            t = tok.split("%")[0].split("(")[0].strip()
+            if t.count(":") >= 2 and all(c in "0123456789abcdefABCDEF:." for c in t):
+                tmp.add(t)
+    return tmp
+
+
+def ipv6_candidates(timeout=4.0):
+    """给信令用的 v6 候选，**稳定的排前面**，并标出哪些会轮换。
+
+    这是 `ipv6_addresses()` 面向「当候选」这件事的版本：
+    地址列表本身不够用，因为两个地址一个明天还在、一个明天就没了，
+    而对端看不出区别。把 temporary 标出来，上层才能决定要不要长连。
+    """
+    addrs = ipv6_addresses()
+    if not addrs:
+        return []
+    tmp = _win_temporary_ipv6()
+    out = []
+    for ip in addrs:
+        # 拿不到临时地址清单时（非 Windows / 解析失败）一律标 unknown，
+        # 不标 False —— 那等于替对端担保「这个地址明天还在」。
+        flag = None if not tmp else (ip in tmp)
+        out.append({"ip": ip, "kind": "host6",
+                    "temporary": flag,
+                    "note": ("临时地址，几小时后会变，不适合长期候选"
+                             if flag else
+                             "" if flag is None else
+                             "稳定地址，可做长期入口")})
+    out.sort(key=lambda c: (bool(c["temporary"]) if c["temporary"] is not None else True))
+    return out
+
+
+def ipv6_usable(timeout=4.0, force=False):
+    """「现在能不能靠 IPv6 直连」—— 有全球地址且出得去。带 60 秒缓存。
+
+    为什么缓存：`tun.plan` / `tun.offer` 会被界面反复调用，
+    每次都拨一次 TCP 会把面板拖成幻灯片，而且平白多出一堆出站连接。
+    """
+    now = time.time()
+    if not force and _V6_CACHE["v"] is not None and now - _V6_CACHE["t"] < _V6_TTL:
+        return _V6_CACHE["v"]
+    d = ipv6_diagnose(timeout=timeout)
+    v = {"usable": bool(d["usable"]), "verdict": d["verdict"],
+         "addresses": d["addresses"], "ts": round(now, 1)}
+    _V6_CACHE.update({"t": now, "v": v})
+    return v
 
 
 def cascade(mine, theirs, my_stability=1.0, their_stability=1.0,
@@ -571,6 +800,12 @@ class Tunnel:
                     r = sender(data)
             except Exception as e:
                 return {"ok": False, "err": f"中继发送失败：{e}"}
+            # 中继端点的约定是「返回发出字节数，发不出去返回 0」。
+            # 不检查这个 0，就会把「已经断了」报成 ok=True —— 上层拿到一个
+            # 假成功，等到需要重试时才发现根本没发出去。
+            if isinstance(r, int) and r == 0:
+                self.path = None
+                return {"ok": False, "err": "中继发送失败：连接已断开"}
             return {"ok": True, "via": "relay", "result": r, "bytes": len(data)}
         return {"ok": False, "err": "既没有直连也没有中继"}
 
