@@ -42,9 +42,16 @@ LLMGW_CAPABILITIES = [
                        Param("key", "str", doc="自定义端点 key"),
                        Param("max_tokens", "int", doc="默认 1024"),
                        Param("temperature", "float", doc="缺省走网关默认"),
-                       Param("timeout", "int", doc="秒，默认 120")),
+                       Param("timeout", "int", doc="秒，默认 120"),
+                       Param("stream", "bool", doc="流式：返回 ttft_s/chunks/partial；"
+                                                  "首字节前失败换上游，首字节后断流保留已得内容"),
+                       Param("allow_paid", "bool", doc="允许第一轮就用额度型上游；"
+                                                      "默认免费端点优先，额度型只做兜底"),
+                       Param("session", "str", doc="粘性会话 id，30 分钟内复用同一 (网关,模型)"),
+                       Param("compress", "int", doc="上下文压缩级别 0/1/2，默认 1")),
                side_effect=True, check=_discover_ok,
-               note="[LLMGW] 真 token 消耗；走本地网关（OFM 18900 / zen-gate 8787）"),
+               note="[LLMGW] 真 token 消耗；走本地网关（OFM 18900 / zen-gate 8787）。"
+                    "多上游聚合：匿名端点 → 本机网关 → 带 key 额度型（免费优先，额度兜底）"),
     Capability("llmgw.probe", "单模型体检：可用性 + 首字延迟（学 zen-gate 的探测口径）",
                params=(Param("model", "str", True, "模型 id"),
                        Param("endpoint", "str", doc="缺省逐个端点试到通为止"),

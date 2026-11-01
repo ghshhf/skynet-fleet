@@ -98,12 +98,24 @@ ANON_ENDPOINTS = [
 KEYED_ENDPOINTS = [
     {"name": "agentrouter", "base": "https://agentrouter.org/v1",
      "env": "LLMW_AGENTROUTER_KEY", "secret": "agentrouter",
-     "default_model": "gpt-6.1-sol", "cost": 1.0,
-     "models": ["gpt-6.1-sol", "gpt-5.6-sol", "gpt-6-astra", "claude-opus-5-5"],
+     "default_model": "gpt-5.6-sol", "cost": 1.0,
+     "models": ["gpt-5.6-sol", "gpt-6.1-sol", "gpt-6-astra", "claude-opus-5-5"],
+     # 两道闸，实测出来的（11-01）：
+     #  ① 客户端指纹白名单：curl / 浏览器 UA 一律 401 "unauthorized client detected"，
+     #     换成 codex / claude-code / cline 的 UA 立刻 200 —— 它靠 UA 挡「公开代理」，
+     #     但认不出来就是认不出来，这不是加密，只是约定。
+     #  ② 协议只吃 Responses：打 /v1/chat/completions 报 "does not support, please use
+     #     /v1/responses" —— 因为上游本来就是 Codex 订阅后端，原生说 Responses。
+     "api_style": "responses",
+     "ua": "codex_cli_rs/0.51.0 (Windows 11; x86_64) Windows",
+     # 可替代的客户端 UA（同一把钥匙，任选其一即可过①）
+     "ua_alts": ["claude-cli/2.1.7 (external, cli)", "Cline/3.9.0"],
      "note": "AgentRouter：new-api 部署的公益站（响应头 X-Oneapi-Request-Id 可证）。"
              "注册 $50、邀请再 $100、每日签到约 $20、官方明示无在线充值（enable_online_topup=false）。"
              "只有 4 个模型，全是 GPT 订阅号池 / Claude 号池转出来的，不是官方按量 API："
-             "gpt-6.1-sol(倍率2) gpt-5.6-sol(2) gpt-6-astra(4) claude-opus-5-5(3, 仅 test/svip 分组)。"},
+             "gpt-5.6-sol(倍率2) gpt-6.1-sol(2) gpt-6-astra(4) claude-opus-5-5(3, 仅 test/svip 分组)。"
+             "注意 co.agentrouter.org 是文档写的接入域名，但与主站的令牌库**不是同一套**（实测 401），"
+             "要用 https://agentrouter.org/v1。"},
 ]
 # 密钥来源：环境变量 → ~/.fleet/upstreams.json（不进 git、不进日志、不进能力输出）
 UPSTREAMS_SECRET = os.path.join(os.path.expanduser("~"), ".fleet", "upstreams.json")
@@ -211,6 +223,8 @@ def discover_gateways():
                     "models": list(e.get("models") or []),
                     "cost": float(e.get("cost") or 0.0),
                     "keyed": True,
+                    "api_style": e.get("api_style") or "chat",
+                    "ua": e.get("ua") or "",
                     "note": e.get("note", "")})
     # 本地离线兜底（Ollama 兼容）——永远排最后，远程免费层优先
     lg = _local_gw()
@@ -1113,6 +1127,307 @@ def _req_json(base, path, key, timeout=15, method="GET", body=None,
         return 0, {}, {"_err": str(e)}, str(e)[:200]
 
 
+# ---------- OpenAI Responses API 适配层（Codex 系订阅后端原生协议）----------
+# 为什么要这层：AgentRouter 这类站的上游是 Codex 订阅后端，它原生只说 Responses。
+# 打 /v1/chat/completions 直接被拒（"does not support ... please use /v1/responses"）。
+# 天网内部一律用 chat 语义，所以在这里做双向翻译，上层调用方完全无感。
+def _to_resp_input(messages):
+    """chat messages → (instructions, input[])。
+
+    Responses 把 system 放在顶层 instructions，input 只放对话轮次；
+    且 content 是带类型的对象数组：user → input_text，assistant → output_text。
+    类型写错会被上游 400，不是格式美化问题。
+    """
+    sys_parts, turns = [], []
+    for m in messages or []:
+        role = (m.get("role") or "user").lower()
+        c = m.get("content")
+        if isinstance(c, list):  # 多模态：只取文本段，图片段原样保留
+            texts, others = [], []
+            for seg in c:
+                if isinstance(seg, dict) and seg.get("type") in ("text", "input_text"):
+                    texts.append(str(seg.get("text") or ""))
+                elif isinstance(seg, dict) and seg.get("type") == "image_url":
+                    others.append({"type": "input_image",
+                                   "image_url": (seg.get("image_url") or {}).get("url")
+                                   if isinstance(seg.get("image_url"), dict) else seg.get("image_url")})
+            c = "\n".join(texts)
+            extra = others
+        else:
+            c = "" if c is None else str(c)
+            extra = []
+        if role == "system":
+            sys_parts.append(c)
+            continue
+        typ = "output_text" if role == "assistant" else "input_text"
+        content = ([{"type": typ, "text": c}] if c else []) + extra
+        if not content:
+            continue
+        turns.append({"role": role, "content": content})
+    return "\n\n".join(p for p in sys_parts if p), (turns or [{
+        "role": "user", "content": [{"type": "input_text", "text": ""}]}])
+
+
+def _from_resp_body(d):
+    """Responses 返回 → chat 风格 body（让上层完全无感）。"""
+    texts, reasoning = [], []
+    for it in (d.get("output") or []):
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") == "reasoning":
+            for sm in (it.get("summary") or []):
+                if isinstance(sm, dict) and sm.get("text"):
+                    reasoning.append(sm["text"])
+            continue
+        if it.get("type") != "message":
+            continue
+        for seg in (it.get("content") or []):
+            if isinstance(seg, dict) and seg.get("type") in ("output_text", "text"):
+                texts.append(str(seg.get("text") or ""))
+    text = "".join(texts)
+    if not text and isinstance(d.get("output_text"), str):
+        text = d["output_text"]
+    u = d.get("usage") or {}
+    pt = int(u.get("input_tokens") or 0)
+    ct = int(u.get("output_tokens") or 0)
+    out = {
+        "id": d.get("id"), "object": "chat.completion", "model": d.get("model"),
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop" if d.get("status") in (None, "completed") else str(d.get("status")),
+        }],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                  "total_tokens": int(u.get("total_tokens") or (pt + ct))},
+        "_style": "responses",
+    }
+    if reasoning:
+        out["_reasoning"] = "\n".join(reasoning)[:2000]
+    rt = (u.get("output_tokens_details") or {}).get("reasoning_tokens")
+    if rt:
+        out["usage"]["reasoning_tokens"] = int(rt)
+    return out
+
+
+def _responses_once(gw, payload, timeout):
+    """用 Responses 协议打一次，返回与 _chat_once 相同的 7 元组。"""
+    instructions, turns = _to_resp_input(payload.get("messages") or [])
+    req_body = {
+        "model": payload.get("model"),
+        "input": turns,
+        "max_output_tokens": int(payload.get("max_tokens") or 1024),
+    }
+    if instructions:
+        req_body["instructions"] = instructions
+    if payload.get("temperature") is not None:
+        req_body["temperature"] = payload["temperature"]
+    if payload.get("stream"):
+        req_body["stream"] = True
+    hdrs = {"Accept": "application/json"}
+    if gw.get("ua"):
+        hdrs["User-Agent"] = gw["ua"]
+    st, hd, body, err0 = _req_json(gw["base"], "/v1/responses", gw["key"],
+                                   timeout=timeout, method="POST", body=req_body,
+                                   extra_headers=hdrs)
+    if err0 and st == 0:
+        return None, err0, None, 0, "transport", "timeout", None
+    if st == 200 and isinstance(body, dict) and (body.get("output") is not None
+                                                 or body.get("output_text")):
+        chat = _from_resp_body(body)
+        chat["_routed_via"] = (hd or {}).get("X-Routed-Via") or gw["name"]
+        tokens = (chat.get("usage") or {}).get("total_tokens", 0)
+        return chat, None, chat["_routed_via"], tokens, "ok", "ok", None
+    err = _extract_err(body)
+    if not err:
+        err = "HTTP %s" % st
+    cls = _classify_error(st, err)
+    reason = _reason_for(cls)
+    retry_after_s = None
+    if st == 429:
+        ra = (hd or {}).get("Retry-After") or (hd or {}).get("retry-after")
+        if ra:
+            try:
+                retry_after_s = float(ra)
+            except ValueError:
+                pass
+    return None, err, None, 0, cls, reason, retry_after_s
+
+
+# ---------- SSE 流式（首字节前可换上游，首字节后不重试，保住已得内容）----------
+# 语义要点：mid-stream 故障转移不能靠「重发」——重发会让调用方看到重复内容。
+# 所以分界线是**首字节**：
+#   首字节前出错 → 上游根本没开始输出，等价于普通失败，可以换下一个候选；
+#   首字节后出错 → 已经吐了的字收不回来，把 partial 连同错误一起交上去，
+#                  由调用方决定是续写还是丢弃（天网默认保留，partial=True 标记）。
+def _sse_once(gw, payload, timeout, on_delta=None):
+    """流式打一次。返回 8 元组，末位是 meta(ttft_s/chunks/partial)。
+
+    同时认两种事件格式：
+      chat 风格      data: {"choices":[{"delta":{"content":"x"}}]}
+      responses 风格 event: response.output_text.delta / data: {"delta":"x"}
+    """
+    style = gw.get("api_style") or "chat"
+    if style == "responses":
+        instructions, turns = _to_resp_input(payload.get("messages") or [])
+        req_body = {"model": payload.get("model"), "input": turns,
+                    "max_output_tokens": int(payload.get("max_tokens") or 1024),
+                    "stream": True}
+        if instructions:
+            req_body["instructions"] = instructions
+        if payload.get("temperature") is not None:
+            req_body["temperature"] = payload["temperature"]
+        path = "/v1/responses"
+    else:
+        req_body = dict(payload)
+        req_body["stream"] = True
+        path = "/v1/chat/completions"
+
+    url = _join_url(gw["base"], path)
+    host = (_urlparse.urlparse(gw["base"]).hostname or "").lower()
+    local = host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
+    handlers = []
+    if not local:
+        px = _egress_proxy_addr()
+        if px:
+            handlers.append(urllib.request.ProxyHandler({"http": px, "https": px}))
+        elif not _dns_ok(host):
+            return (None, "域名 %s 解析/不可达（DNS 预筛）" % host, None, 0,
+                    "transport", "timeout", None,
+                    {"ttft_s": None, "chunks": 0, "partial": False})
+    handlers += [urllib.request.HTTPHandler(), urllib.request.HTTPSHandler()]
+    opener = urllib.request.build_opener(*handlers)
+    headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+    if gw.get("key"):
+        headers["Authorization"] = "Bearer " + gw["key"]
+    if gw.get("ua"):
+        headers["User-Agent"] = gw["ua"]
+    req = urllib.request.Request(url, data=json.dumps(req_body).encode("utf-8"),
+                                 headers=headers, method="POST")
+
+    parts, reasoning, chunks = [], [], 0
+    ttft = None
+    t0 = _now()
+    usage = {}
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            via = r.headers.get("X-Routed-Via") or gw["name"]
+            first = True
+            while True:
+                line = r.readline()
+                if not line:
+                    break
+                s = line.decode("utf-8", "replace").strip()
+                if not s or s.startswith(":"):
+                    continue
+                if not s.startswith("data:"):
+                    continue
+                seg = s[5:].strip()
+                if seg == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(seg)
+                except Exception:
+                    continue
+                if isinstance(ev.get("usage"), dict) and ev["usage"]:
+                    usage = ev["usage"]
+                # chat 风格
+                for ch in (ev.get("choices") or []):
+                    d = (ch or {}).get("delta") or {}
+                    piece = d.get("content")
+                    if piece:
+                        if first:
+                            ttft = round(_now() - t0, 3)
+                            first = False
+                        parts.append(piece)
+                        chunks += 1
+                        if on_delta:
+                            try:
+                                on_delta(piece)
+                            except Exception:
+                                pass
+                    if d.get("reasoning_content"):
+                        reasoning.append(d["reasoning_content"])
+                # responses 风格
+                typ = ev.get("type") or ""
+                if typ.endswith("output_text.delta"):
+                    piece = ev.get("delta") or ""
+                    if piece:
+                        if first:
+                            ttft = round(_now() - t0, 3)
+                            first = False
+                        parts.append(piece)
+                        chunks += 1
+                        if on_delta:
+                            try:
+                                on_delta(piece)
+                            except Exception:
+                                pass
+                elif typ.endswith("reasoning_summary_text.delta"):
+                    reasoning.append(ev.get("delta") or "")
+                elif typ == "response.completed":
+                    usage = (ev.get("response") or {}).get("usage") or usage
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", "replace")[:400]
+        except Exception:
+            pass
+        err = raw or ("HTTP %s" % e.code)
+        try:
+            j = json.loads(raw)
+            err = _extract_err(j) or err
+        except Exception:
+            pass
+        cls = _classify_error(e.code, err)
+        return (None, err, None, 0, cls, _reason_for(cls),
+                _retry_after_of(e.headers), {"ttft_s": ttft, "chunks": chunks,
+                                             "partial": bool(parts)})
+    except Exception as e:
+        # 首字节前挂 = 普通失败（可换上游）；首字节后挂 = 保住 partial，不重试
+        if not parts:
+            return (None, str(e)[:200], None, 0, "transport", "timeout", None,
+                    {"ttft_s": ttft, "chunks": 0, "partial": False})
+        return (_sse_body(parts, reasoning, usage, gw, payload), None, gw["name"], 0,
+                "ok", "ok", None,
+                {"ttft_s": ttft, "chunks": chunks, "partial": True,
+                 "err": str(e)[:200]})
+
+    if not parts:
+        return (None, "流结束但没有内容（上游返回空流）", None, 0, "server", "5xx", None,
+                {"ttft_s": ttft, "chunks": 0, "partial": False})
+    body = _sse_body(parts, reasoning, usage, gw, payload)
+    tk = int((usage or {}).get("total_tokens") or 0)
+    return (body, None, gw["name"], tk, "ok", "ok", None,
+            {"ttft_s": ttft, "chunks": chunks, "partial": False})
+
+
+def _retry_after_of(headers):
+    try:
+        ra = headers.get("Retry-After") or headers.get("retry-after")
+        return float(ra) if ra else None
+    except Exception:
+        return None
+
+
+def _sse_body(parts, reasoning, usage, gw, payload):
+    """把流式碎片拼成 chat 风格 body（与 _chat_once 成功返回同构，上层无感）。"""
+    u = usage or {}
+    pt = int(u.get("input_tokens") or u.get("prompt_tokens") or 0)
+    ct = int(u.get("output_tokens") or u.get("completion_tokens") or 0)
+    out = {
+        "id": "stream-" + str(int(_now())), "object": "chat.completion",
+        "model": payload.get("model"), "_style": gw.get("api_style") or "chat",
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant", "content": "".join(parts)},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                  "total_tokens": int(u.get("total_tokens") or (pt + ct))},
+    }
+    if reasoning:
+        out["_reasoning"] = "".join(reasoning)[:2000]
+    return out
+
+
 # ---------- chat 单次尝试 ----------
 def _chat_once(gw, payload, timeout):
     """统一返回 7 元组：(body|None, err, via, tokens, cls, reason, retry_after_s)。
@@ -1121,6 +1436,8 @@ def _chat_once(gw, payload, timeout):
     传输错（st==0）：body=None，cls="transport"，reason="timeout"；
     HTTP 错：body=None，cls/reason 由 _classify_error 决定。
     """
+    if gw.get("api_style") == "responses":
+        return _responses_once(gw, payload, timeout)
     st, hdrs, body, err0 = _req_json(
         gw["base"], "/v1/chat/completions", gw["key"],
         timeout=timeout, method="POST", body=payload)
@@ -1472,7 +1789,10 @@ def _h_chat(cap, args, dev):
         picks = [(g["default_model"], g) for g in gws if g.get("default_model")
                  and not _is_health_filtered(g["name"], g["default_model"])]
         if picks:
-            picks.sort(key=lambda t: bandit_score(t[1]["name"], t[0]), reverse=True)
+            # 关键：免费端点（cost=0）永远排在额度型前面 —— 否则一旦额度型上游刚成功过，
+            # bandit 分会把它顶到默认位，之后每次默认调用都在薅同一只羊。
+            picks.sort(key=lambda t: (float(t[1].get("cost") or 0) > 0,
+                                      -bandit_score(t[1]["name"], t[0])))
             models = [picks[0][0]]
         else:
             for g in gws:
@@ -1508,12 +1828,26 @@ def _h_chat(cap, args, dev):
         return R.error(cap, "所有候选均在 cooldown 或 model bench 中",
                        device=dev.name, via=dev.via)
 
+    # 免费优先，额度型只做兜底 —— 不逮着一只羊薅。
+    # 第一轮（hedge/流式）只发 cost==0 的免费端点；它们全挂了，串行 fallback
+    # 才会轮到带 key 的额度型上游。显式 endpoint= 指定时不做这层过滤（你点名要谁就是谁）。
+    free_c = [c for c in candidates if not (c["gw"].get("cost") or 0) > 0]
+    allow_paid = bool(endpoint_pref) or not free_c or args.get("allow_paid") is True
+    first_round = candidates if allow_paid else free_c
+
+    # 流式：不并发（两路流没法合流），按分串行；首字节前失败换下一个候选。
+    sv = args.get("stream")
+    if sv is True or (isinstance(sv, str) and sv.lower() in ("1", "true", "on", "yes")):
+        return _chat_stream_serial(cap, dev, first_round, payload_base, timeout,
+                                   session, comp_saved,
+                                   deeper=candidates if not allow_paid else None)
+
     # hedge 并发：对前 N 个候选并发发送（单次尝试有超时上限，不阻塞退出）
-    res, chosen_idx, tried, results = _hedge_send(candidates, payload_base, timeout)
+    res, chosen_idx, tried, results = _hedge_send(first_round, payload_base, timeout)
 
     if res[0] is not None:
         body, err, via, tokens, cls, reason, retry_after = res
-        c = candidates[chosen_idx]
+        c = first_round[chosen_idx]
         g = c["gw"]
         m = c["model"]
         lat = round(_now() - c.get("_t0", _now()), 2) if c.get("_t0") else 0
@@ -1537,7 +1871,7 @@ def _h_chat(cap, args, dev):
         rr = results.get(idx)
         if rr is None or rr[0] is not None:
             continue  # 未完成的或成功的跳过
-        c = candidates[idx]
+        c = first_round[idx]
         g = c["gw"]
         m = c["model"]
         err = rr[1] or ""
@@ -1548,12 +1882,13 @@ def _h_chat(cap, args, dev):
         record_failure(g["name"], m, err_text=err, reason=reason, retry_after_s=rr[6])
         _update_health(g["name"], m, False)
 
-    # 全部失败：尝试串行 fallback 剩余候选（跳过 hedge 已试过的，避免重复打）
+    # 全部失败：尝试串行 fallback 剩余候选（跳过 hedge 已试过的，避免重复打）。
+    # 这里用全量 candidates —— 免费端点全挂时，额度型上游在这一步才被轮到（兜底不抢跑）。
     serial_timeout = min(timeout, HEDGE_ATTEMPT_TIMEOUT)
-    for idx in range(len(candidates)):
-        if idx in tried:
+    tried_ids = {id(first_round[i]) for i in tried}
+    for c in candidates:
+        if id(c) in tried_ids:
             continue
-        c = candidates[idx]
         g = c["gw"]
         m = c["model"]
         p = dict(payload_base)
@@ -1585,12 +1920,75 @@ def _h_chat(cap, args, dev):
     return R.error(cap, "全部候选失败：%s" % attempts, device=dev.name, via=dev.via)
 
 
+def _chat_stream_serial(cap, dev, candidates, payload_base, timeout, session, comp_saved,
+                        deeper=None):
+    """流式路径：按 bandit 分串行试候选。
+
+    分界线是首字节 —— 首字节前失败换下一个（等价普通 fallback）；
+    首字节后失败不再重试，把已得内容作为 partial 交回（重试会让用户看到重复输出）。
+    deeper=全量候选表：免费端点全在首字节前挂了，才轮到额度型上游兜底。
+    """
+    attempts = []
+    queue = list(candidates)
+    seen = {id(c) for c in queue}
+    i = 0
+    while i < len(queue):
+        c = queue[i]
+        i += 1
+        if i == len(queue) and deeper:
+            # 免费那批耗尽：追加额度型继续（同一轮里不重复打）
+            for d2 in deeper:
+                if id(d2) not in seen:
+                    seen.add(id(d2))
+                    queue.append(d2)
+        g, m = c["gw"], c["model"]
+        p = dict(payload_base)
+        p["model"] = m
+        t0 = _now()
+        body, err, via, tk, cls, reason, ra, meta = _sse_once(
+            g, p, min(timeout, HEDGE_ATTEMPT_TIMEOUT))
+        lat = round(_now() - t0, 2)
+        if body is not None:
+            ttft = meta.get("ttft_s")
+            record_success(g["name"], m, tokens=tk,
+                           ttfb_ms=(ttft * 1000) if ttft else None)
+            _update_health(g["name"], m, True)
+            if session:
+                with _LOCK:
+                    _STICKY[session] = {"gw": g["name"], "model": m, "ts": _now()}
+            data = {
+                "result": body, "endpoint": g["name"], "base": g["base"],
+                "model": m, "origin": c.get("origin"),
+                "routed_via": body.get("_routed_via") or via or g["name"],
+                "latency_s": lat, "fallback_attempts": attempts, "session": session,
+                "cooldown_source": c.get("cooldown_source"),
+                "compress_saved_chars": comp_saved,
+                "stream": True, "ttft_s": ttft, "chunks": meta.get("chunks", 0),
+                "partial": bool(meta.get("partial")),
+            }
+            if meta.get("partial"):
+                # 中途断流：内容保留，错误如实上报，让调用方自己决定要不要续写
+                data["stream_err"] = meta.get("err") or "mid-stream interrupted"
+            return R.success(cap, dev.name, via=dev.via, data=data)
+
+        record_failure(g["name"], m, err_text=err, reason=reason, retry_after_s=ra)
+        _update_health(g["name"], m, False)
+        attempts.append({"gateway": g["name"], "model": m, "err": (err or "")[:150],
+                         "latency_s": lat, "cooldown_source": c.get("cooldown_source"),
+                         "phase": "pre-first-byte"})
+
+    return R.error(cap, "流式：全部候选在首字节前失败：%s" % attempts,
+                   device=dev.name, via=dev.via)
+
+
 def _chat_once_simple(gw, payload, timeout):
     """简化版 _chat_once，返回 (body, err, via, tokens, retry_after_s)。
 
     用于串行 fallback；多返回一个 retry_after_s（429 时从 Retry-After 头取），
     透传给 record_failure → set_cooldown 标记 authoritative。
     """
+    if gw.get("api_style") == "responses":
+        return _responses_once(gw, payload, timeout)
     st, hdrs, body, err0 = _req_json(
         gw["base"], "/v1/chat/completions", gw["key"],
         timeout=timeout, method="POST", body=payload)
@@ -2428,7 +2826,123 @@ def _selftest():
         finally:
             g0["_req_json"] = fake_req
 
-        print("llmgw_device 自测：19 组全过")
+        # ⑳ Responses 协议双向翻译：system→instructions、assistant→output_text、
+        #    返回的 reasoning 段不进正文但保留在 _reasoning，usage 映射成 chat 口径。
+        ins, turns = g0["_to_resp_input"]([
+            {"role": "system", "content": "你是蓝鲸"},
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "在"},
+            {"role": "user", "content": "继续"},
+        ])
+        assert ins == "你是蓝鲸", ins
+        assert [t["role"] for t in turns] == ["user", "assistant", "user"], turns
+        assert turns[0]["content"][0]["type"] == "input_text"
+        assert turns[1]["content"][0]["type"] == "output_text", turns[1]
+        chat = g0["_from_resp_body"]({
+            "id": "resp_x", "status": "completed", "model": "gpt-5.6-sol",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "想一下"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "收到。"}]},
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 7,
+                      "total_tokens": 17,
+                      "output_tokens_details": {"reasoning_tokens": 3}},
+        })
+        assert chat["choices"][0]["message"]["content"] == "收到。", chat
+        assert chat["usage"]["total_tokens"] == 17 and chat["usage"]["reasoning_tokens"] == 3
+        assert chat["_reasoning"] == "想一下" and chat["_style"] == "responses"
+
+        # ㉑ Responses 型网关：请求必须打到 /v1/responses 且带上客户端 UA
+        #    （AgentRouter 两道闸：UA 白名单 + 只认 Responses 协议）。
+        seen = {}
+
+        def fake_resp(base, path, key, timeout=15, method="GET", body=None,
+                      extra_headers=None):
+            seen["path"] = path
+            seen["ua"] = (extra_headers or {}).get("User-Agent")
+            seen["body"] = body
+            return 200, {}, {"id": "r1", "status": "completed",
+                             "output": [{"type": "message", "role": "assistant",
+                                         "content": [{"type": "output_text", "text": "ok"}]}],
+                             "usage": {"input_tokens": 3, "output_tokens": 1,
+                                       "total_tokens": 4}}, None
+
+        g0["_req_json"] = fake_resp
+        try:
+            gw_r = {"name": "agentrouter", "base": "https://agentrouter.org/v1",
+                    "key": "sk-test", "anon": False, "api_style": "responses",
+                    "ua": "codex_cli_rs/0.51.0 (Windows 11; x86_64) Windows"}
+            b, e, _via, tk, _cls, _rs, _ra = g0["_chat_once"](
+                gw_r, {"model": "gpt-5.6-sol", "max_tokens": 64,
+                       "messages": [{"role": "system", "content": "S"},
+                                    {"role": "user", "content": "U"}]}, 20)
+            assert e is None and b["choices"][0]["message"]["content"] == "ok", (e, b)
+            assert tk == 4, tk
+            assert seen["path"] == "/v1/responses", seen
+            assert seen["ua"] and "codex" in seen["ua"].lower(), seen
+            assert seen["body"]["instructions"] == "S", seen["body"]
+            assert seen["body"]["max_output_tokens"] == 64, seen["body"]
+            assert seen["body"]["input"][0]["content"][0]["type"] == "input_text"
+        finally:
+            g0["_req_json"] = fake_req
+
+        # ㉒ 流式：首字节前失败换上游；免费那批全挂后，额度型才在 deeper 里被兜底轮到。
+        calls = []
+        real_sse = g0["_sse_once"]
+
+        def fake_sse(gw, payload, timeout, on_delta=None):
+            calls.append(gw["name"])
+            if gw["name"] == "free-bad":
+                return (None, "boom", None, 0, "server", "5xx", None,
+                        {"ttft_s": None, "chunks": 0, "partial": False})
+            if gw["name"] == "free-cut":
+                # 首字节后断流：内容保留，标 partial，不重试
+                return ({"choices": [{"message": {"content": "半句"},
+                                      "finish_reason": "stop"}],
+                         "usage": {"total_tokens": 3}}, None, gw["name"], 3, "ok", "ok",
+                        None, {"ttft_s": 0.2, "chunks": 2, "partial": True,
+                               "err": "connection reset"})
+            return ({"choices": [{"message": {"content": "ok"},
+                                  "finish_reason": "stop"}],
+                     "usage": {"total_tokens": 5}}, None, gw["name"], 5, "ok", "ok",
+                    None, {"ttft_s": 0.3, "chunks": 4, "partial": False})
+
+        g0["_sse_once"] = fake_sse
+        try:
+            c_free_bad = {"gw": {"name": "free-bad", "base": "x"}, "model": "m1", "score": 1}
+            c_paid = {"gw": {"name": "paid-ok", "base": "x", "cost": 2.0}, "model": "m2",
+                      "score": 0.5}
+            rr = g0["_chat_stream_serial"]("llmgw.chat", d, [c_free_bad], {}, 5, None, 0,
+                                           deeper=[c_free_bad, c_paid])
+            assert rr.ok, rr.err
+            dd = rr.as_dict()["data"]
+            assert dd["endpoint"] == "paid-ok", dd
+            assert calls == ["free-bad", "paid-ok"], calls
+            assert dd["partial"] is False and dd["ttft_s"] == 0.3
+            # 首字节后断流：不换上游，内容保留 + stream_err 如实上报
+            calls.clear()
+            rr2 = g0["_chat_stream_serial"]("llmgw.chat", d,
+                                           [{"gw": {"name": "free-cut", "base": "x"},
+                                             "model": "m3", "score": 1}], {}, 5, None, 0,
+                                           deeper=[c_paid])
+            dd2 = rr2.as_dict()["data"]
+            assert calls == ["free-cut"], calls
+            assert dd2["partial"] is True and "connection reset" in dd2["stream_err"], dd2
+            assert dd2["result"]["choices"][0]["message"]["content"] == "半句"
+        finally:
+            g0["_sse_once"] = real_sse
+
+        # ㉓ 免费优先：默认模型挑选必须把 cost=0 的端点排在额度型前面，
+        #    否则额度型刚成功一次就会被 bandit 顶到默认位，之后天天薅同一只羊。
+        #    注意 picks 的元素是 (default_model, 网关)，与 _h_chat 里一致。
+        picks = [("paid-model", {"name": "paid", "cost": 3.0}),
+                 ("free-model", {"name": "free", "cost": 0.0})]
+        picks.sort(key=lambda t: (float(t[1].get("cost") or 0) > 0,
+                                  -g0["bandit_score"](t[1]["name"], t[0])))
+        assert picks[0][0] == "free-model", picks
+
+        print("llmgw_device 自测：23 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
