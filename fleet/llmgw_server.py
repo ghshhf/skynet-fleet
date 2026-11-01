@@ -29,11 +29,29 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+if sys.stdout is None or sys.stderr is None:
+    # 计划任务用 pythonw 拉起时没有控制台，流可能为 None —— 那时任何 print 都会抛
+    # AttributeError，而网关是在后台线程里打日志的，一炸就是整条服务静默死掉。
+    # 挂在 Windows 计划任务上跑，这种死法没人看得见，所以必须先把流补上。
+    try:
+        _dir = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tmp")
+        os.makedirs(_dir, exist_ok=True)
+        _fd = open(os.path.join(_dir, "gw8790.log"), "a",
+                   encoding="utf-8", errors="replace")
+        if sys.stdout is None:
+            sys.stdout = _fd
+        if sys.stderr is None:
+            sys.stderr = _fd
+    except Exception:
+        pass
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -415,8 +433,37 @@ def _warmup_loop(delay=3.0, gap=1.0):
         time.sleep(gap)
 
 
+class _ExclusiveServer(ThreadingHTTPServer):
+    """同端口只许一个实例。
+
+    ThreadingHTTPServer 默认 allow_reuse_address=1 → Windows 上会设 SO_REUSEADDR，
+    而 Windows 的 SO_REUSEADDR 语义和 POSIX 完全不同：它允许**第二个进程绑同一端口**
+    「成功」（端口劫持），两个进程各收一部分连接，行为完全不可预测。
+    11-01 把网关挂上计划任务后立刻撞上：自愈和手动拉起撞车，netstat 里出现两个 pid
+    同时 LISTENING 在 8790，客户端随机转到其中一个，报的错互相打架。
+    SO_EXCLUSIVEADDRUSE 才是 Windows 的独占语义 —— 第二个实例绑定时直接失败退出，
+    这是我们要的结果：宁可这个实例起不来，也不能两个半死不活地分流量。
+    """
+    allow_reuse_address = (os.name != "nt")
+
+    def server_bind(self):
+        if os.name == "nt":
+            import socket as _s
+            try:
+                self.socket.setsockopt(_s.SOL_SOCKET, _s.SO_EXCLUSIVEADDRUSE, 1)
+            except Exception:
+                pass
+        ThreadingHTTPServer.server_bind(self)
+
+
 def serve(port=_DEFAULT_PORT, host="127.0.0.1"):
-    srv = ThreadingHTTPServer((host, port), Handler)
+    try:
+        srv = _ExclusiveServer((host, port), Handler)
+    except OSError as e:
+        # 绑不上 = 已经有一个在跑。这是正常情况（自愈和手动会撞），不是故障。
+        print("端口 %d 已被占用（可能已有一个网关在跑）：%s" % (port, e),
+              file=sys.stderr, flush=True)
+        return 2
     print("天网 llmgw 网关已起：http://%s:%d/v1" % (host, port))
     print("  分类：%s" % " / ".join(_classes()))
     print("  用法：OpenAI 兼容客户端里 url 填 http://%s:%d/v1/chat/completions，"
@@ -430,14 +477,47 @@ def serve(port=_DEFAULT_PORT, host="127.0.0.1"):
         srv.server_close()
 
 
+def _selftest():
+    """离线自测：同端口只许一个实例。
+
+    这条必须钉住，因为网关已经挂到 Windows 计划任务上（tools/gw_up.py --install）：
+    自愈和手动拉起撞车是常态。两个进程同时 LISTENING 在 8790 时，Windows 会把
+    连接随机分给其中一个，报的错互相打架 —— 从日志里根本看不出有两个实例。
+    11-01 装计划任务当天就撞了一次（netstat 里两个 pid 并排）。
+    """
+    bad = 0
+    s1 = _ExclusiveServer(("127.0.0.1", 0), Handler)
+    port = s1.server_address[1]
+    try:
+        s2 = _ExclusiveServer(("127.0.0.1", port), Handler)
+        s2.server_close()
+        print("❌ 第二个实例居然绑上了同端口（独占失效）")
+        bad += 1
+    except OSError:
+        print("✅ 第二个实例被拒（独占端口生效）")
+    # 端口被占时 serve() 必须立刻返回 2，而不是进去 serve_forever 干等
+    rc = serve(port)
+    if rc == 2:
+        print("✅ 端口被占时 serve() 立刻返回 2")
+    else:
+        print("❌ 端口被占时 serve() 返回了 %r" % (rc,))
+        bad += 1
+    s1.server_close()
+    print("llmgw_server 自测：%s" % ("全过" if not bad else "%d 项失败" % bad))
+    return 0 if not bad else 1
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="天网 llmgw OpenAI 兼容端点")
     ap.add_argument("--port", type=int, default=_DEFAULT_PORT)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--selftest", action="store_true", help="跑离线自测")
     a = ap.parse_args(argv)
-    serve(a.port, a.host)
+    if a.selftest:
+        return _selftest()
+    return serve(a.port, a.host)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
