@@ -595,10 +595,39 @@ TIER_VALUE = {"Frontier": 4, "Large": 3, "Medium": 2, "Small": 1}
 MODEL_TIER = {}       # model -> tier label
 MODEL_RANK = {}       # model -> intelligence rank (1..1000, 1 = best)
 
-# hedge：并发发前 N 个候选，取第一个成功（FreeLLMAPI 设计）
-HEDGE_FANOUT = 3
+# hedge 并发扇出默认值 —— 11-01 起**默认 1（串行）**，并发改成显式诉求。
+#
+# 为什么改：并发抢跑不是「更快」，是**用额度买延迟**，在免费层上是亏本买卖。
+# 一次 fanout=3 实际代价三条，全都要命：
+#   ① 并发连接数：同时占 3 条。匿名端点上限普遍只有 3~6，一个 fanout 就吃掉全部
+#      （这就是「怕高并发被拉闸」的真身 —— 不是请求太多，是同时太多）。
+#   ② 请求次数：上游按次计 RPM/RPD，一次调用记 3 次。
+#   ③ 钱/额度：被丢弃的那 2 份响应**照样计费 token**，AMD 免费层是 $1/天，
+#      fanout=3 等于每分钟都在扔掉 2/3 的额度去买「快 0.5 秒」。
+# 串行只占 1 条连接、只计 1 次、只烧命中那一份。它唯一的代价是「上游死了要等超时才发现」,
+# 而这个代价被**首字节超时**压到 8s（STREAM_FIRST_BYTE_TIMEOUT），比 40s 的整次超时快得多。
+# 需要抢跑时显式传 fanout=3，默认不给。
+HEDGE_FANOUT = 1
+SERIAL_FANOUT = 1
+# 硬上限：再急也不许超过这个数（防止调用方写 fanout=99 把上游打穿）
+FANOUT_MAX = 5
+
 # fanout 单次尝试超时上限：一个抖动的网关不能拖死整次调用（默认 chat timeout=120s）
 HEDGE_ATTEMPT_TIMEOUT = 40
+
+# ---------- 串行流式：用时间换并发 ----------
+# 非流式请求也在**上游侧走流式**（客户端拿到的是拼好的整段 JSON，无感）：
+#   · 上游只开 1 条连接，不占并发名额；
+#   · 首字节一到就知道「这上游活着」，比等整个响应回来才判断快一个数量级；
+#   · 首字节前挂 = 干净失败，立刻换下一个候选，不浪费额度。
+# 这是「为什么不用并发、用流式」的落地形式。
+UPSTREAM_STREAM = True
+# 首字节超时（秒）：上游连上了但不吐字，等这么久就断它、换下一跳。
+# 实测参考：AMD V4.1-Flash 1.4s、Kiro Sonnet 3.9s、ovh 5s+、匿名端点 1~6s。
+# 给 9s：慢上游能活，死上游不拖人。
+STREAM_FIRST_BYTE_TIMEOUT = 9.0
+# 明确不支持 stream=true 的上游（打一次 400 后自动登记，之后直接走非流式，不再浪费一次请求）
+_NO_STREAM = set()
 
 # 成本权重：路由偏好「不烧额度 / 不烧钱的先上」。cost=0 的匿名端点因子恒为 1（老排序一字不变），
 # 只有显式声明成本的上游（cost>0，例如 AgentRouter 这类额度型聚合站）才被折价。
@@ -1604,12 +1633,17 @@ def _responses_once(gw, payload, timeout):
 #   首字节前出错 → 上游根本没开始输出，等价于普通失败，可以换下一个候选；
 #   首字节后出错 → 已经吐了的字收不回来，把 partial 连同错误一起交上去，
 #                  由调用方决定是续写还是丢弃（天网默认保留，partial=True 标记）。
-def _sse_once(gw, payload, timeout, on_delta=None):
+def _sse_once(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
     """流式打一次。返回 8 元组，末位是 meta(ttft_s/chunks/partial)。
 
     同时认两种事件格式：
       chat 风格      data: {"choices":[{"delta":{"content":"x"}}]}
       responses 风格 event: response.output_text.delta / data: {"delta":"x"}
+
+    first_byte_timeout：**首字节闸**。上游连上了但迟迟不吐字时，等这么久就掐掉换下一跳。
+      这是「串行也能快」的关键 —— 串行唯一怕的是死上游拖时间，而首字节闸把
+      「发现它死了」的时间从整次超时（40~120s）压到 9s。首字节一到就把 socket
+      超时放宽成正常 timeout（慢工出细活的长回答不受影响）。
     """
     style = gw.get("api_style") or "chat"
     if style == "responses":
@@ -1656,10 +1690,21 @@ def _sse_once(gw, payload, timeout, on_delta=None):
     ttft = None
     t0 = _now()
     usage = {}
+    # 首字节闸：open 阶段用短超时（连接 + 等第一个字节），拿到字后再放宽到正常 timeout。
+    fb = STREAM_FIRST_BYTE_TIMEOUT if first_byte_timeout is None else float(first_byte_timeout)
+    open_timeout = timeout
+    if fb and fb > 0:
+        open_timeout = max(3.0, min(float(timeout), fb))
     try:
-        with opener.open(req, timeout=timeout) as r:
+        with opener.open(req, timeout=open_timeout) as r:
             via = r.headers.get("X-Routed-Via") or gw["name"]
             first = True
+            _sock = None
+            try:
+                # http.client.HTTPResponse -> fp(BufferedReader) -> raw(SocketIO) -> _sock
+                _sock = r.fp.raw._sock
+            except Exception:
+                _sock = None
             while True:
                 line = r.readline()
                 if not line:
@@ -1686,6 +1731,12 @@ def _sse_once(gw, payload, timeout, on_delta=None):
                         if first:
                             ttft = round(_now() - t0, 3)
                             first = False
+                            # 首字节已到 = 上游活着，放宽 socket 超时（长回答不再受首字节闸约束）
+                            if _sock is not None:
+                                try:
+                                    _sock.settimeout(timeout)
+                                except Exception:
+                                    pass
                         parts.append(piece)
                         chunks += 1
                         if on_delta:
@@ -1703,6 +1754,12 @@ def _sse_once(gw, payload, timeout, on_delta=None):
                         if first:
                             ttft = round(_now() - t0, 3)
                             first = False
+                            # 首字节已到 = 上游活着，放宽 socket 超时（长回答不再受首字节闸约束）
+                            if _sock is not None:
+                                try:
+                                    _sock.settimeout(timeout)
+                                except Exception:
+                                    pass
                         parts.append(piece)
                         chunks += 1
                         if on_delta:
@@ -1990,17 +2047,50 @@ def _kiro_once(gw, payload, timeout):
 
 
 # ---------- chat 单次尝试 ----------
-def _chat_once(gw, payload, timeout):
+def _sse_chat_once(gw, payload, timeout):
+    """非流式语义 + 上游流式传输（串行主力路径）。
+
+    客户端要的是完整 JSON，但**跟上游要说流式**：
+      · 上游只开 1 条连接 → 不占「并发连接数」这个闸（免费站最容易撞的就是它，
+        AMD 单模型 32、匿名端点 3~6 —— 撞的不是次数，是同时几条）；
+      · 首字节 9s 内没到 = 这上游死了，立刻断掉换下一跳，不用干等 40~120s 整次超时；
+      · 首字节到了就放宽超时，长回答该多长还是多长。
+    返回与 _chat_once 同构的 7 元组，上层无感。
+    """
+    body, err, via, tk, cls, reason, ra, meta = _sse_once(gw, payload, timeout)
+    if body is not None:
+        # 首字节时间带出去：这是「串行也能快」的证据，也是 bandit 速度分的输入。
+        # （以前非流式路径根本拿不到 ttft，速度分只能靠总耗时，慢上游和迟钝上游分不开）
+        body["_ttft_s"] = meta.get("ttft_s")
+        return body, None, via, tk, "ok", "ok", None
+    low = (err or "").lower()
+    # 上游不认 stream（少数老网关 400/422 直接拒）→ 登记一次，本次立刻回退非流式；
+    # 之后的调用直接走非流式，不再每次白撞一次 400（那也是一次计费的请求）。
+    if cls == "client" and ("stream" in low or "unsupported" in low
+                            or "not supported" in low):
+        _NO_STREAM.add(gw["name"])
+        return _chat_once(gw, payload, timeout, prefer_stream=False)
+    return None, err, None, 0, cls, reason, ra
+
+
+def _chat_once(gw, payload, timeout, prefer_stream=None):
     """统一返回 7 元组：(body|None, err, via, tokens, cls, reason, retry_after_s)。
 
     成功：body 非 None，err=None，cls/reason="ok"；
     传输错（st==0）：body=None，cls="transport"，reason="timeout"；
     HTTP 错：body=None，cls/reason 由 _classify_error 决定。
+
+    prefer_stream：默认跟随 UPSTREAM_STREAM（True）—— 非流式请求也走上游流式。
+      responses / kiro 两种私有协议暂时不走（各自有专门实现和定制头），
+      不为了让「统一」把已验证通过的链路弄坏。
     """
     if gw.get("api_style") == "responses":
         return _responses_once(gw, payload, timeout)
     if gw.get("api_style") == "kiro":
         return _kiro_once(gw, payload, timeout)
+    if (UPSTREAM_STREAM if prefer_stream is None else prefer_stream) \
+            and gw["name"] not in _NO_STREAM:
+        return _sse_chat_once(gw, payload, timeout)
     st, hdrs, body, err0 = _req_json(
         gw["base"], "/v1/chat/completions", gw["key"],
         timeout=timeout, method="POST", body=payload)
@@ -2571,13 +2661,21 @@ def _h_chat(cap, args, dev):
                                    session, comp_saved,
                                    deeper=candidates if not allow_paid else None)
 
-    # hedge 并发：对前 N 个候选并发发送（单次尝试有超时上限，不阻塞退出）
-    # class 模式必须 fanout=1：并发是「谁先回用谁」，而分类链是「先要最好的，不行才退」。
+    # 扇出：默认 1（串行）。只有显式 fanout>1 才并发抢跑。
+    # 理由见 HEDGE_FANOUT 上方注释：并发是「用额度买延迟」（3 条连接 + 3 次计费 +
+    # 被丢弃的 2 份照样烧 token），串行是「用时间换额度」，在免费层上前者亏本。
+    _fan = args.get("fanout")
+    try:
+        fanout = int(_fan) if _fan is not None else HEDGE_FANOUT
+    except (TypeError, ValueError):
+        fanout = HEDGE_FANOUT
+    fanout = max(1, min(fanout, FANOUT_MAX))
+    # class 模式仍然强制 1：并发是「谁先回用谁」，而分类链是「先要最好的，不行才退」。
     # 实测踩到（11-01）：给 fanout=3 时 claude 链要的 sonnet 被更快的 haiku 抢掉，
     # cn 链的 kimi 被 glm 抢掉 —— 链序白定，分类就失去意义了。
     res, chosen_idx, tried, results = _hedge_send(
         first_round, payload_base, timeout,
-        max_fanout=1 if chain else HEDGE_FANOUT)
+        max_fanout=1 if chain else fanout)
 
     if res[0] is not None:
         body, err, via, tokens, cls, reason, retry_after = res
@@ -2585,8 +2683,11 @@ def _h_chat(cap, args, dev):
         g = c["gw"]
         m = c["model"]
         lat = round(_now() - c.get("_t0", _now()), 2) if c.get("_t0") else 0
+        # 上游流式带回来的首字节时间：喂 bandit 速度分（区分「慢」和「迟钝」），也算给客户端看
+        ttft_s = body.pop("_ttft_s", None)
         # 记录成功
-        record_success(g["name"], m, tokens=tokens)
+        record_success(g["name"], m, tokens=tokens,
+                       ttfb_ms=(ttft_s * 1000) if ttft_s else None)
         _update_health(g["name"], m, True)
         if session:
             with _LOCK:
@@ -2595,6 +2696,7 @@ def _h_chat(cap, args, dev):
         return R.success(cap, dev.name, via=dev.via, data={
             "result": body, "endpoint": g["name"], "base": g["base"],
             "model": m, "origin": c.get("origin"), "routed_via": routed, "latency_s": lat,
+            "ttft_s": ttft_s,
             "fallback_attempts": attempts, "session": session,
             "cooldown_source": c.get("cooldown_source"),
             "compress_saved_chars": comp_saved,
@@ -2722,11 +2824,27 @@ def _chat_once_simple(gw, payload, timeout):
 
     用于串行 fallback；多返回一个 retry_after_s（429 时从 Retry-After 头取），
     透传给 record_failure → set_cooldown 标记 authoritative。
+
+    这里也优先走上游流式（同 _sse_chat_once）：串行 fallback 本来就是「免费端点全挂了，
+    退到带 key 的额度型」的时候，那时是最不该浪费额度的时刻。
     """
     if gw.get("api_style") == "responses":
-        return _responses_once(gw, payload, timeout)
+        # _responses_once 返回 7 元组，这里要 5 元组 —— 以前直接 return 会让
+        # 上层解包 ValueError（responses 上游一旦走到串行 fallback 就崩）。
+        r7 = _responses_once(gw, payload, timeout)
+        return r7[0], r7[1], r7[2], r7[3], r7[6]
     if gw.get("api_style") == "kiro":
-        return _kiro_once(gw, payload, timeout)
+        r7 = _kiro_once(gw, payload, timeout)
+        return r7[0], r7[1], r7[2], r7[3], r7[6]
+    if UPSTREAM_STREAM and gw["name"] not in _NO_STREAM:
+        body, err, via, tk, cls, reason, ra, meta = _sse_once(gw, payload, timeout)
+        if body is not None:
+            return body, None, via, tk, None
+        low = (err or "").lower()
+        if not (cls == "client" and ("stream" in low or "unsupported" in low
+                                     or "not supported" in low)):
+            return None, err, None, 0, ra
+        _NO_STREAM.add(gw["name"])   # 这家不认 stream，登记后重走下面非流式
     st, hdrs, body, err0 = _req_json(
         gw["base"], "/v1/chat/completions", gw["key"],
         timeout=timeout, method="POST", body=payload)
@@ -3275,6 +3393,11 @@ def _selftest():
     g = globals()
     g["discover_gateways"] = fake_discover
     g["_req_json"] = fake_req
+    # 自测里的 fake 上游只实现了非流式（_req_json），让它走老路径；
+    # 流式路径单独用 patch 过的 _sse_once 测（见 ㉚）。
+    saved_nostream = set(_NO_STREAM)
+    _NO_STREAM.clear()
+    _NO_STREAM.add("fake")
 
     try:
         d = LlmGwDevice("selftest")
@@ -3936,11 +4059,67 @@ def _selftest():
                     "分类 %s 指向 %s 的模型 %r 不在声明清单里；清单是 %s"
                     % (cname, ep_name, model, _decl[ep_name]))
 
-        print("llmgw_device 自测：29 组全过")
+        # ㉚ 串行优先 + 上游流式（主人 11-01 定：不用并发抢跑，用流式）。
+        #    要钉住三件事：
+        #    ① 默认扇出必须是 1。并发 fanout=3 的真实代价是「3 条连接 + 记 3 次 + 扔掉的
+        #       2 份响应照样烧 token」，在按 token 计费的免费层上是纯亏；
+        #    ② 非流式请求必须**在上游侧走流式** —— 只开 1 条连接、首字节一到就知道活着，
+        #       客户端拿到的仍然是完整 JSON（对上层无感）；
+        #    ③ 上游不认 stream 时登记一次并回退非流式，不能每次都白撞一个 400。
+        assert g0["HEDGE_FANOUT"] == 1, "默认扇出必须串行：并发是用额度买延迟"
+        assert g0["SERIAL_FANOUT"] == 1
+        assert g0["FANOUT_MAX"] >= 1
+        assert g0["STREAM_FIRST_BYTE_TIMEOUT"] > 0, "串行必须靠首字节闸换上游"
+
+        seen_sse = {}
+
+        def fake_sse(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
+            seen_sse["model"] = payload.get("model")
+            seen_sse["gw"] = gw["name"]
+            return ({"choices": [{"message": {"role": "assistant", "content": "流式拼好的"}}],
+                     "usage": {"total_tokens": 5}},
+                    None, gw["name"], 5, "ok", "ok", None,
+                    {"ttft_s": 0.3, "chunks": 3, "partial": False})
+
+        _real_sse = g0["_sse_once"]
+        g0["_sse_once"] = fake_sse
+        try:
+            gw_s = {"name": "sse-ep", "base": "http://127.0.0.1:9/v1", "key": "x"}
+            rs = g0["_chat_once"](gw_s, {"model": "m1", "messages": []}, 10)
+            assert rs[1] is None, ("非流式请求没走上游流式：%s" % (rs[1],))
+            assert rs[0]["choices"][0]["message"]["content"] == "流式拼好的", rs[0]
+            assert seen_sse.get("model") == "m1", seen_sse
+            # 上游明确不认 stream（400）→ 登记 + 当次回退非流式，且不在 _NO_STREAM 里越积越多
+
+            def fake_sse_400(gw2, payload, timeout, on_delta=None, first_byte_timeout=None):
+                return (None, "stream is not supported by this model", None, 0,
+                        "client", "429", None, {"ttft_s": None, "chunks": 0, "partial": False})
+
+            g0["_sse_once"] = fake_sse_400
+            gw_s2 = {"name": "nostream-ep", "base": "http://127.0.0.1:9/v1", "key": "x"}
+            _real_req2 = g0["_req_json"]
+            g0["_req_json"] = lambda *a, **k: (
+                200, {"X-Routed-Via": "nostream-ep"},
+                {"choices": [{"message": {"role": "assistant", "content": "非流式回来的"}}],
+                 "usage": {"total_tokens": 3}}, None)
+            try:
+                rs2 = g0["_chat_once"](gw_s2, {"model": "tm", "messages": []}, 10)
+                assert "nostream-ep" in g0["_NO_STREAM"], "不认 stream 的上游应被登记"
+                assert rs2[0] is not None, ("登记后当次必须回退非流式：%s" % (rs2[1],))
+                assert rs2[0]["choices"][0]["message"]["content"] == "非流式回来的", rs2[0]
+            finally:
+                g0["_req_json"] = _real_req2
+        finally:
+            g0["_sse_once"] = _real_sse
+            g0["_NO_STREAM"].discard("nostream-ep")
+
+        print("llmgw_device 自测：30 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
         g["_req_json"] = real_req
+        _NO_STREAM.clear()
+        _NO_STREAM.update(saved_nostream)
         for name, val in saved.items():
             globals()[name].clear()
             globals()[name].update(val)
