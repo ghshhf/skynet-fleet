@@ -10,14 +10,18 @@
     failure benching、bandit 路由评分、错误体自学习限制、cooldown-probe
     早期恢复、hedge 并发、X-Routed-Via 可溯源、状态持久化
   - Free-GPT4-WEB-API：`D:/code/vendor-src/Free-GPT4-WEB-API`（aledipa，基于 g4f）——
-    provider 健康监控 + 多层 fallback，错误体分类（401/403/429/5xx/timeout/context_too_large/transport）
+    实为 g4f 的 Flask 薄壳；其「健康监控」实为流量被动计数（无主动探针），错误分类粗糙、
+    且 401 也算 provider 失败。真正可抄的是 g4f 的 provider 池概念，而非它这层壳。
+    我取它的错误分类 + 多层 fallback 思想，健康监控则用下面更强的实时可用性图谱。
 
 本模块不依赖上面三者运行时，只复用它们的协议/设计，用 Python 标准库
-实现一个 OpenAI 兼容客户端 + 路由器，自动发现 OFM/zen-gate 本地 key，
-并聚合匿名端点（pollinations/llm7/kilo/OVH），支持跨网关·跨模型 fallback、
-配额追踪、cooldown、粘性会话、家族路由。
+实现一个 OpenAI 兼容客户端 + 路由器：自动发现 OFM/zen-gate 本地 key，
+聚合匿名免 key 直连上游（pollinations/llm7/kilo/OVH，均实测 chat 可用），
+支持跨网关·跨模型 fallback、配额追踪、cooldown、粘性会话、家族路由、
+实时可用性图谱 + bandit 路由 + hedge 并发 —— 目标是「模型随时可用」：
+无论哪个上游挂/限流，自动切到其他健康上游，用户无感。
 
-能力（7 项）：
+能力（10 项）：
   llmgw.endpoints   — 列出所有可用网关（OFM/zen-gate/匿名）+ 健康探测
   llmgw.models      — 按网关列出模型清单（含 family 分类）
   llmgw.chat        — OpenAI 兼容 chat，跨网关·跨模型 fallback + cooldown + bandit 路由 + hedge 并发
@@ -25,6 +29,8 @@
   llmgw.probe       — 单模型首字延迟（TTFB）
   llmgw.cooldowns   — 查看当前冷却中的端点/模型（带 source 标记）
   llmgw.sticky      — 查看/清除粘性会话
+  llmgw.compress    — 网关层上下文压缩（省 token、少撞上下文上限）
+  llmgw.health      — 可用性图谱（各端点模型实时健康状态，坏的降权/过滤 → 模型随时可用）
   llmgw.egress      — 网络出口状态（免费端点直连即可用；环境若设了 HTTPS_PROXY 则透明走，非必需）
 """
 import json
@@ -60,20 +66,22 @@ except Exception:
 OFM_SETTINGS = os.path.join(os.path.expanduser("~"), ".our-free-model", "settings.json")
 ZENGATE_CONFIG = os.path.join(os.environ.get("APPDATA") or "", "zen-gate", "config.json")
 
-# 匿名端点（FreeLLMAPI 设计：no key，直接打）
+# 匿名端点（FreeLLMAPI 设计：no key，直接打）。全部经实测（DNS+TCP+chat 探测）确认可用。
+# 不同软件绑定不同上游 → 不同免费模型；天网把这些免 key 直连上游全聚合，加自家 OFM/zen-gate，
+# 再加冷却/hedge/fallback/健康图谱，做到「无论哪个上游挂/限流，总有别的能答 = 模型随时可用」。
 ANON_ENDPOINTS = [
     {"name": "pollinations", "base": "https://text.pollinations.ai/openai/v1",
      "key": "", "anon": True, "default_model": "openai-fast",
-     "note": "GPT-OSS 20B on OVH，匿名可用"},
+     "note": "自建开源权重 GPT-OSS 20B，匿名可用（实测 chat OK）"},
     {"name": "llm7", "base": "https://api.llm7.io/v1",
      "key": "", "anon": True, "default_model": "gpt-oss-20b",
-     "note": "100 req/hr 匿名，聚合多上游"},
+     "note": "100 req/hr 匿名，聚合多上游（偶发超时，靠冷却兜底）"},
     {"name": "kilo", "base": "https://api.kilo.ai/api/gateway/v1",
-     "key": "", "anon": True, "default_model": None,
-     "note": "kilo :free 路由，匿名可用"},
-    {"name": "ovh", "base": "https://api.ai.endpoints.ovh.net/v1",
-     "key": "", "anon": True, "default_model": "Qwen2.5-72B-Instruct",
-     "note": "OVH AI Endpoints 免费开源权重，匿名可用（模型 id 以 /v1/models 为准）"},
+     "key": "", "anon": True, "default_model": "kilo-auto/free",
+     "note": "kilo :free 路由，匿名可用（实测 chat OK，384 模型中挑免费 id）"},
+    {"name": "ovh", "base": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+     "key": "", "anon": True, "default_model": "gpt-oss-20b",
+     "note": "OVH AI Endpoints 免费开源权重，匿名可用（22 模型，修正域名后实测 OK）"},
 ]
 
 
@@ -164,6 +172,15 @@ _BANDIT = {}
 _LEARNED_LIMITS = {}
 # rate 窗口：(gw, model) -> {"rpm": 0, "rpd": 0, "tpm": 0, "tpd": 0, "window": ts}
 _RATE = {}
+# 可用性图谱（freellmapi model_probe_status 思路，但用实时流量驱动而非纯周期探针）：
+# (gw, model) -> {"ok": ts, "fail": ts, "consecutive": int, "healthy": bool}
+# 成功/失败实时更新；已知连续失败且不自愈的端点，_build_candidates 会降权/过滤，
+# 把 hedge 名额留给健康端点 → 请求不浪费在已死上游上 = 模型随时可用。
+_HEALTH = {}
+# 连续失败达到此值且近期无成功 → 判定 unhealthy（过滤出候选，不浪费 hedge 名额）
+HEALTH_FAIL_THRESHOLD = 3
+# 最近一次成功距今小于此值 → 强制 healthy（自愈恢复，哪怕之前连续失败）
+HEALTH_RECOVER_S = 180
 # in-flight leases（check-then-act 竞态关闭）：lease_id -> (gw, model, tokens, created_at)
 _LEASES = {}
 _LEASE_ID = [0]
@@ -340,6 +357,49 @@ def _classify_error(status_code, err_text):
     if "timeout" in low:
         return "timeout"
     return "other"
+
+
+# ---------- 可用性图谱（实时流量驱动；freellmapi model_probe_status 的轻量版） ----------
+def _update_health(gw, model, ok):
+    """请求后更新 (gw, model) 的健康状态。成功 → 重置连续失败并标记 healthy；
+    失败 → 连续失败 +1，连续达到阈值且无近期成功则判定 unhealthy。"""
+    k = _ckey(gw, model)
+    with _LOCK:
+        st = _HEALTH.get(k, {"ok": 0.0, "fail": 0.0, "consecutive": 0, "healthy": True})
+        now = _now()
+        if ok:
+            st["ok"] = now
+            st["consecutive"] = 0
+            st["healthy"] = True
+        else:
+            st["fail"] = now
+            st["consecutive"] = st.get("consecutive", 0) + 1
+            if st["consecutive"] >= HEALTH_FAIL_THRESHOLD and (now - st.get("ok", 0)) > HEALTH_RECOVER_S:
+                st["healthy"] = False
+        _HEALTH[k] = st
+
+
+def _health_state(gw, model):
+    """返回 (healthy: bool, consecutive_fail: int, last_ok_ts, last_fail_ts)。"""
+    k = _ckey(gw, model)
+    with _LOCK:
+        st = _HEALTH.get(k)
+        if not st:
+            return True, 0, 0.0, 0.0   # 未知 = 默认健康（乐观，首次请求自证）
+        # 自愈：最近成功足够近 → 强制 healthy
+        now = _now()
+        if st.get("ok", 0) and (now - st["ok"]) < HEALTH_RECOVER_S:
+            return True, st.get("consecutive", 0), st["ok"], st["fail"]
+        return st.get("healthy", True), st.get("consecutive", 0), st["ok"], st["fail"]
+
+
+def _is_health_filtered(gw, model):
+    """是否应被过滤出候选（已知连续失败且不自愈）。返回 True 表示先别选它。"""
+    healthy, consecutive, last_ok, _ = _health_state(gw, model)
+    if healthy:
+        return False
+    # unhealthy：仅当近期也无成功（已自愈恢复的情况 _health_state 已返回 healthy）
+    return not healthy
 
 
 # ---------- 错误体自学习限制（FreeLLMAPI parseProviderLimit / learnLimitFromError） ----------
@@ -780,9 +840,19 @@ def _dns_ok(host, timeout=2.5):
 
 
 # ---------- HTTP 请求（标准库 urllib） ----------
+def _join_url(base, path):
+    """拼 base+path，避免 base 已含 /v1 时 path 再带 /v1 造成 /v1/v1 重复
+    （匿名端点 base 多含 /v1，而统一 path 又是 /v1/chat/completions）。"""
+    b = (base or "").rstrip("/")
+    p = path or ""
+    if b.endswith("/v1") and p.startswith("/v1/"):
+        return b + p[3:]
+    return b + p
+
+
 def _req_json(base, path, key, timeout=15, method="GET", body=None,
               extra_headers=None):
-    url = base.rstrip("/") + path
+    url = _join_url(base, path)
     host = (_urlparse.urlparse(base).hostname or "").lower()
     local = host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
     # 本地网关直连；远程默认直连（免费端点直连即可用，正是 FreeLLMAPI/Free-GPT4-WEB-API 的玩法），
@@ -915,9 +985,14 @@ def _build_candidates(gws, models, session=None, sticky_pref=None):
             if cooled:
                 continue
             score = bandit_score(g["name"], m, models_for_intel=intel_models)
+            # 健康图谱：已知连续失败且不自愈的端点降权（不浪费 hedge 名额，但不完全丢弃 —
+            # 万一是全部上游都临时抽风，仍会按降权顺序尝试，不至于直接返回「无候选」）
+            healthy = not _is_health_filtered(g["name"], m)
+            if not healthy:
+                score *= 0.001
             candidates.append({
                 "gw": g, "model": m, "score": score,
-                "cooldown_source": source,
+                "cooldown_source": source, "healthy": healthy,
             })
     # 先按 local 标志升序（非本地在前），再按 bandit 分降序（稳定排序：同分时本地仍压最后）
     candidates.sort(key=lambda c: c["gw"].get("local", False))
@@ -1116,6 +1191,7 @@ def _h_chat(cap, args, dev):
         lat = round(_now() - c.get("_t0", _now()), 2) if c.get("_t0") else 0
         # 记录成功
         record_success(g["name"], m, tokens=tokens)
+        _update_health(g["name"], m, True)
         if session:
             with _LOCK:
                 _STICKY[session] = {"gw": g["name"], "model": m, "ts": _now()}
@@ -1142,6 +1218,7 @@ def _h_chat(cap, args, dev):
                          "err": (err or "")[:150], "latency_s": 0,
                          "cooldown_source": c.get("cooldown_source"), "via": "hedge"})
         record_failure(g["name"], m, err_text=err, reason=reason, retry_after_s=rr[6])
+        _update_health(g["name"], m, False)
 
     # 全部失败：尝试串行 fallback 剩余候选（跳过 hedge 已试过的，避免重复打）
     serial_timeout = min(timeout, HEDGE_ATTEMPT_TIMEOUT)
@@ -1172,6 +1249,7 @@ def _h_chat(cap, args, dev):
         cls = _classify_error(0, err)
         reason = {"timeout": "timeout", "transport": "timeout"}.get(cls, "5xx")
         record_failure(g["name"], m, err_text=err, reason=reason, retry_after_s=retry_after_s)
+        _update_health(g["name"], m, False)
         attempts.append({"gateway": g["name"], "model": m,
                          "err": (err or "")[:150], "latency_s": lat,
                          "cooldown_source": c.get("cooldown_source")})
@@ -1409,6 +1487,29 @@ def _h_compress(cap, args, dev):
         "level": level, "count": len(out)})
 
 
+def _h_health(cap, args, dev):
+    """可用性图谱：各 (gw, model) 实时健康状态（流量驱动，已知死的端点会降权/过滤）。"""
+    now = _now()
+    with _LOCK:
+        items = []
+        for (g, m), st in list(_HEALTH.items()):
+            ok_ts = st.get("ok", 0.0)
+            healthy = bool(st.get("healthy", True)) or (ok_ts and (now - ok_ts) < HEALTH_RECOVER_S)
+            items.append({
+                "gateway": g, "model": (None if m == "*" else m),
+                "healthy": bool(healthy),
+                "consecutive_fail": st.get("consecutive", 0),
+                "last_ok": round(ok_ts, 1), "last_fail": round(st.get("fail", 0.0), 1),
+            })
+    total = len(items)
+    healthy_n = sum(1 for x in items if x["healthy"])
+    return R.success(cap, dev.name, via=dev.via, data={
+        "items": items[:500], "total": total, "healthy": healthy_n,
+        "unhealthy": total - healthy_n,
+        "fail_threshold": HEALTH_FAIL_THRESHOLD, "recover_s": HEALTH_RECOVER_S,
+    })
+
+
 _HANDLERS = {
     "llmgw.endpoints": _h_endpoints,
     "llmgw.models": _h_models,
@@ -1419,6 +1520,7 @@ _HANDLERS = {
     "llmgw.sticky": _h_sticky,
     "llmgw.compress": _h_compress,
     "llmgw.egress": _h_egress,
+    "llmgw.health": _h_health,
 }
 
 
@@ -1595,7 +1697,29 @@ def _selftest():
         # 还原代理环境变量
         for k, v in _pv.items():
             os.environ[k] = v
-        print("llmgw_device 自测：12 组全过")
+        # ⑬ 可用性图谱（流量驱动，不依赖真实网络）
+        g0["_HEALTH"].clear()
+        hg, hm = "hgw", "hmodel"
+        assert g0["_health_state"](hg, hm)[0] is True, "未知端点默认健康"
+        assert g0["_is_health_filtered"](hg, hm) is False
+        g0["_update_health"](hg, hm, True)
+        assert g0["_health_state"](hg, hm)[0] is True
+        # 让 last_ok 落到自愈窗口之外，再连续失败 3 次 → 判定 unhealthy
+        g0["_HEALTH"][(hg, hm)]["ok"] = _now() - (HEALTH_RECOVER_S + 300)
+        for _ in range(HEALTH_FAIL_THRESHOLD):
+            g0["_update_health"](hg, hm, False)
+        assert g0["_is_health_filtered"](hg, hm) is True, "连续失败应判定 unhealthy"
+        # 一次成功立即恢复（自愈）
+        g0["_update_health"](hg, hm, True)
+        assert g0["_is_health_filtered"](hg, hm) is False, "成功后应恢复健康"
+        # llmgw.health 能力返回图谱
+        rh = d.invoke("llmgw.health", {})
+        assert rh.ok and rh.as_dict()["data"]["total"] >= 1
+        # URL 拼接去重：base 含 /v1 时 path 的 /v1 不重复
+        assert g0["_join_url"]("https://x/v1", "/v1/chat/completions") == "https://x/v1/chat/completions"
+        assert g0["_join_url"]("https://x", "/v1/models") == "https://x/v1/models"
+        assert g0["_join_url"]("http://127.0.0.1:1/v1", "/models") == "http://127.0.0.1:1/v1/models"
+        print("llmgw_device 自测：13 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
