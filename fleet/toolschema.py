@@ -33,6 +33,7 @@ providers 管「用哪条车道」，本模块管「给模型看什么、模型�
     本模块不碰 adb、不碰网络、不碰文件。
 """
 import json
+import re
 
 from .mcp.schema import (ToolIndex, input_schema, is_valid_mcp_name,
                          to_mcp_name)
@@ -157,6 +158,95 @@ def tools_for(flavor, caps, include_unsafe=False, owners=None):
     if flavor == FLAVOR_ANTHROPIC:
         return anthropic_tools(caps, include_unsafe=include_unsafe, owners=owners)
     raise ValueError(f"未知 flavor：{flavor!r}（只认 {FLAVORS}）")
+
+
+# ---------------------------------------------------------------- 工具表收窄
+# 为什么必须收窄（11-01 实测，不是理论）：
+#   全量 204 条工具表 = **93.1K 字符 ≈ 26.6K token**，一次问答就烧掉这么多。
+#   同一句话做对照：
+#     给 1 条工具  → 368 token、1.9s、**正确**调 echo
+#     给 204 条    → 26,601 token、4.2s、**调错**（调了个 llmgw_compress）
+#   也就是说：大工具表不只贵 72 倍，它还会**把模型淹掉**——工具越多，选得越不准。
+#   Pi（115k star 的终端代理）默认只给 4 个工具，同一个道理。
+#
+# 所以工具表不是「能力清单」，是**这一轮允许动的手**。少而准 > 多而全。
+
+#: 底座工具：不管问什么都给。它们是「先看看情况」的最小集合，
+#: 缺了它们模型只能瞎猜（实测就是这样：问机器状态，它说「查不到」）。
+HOT_BASE = ("pc.state", "apps.list", "app.foreground", "screen.read",
+            "screen.look", "tree.read", "jobs.list", "node.list")
+
+#: 默认上限。18 条 ≈ 2.3K token，实测这个量级模型选得准。
+DEFAULT_TOOL_LIMIT = 18
+
+
+def _q_grams(question):
+    """把一句话拆成可用于匹配的小碎片（中英通吃）。
+
+    没有分词器，用 2 字滑窗——中文最短的有效词就是两个字（"截屏""前台""电量"），
+    英文按词切。宁可粗一点：匹配多算几个候选，好过漏掉真正该给的那只手。
+    """
+    q = re.sub(r"[^\w\u4e00-\u9fff]+", " ", (question or "").lower())
+    grams = set()
+    for tok in q.split():
+        if len(tok) <= 2:
+            grams.add(tok)
+        else:
+            grams.add(tok)
+            for i in range(len(tok) - 1):
+                grams.add(tok[i:i + 2])
+    return {g for g in grams if g}
+
+
+def pick_caps(caps, question="", limit=DEFAULT_TOOL_LIMIT, must=HOT_BASE):
+    """按问题挑「这一轮该给模型看的能力子集」。
+
+    规则（按优先级）：
+      1. `must` 里的底座能力永远进（存在才进，名字打错不报错——它不是权限声明）；
+      2. 问题碎片命中 title/note/name 的加分，命中 name 的**段**再加权
+         （`app.foreground` 对「前台」这种词命中更硬）；
+      3. 危险/有副作用的能力跳过（与 `_visible` 同口径，别在这儿另立一套）；
+      4. 分数相同的按原顺序，保证同一问题每次拿到的表**稳定**（不稳定会让模型反复横跳）。
+
+    返回 list[Capability]，**保持传入顺序**（工具表排序稳定，diff 好读）。
+    """
+    caps = list(caps or [])
+    if not caps:
+        return []
+    limit = max(1, int(limit or DEFAULT_TOOL_LIMIT))
+    by_name = {c.name: c for c in caps}
+    chosen = set()
+    for n in (must or ()):
+        c = by_name.get(n)
+        if c is not None and not (c.side_effect or c.destructive):
+            chosen.add(n)
+    if len(chosen) >= limit:
+        return [c for c in caps if c.name in chosen][:limit]
+
+    grams = _q_grams(question)
+    scored = []
+    for i, c in enumerate(caps):
+        if c.name in chosen:
+            continue
+        if c.side_effect or c.destructive:
+            continue
+        hay = " ".join([c.name.replace(".", " "), c.title or "", c.note or ""]).lower()
+        score = 0
+        for g in grams:
+            if g in hay:
+                score += 1
+        if score:
+            for seg in c.name.split("."):
+                if seg and seg.lower() in grams:
+                    score += 2
+        if score:
+            scored.append((score, -i, c))     # -i：同分时保持原顺序
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    for _s, _i, c in scored:
+        if len(chosen) >= limit:
+            break
+        chosen.add(c.name)
+    return [c for c in caps if c.name in chosen]
 
 
 # ---------------------------------------------------------------- 回信（读回来）
@@ -501,6 +591,31 @@ def _selftest():
     clipped = clip_result(long)
     assert clipped.endswith("原长 5000 字符）") and len(clipped) < 1300
     assert clip_result("短") == "短"
+
+    # ---- 工具表收窄（pick_caps）：204 条 → 18 条 ----
+    # 为什么这条必须进自测：收窄是「省钱 + 让模型选得准」的唯一手段，
+    # 而它最容易悄悄退化成「全给」（谁把 limit 传成 None 就退回 204 条/26.6K token）。
+    # 11-01 实测对照：1 条表 368 token 选对；204 条表 26,601 token 还选错。
+    for q in ("手机现在前台是什么应用", "这台机器状态怎么样", "帮我看看装了什么应用"):
+        sub = pick_caps(caps, q, limit=18)
+        assert 0 < len(sub) <= 18, (q, len(sub))
+        assert all(not (c.side_effect or c.destructive) for c in sub), \
+            "收窄不许把危险能力带进来（与 _visible 同口径）"
+    # 底座永远在：问什么都先给「看看情况」的几只眼睛
+    base = {c.name for c in pick_caps(caps, "", limit=18)}
+    for n in ("pc.state", "apps.list"):
+        if any(c.name == n for c in caps):
+            assert n in base, f"底座能力 {n} 没进任何问题的默认表"
+    # 意图命中：问前台 → app.foreground 必须在
+    fg = {c.name for c in pick_caps(caps, "手机现在前台是什么应用", limit=18)}
+    assert "app.foreground" in fg or not any(c.name == "app.foreground" for c in caps), fg
+    # 空问题 = 只给底座，不瞎猜
+    assert len(pick_caps(caps, "", limit=18)) <= len(HOT_BASE) + 2, \
+        "空问题不该因为「全都不匹配」而漏成一大片"
+    # 顺序稳定：同一问题问两次，表必须一模一样（不然模型会反复横跳）
+    a1 = [c.name for c in pick_caps(caps, "截个屏看看", limit=18)]
+    a2 = [c.name for c in pick_caps(caps, "截个屏看看", limit=18)]
+    assert a1 == a2, (a1, a2)
 
     print("fleet.toolschema selftest ok")
 
