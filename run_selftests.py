@@ -392,6 +392,10 @@ CASES = [
     #     天网文档里的进度数字漂过四个门禁数并存，根子是数字与真源之间没有断言。
     ("eval_t54_stats_sync", ["evals/t54_stats_sync.py"], HERE, 60),
     ("eval_t55_net_accel", ["evals/t55_net_accel.py"], HERE, 300),
+    # t56 是「打不通也不许断」：t53 证明隔着 NAT 能打通，但打通是动作不是通路 ——
+    #     真实网络里打不通是常态。t56 钉的是「先中继可用、后台再升级」这套契约，
+    #     以及 IPv6 一票否决整套 NAT 分析的优先级。
+    ("eval_t56_tunnel", ["evals/t56_tunnel.py"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),
