@@ -185,7 +185,7 @@ def _history_messages(journal, hours=24, limit=20, max_chars=600):
 def _run_loop(question, executor, caps=None, tools=None, index=None,
               provs=None, need=None, model=None, account="", quota=None,
               max_rounds=MAX_ROUNDS, budget_s=BUDGET_S, system=SYSTEM,
-              flavor=TS.FLAVOR_OPENAI, on_event=None, history=None):
+              flavor=TS.FLAVOR_OPENAI, on_event=None, history=None, tool_limit=None):
     """跑完一圈。返回 dict。
 
     参数：
@@ -224,7 +224,13 @@ def _run_loop(question, executor, caps=None, tools=None, index=None,
         index = TS.ToolIndex(caps)
     if tools is None:
         # 默认只给只读：云端模型不该在没人看着的时候动手（见 toolschema 口径）
-        tools = TS.tools_for(flavor, caps, include_unsafe=False)
+        _tool_caps = caps
+        if tool_limit:
+            # 按问题收窄工具表。11-01 实测：204 条 = 93.1K 字符 ≈ 26.6K token，
+            # 而且模型会**选错工具**（问「回显 hello」它调了个 llmgw_compress）；
+            # 同样的问法给 1 条表 → 368 token、选对。少而准 > 多而全。
+            _tool_caps = TS.pick_caps(caps, question, limit=tool_limit)
+        tools = TS.tools_for(flavor, _tool_caps, include_unsafe=False)
 
     # **工具表就是权限边界**，不是给模型看的菜单。
     # 模型完全可以叫一个没出现在表里的名字（幻觉、或者它记得别家的工具名），
@@ -370,7 +376,7 @@ def run(question, executor, caps=None, tools=None, index=None,
         provs=None, need=None, model=None, account="", quota=None,
         max_rounds=MAX_ROUNDS, budget_s=BUDGET_S, system=SYSTEM,
         flavor=TS.FLAVOR_OPENAI, on_event=None,
-        journal=None, history_hours=24, history_limit=20):
+        journal=None, history_hours=24, history_limit=20, tool_limit=None):
     """跑完一圈（带记忆）。参数见 `_run_loop`；额外两个：
 
       `journal`     给了就接记忆：开跑前从它捞最近的人机对话塞进上下文，
@@ -385,7 +391,7 @@ def run(question, executor, caps=None, tools=None, index=None,
                     provs=provs, need=need, model=model, account=account,
                     quota=quota, max_rounds=max_rounds, budget_s=budget_s,
                     system=system, flavor=flavor, on_event=on_event,
-                    history=history)
+                    history=history, tool_limit=tool_limit)
     _persist(journal, question, res)
     return res
 
@@ -735,6 +741,16 @@ def main(argv=None):
     if "--selftest" in argv:
         return _selftest()
 
+    # 工具表收窄（11-01 起默认开）。--tools N 改上限；--tools 0 = 老行为（全量 204 条）。
+    limit = TS.DEFAULT_TOOL_LIMIT
+    if "--tools" in argv:
+        i = argv.index("--tools")
+        try:
+            limit = int(argv[i + 1])
+        except Exception:
+            limit = TS.DEFAULT_TOOL_LIMIT
+        del argv[i:i + 2]
+
     # 真跑：默认只读工具表 + 本机能力表，执行层走 Registry
     q = argv[0] if argv else "这台机器现在怎么样"
     from fleet import catalog
@@ -746,7 +762,8 @@ def main(argv=None):
     def fire(phase, payload):
         print("  · [%s] %s" % (phase, payload))
 
-    r = run(q, lambda cap, args: reg.call(cap, args=args), on_event=fire)
+    r = run(q, lambda cap, args: reg.call(cap, args=args), on_event=fire,
+            tool_limit=(limit if limit and limit > 0 else None))
     print("used=%s model=%s rounds=%s" % (r.get("used"), r.get("used_model"),
                                           r.get("rounds")))
     for s in r["steps"]:
