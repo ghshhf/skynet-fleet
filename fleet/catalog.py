@@ -32,6 +32,7 @@ from .kinds.lan_scanner import LanScanner
 from .kinds.lan_transfer import LanTransfer
 from .kinds.reach_layer import ReachLayer
 from .kinds.nat_traversal import NatTraversal, SESSION_TTL
+from .kinds.tunnel_layer import TunnelLayer
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.reverse import Reverse
@@ -464,6 +465,59 @@ CAPABILITIES = [
                params=(Param("id", "str", doc="不给就关最早那个")),
                side_effect=True,
                note="只关本端端口，不通知对端；对端下次发包会失败"),
+    # ---- 隧道编排（打洞的上层）----
+    # 与 nat.* 的分工不是「封装一层」，是**失败语义不同**：
+    #   nat.punch 失败 = 会话废了，上层要么重试要么放弃；
+    #   tun.upgrade 失败 = 什么都没发生，业务一直跑在中继上。
+    # 一句话：nat 负责「打得通」，tun 负责「打不通也能用」。
+    # 这也是为什么 tun.open 先连中继——打洞失败在网络差的地方是常态，
+    # 一个只在好网络里能用的功能等于没有。
+    Capability("tun.ipv6", "本机 IPv6 实况（有公网 v6 时，整套 NAT 分析都可以跳过）",
+               params=(),
+               note="IPv6 无 NAT：与同样有 v6 的对端直连不需要打洞/STUN/中继。"
+                    "但主机防火墙仍会拦入站，必要时需开 pinhole"),
+    Capability("tun.plan", "给定两端网况，我该按什么顺序试、各自多大把握（只算不连）",
+               params=(Param("mine", "str", doc="本端 nat.classify() 结果"),
+                       Param("theirs", "str", doc="对端网况"),
+                       Param("ipv6", "str", doc="both / one / none；不给就现场探本端"),
+                       Param("theirs_ipv6", "json", doc="对端的 v6 地址数组"),
+                       Param("upnp", "bool", doc="路由器是否支持端口映射"),
+                       Param("has_relay", "bool", doc="有没有中继，默认有"),
+                       Param("same_lan", "bool", doc="是否同一网段")),
+               note="无副作用。返回完整阶梯（含不可行项，便于解释「为什么没试直连」）"),
+    Capability("tun.offer", "产一条隧道信令 offer（候选地址 + 双方一致的开打时刻）",
+               params=(Param("sid", "str", doc="会话 id，不给就新生成"),
+                       Param("candidates", "json", doc="候选地址数组，不给就现场探"),
+                       Param("nonce", "str", doc="会话 token（hex），两侧须一致"),
+                       Param("mine", "str", doc="本端网况"),
+                       Param("lead", "float", doc="距开打还有几秒，默认 1.2")),
+               side_effect=False,
+               note="打洞时刻由 sid 的 hash 推出，两端各算一次即对齐，信令只花一轮"),
+    Capability("tun.accept", "校验对端 offer 并回一条应答（脏数据在这里被挡住）",
+               params=(Param("offer", "json", True, "对端给的 offer"),
+                       Param("mine", "str", doc="本端网况"),
+                       Param("port", "int", doc="候选端口")),
+               note="字段不合法、候选超量、端口越界一律拒；不拿脏数据去打洞"),
+    Capability("tun.open", "开一条隧道：**先连中继，此刻就能用**",
+               params=(Param("sid", "str", doc="会话 id"),
+                       Param("mine", "str", doc="本端网况"),
+                       Param("theirs", "str", doc="对端网况"),
+                       Param("ipv6", "str", doc="both / one / none")),
+               side_effect=True,
+               note="没有可用中继时会如实报不可用，不造一个假中继让流程走通"),
+    Capability("tun.upgrade", "后台试直连；成了主路迁移，败了不影响当前可用性",
+               params=(Param("sid", "str", True, "tun.open 返回的会话 id"),
+                       Param("peer", "json", doc="对端候选地址"),
+                       Param("seconds", "int", doc="最多打多久，默认 6"),
+                       Param("wait", "bool", doc="同步等结果（默认异步）")),
+               side_effect=True,
+               note="失败退回 relayed 而不是 idle —— 业务不能因为「升级没成功」被掐断"),
+    Capability("tun.status", "这条隧道现在走哪条路、怎么变的",
+               params=(Param("sid", "str", True, "会话 id")), note=""),
+    Capability("tun.sessions", "现在开着哪些隧道", params=()),
+    Capability("tun.close", "关掉隧道（先停升级线程，再关直连，最后拆中继）",
+               params=(Param("sid", "str", doc="不给就什么都不做")),
+               side_effect=True, note="收摊有次序，避免留半条连接"),
     # ---- 编队节点（远程机器）----
     # D1 真代发（2026-10-25）：控制面已加对外协议（common.CLIENT*），
     # 非 commander 进程可经 fleet.ctrl_client 让节点执行命令/推取文件。
@@ -988,6 +1042,9 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())
+    # D4 之后：隧道编排层。nat 只会「打通」，打通失败就什么都没有；
+    # tunnel 保证「打不通也先能用」，IPv6 直连能连时连 NAT 都不碰。
+    reg.add(TunnelLayer())
     if with_nodes:
         for name, rec in load_nodes().items():
             try:
