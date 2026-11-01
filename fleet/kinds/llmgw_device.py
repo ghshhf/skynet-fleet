@@ -2047,6 +2047,101 @@ def _kiro_once(gw, payload, timeout):
 
 
 # ---------- chat 单次尝试 ----------
+# ---------- 上游并发闸 ----------
+# 「怕高并发把它拉闸」——被拉闸的从来不是**累计请求次数**，而是**同时进行的连接数**。
+# 串行化解决了单次调用内部的扇出（HEDGE_FANOUT=1），但多个客户端 / 以后的多代理同时开火，
+# 还是会在同一个上游上叠出 N 条连接。所以每个上游加一道闸：
+#   拿到位子就发；等一小会儿还拿不到，就当「忙」如实上报，让链退下一跳 ——
+#   而不是硬着头皮把上游打穿（打穿一次，整个上游一起冷却，反而全线更慢）。
+# 默认值保守：没有实测依据的端点给 2；有实测的按实测往下压（宁可排队，不要拉闸）。
+DEFAULT_EP_CONCURRENCY = 2
+GLOBAL_CONCURRENCY = 6
+# 排队等位子的耐心：等不到就报 busy 退下一跳。给 2s —— 上游一轮回答通常也就 2~5s，
+# 等太久等于把「另一个请求的耗时」加到自己的头上，不如换一家。
+GATE_WAIT_S = 2.0
+EP_CONCURRENCY = {
+    "amd": 6,          # 单模型实测 32，但整把 key 还要留给别的模型，取 6
+    "kiro": 2,         # AWS 免费层，没明说就别试
+    "ovh": 2,
+    "kilo": 3,
+    "llm7": 2,
+    "pollinations": 3,
+    "ofm": 6,          # 本机转发网关，不吃外部并发
+    "zen-gate": 4,
+    "sensenova": 2,
+    "nvidia": 2,
+}
+_EP_SEM = {}
+_SEM_LOCK = threading.Lock()
+_GLOBAL_SEM = threading.BoundedSemaphore(GLOBAL_CONCURRENCY)
+_LOCAL = threading.local()
+
+
+def _ep_sem(name):
+    with _SEM_LOCK:
+        s = _EP_SEM.get(name)
+        if s is None:
+            s = threading.BoundedSemaphore(EP_CONCURRENCY.get(name, DEFAULT_EP_CONCURRENCY))
+            _EP_SEM[name] = s
+        return s
+
+
+class _Gate(object):
+    """上游并发位子（可重入）。
+
+    拿不到返回 ok=False，调用方据此报 busy（cls=rate）→ 上层退下一跳。
+    可重入是必须的：_sse_chat_once 在「上游不认 stream」时会回退 _chat_once，
+    那是同一线程对同一端点的第二次进入，不能再吃一个位子（端点只有 2 个位子时会自锁）。
+    """
+
+    def __init__(self, gw, wait=None):
+        self.name = (gw or {}).get("name") or "?"
+        self.wait = GATE_WAIT_S if wait is None else wait
+        self.ok = False
+        self.reentrant = False
+
+    def __enter__(self):
+        held = getattr(_LOCAL, "held", None)
+        if held is None:
+            held = set()
+            _LOCAL.held = held
+        if self.name in held:
+            self.reentrant = True
+            self.ok = True
+            return self
+        if not _GLOBAL_SEM.acquire(timeout=self.wait):
+            return self
+        if not _ep_sem(self.name).acquire(timeout=self.wait):
+            try:
+                _GLOBAL_SEM.release()
+            except Exception:
+                pass
+            return self
+        held.add(self.name)
+        self.ok = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.ok and not self.reentrant:
+            held = getattr(_LOCAL, "held", None)
+            if held:
+                held.discard(self.name)
+            try:
+                _ep_sem(self.name).release()
+            except Exception:
+                pass
+            try:
+                _GLOBAL_SEM.release()
+            except Exception:
+                pass
+        return False
+
+
+def _busy_tuple(name):
+    return (None, "上游 %s 并发位已满（busy，已等待但仍无位），本轮跳过" % name,
+            None, 0, "rate", "429", 1.0)
+
+
 def _sse_chat_once(gw, payload, timeout):
     """非流式语义 + 上游流式传输（串行主力路径）。
 
@@ -2083,7 +2178,17 @@ def _chat_once(gw, payload, timeout, prefer_stream=None):
     prefer_stream：默认跟随 UPSTREAM_STREAM（True）—— 非流式请求也走上游流式。
       responses / kiro 两种私有协议暂时不走（各自有专门实现和定制头），
       不为了让「统一」把已验证通过的链路弄坏。
+
+    外面套着上游并发闸：多个客户端/代理同时打同一个上游时在这里排队，
+      排不上就报 busy 让链退下一跳，绝不把上游打穿（打穿 = 全上游一起冷却）。
     """
+    with _Gate(gw) as _gt:
+        if not _gt.ok:
+            return _busy_tuple(_gt.name)
+        return _chat_once_inner(gw, payload, timeout, prefer_stream)
+
+
+def _chat_once_inner(gw, payload, timeout, prefer_stream=None):
     if gw.get("api_style") == "responses":
         return _responses_once(gw, payload, timeout)
     if gw.get("api_style") == "kiro":
@@ -2783,8 +2888,16 @@ def _chat_stream_serial(cap, dev, candidates, payload_base, timeout, session, co
         p = dict(payload_base)
         p["model"] = m
         t0 = _now()
-        body, err, via, tk, cls, reason, ra, meta = _sse_once(
-            g, p, min(timeout, HEDGE_ATTEMPT_TIMEOUT))
+        # 流式串行也是串行：每次尝试仍要过并发闸（多客户端同时流式照样会叠连接）
+        with _Gate(g) as _gt:
+            if not _gt.ok:
+                attempts.append({"gateway": g["name"], "model": m,
+                                 "err": _busy_tuple(_gt.name)[1], "latency_s": 0,
+                                 "cooldown_source": c.get("cooldown_source"),
+                                 "phase": "busy"})
+                continue
+            body, err, via, tk, cls, reason, ra, meta = _sse_once(
+                g, p, min(timeout, HEDGE_ATTEMPT_TIMEOUT))
         lat = round(_now() - t0, 2)
         if body is not None:
             ttft = meta.get("ttft_s")
@@ -2828,6 +2941,13 @@ def _chat_once_simple(gw, payload, timeout):
     这里也优先走上游流式（同 _sse_chat_once）：串行 fallback 本来就是「免费端点全挂了，
     退到带 key 的额度型」的时候，那时是最不该浪费额度的时刻。
     """
+    with _Gate(gw) as _gt:
+        if not _gt.ok:
+            return None, _busy_tuple(_gt.name)[1], None, 0, 1.0
+        return _chat_once_simple_inner(gw, payload, timeout)
+
+
+def _chat_once_simple_inner(gw, payload, timeout):
     if gw.get("api_style") == "responses":
         # _responses_once 返回 7 元组，这里要 5 元组 —— 以前直接 return 会让
         # 上层解包 ValueError（responses 上游一旦走到串行 fallback 就崩）。
@@ -4113,7 +4233,52 @@ def _selftest():
             g0["_sse_once"] = _real_sse
             g0["_NO_STREAM"].discard("nostream-ep")
 
-        print("llmgw_device 自测：30 组全过")
+        # ㉛ 上游并发闸：多个客户端/代理同时打同一上游时必须排队，排不上报 busy 退下一跳，
+        #    而不是硬把上游打穿（打穿 = 这家整片冷却，反而全线更慢）。
+        #    另外要钉住「位子必须归还」—— 漏一个位子，这个端点从此就永久少一条命，
+        #    漏够 2 次就彻底卡死，而且现象是「某个上游突然永久 429」，极难查。
+        import threading as _th
+        real_gate_wait = g0["GATE_WAIT_S"]
+        g0["GATE_WAIT_S"] = 0.1
+        g0["EP_CONCURRENCY"]["gate-ep"] = 1
+        g0["_EP_SEM"].pop("gate-ep", None)
+
+        def slow_sse(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
+            time.sleep(0.6)
+            return ({"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                     "usage": {"total_tokens": 1}}, None, gw["name"], 1, "ok", "ok", None,
+                    {"ttft_s": 0.1, "chunks": 1, "partial": False})
+
+        _real_sse3 = g0["_sse_once"]
+        g0["_sse_once"] = slow_sse
+        out = []
+        try:
+            gw_g = {"name": "gate-ep", "base": "http://127.0.0.1:9/v1", "key": "x"}
+
+            def _hit():
+                out.append(g0["_chat_once"](gw_g, {"model": "m", "messages": []}, 10))
+
+            ts = [_th.Thread(target=_hit) for _ in range(2)]
+            for t in ts:
+                t.start()
+            time.sleep(0.15)
+            for t in ts:
+                t.join()
+            oks = [r for r in out if r[0] is not None]
+            busy = [r for r in out if r[0] is None and "busy" in (r[1] or "")]
+            assert len(oks) == 1 and len(busy) == 1, \
+                ("并发闸没拦住第二个：ok=%d busy=%d" % (len(oks), len(busy)), out)
+            assert g0["_ep_sem"]("gate-ep")._value == 1, "位子没归还"
+            for _ in range(3):
+                g0["_chat_once"](gw_g, {"model": "m", "messages": []}, 10)
+            assert g0["_ep_sem"]("gate-ep")._value == 1, "并发闸漏位子（重复调用后不该被占死）"
+        finally:
+            g0["_sse_once"] = _real_sse3
+            g0["GATE_WAIT_S"] = real_gate_wait
+            g0["EP_CONCURRENCY"].pop("gate-ep", None)
+            g0["_EP_SEM"].pop("gate-ep", None)
+
+        print("llmgw_device 自测：31 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
