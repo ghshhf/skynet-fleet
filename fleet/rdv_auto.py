@@ -204,9 +204,14 @@ class AutoLink:
                            "current": r.get("current")})
 
         # ---- ② 该不该上报
+        # 换了中继必须立刻重报：状态里记着「已经报过」，但报的是**那个**中继。
+        # 不判这一条的话，换 PaaS 域名后最长 30 分钟内对端查不到 —— 而现象是
+        # 「设备明明在线却找不到」，最难查的那种。
+        origin_key = _mask(self.origin)
         need = (changed
                 or not st.get("last_publish_ts")
-                or now - float(st["last_publish_ts"]) >= self.republish_every)
+                or now - float(st["last_publish_ts"]) >= self.republish_every
+                or st.get("origin") != origin_key)
         # 退避期不上报：连续失败时每 60 秒猛试一次，只会把中继当靶子
         backoff_until = float(st.get("backoff_until") or 0)
         if need and now < backoff_until:
@@ -232,6 +237,7 @@ class AutoLink:
             st["fails"] = 0
             st["backoff_until"] = 0
             st["last_publish_ts"] = now
+            st["origin"] = origin_key
             st["published"] = published.get("published")
             events.append({"ts": round(now, 1), "kind": "published",
                            "count": len(published.get("published") or []),
@@ -587,7 +593,16 @@ def _selftest():
         chk(pub["n"] == n_before, "退避期内确实没再打中继")
         pub["ok"] = True
 
-        print("\n【7】没配置中继：如实拒绝起循环，不空转")
+        print("\n【7】换中继要立刻重报（否则换 PaaS 后对端 30 分钟内找不到设备）")
+        t["now"] += 1.0
+        n_before = pub["n"]
+        d2 = AutoLink(rdv=FakeRdv(), origin="http://other-relay.example", secret="s",
+                      state_path=os.path.join(d, "a.json"), clock=clock,
+                      publish_fn=fake_pub, verify_fn=fake_ver)
+        d2.tick()
+        chk(pub["n"] == n_before + 1, "中继地址变了 → 立刻重新上报")
+
+        print("\n【8】没配置中继：如实拒绝起循环，不空转")
         e = AutoLink(rdv=FakeRdv(), origin="", secret="",
                      state_path=os.path.join(d, "e.json"), clock=clock)
         chk(not e.configured(), "空配置判定为未配置")
@@ -595,7 +610,7 @@ def _selftest():
         chk(rr.get("ok") is False and "FLEET_WSRELAY" in (rr.get("err") or ""),
             "起循环被拒，并说清缺什么")
 
-        print("\n【8】持久化：重启后还知道上次状态，且不重复记同一件事")
+        print("\n【9】持久化：重启后还知道上次状态，且不重复记同一件事")
         st = json.load(open(os.path.join(d, "a.json"), encoding="utf-8"))
         chk(st.get("status") == "blind", "运行态已落盘")
         a2 = AutoLink(rdv=FakeRdv(), origin="http://relay.example/pair", secret="s",
@@ -604,7 +619,7 @@ def _selftest():
         chk(a2.status_dict["status"] == "blind", "新实例读回的是 blind（跨重启记得）")
         chk(len(a2.events()) > 0, "历史事件也读回来了")
 
-        print("\n【9】配置不全会说清缺什么，而不是「失败」了事")
+        print("\n【10】配置不全会说清缺什么，而不是「失败」了事")
         chk("FLEET_WSRELAY" in e.status_dict["advice"], "advice 直指环境变量名")
     finally:
         shutil.rmtree(d, ignore_errors=True)

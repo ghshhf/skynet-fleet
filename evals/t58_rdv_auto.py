@@ -183,6 +183,15 @@ def main():
     check(pub["n"] == 2, "地址一变立刻上报（自动切换落地）")
     check("addr-changed" in [e["kind"] for e in a.events()], "记了 addr-changed")
 
+    print("\n【3b】换中继必须立刻重报")
+    n_before = pub["n"]
+    a2 = RA.AutoLink(rdv=FakeRdv(), origin="http://other-relay.example",
+                     secret=SECRET, state_path=os.path.join(TMP, "a.json"),
+                     clock=clock, publish_fn=fake_pub, verify_fn=fake_ver)
+    a2.tick()
+    check(pub["n"] == n_before + 1,
+          "中继地址变了 → 立刻重报（否则换 PaaS 后对端要等半小时才找得到设备）")
+
     print("\n【4】测不了 ≠ 进不来")
     ver["ok"] = False
     t["now"] += 400.0
