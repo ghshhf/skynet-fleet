@@ -94,6 +94,12 @@ _SECRET_FIELDS = ("key", "key_hint")
 # 内置候选：每个都带「为什么是这个端口」的出处，省得下次再翻 README。
 BUILTIN = [
     Provider(
+        id="llmgw", label="天网 llmgw 网关", kind="gateway",
+        base="http://127.0.0.1:8790/v1", source="self",
+        note="8 类模型链（claude/gpt/cn/coder/big/fast/vision/flash）；串行流式 + 上游并发闸；"
+             "http://127.0.0.1:8790/v1/models 会列出分类名",
+    ),
+    Provider(
         id="freellmapi", label="FreeLLMAPI", kind="gateway",
         base="http://127.0.0.1:3001/v1", source="freellmapi",
         key_env="FREELMAPI_KEY",
@@ -132,7 +138,13 @@ BUILTIN = [
 # 降级链：按「失效概率从低到高」排。
 # 本地排第一不是偏好，是它唯一不依赖任何上游政策；
 # 自付排最后因为它唯一会真花钱。
-FALLBACK_ORDER = ["llama-8080", "llama-8090", "dsh-local", "dsh-relay",
+#
+# llmgw（11-01 接入）排在最前，理由值得写清楚：它不是「第四家网关」，而是**上面那批的总出口**。
+# 它背后串着 8 条分类链（claude/gpt/cn/coder/big/fast/vision/flash），链内每个候选都是免费额度，
+# 前一个挂了自动退下一个，还带首字节闸和上游并发闸。放在最前不是偏爱自己，
+# 是「先走那条已经做过失败兜底的路」——本地 llama.cpp 只有一个小模型，拿它当第一跳
+# 等于把「能答对」换成了「能答」。本地那两跳留作 llmgw 整个没起时的兜底。
+FALLBACK_ORDER = ["llmgw", "llama-8080", "llama-8090", "dsh-local", "dsh-relay",
                   "zen-gate", "freellmapi", "paid"]
 
 
