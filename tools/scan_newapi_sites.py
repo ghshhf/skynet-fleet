@@ -91,13 +91,40 @@ def one(host, tmo=8):
     return out
 
 
-def main():
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="批量扫 new-api 系站点：只读 /api/status + /api/pricing，零登录零额度")
+    ap.add_argument("--sites", metavar="FILE",
+                    help="从文件读站点清单（每行一个域名，# 开头是注释）。"
+                         "不给就跑内置的 45 家。派活时由上游代理产出清单、这里只负责测")
+    ap.add_argument("--out", metavar="FILE", default=OUT,
+                    help="结果 JSON 落哪（默认 tmp/newapi_sites.json）")
+    a = ap.parse_args(argv)
+
+    cands = list(CANDIDATES)
+    if a.sites:
+        seen, got = set(), []
+        for line in open(a.sites, encoding="utf-8"):
+            s = line.split("#", 1)[0].strip().lower()
+            s = s.replace("https://", "").replace("http://", "").strip("/")
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            got.append(s)
+        if not got:
+            print("--sites 文件里没有任何域名：%s" % a.sites)
+            return 2
+        cands = got
+        print("从 %s 读入 %d 个站点（内置清单不参与）" % (a.sites, len(got)))
+    out_path = a.out or OUT
+
     t_all = time.time()
     _install_ua()
     rows = {}
     try:
         with cf.ThreadPoolExecutor(max_workers=12) as ex:
-            for r in ex.map(one, CANDIDATES):
+            for r in ex.map(one, cands):
                 rows[r["site"]] = r
         dead = [s for s, r in rows.items() if r["kind"] == "dead"]
         px = L._egress_proxy_addr() or os.environ.get("LLMW_SCAN_PROXY") \
@@ -147,10 +174,10 @@ def main():
     print("模型最多的 8 家：%s"
           % ", ".join("%s(%d)" % (r["site"], r["model_count"]) for r in multi))
 
-    with open(OUT, "w", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"at": datetime.datetime.now().isoformat(timespec="seconds"),
                    "count": len(out), "rows": out}, f, ensure_ascii=False, indent=1)
-    print("已落盘 →", OUT)
+    print("已落盘 →", out_path)
 
 
 if __name__ == "__main__":
