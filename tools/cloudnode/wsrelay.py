@@ -729,8 +729,20 @@ class WsTunnelServer:
             try:
                 t0 = time.time()
                 s = socket.create_connection((target, tport), timeout=5)
+                # **连上之后取源地址**，这是整个 /probe 里最容易被忽略的一格，
+                # 也是唯一能区分「真的从墙外连进来」和「连的其实是自己」的东西。
+                #
+                # 为什么必须报：中继如果就跑在对方机器上（或者对方用隧道把本地
+                # 中继暴露成一个公网域名），它来连那个公网地址走的是**回环路径**，
+                # 必然成功、毫秒级。那个「成功」什么都证明不了，却会被判成
+                # 「入站通了」—— 对端拿到这个结论会直接去连、然后超时。
+                # 客户端拿这个 from 与目标地址比前缀就能识破。
+                try:
+                    src = s.getsockname()[0]
+                except Exception:
+                    src = ""
                 s.close()
-                reply({"ok": True, "target": target,
+                reply({"ok": True, "target": target, "from": src,
                        "ms": round((time.time() - t0) * 1000)})
             except Exception as e:
                 reply({"ok": False, "target": target, "errno": _errno_of(e),
