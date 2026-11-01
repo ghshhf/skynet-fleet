@@ -404,6 +404,11 @@ CASES = [
     #     复用天网已有的 beat（心跳骨架此前没有任何循环在用）+ Rendezvous，
     #     钉五档状态机、测不了≠进不来、失败退避、地址簿重启不丢、坏文件不阻断启动。
     ("eval_t58_rdv_auto", ["evals/t58_rdv_auto.py"], HERE, 300),
+    # ---- T59：能力归组（同一动作的几套实现 → 一张表）
+    # 全离线。验的是「357 项里哪些其实是同一件事」这件事本身：
+    # 折叠后每动作只剩一条、动作名可解析、参数别名能双向喂、
+    # 兜底只在「说的是动作」时发生（点名实现就不许换手）。
+    ("eval_t59_groups", ["-m", "fleet.groups"], HERE, 120),
     ("eval_t5_metrics", ["evals/t5_metrics.py"], HERE, 90),
     ("eval_t6_mcp", ["evals/t6_mcp.py"], HERE, 90),
     ("eval_t7_memory", ["evals/t7_memory.py"], HERE, 90),

@@ -179,6 +179,21 @@ HOT_BASE = ("pc.state", "apps.list", "app.foreground", "screen.read",
 #: 默认上限。18 条 ≈ 2.3K token，实测这个量级模型选得准。
 DEFAULT_TOOL_LIMIT = 18
 
+#: 重型/专业域：不是日常能力，只在**明确问到时**才该占位子。
+#:
+#: 为什么单独列（11-01 实测）：问「查一下 github.com 的解析」，18 条表里挤进 10 条
+#: `rea.*`（英文长名的逆向套件，Frida/GDB/objdump/Rizin 那一整套）。它们因为描述里
+#: 有「解析」「application」这类字被中文 2-gram 撞上——**语言不通导致的假命中**。
+#: 模型拿到这种表，等于在通用问题上先被塞了十把手术刀。
+HEAVY_PREFIXES = ("rea.", "pentest.", "re.", "rizin.", "tun.", "nat.", "rdv.",
+                  "card.", "render.", "mqtt.", "radio.")
+#: 重型域在一张表里最多占几个位子。明确问逆向时它照样能进，只是不挤满。
+HEAVY_QUOTA = 3
+
+
+def _is_heavy(name):
+    return str(name).startswith(HEAVY_PREFIXES)
+
 
 def _q_grams(question):
     """把一句话拆成可用于匹配的小碎片（中英通吃）。
@@ -213,17 +228,26 @@ def pick_caps(caps, question="", limit=DEFAULT_TOOL_LIMIT, must=HOT_BASE):
     caps = list(caps or [])
     if not caps:
         return []
+    # 先折叠再打分：模型看到的是动作，评分也该按**动作名**算
+    # （"pc.screen" 的 screen 段比 "host.screen" 更能命中「截屏/看看屏幕」这类问法）。
+    # `must` 同步映射：HOT_BASE 里写的 screen.read 折叠后成了 phone.screen，
+    # 不映射就会「底座全部找不到」——那是最糟的退步，模型连基本盘都没了。
+    caps = present_caps(caps)
     limit = max(1, int(limit or DEFAULT_TOOL_LIMIT))
     by_name = {c.name: c for c in caps}
     chosen = set()
     for n in (must or ()):
-        c = by_name.get(n)
+        c = by_name.get(n) or by_name.get(action_of(n))
         if c is not None and not (c.side_effect or c.destructive):
-            chosen.add(n)
+            chosen.add(c.name)
     if len(chosen) >= limit:
         return [c for c in caps if c.name in chosen][:limit]
 
     grams = _q_grams(question)
+    # 中文口语会在词里塞量词/助词（"截**个**屏"、"看**下**电量"），2 字滑窗切出来是
+    # 「截个/个屏」，跟「截屏」永远对不上。单字兜底只为**把明显相关的拉进候选**，
+    # 权重故意低（0.3），不许抢掉精确命中的位子。
+    qchars = {ch for ch in (question or "") if "\u4e00" <= ch <= "\u9fff"}
     scored = []
     for i, c in enumerate(caps):
         if c.name in chosen:
@@ -239,14 +263,88 @@ def pick_caps(caps, question="", limit=DEFAULT_TOOL_LIMIT, must=HOT_BASE):
             for seg in c.name.split("."):
                 if seg and seg.lower() in grams:
                     score += 2
+        # 单字兜底：至少命中两个字才算，防「的/了/看」这种虚字单独把一堆拉进来。
+        # 上限 0.6 —— **必须小于一次精确 2-gram 命中的 1 分**，否则单字噪音会
+        # 把精确命中挤下去（实测 0.3×4=1.2 时，问「查解析」拉进来 voice.interpret、
+        # memory.pack.render 这些半点关系没有的）。
+        if qchars:
+            ch_hit = sum(1 for ch in qchars if ch in hay)
+            if ch_hit >= 2:
+                score += 0.2 * min(ch_hit, 3)
         if score:
             scored.append((score, -i, c))     # -i：同分时保持原顺序
     scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    heavy = 0
     for _s, _i, c in scored:
         if len(chosen) >= limit:
             break
+        if _is_heavy(c.name):
+            # 重型域限流：不是不让进，是不许把日常问题的表挤满。
+            # 得分门槛更高（要求 ≥2，即精确命中过），且数量封顶。
+            if _s < 2 or heavy >= HEAVY_QUOTA:
+                continue
+            heavy += 1
         chosen.add(c.name)
     return [c for c in caps if c.name in chosen]
+
+
+# ---------------------------------------------------------------- 呈现层（折叠 + 动作名）
+
+def present_caps(caps):
+    """工具表对外呈现：**每个动作只出现一条**，名字用动作名，不用实现名。
+
+    为什么这一步是必须的（11-01 盘点）：
+
+        357 项能力里，同一件事有好几套实现且参数名还不一样：
+            pcctl.key(keys="ctrl+c")  vs  host.input.key(key="enter")
+            osint.dns(domain=...)     vs  web.dns(url=...)
+            pc.state / pcctl.sysinfo / host.monitor   —— 三个都答「本机怎么样」
+        模型面对这些不是「多了几个选择」，而是**多了几个能抓错的手**。
+
+    为什么用动作名而不是主实现名：
+        `host.screen` / `pcctl.screenshot` / `pcctl.look` 是**手段**，
+        「看本机屏幕」才是**意图**。工具表该写意图——手段是可以换的
+        （实测 pcctl.look 就是坏的，host.screen 才出预览），把它写进工具表
+        等于把可替换的实现细节焊死给模型看。
+
+    折叠只影响「给模型看什么」：能力本身、设备声明、审批档一概不动。
+    """
+    from . import groups as G
+    out = []
+    for c in G.collapse(caps):
+        n = getattr(c, "name", "")
+        a = G.canonical(n)
+        if not a or a == n:
+            out.append(c)
+            continue
+        try:
+            from dataclasses import replace
+            c = replace(c, name=a, title=G.label(a) or c.title)
+        except Exception:
+            pass                      # 换不动就留主名，绝不因为改标签把能力弄丢
+        out.append(c)
+    return out
+
+
+def action_of(name):
+    """工具名 → 动作名（不认识的返回原名）。执行层用它把动作名翻回实现链。"""
+    from . import groups as G
+    return G.canonical(name) or name
+
+
+def index_caps(caps):
+    """给 ToolIndex 用的能力表：**真名 + 动作名都要能解析**。
+
+    工具表发给模型的是动作名（`pc_screen`），模型回话里也只会说这个。
+    若 ToolIndex 只按真名建，`pc_screen` 会被判成「叫错名字」——工具明明给了，
+    模型一调就被拒，看起来像它不会用工具。
+    反过来真名也得留着：模型记得老名字、或者别的入口（MCP）用的是真名。
+    两边都要认，且动作名不许覆盖真名（`pc.state` 既是动作名又是真名，留着真身）。
+    """
+    caps = list(caps or [])
+    have = {getattr(c, "name", "") for c in caps}
+    extra = [c for c in present_caps(caps) if getattr(c, "name", "") not in have]
+    return caps + extra
 
 
 # ---------------------------------------------------------------- 回信（读回来）
@@ -616,6 +714,41 @@ def _selftest():
     a1 = [c.name for c in pick_caps(caps, "截个屏看看", limit=18)]
     a2 = [c.name for c in pick_caps(caps, "截个屏看看", limit=18)]
     assert a1 == a2, (a1, a2)
+
+    # ---- 呈现层：动作名上桌，实现名退场（fleet/groups.py）----
+    from . import groups as G
+    pres = present_caps(caps)
+    pnames = {c.name for c in pres}
+    # ① 折叠必须真减少，且组内只留一条
+    assert len(pres) < len(caps), "折叠没生效：%d → %d" % (len(caps), len(pres))
+    for _a, (_l, ms) in G.ACTIONS.items():
+        present = [m for m in ms if m in pnames]
+        assert len(present) <= 1, "动作 %s 折叠后还有多套实现：%s" % (_a, present)
+    # ② 有动作名的组，工具表里不该再出现实现名（模型不该被要求记住是谁实现的）
+    assert "pc.screen" in pnames and "host.screen" not in pnames, sorted(pnames)[:5]
+    assert "net.dns" in pnames and "osint.dns" not in pnames
+    # ③ 动作名要有自己的 title（不能把实现名的标题照搬，那样模型仍按实现理解）
+    assert G.label("pc.screen") and G.label("pc.screen") != [c for c in caps
+                                                            if c.name == "host.screen"][0].title
+
+    # ---- index 必须同时认动作名与真名（否则模型照着工具表叫，却被判「叫错名字」）----
+    idx = ToolIndex(index_caps(caps))
+    assert idx.resolve("pc_screen") is not None, "动作名解析不出来"
+    assert idx.resolve("pc_screen").name == "pc.screen"
+    assert idx.resolve("host_screen") is not None, "真名不许丢（MCP/老入口还在用）"
+
+    # ---- 重型域限流：泛问不许被逆向套件挤满 ----
+    heavy = [c.name for c in pick_caps(caps, "查一下这个域名的解析", limit=18)
+             if _is_heavy(c.name)]
+    assert len(heavy) <= HEAVY_QUOTA, "重型域超配额：%s" % heavy
+    # 但**明确问**的时候必须给得出来（限流不是禁用）
+    fr = [c.name for c in pick_caps(caps, "用 frida 挂上进程看参数", limit=18)
+          if c.name.startswith("rea.")]
+    assert fr, "明确问 frida 却一条 rea 工具都没给"
+
+    # ---- 中文口语插量词也要能命中（"截个屏" 切不出 "截屏"）----
+    shot = {c.name for c in pick_caps(caps, "帮我截个屏看看", limit=18)}
+    assert "pc.screen" in shot or "phone.screen" in shot, shot
 
     print("fleet.toolschema selftest ok")
 

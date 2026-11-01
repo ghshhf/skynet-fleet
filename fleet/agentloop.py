@@ -98,8 +98,45 @@ def _summarize_steps(steps, why=""):
     return head + "\n" + "\n".join(lines)
 
 
-def _exec(executor, cap, args, sink=None):
-    """调一次执行层，把结果统一成 (ok, 文本)。
+def _exec(executor, cap, args, sink=None, cap_obj=None):
+    """调一次能力。同一动作有多套实现时（fleet/groups.py），前一套失败换下一套。
+
+    为什么兜底放在这一层：模型说的是**动作**（"看本机屏幕"），不是实现
+    （"host.screen"）。实测三套截屏里 `pcctl.look` 是坏的、`host.screen` 能出预览
+    ——组内互备把「一套坏掉」从「这项能力不可用」降级成「换个实现」，
+    这是白捡的可靠性，不该让模型自己重试去发现。
+
+    **副作用能力一律不兜底**：`pc.key` 重试成按两次是另一个动作，不是兜底。
+    判据看 Capability.side_effect / destructive；调用方没传 cap_obj 时按「只打主实现」处理
+    （宁可少兜一次，不可多按一下）。
+    """
+    from . import groups as G
+    se = bool(cap_obj is not None and (getattr(cap_obj, "side_effect", False)
+                                       or getattr(cap_obj, "destructive", False)))
+    # 三条不兜底的理由，各管一件事：
+    #   ① 调用者点名了具体实现（`host.screen`）→ 就照它说的打，它可能要的就是那套形状；
+    #   ② 副作用能力 → 重试成「按两次」是另一个动作；
+    #   ③ 不认识的裸名字 → 没有组，单发。
+    chain = [cap] if (se or cap_obj is None or G.is_impl(cap)) else G.impls(cap)
+    reasons, out = [], None
+    for impl in chain:
+        a = G.norm_args(cap, args or {}, target=impl)
+        ok, text, dealt = _exec_one(executor, impl, a, sink)
+        if ok:
+            if len(chain) > 1 and impl != chain[0]:
+                # 降级要说出来：用了哪套、前面几套为什么没成。一句话，别糊一屏。
+                text = (text + "\n（本结果由 %s 提供；主实现失败：%s）"
+                        % (impl, "；".join(reasons)))[:4000]
+            return True, text
+        reasons.append("%s → %s" % (impl, text))
+        out = text
+    if len(reasons) > 1:
+        return False, ("这个动作的 %d 套实现全失败：%s" % (len(reasons), "；".join(reasons)))[:800]
+    return False, (out or "执行失败（没说原因）")
+
+
+def _exec_one(executor, cap, args, sink=None):
+    """调**一套具体实现**，把结果统一成 (ok, 文本, 是否执行过)。
 
     执行层可能是 Registry（返回 DeviceResult），也可能只是个函数（返回 str）。
     两种都得接住——**结果形态不统一是「工具跑了但没内容」这类 bug 的来源**。
@@ -107,12 +144,12 @@ def _exec(executor, cap, args, sink=None):
     try:
         r = executor(cap, args)
     except Exception as e:
-        return False, "%s: %s" % (type(e).__name__, e)
+        return False, "%s: %s" % (type(e).__name__, e), True
 
     if r is None:
-        return False, "执行层没返回任何东西"
+        return False, "执行层没返回任何东西", False
     if isinstance(r, str):
-        return True, r
+        return True, r, True
 
     # ① 先把「两种形态」收敛成同一份字段。
     #    🔴 这里原来是个真伤（2026-10-25 查出来的）：
@@ -142,16 +179,16 @@ def _exec(executor, cap, args, sink=None):
             and isinstance(data.get("approval"), dict):
         sink["approval"] = data["approval"]
     if not ok:
-        return False, err or "执行失败（没说原因）"
+        return False, err or "执行失败（没说原因）", True
     if data is None or data == {}:
-        return True, ""
+        return True, "", True
     if isinstance(data, str):
-        return True, data
+        return True, data, True
     try:
         import json
-        return True, json.dumps(data, ensure_ascii=False)
+        return True, json.dumps(data, ensure_ascii=False), True
     except Exception:
-        return True, str(data)
+        return True, str(data), True
 
 
 def _history_messages(journal, hours=24, limit=20, max_chars=600):
@@ -221,7 +258,8 @@ def _run_loop(question, executor, caps=None, tools=None, index=None,
         from fleet.catalog import CAPABILITIES
         caps = list(CAPABILITIES)
     if index is None:
-        index = TS.ToolIndex(caps)
+        # 真名与动作名都要认：工具表发出去的是动作名（见 toolschema.present_caps）
+        index = TS.ToolIndex(TS.index_caps(caps))
     if tools is None:
         # 默认只给只读：云端模型不该在没人看着的时候动手（见 toolschema 口径）
         _tool_caps = caps
@@ -231,6 +269,12 @@ def _run_loop(question, executor, caps=None, tools=None, index=None,
             # 同样的问法给 1 条表 → 368 token、选对。少而准 > 多而全。
             _tool_caps = TS.pick_caps(caps, question, limit=tool_limit)
         tools = TS.tools_for(flavor, _tool_caps, include_unsafe=False)
+
+    # 执行层要知道「这一手能不能重试」：副作用能力兜底 = 多按一下，必须拦住。
+    # 动作名和真名都登记（模型回话里两种都可能出现）。
+    _cap_obj = {}
+    for _c in list(caps) + list(TS.present_caps(caps)):
+        _cap_obj.setdefault(_c.name, _c)
 
     # **工具表就是权限边界**，不是给模型看的菜单。
     # 模型完全可以叫一个没出现在表里的名字（幻觉、或者它记得别家的工具名），
@@ -317,7 +361,8 @@ def _run_loop(question, executor, caps=None, tools=None, index=None,
             fire("exec", {"round": rnd, "cap": c.cap,
                           "args": json.dumps(c.args, ensure_ascii=False)})
             sink = {}
-            ok, text = _exec(executor, c.cap, c.args, sink=sink)
+            ok, text = _exec(executor, c.cap, c.args, sink=sink,
+                             cap_obj=_cap_obj.get(c.cap))
             text = TS.clip_result(text)
             st = Step(rnd, c.cap, c.args, ok, text, "" if ok else text,
                       approval=sink.get("approval"))
