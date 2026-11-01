@@ -49,6 +49,7 @@ from fleet import beat as BEAT                            # noqa: E402
 from fleet import catalog                                 # noqa: E402
 from fleet import rdv_auto as RA                          # noqa: E402
 from fleet import rendezvous as RV                        # noqa: E402
+from fleet import tunnel as TU                            # noqa: E402
 from fleet.catalog import CAPABILITIES                    # noqa: E402
 from tools.cloudnode import wsrelay as WSR                # noqa: E402
 
@@ -245,7 +246,7 @@ def main():
     check(pr.get("invalid") is True, "/probe 对 port=0 明确回 invalid")
     check("没有可探测端口" in (pr.get("err") or ""), "错误说明是人话，不是裸 WinError")
 
-    print("\n【8】有端口 + 真监听 → linked；hint 要把错误码翻成人话")
+    print("\n【8】中继就在本机时，不许出「linked」这个假结论")
     s6 = None
     p6 = 0
     try:
@@ -255,7 +256,7 @@ def main():
         s6.listen(4)
         p6 = s6.getsockname()[1]
     except Exception as e:
-        print("    （本机 v6 监听不可用，跳过正向验证：%s）" % e)
+        print("    （本机 v6 监听不可用，跳过这一段：%s）" % e)
     if p6:
         # pinhole_fn 必须注入假实现：这一段会带着一个**真实的 v6 监听端口**跑
         # 完整 tick，而 tick 里现在会自动去防火墙开入站放行。
@@ -270,16 +271,36 @@ def main():
                                               "existed": [], "ports": list(ports)})
         rp = loop2.tick()
         vp = rp.get("verify") or {}
-        check(vp.get("confident") is True, "这次自检结论可信（有端口）")
-        check(rp["status"] in ("linked", "blind"), "有端口时能给出明确结论")
+        # 这一段曾经断言「confident=True / status 是 linked 或 blind」——
+        # 那是在**奖励假阳性**：中继就跑在本机，它回连我们的公网 v6 地址
+        # 走的是回环路径，必然成功、十几毫秒。那个「可达」与「墙外能不能进来」
+        # 毫无关系，而对端拿到 linked 会直接去连、然后超时。
+        # 现在 /probe 会带上源地址，"from 与目标同 /64" 就能识破它。
+        check(vp.get("confident") is False,
+              "中继在本机 → 结论不可信（回环可达不能当「墙外能进」）")
+        check(rp["status"] == "unverified",
+              "状态留在 unverified，不升 linked（这就是这次要防的东西）")
+        check(bool(vp.get("self_loop")), "报出是哪几条走了回环，而不是只说「不知道」")
+        check("回环" in (vp.get("err") or ""), "用一句人话说清为什么不算数")
         check((rp.get("pinhole") or {}).get("ok") is True,
               "有端口时走了一次入站放行（注入的假实现，不碰真防火墙）")
         # 打一个必然拒绝的端口，验证 hint 翻译
         pr2 = WSR.probe_from_relay(origin, "127.0.0.1", 1, SECRET)
         check(bool(pr2.get("hint")) or pr2.get("ok") is False,
               "连不上时带 hint/否决，不是空手而归")
+        v6s = TU.ipv6_addresses()
+        if v6s:
+            pr3 = WSR.probe_from_relay(origin, v6s[0], p6, SECRET)
+            check(pr3.get("ok") is True and bool(pr3.get("from")),
+                  "/probe 回连成功时必须报源地址（识破回环的唯一依据）")
+        else:
+            print("    ⊘ 本机没有公网 v6，跳过 /probe 源地址检查")
         if s6:
             s6.close()
+
+    # 正向结论（真墙外中继回连成功 → linked）需要一台**真在墙外**的中继，
+    # 本机起的中继永远是回环。这里如实标跳过，不用假信号充数。
+    print("    ⊘ 真墙外可达 → linked 的正向验证：需要一台真在墙外的中继，本机不具备")
 
     # ---------------------------------------------------------------- ⑦
     print("\n【9】持久化：重启后地址簿还在")

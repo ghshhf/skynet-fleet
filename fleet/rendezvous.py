@@ -45,6 +45,7 @@
 也能被某次真实发送顺手带起来，而不需要养一个后台进程。
 """
 import hashlib
+import ipaddress
 import json
 import os
 import sys
@@ -220,6 +221,61 @@ def diff(before, after):
             "changed": bool(a != b)}
 
 
+def _host_is_local(origin):
+    """origin 的 host 是不是回环/私网地址。
+
+    旧版中继不报源地址时的兜底判据：如果连中继本身都走的是本机回环，
+    它「回连成功」这件事一点信息量都没有。
+    域名返回 False（判不了，不算本地）—— 这正是为什么不能只靠这一条：
+    把本地中继用隧道暴露成一个公网域名，这里就看不出来了。
+    """
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(origin if "//" in origin else "//" + origin).hostname or ""
+    except Exception:
+        return None
+    if not host:
+        return None
+    if host.lower() in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        a = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(a.is_loopback or a.is_private or a.is_link_local)
+
+
+def _src_is_local(src, target=""):
+    """中继回连时报上来的**源地址**，是不是「就在本机 / 同一网段」。
+
+    True  = 就在本地 ⇒ 这次「可达」是回环假信号，结论作废
+    False = 从外部来的 ⇒ 这次可达是真信号
+    None  = 判断不了（没报，或报了看不懂的东西）
+
+    为什么同 /64 也算本地：IPv6 没有 NAT，同一个 /64 就是同一条链路 ——
+    本机的两个地址（稳定 + 临时）全落在 `240e:404:1900:c780::/64` 里，
+    中继若也在这台机器上，它连我们的公网地址时源地址就在同一个 /64。
+    这一条是识别「隧道把本地中继伪装成公网域名」的唯一硬判据：
+    只判回环/私网抓不到它 —— 那时源地址是货真价实的公网 v6。
+    """
+    if not src:
+        return None
+    try:
+        s = ipaddress.ip_address(str(src).split("%")[0])
+    except ValueError:
+        return None
+    if s.is_loopback or s.is_private or s.is_link_local:
+        return True
+    if target and s.version == 6:
+        try:
+            t = ipaddress.ip_address(str(target).split("%")[0])
+        except ValueError:
+            t = None
+        if t is not None and t.version == 6 and s.packed[:8] == t.packed[:8]:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------- 编排
 class Rendezvous:
     """把「检测 / 上报 / 自检 / 切换」串成一条可反复调用的链。
@@ -361,27 +417,47 @@ class Rendezvous:
                             "（例如 tun.open 之后），再来验入站。"
                             "这不是「进不来」，是「还没法测」"}
         out = []
+        looped = []
+        origin_local = _host_is_local(origin)
         for c in todo:
             r = wsr.probe_from_relay(origin, c["ip"], _p(c),
                                      secret, timeout=timeout)
+            src = r.get("from") or ""
+            loc = _src_is_local(src, c["ip"])
+            if loc is None and origin_local:
+                # 旧中继不报源地址，退回到「中继本身是不是本机」这一条
+                loc = True
+            if loc:
+                looped.append({"ip": c["ip"], "from": src})
             out.append({"ip": c["ip"], "kind": c["kind"],
                         "reachable": bool(r.get("ok")),
                         "invalid": bool(r.get("invalid")),
+                        "from": src, "self_loop": bool(loc),
                         "ms": r.get("ms"), "err": r.get("err") or "",
                         "hint": r.get("hint") or ""})
 
-        ok = [x for x in out if x["reachable"]]
-        # 只要有一项是「参数无效」，这次结论整体不算可信
-        confident = not any(x.get("invalid") for x in out)
+        # 回环的「可达」不能算可达：那说明中继和我们是同一台机器 / 同一条链路，
+        # 这类连上必然成功，与「墙外能不能进来」毫无关系。
+        ok = [x for x in out if x["reachable"] and not x["self_loop"]]
+        # 只要有一项是「参数无效」，或任何一项是回环，这次结论整体不算可信
+        confident = (not any(x.get("invalid") for x in out)) and not looped
         st = self.state()
         st["verified"] = {"ts": round(time.time(), 1), "results": out,
-                          "confident": confident}
+                          "confident": confident, "self_loop": looped}
         _save(st, self.state_path)
+        if looped:
+            note = ("中继就在本机/同一链路（回连源地址 %s）：这次「可达」是回环，"
+                    "不算验过入站。换一个真在墙外的中继才有意义"
+                    % (looped[0].get("from") or "本机"))
+        elif ok:
+            note = "有地址能被墙外连进来"
+        elif not confident:
+            note = "这次自检有项是参数无效，结论不可信"
+        else:
+            note = ("没有一个地址能被墙外连进来：地址可能在，但入站被拦"
+                    "（主机防火墙 / 路由侧 v6 防火墙默认全拦）")
         return {"ok": bool(ok), "confident": confident, "reachable": ok, "all": out,
-                "note": ("有地址能被墙外连进来" if ok else
-                         ("这次自检有项是参数无效，结论不可信" if not confident else
-                          "没有一个地址能被墙外连进来：地址可能在，但入站被拦"
-                          "（主机防火墙 / 路由侧 v6 防火墙默认全拦）"))}
+                "self_loop": looped, "note": note}
 
     # ---- 解析（对端按指纹查）
     def resolve(self, origin, fp, timeout=8.0):

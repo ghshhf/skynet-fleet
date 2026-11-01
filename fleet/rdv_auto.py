@@ -295,7 +295,11 @@ class AutoLink:
                     verify = {"ts": round(now, 1), "ok": bool(vr.get("ok")),
                               "reachable": vr.get("reachable") or [],
                               "all": vr.get("all") or [],
-                              # 没有端口 / 有项参数无效 ⇒ 这次结论不算数，
+                              # 中继自己就在本机/同链路时报出来的那几条：
+                              # 它们的「可达」是回环，透传上去让上层看得见原因，
+                              # 而不是只看到一句「入站仍未知」。
+                              "self_loop": vr.get("self_loop") or [],
+                              # 没有端口 / 有项参数无效 / 中继在本机 ⇒ 这次结论不算数，
                               # 不能让「测不了」冒充「进不来」
                               "confident": bool(vr.get("confident", True)),
                               "err": "" if vr.get("ok") else (vr.get("note") or "")}

@@ -46,6 +46,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 from fleet import tunnel as T                              # noqa: E402
+from fleet import rendezvous as RV                          # noqa: E402
 from fleet.kinds.tunnel_layer import TunnelLayer            # noqa: E402
 
 FAIL = []
@@ -404,6 +405,27 @@ def main():
         check(not _scan_autolink_leaks(probe_dir), "注入了 pinhole_fn 就不算漏")
     finally:
         shutil.rmtree(probe_dir, ignore_errors=True)
+
+    # ---------------- ⑫ 回环识别
+    print("\n【12】回环识别：中继在本机时不许给出「墙外可达」")
+    S = RV._src_is_local
+    check(S("127.0.0.1") is True, "回环 v4 → 本地")
+    check(S("10.1.2.3") is True, "私网 v4 → 本地")
+    check(S("192.168.1.9") is True, "家用网段 → 本地")
+    check(S("fe80::1") is True, "链路本地 v6 → 本地")
+    check(S("240e:404:1900:c780:f8f1:be2e:8deb:68dc",
+            "240e:404:1900:c780:b0d8:292b:cdb1:fdba") is True,
+          "与目标同一个 /64 → 同一条链路，判本地（单看回环/私网抓不到这种情况）")
+    check(S("240e:404:1900:c780::1", "240e:404:1900:c781::1") is False,
+          "不同 /64 的公网 v6 → 真外部")
+    check(S("8.8.8.8") is False, "公网 v4 → 真外部")
+    check(S("") is None and S("不是地址") is None, "报不出/看不懂 → None，不猜")
+    H = RV._host_is_local
+    check(H("http://127.0.0.1:8080") is True, "origin 是回环 → 本地")
+    check(H("http://localhost:9/") is True, "localhost 也算本地")
+    check(H("http://192.168.1.5:9") is True, "私网 origin → 本地")
+    check(H("https://skynet-wsrelay-abcd.onrender.com/tunnel") is False,
+          "域名判不了 → 不算本地（所以还得靠 /probe 报源地址）")
 
     print()
     if SKIP:
