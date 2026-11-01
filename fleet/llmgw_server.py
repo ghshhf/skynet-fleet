@@ -152,12 +152,44 @@ def _as_completion(data, model_name):
     return body
 
 
+def _fails_brief(data, n=4):
+    """把失败跳压成一行：`ofm/xxx 401｜amd/yyy timeout`。
+
+    只记个数没有诊断价值 —— 「retries=7」告诉你有 7 跳挂了，但看不出是哪家、
+    为什么挂，于是每次只能靠猜（11-01 就是这样把 ofm 的 401 拖了好几轮的）。
+    """
+    fa = (data or {}).get("fallback_attempts") or []
+    if not fa:
+        return "-"
+    bits = []
+    for a in fa[-n:]:
+        bits.append("%s/%s %s" % (
+            str(a.get("gateway") or "?")[:10],
+            str(a.get("model") or "?")[:14],
+            str(a.get("err") or "?")[:44].replace(" ", "_")))
+    return " | ".join(bits)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "tianwang-llmgw"
     protocol_version = "HTTP/1.1"   # chunked 传输需要 1.1；每个响应都自带 Content-Length 或 chunked
 
     def log_message(self, fmt, *a):
-        sys.stderr.write("[llmgw-server] " + (fmt % a) + "\n")
+        sys.stderr.write("[%s] [llmgw] " % time.strftime("%H:%M:%S")
+                         + (fmt % a) + "\n")
+
+    def note(self, kind, **kw):
+        """结构化一行日志。
+
+        没有时间戳的日志等于没有日志：客户端说「等了 50 秒」，我们事后只能靠猜
+        到底是哪一跳慢、几个候选挂了、是不是并发闸在排队。每次请求都记一行，
+        把「谁答的 / 失败几次 / 各跳错误 / 总耗时」全留下，事后 grep 就有答案。
+        """
+        bits = " ".join("%s=%s" % (k, kw[k]) for k in sorted(kw)
+                        if kw[k] not in (None, ""))
+        sys.stderr.write("[%s] [llmgw] %s %s\n"
+                         % (time.strftime("%H:%M:%S"), kind, bits))
+        sys.stderr.flush()
 
     def _send(self, code, obj, ctype="application/json"):
         raw = obj if isinstance(obj, bytes) else json.dumps(obj, ensure_ascii=False).encode()
@@ -178,15 +210,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def _stream_chat(self, payload):
+    def _stream_chat(self, payload, t0=None):
         """上游吐一块就转一块，首字节一到客户端就能看见字。
 
         关键设计：200 响应头在**第一个 delta 到达时**才发。这样首字节前的候选失败
         （换下一跳、全部挂掉）时我们手里还有干净的连接，可以体面地回 502，
         而不是先发 200 再吐一个错误帧（那会让客户端以为请求成功了）。
         """
+        t0 = t0 or time.time()
         started = {"ok": False}
         dead = {"ok": False}
+        first = {"at": None}
         mid = "chatcmpl-tianwang-%d" % int(time.time() * 1000)
         model_name = payload.get("model")
 
@@ -229,6 +263,11 @@ class Handler(BaseHTTPRequestHandler):
             #      11-01 Pi 接入实测踩到：把它当失败会 502，于是「代理能用工具」直接失效。
             #      正解是整段补发一帧（含 tool_calls），流式语义照样成立。
             if err or not data:
+                dt = round(time.time() - t0, 2)
+                self.note("stream-FAIL", dt=dt, model=model_name,
+                          n_msg=len(payload.get("messages") or []),
+                          has_tools=bool(payload.get("tools")),
+                          err=str(err or "上游无输出")[:200])
                 return self._send(502, {"error": {"message": err or "上游无输出",
                                                   "type": "upstream_error"}})
             body = _as_completion(data, model_name)
@@ -236,6 +275,10 @@ class Handler(BaseHTTPRequestHandler):
             delta = {"role": "assistant", "content": msg.get("content") or ""}
             if msg.get("tool_calls"):
                 delta["tool_calls"] = msg["tool_calls"]
+            self.note("stream-ok", dt=round(time.time() - t0, 2), model=model_name,
+                      ttft="-", chunks=0, tool_calls=bool(msg.get("tool_calls")),
+                      via=(body.get("_tianwang") or {}).get("endpoint"),
+                      retries=(body.get("_tianwang") or {}).get("fallback_attempts"))
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
@@ -265,6 +308,12 @@ class Handler(BaseHTTPRequestHandler):
             meta["stream_err"] = err
         elif (data or {}).get("stream_err"):
             meta["stream_err"] = data["stream_err"]
+        self.note("stream-ok", dt=round(time.time() - t0, 2), model=model_name,
+                  ttft=meta.get("ttft_s"), via=meta.get("endpoint"),
+                  retries=meta.get("fallback_attempts"),
+                  mid_stream_err=bool(meta.get("stream_err")),
+                  degraded=meta.get("degraded_tools"),
+                  fails=_fails_brief(data))
         self._chunk(frame({}, "stop", {"_tianwang": meta}))
         self._chunk(b"data: [DONE]\n\n")
         try:
@@ -312,13 +361,58 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(400, {"error": {"message": "bad json: %s" % e}})
         want_stream = payload.get("stream") in (True, "true", "1", 1)
+        t0 = time.time()
         if want_stream:
-            return self._stream_chat(payload)
+            return self._stream_chat(payload, t0)
         data, err = _chat(payload)
+        dt = round(time.time() - t0, 2)
+        # 注意：路由明细在 data **顶层**（endpoint/model/latency_s/fallback_attempts），
+        # 而 "_tianwang" 是 _as_completion 之后才造出来的包装。这里取顶层，
+        # 否则日志里 via 永远是空的 —— 等于白装黑匣子。
         if err:
+            self.note("chat-FAIL", dt=dt, model=payload.get("model"),
+                      n_msg=len(payload.get("messages") or []),
+                      has_tools=bool(payload.get("tools")), err=str(err)[:160])
             return self._send(502, {"error": {"message": err, "type": "upstream_error"}})
+        self.note("chat-ok", dt=dt, model=payload.get("model"),
+                  n_msg=len(payload.get("messages") or []),
+                  tools=bool(payload.get("tools")),
+                  via=(data or {}).get("endpoint"), real=(data or {}).get("model"),
+                  lat=(data or {}).get("latency_s"),
+                  retries=len((data or {}).get("fallback_attempts") or []),
+                  degraded=bool((data or {}).get("degraded_tools")),
+                  fails=_fails_brief(data))
         body = _as_completion(data, payload.get("model"))
         return self._send(200, body)
+
+
+def _warmup_loop(delay=3.0, gap=1.0):
+    """启动后异步体检：每条分类链真打一次，把死端点提前记住。
+
+    为什么值得做：健康表是「撞过才记得」的，而第一次撞要用户陪着等
+    （实测 cn 连撞 7 跳 17.8s，客户端重试一次就是 50s+）。启动时自己先撞一遍，
+    用户就永远撞不到。用后台线程、串行跑，不挡启动、不跟用户的请求抢并发。
+    """
+    time.sleep(delay)
+    try:
+        classes = _classes()
+    except Exception:
+        return
+    for cls in classes:
+        try:
+            t0 = time.time()
+            data, err = _chat({"class": cls, "max_tokens": 4,
+                               "messages": [{"role": "user", "content": "1"}]})
+            tw = data or {}
+            print("[%s] [llmgw] warmup %-7s %s %.2fs via=%s %s"
+                  % (time.strftime("%H:%M:%S"), cls,
+                     "ok" if data else "FAIL", time.time() - t0,
+                     tw.get("endpoint"), "" if data else str(err)[:60]),
+                  file=sys.stderr, flush=True)
+        except Exception as e:
+            print("[%s] [llmgw] warmup %s 异常 %r"
+                  % (time.strftime("%H:%M:%S"), cls, e), file=sys.stderr, flush=True)
+        time.sleep(gap)
 
 
 def serve(port=_DEFAULT_PORT, host="127.0.0.1"):
@@ -327,6 +421,7 @@ def serve(port=_DEFAULT_PORT, host="127.0.0.1"):
     print("  分类：%s" % " / ".join(_classes()))
     print("  用法：OpenAI 兼容客户端里 url 填 http://%s:%d/v1/chat/completions，"
           "model 填上面的分类名" % (host, port))
+    threading.Thread(target=_warmup_loop, name="warmup", daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

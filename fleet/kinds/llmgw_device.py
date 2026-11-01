@@ -673,14 +673,26 @@ def _save_state():
             "bandit": {f"{g}|{m or '*'}": v for (g, m), v in _BANDIT.items()},
             "learned_limits": {f"{g}|{m or '*'}": v for (g, m) in _LEARNED_LIMITS.keys() for v in [_LEARNED_LIMITS[(g, m)]]},
             "rate": {f"{g}|{m or '*'}": v for (g, m), v in _RATE.items()},
+            # 健康图谱必须落盘：不落盘的话每次重启网关都「失忆」，
+            # 那些额度已尽/并发已满的端点会被当成健康重新撞一遍 ——
+            # 而重启恰恰是我们最常做的动作（改完代码就重启）。
+            # 注意 key 必须转字符串：_HEALTH 的 key 是 (gateway, model) 元组，
+            # 直接塞进 json.dump 会抛 TypeError，然后被下面的 except 吞掉 ——
+            # 结果**整个状态文件都写不出去**（cooldown/bandit 跟着一起丢）。
+            # 这个坑 11-01 踩过：改成 dict(_HEALTH) 后盘上永远是 0 条。
+            "health": {f"{g}|{m}": v for (g, m), v in _HEALTH.items()},
         }
     try:
         tmp = _STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=1)
         os.replace(tmp, _STATE_PATH)
-    except Exception:
-        pass
+    except Exception as _e:
+        # 以前这里是 `pass`。静默失败最贵：状态写不出去，表现是「重启后全忘」，
+        # 而人只会看到「怎么又变慢了」，根本追不到这里。宁可刷一行噪音。
+        import sys as _sys
+        _sys.stderr.write("[llmgw] 状态落盘失败：%r（%s）\n"
+                          % (_e, _STATE_PATH))
 
 
 def _load_state():
@@ -714,6 +726,18 @@ def _load_state():
             parts = k.split("|", 1)
             if len(parts) == 2:
                 _RATE[(parts[0], parts[1] if parts[1] != "*" else None)] = v
+        # 健康图谱：连败/判脏跨重启保留。只保留 24h 内的记录，
+        # 太久的不再当证据（端点可能早就恢复了，硬拦着反而错过好货源）。
+        now = _NOW()
+        _HEALTH.clear()
+        for k, v in (payload.get("health") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            if (now - max(v.get("fail") or 0, v.get("ok") or 0)) > 86400:
+                continue
+            parts = str(k).split("|", 1)
+            if len(parts) == 2:
+                _HEALTH[(parts[0], parts[1])] = v
 
 
 _load_state()
@@ -806,23 +830,57 @@ def _reason_for(cls):
 
 
 # ---------- 可用性图谱（实时流量驱动；freellmapi model_probe_status 的轻量版） ----------
-def _update_health(gw, model, ok):
+#: 「硬失败」标记 —— 这些错误不会自己好，撞一次就该记住，不该撞满 3 次才信。
+#:
+#: 11-01 实测教训：`ofm` 的 4 个 buddy 模型全部回「空流」（HTTP 200 但零内容，额度尽），
+#: `amd` 的 GLM-5.3-Flash 回「at its concurrency limit」。这些都不是网络抖动，
+#: 是确定性的额度/并发上限。但健康机制要连续失败 3 次才判脏，于是用户每次
+#: 都要陪着把这条死链走完 —— 实测 cn 连撞 7 跳、单次 17.8s，客户端重试一次就 50s+。
+#: 硬失败一次判脏，软失败（超时/5xx/连不上）仍按 3 次，避免一次抖动就误伤。
+_HARD_FAIL_MARKS = (
+    "空流", "no content", "concurrency limit", "concurrent",
+    "quota", "insufficient", "region", "not available in your country",
+    "unsupported_country", "throttled", "credit", "余额", "额度",
+)
+
+
+def _is_hard_fail(err) -> bool:
+    """这个错误是不是「再试也不会好」的确定性失败。"""
+    e = str(err or "").lower()
+    return any(k.lower() in e for k in _HARD_FAIL_MARKS)
+
+
+def _update_health(gw, model, ok, hard=False):
     """请求后更新 (gw, model) 的健康状态。成功 → 重置连续失败并标记 healthy；
-    失败 → 连续失败 +1，连续达到阈值且无近期成功则判定 unhealthy。"""
+    失败 → 连续失败 +1，连续达到阈值且无近期成功则判定 unhealthy。
+
+    hard=True：确定性失败（额度尽/并发满/地区封/空流），**一次就判脏**，
+    并且不因为「几分钟前还成功过」就被豁免 —— 额度用完了就是完了。
+    """
     k = _ckey(gw, model)
+    changed = False
     with _LOCK:
         st = _HEALTH.get(k, {"ok": 0.0, "fail": 0.0, "consecutive": 0, "healthy": True})
         now = _now()
         if ok:
+            if not st.get("healthy", True) or st.get("consecutive"):
+                changed = True
             st["ok"] = now
             st["consecutive"] = 0
             st["healthy"] = True
         else:
             st["fail"] = now
             st["consecutive"] = st.get("consecutive", 0) + 1
-            if st["consecutive"] >= HEALTH_FAIL_THRESHOLD and (now - st.get("ok", 0)) > HEALTH_RECOVER_S:
+            need = 1 if hard else HEALTH_FAIL_THRESHOLD
+            fresh_ok = (now - st.get("ok", 0)) <= HEALTH_RECOVER_S
+            if st["consecutive"] >= need and (hard or not fresh_ok):
+                if st.get("healthy", True):
+                    changed = True
                 st["healthy"] = False
         _HEALTH[k] = st
+    # 只在「健康结论变了」时落盘。_LOCK 是 RLock，这里已出 with 块，不会自锁。
+    if changed:
+        _save_state()
 
 
 def _health_state(gw, model):
@@ -1693,6 +1751,31 @@ def _sse_once(gw, payload, timeout, on_delta=None, first_byte_timeout=None):
       超时放宽成正常 timeout（慢工出细活的长回答不受影响）。
     """
     style = gw.get("api_style") or "chat"
+    if style == "kiro":
+        # Kiro 是 AWS CodeWhisperer 私有协议（Event Stream 包着 JSON），不是标准 SSE，
+        # 不能拼 /v1/chat/completions —— kiro 的 base 本来就是空的，拼出来是相对 URL，
+        # urllib 当场 ValueError: unknown url type: '/v1/chat/completions'。
+        #
+        # 11-01 实测踩到：**主人的客户端全用 stream=true**，所以 claude 类在客户端里
+        # 一直是 502，而非流式路径（走 _kiro_once）一直好好的，问题被掩盖了很久。
+        # 这里退化成「非流式拿全文、整段推一次」：对客户端是慢一点的流式，
+        # 但比 502 强得多，而且 tool_calls 轮次同样能带出来。
+        _t0 = _now()
+        body, err, via, tk, _cls, _reason, ra = _kiro_once(gw, payload, timeout)
+        if body is None:
+            return (None, err, None, 0, _cls, _reason, ra,
+                    {"ttft_s": None, "chunks": 0, "partial": False})
+        msg = {}
+        try:
+            msg = (body.get("choices") or [{}])[0].get("message") or {}
+        except Exception:
+            msg = {}
+        text = msg.get("content") or ""
+        if on_delta and text:
+            on_delta(text)
+        return (body, None, via, tk, "ok", "ok", None,
+                {"ttft_s": round(_now() - _t0, 3) if text else None,
+                 "chunks": 1 if text else 0, "partial": False})
     if style == "responses":
         instructions, turns = _to_resp_input(payload.get("messages") or [])
         req_body = {"model": payload.get("model"), "input": turns, "stream": True}
@@ -2492,9 +2575,25 @@ def _build_candidates(gws, models, session=None, sticky_pref=None, chain=None):
         for i, (ep_name, model) in enumerate(chain):
             order.setdefault((ep_name, model), i)
         kept = [c for c in candidates if (c["gw"]["name"], c["model"]) in order]
-        # 同一 (端点,模型) 只留一条，链序升序；顺带把链序号塞进去便于排查
+
+        # 链内分梯队：**健康的按人定顺序，已知坏的排最后**。
+        #
+        # 11-01 实测踩到：`cn` 链头 `buddy/kimi-k3.1-pro` 成功率是 0，但链序由人定、
+        # bandit 不参与排序，于是每次请求都要先撞它一次、白等一整个首字节闸（9s），
+        # 才退到能用的那家 —— 客户端侧表现就是「发条消息等几十秒」。
+        # 上面 candidates 里的 `score *= 0.001` 降权对分类链**完全无效**：chain 分支
+        # 按 order 排，压根不看 score。这是「机制写了但没接上」的典型。
+        #
+        # 注意只拿 unhealthy（我们自己刚撞过、最可信）做梯队依据；
+        # ext_dead 是别人探的、可能过时，继续只做降权不参与梯队，
+        # 免得 OFM 一句 region-blocked 就把还能用的端点踢到队尾。
+        def _chain_key(c):
+            return (1 if not c["healthy"] else 0,
+                    order[(c["gw"]["name"], c["model"])])
+
+        # 同一 (端点,模型) 只留一条，梯队内按链序升序；顺带把链序号塞进去便于排查
         uniq, seen = [], set()
-        for c in sorted(kept, key=lambda c: order[(c["gw"]["name"], c["model"])]):
+        for c in sorted(kept, key=_chain_key):
             k = (c["gw"]["name"], c["model"])
             if k in seen:
                 continue
@@ -2928,7 +3027,7 @@ def _h_chat(cap, args, dev):
                          "err": (err or "")[:150], "latency_s": 0,
                          "cooldown_source": c.get("cooldown_source"), "via": "hedge"})
         record_failure(g["name"], m, err_text=err, reason=reason, retry_after_s=rr[6])
-        _update_health(g["name"], m, False)
+        _update_health(g["name"], m, False, hard=_is_hard_fail(err))
 
     # 全部失败：尝试串行 fallback 剩余候选（跳过 hedge 已试过的，避免重复打）。
     # 这里用全量 candidates —— 免费端点全挂时，额度型上游在这一步才被轮到（兜底不抢跑）。
@@ -2961,7 +3060,7 @@ def _h_chat(cap, args, dev):
         cls = _classify_error(0, err)
         reason = {"timeout": "timeout", "transport": "timeout"}.get(cls, "5xx")
         record_failure(g["name"], m, err_text=err, reason=reason, retry_after_s=retry_after_s)
-        _update_health(g["name"], m, False)
+        _update_health(g["name"], m, False, hard=_is_hard_fail(err))
         attempts.append({"gateway": g["name"], "model": m,
                          "err": (err or "")[:150], "latency_s": lat,
                          "cooldown_source": c.get("cooldown_source")})
@@ -3031,7 +3130,7 @@ def _chat_stream_serial(cap, dev, candidates, payload_base, timeout, session, co
             return R.success(cap, dev.name, via=dev.via, data=data)
 
         record_failure(g["name"], m, err_text=err, reason=reason, retry_after_s=ra)
-        _update_health(g["name"], m, False)
+        _update_health(g["name"], m, False, hard=_is_hard_fail(err))
         attempts.append({"gateway": g["name"], "model": m, "err": (err or "")[:150],
                          "latency_s": lat, "cooldown_source": c.get("cooldown_source"),
                          "phase": "pre-first-byte"})
@@ -4442,7 +4541,71 @@ def _selftest():
         assert ch["message"]["tool_calls"][0]["function"]["name"] == "pc_state", ch
         assert ch["message"]["content"] == "我查一下", ch
 
-        print("llmgw_device 自测：33 组全过")
+        # ㉞ 硬失败一次判脏：空流/并发满/额度尽 这类确定性失败，不再要求连败 3 次。
+        #    11-01 现场：ofm 四个 buddy 全回空流，健康表要撞满 3 次才信，
+        #    cn 单次连撞 7 跳 17.8s，客户端重试 = 50s+。
+        saved_health = dict(g0["_HEALTH"])
+        try:
+            g0["_HEALTH"].clear()
+            assert g0["_is_hard_fail"]("流结束但没有内容（上游返回空流）") is True
+            assert g0["_is_hard_fail"]("Model 'x' is at its concurrency limit") is True
+            assert g0["_is_hard_fail"]("HTTP 503 service unavailable") is False, "5xx 算软失败"
+            assert g0["_is_hard_fail"]("timed out") is False, "超时算软失败"
+            gw_h = {"name": "hp", "base": "http://127.0.0.1:9/v1"}
+            # 注意 _ckey(gw, model) 里的 gw 是**端点名字符串**，不是端点字典
+            # （调用点全是 g["name"]）；传成字典会 unhashable。
+            g0["_update_health"](gw_h["name"], "m-hard", False, hard=True)
+            h_, c_, _, _ = g0["_health_state"](gw_h["name"], "m-hard")
+            assert h_ is False and c_ == 1, (h_, c_)
+            # 软失败第一次不许判脏（一次抖动不能误伤好货源）
+            g0["_update_health"](gw_h["name"], "m-soft", False)
+            h2, c2, _, _ = g0["_health_state"](gw_h["name"], "m-soft")
+            assert h2 is True and c2 == 1, (h2, c2)
+        finally:
+            g0["_HEALTH"].clear()
+            g0["_HEALTH"].update(saved_health)
+
+        # ㉟ 链内健康梯队：分类链的「顺序由人定」只对**健康**端点成立，
+        #    已知判脏的必须沉到梯队末尾 —— 否则链头那个死端点每次都让人等一整个首字节闸。
+        saved_health = dict(g0["_HEALTH"])
+        try:
+            g0["_HEALTH"].clear()
+            gwA = {"name": "epA", "base": "http://127.0.0.1:9/v1"}
+            gwB = {"name": "epB", "base": "http://127.0.0.1:9/v1"}
+            g0["_update_health"]("epA", "m1", False, hard=True)   # A 判脏
+            cand = g0["_build_candidates"](
+                [gwA, gwB], ["m1"], chain=[("epA", "m1"), ("epB", "m1")])
+            order = [(c["gw"]["name"], c["model"]) for c in cand]
+            assert order == [("epB", "m1"), ("epA", "m1")], order
+            # 两个都健康时，必须严格按人定的链序
+            g0["_HEALTH"].clear()
+            cand2 = g0["_build_candidates"](
+                [gwA, gwB], ["m1"], chain=[("epA", "m1"), ("epB", "m1")])
+            order2 = [c["gw"]["name"] for c in cand2]
+            assert order2 == ["epA", "epB"], order2
+        finally:
+            g0["_HEALTH"].clear()
+            g0["_HEALTH"].update(saved_health)
+
+        # ㊱ 健康表必须能落盘：key 是 (gw, model) 元组，直接用会 json 序列化失败，
+        #    而那个异常以前被 `except: pass` 吞掉 —— 连带 cooldown/bandit 全丢。
+        saved_health = dict(g0["_HEALTH"])
+        try:
+            g0["_HEALTH"].clear()
+            g0["_HEALTH"][("gwx", "mx")] = {"ok": 0.0, "fail": _now(), "consecutive": 1,
+                                            "healthy": False}
+            g0["_save_state"]()
+            with open(g0["_STATE_PATH"], encoding="utf-8") as f:
+                disk = json.load(f)
+            assert "health" in disk, "health 没进状态文件（落盘又断了）"
+            assert "gwx|mx" in disk["health"], disk.get("health")
+            assert disk["health"]["gwx|mx"]["healthy"] is False
+        finally:
+            g0["_HEALTH"].clear()
+            g0["_HEALTH"].update(saved_health)
+            g0["_save_state"]()      # 把刚才写盘里的测试记录冲掉，别污染真状态
+
+        print("llmgw_device 自测：36 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
