@@ -2764,7 +2764,8 @@ def _h_chat(cap, args, dev):
     if sv is True or (isinstance(sv, str) and sv.lower() in ("1", "true", "on", "yes")):
         return _chat_stream_serial(cap, dev, first_round, payload_base, timeout,
                                    session, comp_saved,
-                                   deeper=candidates if not allow_paid else None)
+                                   deeper=candidates if not allow_paid else None,
+                                   on_delta=args.get("_on_delta"))
 
     # 扇出：默认 1（串行）。只有显式 fanout>1 才并发抢跑。
     # 理由见 HEDGE_FANOUT 上方注释：并发是「用额度买延迟」（3 条连接 + 3 次计费 +
@@ -2864,12 +2865,14 @@ def _h_chat(cap, args, dev):
 
 
 def _chat_stream_serial(cap, dev, candidates, payload_base, timeout, session, comp_saved,
-                        deeper=None):
+                        deeper=None, on_delta=None):
     """流式路径：按 bandit 分串行试候选。
 
     分界线是首字节 —— 首字节前失败换下一个（等价普通 fallback）；
     首字节后失败不再重试，把已得内容作为 partial 交回（重试会让用户看到重复输出）。
     deeper=全量候选表：免费端点全在首字节前挂了，才轮到额度型上游兜底。
+    on_delta=逐块回调：给 llmgw_server 做真 SSE 转发用。首字节前的候选失败时
+      一个 delta 都没有，所以「换下一跳」对已发给客户端的内容永远无害。
     """
     attempts = []
     queue = list(candidates)
@@ -2897,7 +2900,7 @@ def _chat_stream_serial(cap, dev, candidates, payload_base, timeout, session, co
                                  "phase": "busy"})
                 continue
             body, err, via, tk, cls, reason, ra, meta = _sse_once(
-                g, p, min(timeout, HEDGE_ATTEMPT_TIMEOUT))
+                g, p, min(timeout, HEDGE_ATTEMPT_TIMEOUT), on_delta=on_delta)
         lat = round(_now() - t0, 2)
         if body is not None:
             ttft = meta.get("ttft_s")

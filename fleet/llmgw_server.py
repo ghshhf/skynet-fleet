@@ -17,9 +17,10 @@
 设计上的三条取舍（都是踩过的）：
 1. **只报分类，不默认报 75 个真名**。客户端下拉框不是数据库，塞 75 条没人选得动；
    分类是「我要哪一类智力」，真实模型由链去挑。
-2. **stream=true 也回 SSE，但内容是整段一次性发**。llmgw 的流式在内部已经读完再
-   聚合（_sse_once 拼 choices），这里如实包装成 SSE 帧，客户端能正常解析；
-   逐 token 真流式是后续单独一件事，不和接入混在一个提交里。
+2. **stream=true 是真流式**：上游吐一块就转一块（_sse_once 的 on_delta 直推 socket），
+   首字节 1.3s 就出现在客户端，不用等上游把整段说完。首字节前的候选失败一个 delta
+   都不会发出去，所以「换下一跳」对已经发出去的内容永远无害。
+   早期版本是「整段一次性发」——SSE 帧是真的、流式是假的：客户端要等全部说完才有字。
 3. **不校验 API key**。绑 127.0.0.1，只给本机用；客户端随便填个 key 都能连。
    要对外必须另加鉴权，这里不做——做了就是「以为安全其实没有」。
 
@@ -99,8 +100,11 @@ def _refresh_hints():
         pass
 
 
-def _chat(payload):
-    """把 OpenAI 请求转成 llmgw.chat 的调用。返回 (result_dict, err_str)。"""
+def _chat(payload, on_delta=None):
+    """把 OpenAI 请求转成 llmgw.chat 的调用。返回 (data_dict, err_str)。
+
+    on_delta 非空时走真流式：上游每吐一块就回调一次（含换上游前一个 delta 都没发的情况）。
+    """
     model = (payload.get("model") or "").strip()
     messages = payload.get("messages")
     if not messages:
@@ -112,12 +116,15 @@ def _chat(payload):
     elif model:
         args["model"] = model
     for k in ("temperature", "max_tokens", "top_p", "session", "timeout",
-              "tools", "tool_choice", "compress"):
+              "tools", "tool_choice", "compress", "fanout"):
         if payload.get(k) is not None:
             args[k] = payload[k]
     # 客户端普遍只发 max_tokens（有些发 max_completion_tokens），统一一下
     if payload.get("max_completion_tokens") and not args.get("max_tokens"):
         args["max_tokens"] = payload["max_completion_tokens"]
+    if on_delta is not None:
+        args["stream"] = True
+        args["_on_delta"] = on_delta
     r = _dev().invoke("llmgw.chat", args).as_dict()
     if not r.get("ok"):
         return None, str(r.get("err") or "unknown")
@@ -145,21 +152,9 @@ def _as_completion(data, model_name):
     return body
 
 
-def _as_sse(body):
-    """包装成 SSE：一帧完整结果 + [DONE]。客户端能解析，只是不逐字。"""
-    chunk = {
-        "id": body["id"], "object": "chat.completion.chunk", "created": body["created"],
-        "model": body["model"],
-        "choices": [{"index": 0, "delta": {"role": "assistant", "content":
-                     ((body["choices"][0].get("message") or {}).get("content") or "")},
-                     "finish_reason": "stop"}],
-    }
-    return ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
-            + "data: [DONE]\n\n").encode("utf-8")
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "tianwang-llmgw"
+    protocol_version = "HTTP/1.1"   # chunked 传输需要 1.1；每个响应都自带 Content-Length 或 chunked
 
     def log_message(self, fmt, *a):
         sys.stderr.write("[llmgw-server] " + (fmt % a) + "\n")
@@ -172,6 +167,85 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(raw)
+
+    # ---------- 真流式（chunked） ----------
+    def _chunk(self, raw):
+        """写一个 HTTP chunk。客户端断开时静默收场——它不听了不是我们的错。"""
+        try:
+            self.wfile.write(b"%x\r\n" % len(raw) + raw + b"\r\n")
+            self.wfile.flush()
+            return True
+        except Exception:
+            return False
+
+    def _stream_chat(self, payload):
+        """上游吐一块就转一块，首字节一到客户端就能看见字。
+
+        关键设计：200 响应头在**第一个 delta 到达时**才发。这样首字节前的候选失败
+        （换下一跳、全部挂掉）时我们手里还有干净的连接，可以体面地回 502，
+        而不是先发 200 再吐一个错误帧（那会让客户端以为请求成功了）。
+        """
+        started = {"ok": False}
+        dead = {"ok": False}
+        mid = "chatcmpl-tianwang-%d" % int(time.time() * 1000)
+        model_name = payload.get("model")
+
+        def frame(delta, finish=None, extra=None):
+            obj = {"id": mid, "object": "chat.completion.chunk",
+                   "created": int(time.time()), "model": model_name,
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            if extra:
+                obj.update(extra)
+            return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+        def on_delta(piece):
+            if dead["ok"]:
+                return
+            if not started["ok"]:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                started["ok"] = True
+                if not self._chunk(frame({"role": "assistant", "content": ""})):
+                    dead["ok"] = True
+                    return
+            if not self._chunk(frame({"content": piece})):
+                dead["ok"] = True
+
+        err = None
+        try:
+            data, err = _chat(payload, on_delta=on_delta)
+        except Exception as e:
+            err = repr(e)[:200]
+            data = None
+        if not started["ok"]:
+            # 一个字节都没发出去：干净地报错，客户端能正常重试
+            return self._send(502, {"error": {"message": err or "上游无输出",
+                                              "type": "upstream_error"}})
+        if dead["ok"]:
+            return
+        meta = {
+            "endpoint": (data or {}).get("endpoint"),
+            "model": (data or {}).get("model"),
+            "latency_s": (data or {}).get("latency_s"),
+            "ttft_s": (data or {}).get("ttft_s"),
+            "fallback_attempts": len((data or {}).get("fallback_attempts") or []),
+            "degraded_tools": bool((data or {}).get("degraded_tools")),
+        }
+        if err:
+            meta["stream_err"] = err
+        elif (data or {}).get("stream_err"):
+            meta["stream_err"] = data["stream_err"]
+        self._chunk(frame({}, "stop", {"_tianwang": meta}))
+        self._chunk(b"data: [DONE]\n\n")
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -212,12 +286,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(400, {"error": {"message": "bad json: %s" % e}})
         want_stream = payload.get("stream") in (True, "true", "1", 1)
+        if want_stream:
+            return self._stream_chat(payload)
         data, err = _chat(payload)
         if err:
             return self._send(502, {"error": {"message": err, "type": "upstream_error"}})
         body = _as_completion(data, payload.get("model"))
-        if want_stream:
-            return self._send(200, _as_sse(body), ctype="text/event-stream")
         return self._send(200, body)
 
 
