@@ -37,6 +37,7 @@ import json
 import math
 import os
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -77,8 +78,9 @@ ANON_ENDPOINTS = [
      "key": "", "anon": True, "default_model": "gpt-oss-20b",
      "note": "100 req/hr 匿名，聚合多上游（偶发超时，靠冷却兜底）"},
     {"name": "kilo", "base": "https://api.kilo.ai/api/gateway/v1",
-     "key": "", "anon": True, "default_model": "kilo-auto/free",
-     "note": "kilo :free 路由，匿名可用（实测 chat OK，384 模型中挑免费 id）"},
+     "key": "", "anon": True, "default_model": "kilo-auto/free", "free_only": True,
+     "note": "kilo 免费池；/v1/models 会吐 384 个（绝大多数要付费/需 key），"
+             "只有 :free / -free 结尾的是匿名免费 → free_only 过滤，别把付费模型当可用上报"},
     {"name": "ovh", "base": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
      "key": "", "anon": True, "default_model": "gpt-oss-20b",
      "note": "OVH AI Endpoints 免费开源权重，匿名可用（22 模型，修正域名后实测 OK）"},
@@ -91,6 +93,23 @@ def _load_json(path):
             return json.load(f)
     except Exception:
         return None
+
+
+# 免费模型 id 标记：`:free` / `-free` / `/free` 结尾（`kilo-auto/free`、`nvidia/x:free`、
+# `glm-5.3-flash-free` 都算）。只为「只认免费池」的端点做上报过滤，不做能力判断。
+_FREE_ID = re.compile(r"(:free|/free|-free)$", re.I)
+
+
+def _is_free_id(mid):
+    return bool(_FREE_ID.search((mid or "").strip()))
+
+
+def _only_free(gw, ids):
+    """端点声明 free_only 时过滤掉付费模型 id；过滤后为空则原样返回（宁可多报，不误杀）。"""
+    if not gw.get("free_only") or not ids:
+        return ids
+    kept = [x for x in ids if _is_free_id(x)]
+    return kept or ids
 
 
 # ---------- 本地离线兜底桥（Ollama 兼容 / 天网 compute.py） ----------
@@ -145,6 +164,7 @@ def discover_gateways():
         gws.append({"name": a["name"], "base": a["base"],
                     "key": a["key"], "anon": True,
                     "default_model": a.get("default_model"),
+                    "free_only": bool(a.get("free_only")),
                     "note": a.get("note", "")})
     # 本地离线兜底（Ollama 兼容）——永远排最后，远程免费层优先
     lg = _local_gw()
@@ -968,6 +988,64 @@ def _compress_messages(messages, level=1, cap=16000):
     return out, saved
 
 
+# ---------- 上游同源识别（"假多样性"的解药） ----------
+# 本机实证（见记忆 2026-11-01-反代与免费上游机制.md）：OFM 报 50 个模型、zen-gate 报 21 个，
+# 但两家的上游其实是同一批（kilo free / OpenCode-zen free / 自家账号池）。同一个模型的
+# 不同写法（`glm-5.3-flash-free` vs `opencode/glm-5.3-flash-free`）会被当成两个独立候选，
+# 于是一次 hedge 三个名额全打在同源上 —— 上游一挂同时挂，降权也救不回来。
+# 解法：按模型身份归一，同源候选只让分最高的那一个进并发，其余留作串行备位。
+_IDENTITY_TAIL = re.compile(r"(:free|:latest|-free|-latest)+$", re.I)
+
+
+def _model_identity(model):
+    """模型身份归一 key：大小写、`opencode/` 这类厂商前缀、`:free`/`-free` 后缀都不算差异。
+
+    例：`glm-5.3-flash-free` / `opencode/glm-5.3-flash-free` / `glm-5.3-flash:free`
+        → 全部归一为 `glm-5.3-flash`
+        `nvidia/nemotron-3.5-super-vl:free` / `nemotron-3.5-super-vl-free`
+        → 全部归一为 `nemotron-3.5-super-vl`
+    只在「同一模型的不同入口」上合并；确实不同的模型（ling-3.0 vs ling-3.1）仍然分开。
+    """
+    m = (model or "").strip().lower()
+    if not m:
+        return ""
+    m = _IDENTITY_TAIL.sub("", m)
+    if "/" in m:
+        tail = m.rsplit("/", 1)[-1].strip()
+        # 斜杠后为空（如 `kilo-auto/free` 去掉 :free 后剩 `kilo-auto/free`）时保留原样
+        if tail:
+            m = tail
+    return _IDENTITY_TAIL.sub("", m) or m
+
+
+def _fanout_pick(candidates, n):
+    """从有序候选里挑 n 个「不同模型身份」的下标；名额不足时才用同源备位补。
+
+    返回 candidates 的**全局下标**列表（调用方按它索引，不要用局部序号）。
+    """
+    if n <= 0:
+        return []
+    picked, seen = [], set()
+    for i, c in enumerate(candidates):
+        o = c.get("origin") or c.get("model")
+        if o in seen:
+            continue
+        seen.add(o)
+        picked.append(i)
+        if len(picked) >= n:
+            return picked
+    # 不同模型不够 n 个：拿同源备位补足并发名额（总比空着强）
+    chosen = set(picked)
+    for i in range(len(candidates)):
+        if i in chosen:
+            continue
+        picked.append(i)
+        chosen.add(i)
+        if len(picked) >= n:
+            break
+    return picked
+
+
 # ---------- 候选排序（bandit + model bench + cooldown 过滤） ----------
 def _build_candidates(gws, models, session=None, sticky_pref=None):
     """构建按 bandit 得分排序的候选列表，过滤 cooldown 和 model bench。"""
@@ -975,6 +1053,7 @@ def _build_candidates(gws, models, session=None, sticky_pref=None):
     candidates = []
     intel_models = list(models) if models else []
     for m in models:
+        origin = _model_identity(m)
         for g in gws:
             # model-level bench
             benched, _ = is_model_benched(m)
@@ -991,7 +1070,7 @@ def _build_candidates(gws, models, session=None, sticky_pref=None):
             if not healthy:
                 score *= 0.001
             candidates.append({
-                "gw": g, "model": m, "score": score,
+                "gw": g, "model": m, "score": score, "origin": origin,
                 "cooldown_source": source, "healthy": healthy,
             })
     # 先按 local 标志升序（非本地在前），再按 bandit 分降序（稳定排序：同分时本地仍压最后）
@@ -1011,20 +1090,25 @@ def _hedge_send(candidates, payload_base, timeout, max_fanout=HEDGE_FANOUT):
       - results：tried_indices → 对应 7 元组（调用方据此记录冷却 / 填错误报告）
     关键：绝不在 executor 退出时 wait 所有任务——一个抖动的网关不能拖死整次调用。
     """
-    top = candidates[:max_fanout]
-    if len(top) <= 1:
-        res, idx = _chat_once_top(top[0] if top else None, payload_base, timeout)
-        return res, idx, set(range(len(top))), {idx: res}
+    # 同源去重取位：避免多个并发名额打在同一批上游的不同入口上（一起挂 = 白打）
+    top_idx = _fanout_pick(candidates, max_fanout)
+    if not top_idx:
+        return (None, "no candidate", None, 0, "transport", "timeout", None), -1, set(), {}
+    if len(top_idx) <= 1:
+        i = top_idx[0]
+        res, _ = _chat_once_top(candidates[i], payload_base, timeout)
+        return res, i, {i}, {i: res}
 
     # 单次 fanout 尝试超时：避免一个卡住的网关吃满整次 timeout（默认 120s）
     attempt_timeout = min(timeout, HEDGE_ATTEMPT_TIMEOUT)
 
     results = {}
     tried = set()
-    executor = ThreadPoolExecutor(max_workers=len(top))
+    executor = ThreadPoolExecutor(max_workers=len(top_idx))
     try:
         fut_to_idx = {}
-        for idx, c in enumerate(top):
+        for idx in top_idx:
+            c = candidates[idx]
             p = dict(payload_base)
             p["model"] = c["model"]
             fut = executor.submit(_chat_once, c["gw"], p, attempt_timeout)
@@ -1072,6 +1156,7 @@ def _h_endpoints(cap, args, dev):
         raw_ids = []
         if st == 200 and isinstance(body, dict):
             raw_ids = [m.get("id") for m in (body.get("data") or body.get("models") or []) if m.get("id")]
+        raw_ids = _only_free(g, raw_ids)
         ids = list(raw_ids)
         if not ids and g.get("default_model"):
             # /v1/models 未实现或返回空（如 pollinations 在 openai 基址下返回 200 空列表）
@@ -1097,18 +1182,41 @@ def _h_models(cap, args, dev):
         raw_ids = []
         if st == 200 and isinstance(body, dict):
             raw = body.get("data") or body.get("models") or []
+            mids = []
             for m in raw:
                 mid = m.get("id") or m.get("name") or (m if isinstance(m, str) else None)
                 if mid:
-                    ids.append({"id": mid, "family": _family(mid)})
-                    raw_ids.append(mid)
+                    mids.append(mid)
+            # free_only 端点（如 kilo 报 384 个但绝大多数要付费）只统计真免费的
+            mids = _only_free(g, mids)
+            for mid in mids:
+                ids.append({"id": mid, "family": _family(mid)})
+                raw_ids.append(mid)
         if not ids and g.get("default_model"):
             ids = [{"id": g["default_model"], "family": _family(g["default_model"]),
                     "via": "default_model"}]
-        result[g["name"]] = {"count": len(ids), "models": ids[:300],
+        idents = []
+        for it in ids:
+            it2 = dict(it)
+            it2["origin"] = _model_identity(it["id"])
+            idents.append(it2)
+        result[g["name"]] = {"count": len(ids), "models": idents[:300],
                              "ok": bool(ids),
+                             "distinct_origins": len({x["origin"] for x in idents}),
                              "err": None if ids else str(err)[:120]}
-    return R.success(cap, dev.name, via=dev.via, data={"endpoints": result})
+    # 全局同源度：模型条目总数 vs 真正不同的模型数（"假多样性"的量化指标）
+    all_origins = set()
+    total_rows = 0
+    for v in result.values():
+        total_rows += v["count"]
+        for it in v["models"]:
+            all_origins.add(it["origin"])
+    return R.success(cap, dev.name, via=dev.via, data={
+        "endpoints": result,
+        "total_model_rows": total_rows,
+        "distinct_models": len(all_origins),
+        "duplication": (round(total_rows / len(all_origins), 2) if all_origins else 0),
+    })
 
 
 def _h_chat(cap, args, dev):
@@ -1145,17 +1253,27 @@ def _h_chat(cap, args, dev):
                 if not models:
                     models = [st["model"]]
 
-    # 默认模型：从首个可用网关取；匿名端点拿不到 /v1/models 时用 default_model
+    # 默认模型选取（用户没指定 model 时）：
+    # 1) 各网关的 default_model 是**实测验证过能 chat** 的精挑模型 → 优先；
+    #    多个就按 bandit 分挑最高的，且跳过已知不健康的。
+    #    （反例：OFM 的 /v1/models[0] 是 `big-pickle`，实测 availability 标 throttled —— 不能当默认）
+    # 2) 都没有才退到 /v1/models 第一个（free_only 端点先过滤付费模型）。
     if not models:
-        for g in gws:
-            st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=8)
-            ids = [m.get("id") for m in (body or {}).get("data", []) if m.get("id")] if (st == 200 and isinstance(body, dict)) else []
-            if ids:
-                models = [ids[0]]
-                break
-            if g.get("default_model"):
-                models = [g["default_model"]]
-                break
+        picks = [(g["default_model"], g) for g in gws if g.get("default_model")
+                 and not _is_health_filtered(g["name"], g["default_model"])]
+        if picks:
+            picks.sort(key=lambda t: bandit_score(t[1]["name"], t[0]), reverse=True)
+            models = [picks[0][0]]
+        else:
+            for g in gws:
+                st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=8)
+                ids = []
+                if st == 200 and isinstance(body, dict):
+                    ids = [m.get("id") for m in (body.get("data") or []) if m.get("id")]
+                    ids = _only_free(g, ids)
+                if ids:
+                    models = [ids[0]]
+                    break
         if not models:
             return R.error(cap, "未指定 model 且拿不到模型清单", device=dev.name, via=dev.via)
 
@@ -1198,7 +1316,7 @@ def _h_chat(cap, args, dev):
         routed = body.get("_routed_via") or via or g["name"]
         return R.success(cap, dev.name, via=dev.via, data={
             "result": body, "endpoint": g["name"], "base": g["base"],
-            "model": m, "routed_via": routed, "latency_s": lat,
+            "model": m, "origin": c.get("origin"), "routed_via": routed, "latency_s": lat,
             "fallback_attempts": attempts, "session": session,
             "cooldown_source": c.get("cooldown_source"),
             "compress_saved_chars": comp_saved,
@@ -1241,7 +1359,7 @@ def _h_chat(cap, args, dev):
             routed = body.get("_routed_via") or via or g["name"]
             return R.success(cap, dev.name, via=dev.via, data={
                 "result": body, "endpoint": g["name"], "base": g["base"],
-                "model": m, "routed_via": routed, "latency_s": lat,
+                "model": m, "origin": c.get("origin"), "routed_via": routed, "latency_s": lat,
                 "fallback_attempts": attempts, "session": session,
                 "cooldown_source": c.get("cooldown_source"),
                 "compress_saved_chars": comp_saved,
@@ -1719,7 +1837,54 @@ def _selftest():
         assert g0["_join_url"]("https://x/v1", "/v1/chat/completions") == "https://x/v1/chat/completions"
         assert g0["_join_url"]("https://x", "/v1/models") == "https://x/v1/models"
         assert g0["_join_url"]("http://127.0.0.1:1/v1", "/models") == "http://127.0.0.1:1/v1/models"
-        print("llmgw_device 自测：13 组全过")
+
+        # ⑭ 上游同源归并（假多样性解药，不依赖真实网络）
+        ident = g0["_model_identity"]
+        # 同一模型的不同写法必须归一到同一个 key
+        assert ident("glm-5.3-flash-free") == ident("opencode/glm-5.3-flash-free") == "glm-5.3-flash"
+        assert ident("glm-5.3-flash:free") == "glm-5.3-flash"
+        assert ident("nvidia/nemotron-3.5-super-vl:free") == ident("nemotron-3.5-super-vl-free") \
+            == "nemotron-3.5-super-vl"
+        # 不同模型不许被合并（否则会把真备选也砍掉）
+        assert ident("ling-3.0-flash-fin-free") != ident("ling-3.1-flash-1019-free")
+        assert ident("") == ""
+        # 去重取位：同源只拿一个并发名额
+        cands = [
+            {"model": "glm-5.3-flash-free", "origin": "glm-5.3-flash"},
+            {"model": "opencode/glm-5.3-flash-free", "origin": "glm-5.3-flash"},
+            {"model": "deepseek-v4.1-flash-free", "origin": "deepseek-v4.1-flash"},
+            {"model": "opencode/deepseek-v4.1-flash-free", "origin": "deepseek-v4.1-flash"},
+            {"model": "kilo-auto/free", "origin": "kilo-auto/free"},
+        ]
+        pick = g0["_fanout_pick"](cands, 3)
+        assert pick == [0, 2, 4], pick          # 3 个不同模型，跳过 1 和 3
+        # 不同模型不够时用同源备位补足并发名额（不能空着）
+        assert g0["_fanout_pick"](cands, 5) == [0, 2, 4, 1, 3]
+        assert g0["_fanout_pick"]([], 3) == []
+        # _build_candidates 必须带上 origin 字段
+        real_disc = g0["discover_gateways"]
+        g0["discover_gateways"] = lambda: [
+            {"name": "ofm", "base": "http://127.0.0.1:1/v1", "key": "k"},
+            {"name": "zen-gate", "base": "http://127.0.0.1:2/v1", "key": "k"},
+        ]
+        try:
+            cs = g0["_build_candidates"](g0["discover_gateways"](),
+                                          ["glm-5.3-flash-free", "opencode/glm-5.3-flash-free"])
+            assert cs and all("origin" in x for x in cs), cs
+            assert len({x["origin"] for x in cs}) == 1, "两个写法应归一到同一 origin"
+        finally:
+            g0["discover_gateways"] = real_disc
+        # free_only 上游（kilo 报 384 个但绝大多数要付费）：只留真免费的，过滤后为空不误杀
+        is_free = g0["_is_free_id"]
+        assert is_free("kilo-auto/free") and is_free("nvidia/x:free") and is_free("glm-5.3-flash-free")
+        assert not is_free("gpt-4o") and not is_free("claude-sonnet-4")
+        only = g0["_only_free"]
+        kilo_gw = {"free_only": True}
+        assert only(kilo_gw, ["gpt-4o", "kilo-auto/free", "nvidia/x:free"]) \
+            == ["kilo-auto/free", "nvidia/x:free"]
+        assert only(kilo_gw, ["gpt-4o"]) == ["gpt-4o"], "全付费时不许把列表清空"
+        assert only({}, ["gpt-4o"]) == ["gpt-4o"], "非 free_only 端点不过滤"
+        print("llmgw_device 自测：14 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
