@@ -11,16 +11,31 @@
 
 **一个只在好网络里能用的功能，等于没有。** 这就是本层存在的全部理由。
 
-## 八条能力，按「一条真实连接」的次序排
+## 十一条能力，按「一条真实连接」的次序排
 
-    tun.ipv6      我在 IPv6 上的实况（这一条能让后面七条全部变得不必要）
+    tun.ipv6      我在 IPv6 上的实况（这一条能让后面大半变得不必要）
     tun.plan      给定两端网况，我该按什么顺序试（只算，不连，无副作用）
     tun.offer     产一条信令 offer（候选 + 打洞时刻，由会话 id 定）
     tun.accept    校验对端 offer 并回一条（脏数据在这里被挡掉）
     tun.open      开会话。**先连中继，此刻就已经可用**
     tun.upgrade   后台试直连；失败不改可用性，成功则主路迁移
     tun.status    现在走的哪条路、历史怎么变的
+    tun.pinhole   入站放行查/开/关 —— 「地址有、对端进不来」的最后一道墙
     tun.sessions / tun.close
+
+## 为什么 pinhole 在这层，而且排在 status 后面
+
+前面八条解决的都是「我怎么出去找对端」。pinhole 解决的是反过来的那件事：
+「对端怎么进来」。这两件事在 v4 上可以混着谈，因为 NAT 顺手把入站也管了；
+**v6 没有 NAT**，地址全球可达，于是主机防火墙成了唯一的门，
+而它的默认策略对 v6 入站是**全拦**。所以「v6 地址有、出网也通、
+对端就是连不进来」并不是玄学，是一个默认配置。
+
+它排在 status 后面，是因为它**有副作用**：前八条最多是花掉几个包，
+pinhole 是真的改系统状态。名字里带 `.open` / `.close` 是故意的 ——
+调用方在读到这个名字时就应该知道自己在改防火墙。
+
+边界写在实现里：只放当前在用的端口、只对 v6 源生效、只清自己的前缀。
 
 ## 为什么 IPv6 排在最前面
 
@@ -97,6 +112,7 @@ class TunnelLayer(BaseDevice):
     def caps(self):
         return ("tun.ipv6", "tun.plan", "tun.offer", "tun.accept",
                 "tun.open", "tun.upgrade", "tun.status",
+                "tun.pinhole", "tun.pinhole.open", "tun.pinhole.close",
                 "tun.sessions", "tun.close")
 
     # ---------------------------------------------------------- 分派
@@ -124,6 +140,15 @@ class TunnelLayer(BaseDevice):
 
         if cap == "tun.status":
             return self._status(args)
+
+        if cap == "tun.pinhole":
+            return self._pinhole(args)
+
+        if cap == "tun.pinhole.open":
+            return self._pinhole_open(args)
+
+        if cap == "tun.pinhole.close":
+            return self._pinhole_close(args)
 
         if cap == "tun.sessions":
             return self._sessions()
@@ -232,6 +257,76 @@ class TunnelLayer(BaseDevice):
                      "对端给的开打时刻已过去太多：多半两端时钟不同步，"
                      "应立刻开打并拉长窗口"),
         })
+
+    # ---------------------------------------------------------- 入站放行
+    def _pinhole(self, args=None):
+        """「为什么地址明明有、对端就是连不进来」的最后一道墙。
+
+        这一条只读，一个字都不改：查规则、看防火墙档位、判 v6 出不出得去，
+        然后给一句能直接照做的话。真正动手的是 .open / .close。
+        """
+        d = tun_mod.pinhole_status(deep=bool((args or {}).get("deep")))
+        return R.success("tun.pinhole", self.name, via=self.via, data=d)
+
+    def _pinhole_open(self, args):
+        """按端口放行 v6 入站。**只对 v6 源生效**，v4 侧端口不受影响。
+
+        端口必须由调用方给：本层不猜「大概要开哪个」。
+        猜错的代价是把一个业务端口在公网上敞开，而用户以为只开了隧道口。
+        """
+        ports = args.get("ports")
+        if ports is None and args.get("port") is not None:
+            ports = [args["port"]]
+        if not ports:
+            return R.error("tun.pinhole.open",
+                           "必须给 ports（一个端口列表）：不猜该开哪个口",
+                           device=self.name, via=self.via)
+        if isinstance(ports, (int, str)):
+            ports = [ports]
+        protos = args.get("protos") or ["TCP"]
+        r = tun_mod.pinhole_open(ports, protos)
+        if r.get("need_admin"):
+            return R.unavailable("tun.pinhole.open", r.get("err") or "需要管理员权限",
+                                 device=self.name, via=self.via)
+        if not r.get("ok"):
+            bad = r.get("failed") or []
+            why = r.get("err") or "放行没成功"
+            if bad:
+                why += "：" + "；".join("%s(%s)" % (b.get("name"), b.get("err"))
+                                       for b in bad[:3])
+            return R.error("tun.pinhole.open", why, device=self.name, via=self.via)
+        return R.success(
+            "tun.pinhole.open", self.name, side_effect=True, via=self.via,
+            data={"ports": r.get("ports"), "protos": r.get("protos"),
+                  "created": r.get("created"), "existed": r.get("existed"),
+                  "v6_any": list(tun_mod.PINHOLE_V6_ANY),
+                  "note": ("已放行 %s 的 v6 入站（源地址限 %s），"
+                           "v4 侧同端口不受影响"
+                           % (",".join(str(p) for p in r.get("ports") or []),
+                              "+".join(tun_mod.PINHOLE_V6_ANY)))})
+
+    def _pinhole_close(self, args):
+        """撤销放行。不给端口就全清 —— **但只清本模块前缀的规则**。
+
+        用户机器上还有远程桌面、共享、杀毒的规则。做全量清理的工具，
+        没人敢用第二回。
+        """
+        ports = args.get("ports")
+        if ports is None and args.get("port") is not None:
+            ports = [args["port"]]
+        if isinstance(ports, (int, str)):
+            ports = [ports]
+        r = tun_mod.pinhole_close(ports)
+        if r.get("need_admin"):
+            return R.unavailable("tun.pinhole.close", r.get("err") or "需要管理员权限",
+                                 device=self.name, via=self.via)
+        if not r.get("ok"):
+            why = r.get("err") or "撤销没成功"
+            if r.get("left"):
+                why += "（还剩 %d 条规则没删掉）" % r["left"]
+            return R.error("tun.pinhole.close", why, device=self.name, via=self.via)
+        return R.success("tun.pinhole.close", self.name, side_effect=True,
+                         via=self.via, data=r)
 
     # ---------------------------------------------------------- 会话
     def _open(self, args):

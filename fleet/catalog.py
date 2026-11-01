@@ -516,6 +516,25 @@ CAPABILITIES = [
                note="失败退回 relayed 而不是 idle —— 业务不能因为「升级没成功」被掐断"),
     Capability("tun.status", "这条隧道现在走哪条路、怎么变的",
                params=(Param("sid", "str", True, "会话 id")), note=""),
+    # ---- 入站放行（pinhole）：v6 没有 NAT，主机防火墙是唯一的门 ----
+    # 前三层解决「我怎么出去找对端」，这一层解决反过来的那件事：
+    # 「对端怎么进来」。v4 有 NAT 顺手把入站管了，v6 没有，
+    # 而主机防火墙对 v6 入站的默认策略是**全拦**。
+    # 所以「地址明明有、出网也通、对端就是连不进来」不是玄学，是默认配置。
+    Capability("tun.pinhole", "入站放行现在什么状态、要不要开（只读，不改任何东西）",
+               params=(Param("deep", "bool", doc="顺带查防火墙三个档位的开关状态")),
+               note="「地址有、对端进不来」的头号原因就在这里，先查再开"),
+    Capability("tun.pinhole.open", "放行指定端口的 v6 入站（**只对 v6 源生效**，v4 侧不受影响）",
+               params=(Param("ports", "list", True, "要放行的端口，一次最多 8 个"),
+                       Param("protos", "list", doc="TCP / UDP，默认只开 TCP"),
+                       Param("port", "int", doc="单个端口的简写")),
+               side_effect=True,
+               note="幂等：已存在就跳过；一半成功会标 partial，不折叠成 ok"),
+    Capability("tun.pinhole.close", "撤销放行（不给端口就全清，但只清自己前缀的规则）",
+               params=(Param("ports", "list", doc="只清这几个端口"),
+                       Param("port", "int", doc="单个端口的简写")),
+               side_effect=True,
+               note="不动别人（远程桌面/共享/杀毒）的规则：能做全量的工具没人敢用第二回"),
     Capability("tun.sessions", "现在开着哪些隧道", params=()),
     Capability("tun.close", "关掉隧道（先停升级线程，再关直连，最后拆中继）",
                params=(Param("sid", "str", doc="不给就什么都不做")),

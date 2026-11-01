@@ -30,6 +30,7 @@
 """
 import hashlib
 import ipaddress
+import json
 import os
 import socket
 import subprocess
@@ -375,6 +376,357 @@ def ipv6_usable(timeout=4.0, force=False):
          "addresses": d["addresses"], "ts": round(now, 1)}
     _V6_CACHE.update({"t": now, "v": v})
     return v
+
+
+# ------------------------------------------- IPv6 入站放行（pinhole）
+#: 规则名前缀。查、清、审计全靠它 —— 改了前缀等于让已经建好的规则失去撤销入口。
+PINHOLE_PREFIX = "skynet.pinhole."
+
+#: 一次最多开几个端口。防火墙是**全局状态**，传进来一个长列表就等于把机器敞开；
+#: 上限不设，「批量开端口」本身就会变成一个可以被远程触发的洞。
+PINHOLE_MAX_PORTS = 8
+
+#: 只对 IPv6 源生效的地址前缀集合。
+#:
+#: 为什么不是 `::/0`：本机是 Win10 19045，实测 `-RemoteAddress '::/0'` 和
+#: `netsh ... remoteip=::/0` 都报「一个或多个地址前缀无效」——**/0 这个前缀
+#: 被这个版本拒了**，而 `::/1`、`::/2`、`240e::/16` 都正常接受。
+#: `::/1` + `8000::/1` 并起来恰好覆盖整个 v6 空间，语义与 `::/0` 等价，
+#: 而且能作为数组塞进同一条规则的地址过滤器。这不是绕开校验，
+#: 是把「一个写不进去的表达式」换成「两个写得进去的等效表达式」。
+#:
+#: 为什么一定要限源、而不是干脆不限：不限 remoteip 的入站放行会**在 v4 上
+#: 同时敞开同一个端口**。用户以为开了一个 v6 的洞，实际开了两个，
+#: 而且 v4 那头没有 NAT 兜着。限源是这条能力敢自动跑的前提。
+PINHOLE_V6_ANY = ("::/1", "8000::/1")
+
+#: 合法协议白名单。`protocol=any` 加 `localport` 会被 netsh 直接拒
+#: （「仅当协议是 TCP 或 UDP 时可以指定端口」），所以只能逐协议建。
+PINHOLE_PROTOS = ("TCP", "UDP")
+
+#: 最近一次规则列表的缓存。面板会反复问「开了没」，每次都起一个 PowerShell
+#: 冷启动（实测 0.5~1.5 秒）会把界面拖成幻灯片。
+_PINHOLE_CACHE = {"t": 0.0, "v": None}
+_PINHOLE_TTL = 5.0
+
+
+def is_admin():
+    """当前进程是不是提权状态。拿不到就返回 False（保守：不假装有权限）。"""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _ps(script, timeout=20):
+    """跑一段 PowerShell，返回 (rc, 文本)。
+
+    统一强制 UTF-8 输出再按 UTF-8 解 —— 中文 Windows 的控制台默认 GBK，
+    而脚本里可能把中文错误消息原样抛回来，用默认编码解会得到乱码，
+    上层就没法判断到底是不是「权限不足」。显式设定比猜编码可靠。
+    """
+    if os.name != "nt":
+        return 1, "not windows"
+    full = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+            "$ProgressPreference='SilentlyContinue';" + script)
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", full],
+            capture_output=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        return 1, "%s: %s" % (type(e).__name__, e)
+
+    raw = (out.stdout or b"")
+    for enc in ("utf-8", "gbk", "cp1252"):
+        try:
+            txt = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        txt = raw.decode("utf-8", "replace")
+    err = (out.stderr or b"").decode("utf-8", "replace")
+    return out.returncode, (txt + ("\n" + err if err.strip() else "")).strip()
+
+
+def pinhole_rule_name(port, proto):
+    """规则名 = 前缀 + 协议 + 端口。**端口必须进名字**。
+
+    理由：撤销要能按端口点名。只用 `skynet.pinhole.1`、`.2` 这种序号，
+    事后没人知道 `.2` 对应哪个端口，`tun.pinhole.close` 就变成了「全清」
+    或者「不敢清」——两种都不是好结果。
+    """
+    return "%s%s.%d" % (PINHOLE_PREFIX, str(proto).upper(), int(port))
+
+
+def pinhole_parse(name):
+    """从规则名反解 (proto, port)。解析不出来返回 None，不猜。"""
+    if not name.startswith(PINHOLE_PREFIX):
+        return None
+    rest = name[len(PINHOLE_PREFIX):]
+    if "." not in rest:
+        return None
+    proto, _, port = rest.rpartition(".")
+    if proto.upper() not in PINHOLE_PROTOS:
+        return None
+    try:
+        return proto.upper(), int(port)
+    except ValueError:
+        return None
+
+
+def pinhole_list(force=False):
+    """列出本模块建过的入站规则。
+
+    只认前缀，不列全表 —— 用户机器上可能有几百条别人的规则，
+    把全表倒出来既拖时间又让人找不到重点。
+    """
+    now = time.time()
+    if not force and _PINHOLE_CACHE["v"] is not None \
+            and now - _PINHOLE_CACHE["t"] < _PINHOLE_TTL:
+        return _PINHOLE_CACHE["v"]
+
+    if os.name != "nt":
+        v = {"ok": False, "platform": "non-windows", "rules": [], "count": 0,
+             "err": "pinhole 只处理 Windows 防火墙；这台机器不是 Windows"}
+        _PINHOLE_CACHE.update({"t": now, "v": v})
+        return v
+
+    script = (
+        "$o=@();"
+        "Get-NetFirewallRule -DisplayName '%s*' -ErrorAction SilentlyContinue"
+        " | ForEach-Object {"
+        " $pf=$_ | Get-NetFirewallPortFilter;"
+        " $af=$_ | Get-NetFirewallAddressFilter;"
+        " $o += @{name=$_.DisplayName; enabled=[string]$_.Enabled;"
+        " action=[string]$_.Action; dir=[string]$_.Direction;"
+        " proto=[string]$pf.Protocol; port=[string]$pf.LocalPort;"
+        " remote=@($af.RemoteAddress)} };"
+        "$o | ConvertTo-Json -Compress -Depth 5"
+    ) % PINHOLE_PREFIX
+
+    rc, txt = _ps(script)
+    rules = []
+    if txt and txt.strip().startswith(("[", "{")):
+        try:
+            data = json.loads(txt)
+            rules = data if isinstance(data, list) else [data]
+        except ValueError:
+            rules = []
+    v = {"ok": rc == 0, "platform": "windows", "count": len(rules),
+         "rules": rules, "err": "" if rc == 0 else txt[:300]}
+    _PINHOLE_CACHE.update({"t": now, "v": v})
+    return v
+
+
+def pinhole_open(ports, protos=("TCP", "UDP"), profile="any"):
+    """按端口开 v6 入站放行。**幂等**：已存在的规则不重建、不报错。
+
+    幂等不是礼貌，是必需：这个方法会被后台循环反复调用。
+    不幂等的版本每轮都在防火墙里追加一批同名规则，几十轮之后
+    机器上会有几百条一模一样的放行 —— 而且没人看得出哪条是哪条。
+
+    返回逐条结果，**不把「部分成功」折叠成一个 ok**：
+    一半成功时报 ok=True 会让上层以为入站已经通了，
+    然后去等一个永远连不进来的连接。
+    """
+    if os.name != "nt":
+        return {"ok": False, "err": "pinhole 只处理 Windows 防火墙",
+                "need_admin": False, "results": []}
+
+    clean, seen = [], set()
+    for p in ports or []:
+        try:
+            n = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 0 < n < 65536 and n not in seen:
+            seen.add(n)
+            clean.append(n)
+    if not clean:
+        return {"ok": False, "err": "没有合法端口（1-65535）",
+                "need_admin": False, "results": []}
+    if len(clean) > PINHOLE_MAX_PORTS:
+        return {"ok": False, "need_admin": False, "results": [],
+                "err": "一次最多放行 %d 个端口（给了 %d 个）："
+                       "防火墙是全局状态，批量开口不该被随手触发"
+                       % (PINHOLE_MAX_PORTS, len(clean))}
+
+    prot = [str(x).upper() for x in (protos or PINHOLE_PROTOS)
+            if str(x).upper() in PINHOLE_PROTOS] or ["TCP"]
+
+    # 没权限就别去撞墙：直接报 need_admin，让调用方给出「提权后再试」，
+    # 而不是把 PowerShell 的「拒绝访问」翻译成「开失败」——
+    # 后者会让人以为防火墙坏了。
+    if not is_admin():
+        return {"ok": False, "need_admin": True, "results": [],
+                "err": "当前进程没有管理员权限：改防火墙必须先提权。"
+                       "这不是失败，是还没开始。"}
+
+    items = ";".join("@(@{p='%s';port=%d})" % (p, n) for p in prot for n in clean)
+    addrs = ",".join("'%s'" % a for a in PINHOLE_V6_ANY)
+    script = (
+        "$want=@(%s);$o=@();"
+        "foreach($w in $want){"
+        " $n='%s'+$w.p+'.'+$w.port;"
+        " $ex=Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue;"
+        " if($ex){$o+=@{name=$n;port=$w.port;proto=$w.p;ok=$true;existed=$true};continue};"
+        " try{"
+        "  New-NetFirewallRule -DisplayName $n -Direction Inbound -Action Allow"
+        " -Protocol $w.p -LocalPort $w.port -RemoteAddress @(%s) -Profile %s"
+        " -Description 'skynet fleet pinhole (IPv6 inbound)'"
+        " -ErrorAction Stop | Out-Null;"
+        "  $o+=@{name=$n;port=$w.port;proto=$w.p;ok=$true;existed=$false}"
+        " }catch{"
+        "  $o+=@{name=$n;port=$w.port;proto=$w.p;ok=$false;existed=$false;err=$_.Exception.Message}"
+        " } };"
+        "$o | ConvertTo-Json -Compress -Depth 4"
+    ) % (items, PINHOLE_PREFIX, addrs, profile)
+
+    rc, txt = _ps(script, timeout=40)
+    results = []
+    if txt and txt.strip().startswith(("[", "{")):
+        try:
+            data = json.loads(txt)
+            results = data if isinstance(data, list) else [data]
+        except ValueError:
+            results = []
+
+    if not results:
+        return {"ok": False, "need_admin": False, "results": [],
+                "err": txt[:400] or "PowerShell 没有返回结果"}
+
+    made = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+    _PINHOLE_CACHE.update({"t": 0.0, "v": None})  # 让下一次 list 重新读
+    return {
+        "ok": bool(made) and not failed,
+        "partial": bool(made) and bool(failed),
+        "need_admin": False,
+        "ports": clean, "protos": prot,
+        "created": [r["name"] for r in made if not r.get("existed")],
+        "existed": [r["name"] for r in made if r.get("existed")],
+        "failed": [{"name": r.get("name"), "err": r.get("err")} for r in failed],
+        "results": results,
+        "err": "" if not failed else "有 %d 条规则没建成，见 failed" % len(failed),
+    }
+
+
+def pinhole_close(ports=None):
+    """撤销放行。不给 ports 就是全清（只清本模块前缀的规则）。
+
+    「只清前缀」是这条能力的边界：用户机器上其他程序（远程桌面、
+    局域网共享、杀毒）的规则不在射程内。做全量清理的工具没人敢用第二回。
+    """
+    if os.name != "nt":
+        return {"ok": False, "err": "pinhole 只处理 Windows 防火墙",
+                "removed": []}
+    if not is_admin():
+        return {"ok": False, "need_admin": True, "removed": [],
+                "err": "当前进程没有管理员权限：改防火墙必须先提权"}
+
+    if ports:
+        names = []
+        for p in ports:
+            try:
+                n = int(p)
+            except (TypeError, ValueError):
+                continue
+            if 0 < n < 65536:
+                names += [pinhole_rule_name(n, proto) for proto in PINHOLE_PROTOS]
+        if not names:
+            return {"ok": False, "removed": [], "err": "没有合法端口"}
+    else:
+        script = ("Get-NetFirewallRule -DisplayName '%s*' -ErrorAction SilentlyContinue"
+                  " | ForEach-Object { $_.DisplayName }") % PINHOLE_PREFIX
+        rc, txt = _ps(script, timeout=30)
+        names = [ln.strip() for ln in txt.splitlines()
+                 if ln.strip().startswith(PINHOLE_PREFIX)]
+
+    names = [n for n in names if n.startswith(PINHOLE_PREFIX)]
+    if not names:
+        _PINHOLE_CACHE.update({"t": 0.0, "v": None})
+        return {"ok": True, "removed": [], "count": 0,
+                "note": "本来就没有这类规则"}
+
+    # 先问「这些名字里哪些真的存在」，再删。
+    # 为什么不直接 `Remove-NetFirewallRule -DisplayName @(全部名字)`：
+    # 点名要删的东西里，有的可能本来就不在（例如只开过 TCP，没开 UDP）。
+    # 一次性删一批不存在的规则，PowerShell 在中文环境下会走到错误分支，
+    # 于是「删成功了一条」被报成「撤销失败」—— 事实相反，最难查的那种错。
+    quoted = ",".join("'%s'" % n.replace("'", "''") for n in names)
+    _, txt0 = _ps(
+        "Get-NetFirewallRule -DisplayName @(%s) -ErrorAction SilentlyContinue"
+        " | ForEach-Object { $_.DisplayName }" % quoted, timeout=30)
+    exist = [ln.strip() for ln in txt0.splitlines()
+             if ln.strip().startswith(PINHOLE_PREFIX)]
+    if not exist:
+        _PINHOLE_CACHE.update({"t": 0.0, "v": None})
+        return {"ok": True, "removed": [], "count": 0,
+                "note": "这些端口本来就没有放行规则"}
+
+    quoted = ",".join("'%s'" % n.replace("'", "''") for n in exist)
+    rc2, txt2 = _ps(
+        "Remove-NetFirewallRule -DisplayName @(%s) -Confirm:$false "
+        "-ErrorAction SilentlyContinue" % quoted, timeout=30)
+    _PINHOLE_CACHE.update({"t": 0.0, "v": None})
+    left = pinhole_list(force=True)
+    alive = {r.get("name") for r in left.get("rules") or []}
+
+    # 判据是「**这一批**里还有没有活的」，不是「全局还剩几条」。
+    # 用全局计数当判据时，机器上只要还留着别的端口，删对了也会报失败。
+    still = [n for n in exist if n in alive]
+    return {"ok": not still, "removed": [n for n in exist if n not in alive],
+            "count": len(exist), "still": still, "left": left["count"],
+            "err": "" if not still else "有 %d 条规则没删掉" % len(still)}
+
+
+def pinhole_status(deep=False):
+    """入站放行现在什么状态，以及**要不要开**。
+
+    这一条要回答的其实不是「开了没」，是「不开会怎样、开了会多出什么」：
+      v6 不可用      → 开了也没用，先修出网
+      防火墙全关      → 不必开（开了也是空转）
+      防火墙开 + 无规则 → 这是「地址明明有、对端就是连不进来」的头号原因
+      有规则          → 报清楚哪几个端口、哪个协议
+    """
+    fw = _win_firewall_state() if deep else None
+    rules = pinhole_list(force=deep)
+    v6 = ipv6_usable()
+    ports = sorted({p for p in (pinhole_parse(r.get("name"))
+                                for r in rules.get("rules") or []) if p})
+    blocked = bool(fw and any(v == "on" for v in fw.values()))
+
+    if not v6.get("usable"):
+        advice = "IPv6 当前不可用（%s），开 pinhole 没有意义：先让地址出得去" % v6.get("verdict")
+        need = False
+    elif fw is not None and not blocked:
+        advice = "本机防火墙没开，入站不经过主机过滤，不需要 pinhole"
+        need = False
+    elif rules.get("count"):
+        advice = "已放行 %d 个端口的 v6 入站（%s）；对端仍连不进来就查路由侧 v6 防火墙" % (
+            len(ports), ",".join(str(x[1]) for x in ports) or "?")
+        need = False
+    else:
+        advice = ("IPv6 出得去，但本机防火墙对 v6 入站默认全拦 —— "
+                  "这正是「地址明明有、对端就是连不进来」的头号原因。"
+                  "开 pinhole 只放指定端口，且只对 v6 源生效，v4 侧不受影响")
+        need = True
+
+    return {"v6_usable": bool(v6.get("usable")), "verdict": v6.get("verdict"),
+            "firewall": fw, "firewall_blocking": blocked,
+            "admin": is_admin(), "need": need,
+            "count": rules.get("count", 0),
+            "ports": [{"proto": p, "port": n} for p, n in ports],
+            "rules": rules.get("rules") or [],
+            "v6_any": list(PINHOLE_V6_ANY),
+            "advice": advice}
 
 
 def cascade(mine, theirs, my_stability=1.0, their_stability=1.0,
