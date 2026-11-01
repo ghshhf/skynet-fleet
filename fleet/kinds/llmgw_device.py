@@ -83,6 +83,40 @@ def _load_json(path):
         return None
 
 
+# ---------- 本地离线兜底桥（Ollama 兼容 / 天网 compute.py） ----------
+# 默认关闭：需显式 LLMW_LOCAL=1 开启。开启后探测 127.0.0.1:11434（Ollama 的 OpenAI 兼容 /v1），
+# 在线才加入，且永远排在所有远程免费层之后（remote 优先，local 是断网安全网 → 随处可用）。
+# 默认关闭的原因：本机实测关闭的 11434 被防火墙静默丢弃而非拒绝，探测会阻塞 ~2s；
+# 对没装 Ollama 的机器做无谓探测不划算。LLMW_LOCAL_BASE 改指向天网自己的 compute 端点。
+_LOCAL_BASE = os.environ.get("LLMW_LOCAL_BASE", "http://127.0.0.1:11434")
+_LOCAL_MODEL = os.environ.get("LLMW_LOCAL_MODEL", "llama3.1:latest")
+_LOCAL_CACHE = {"gw": None, "ts": 0.0, "ttl": 30.0}
+
+
+def _local_enabled():
+    v = os.environ.get("LLMW_LOCAL", "")
+    if v == "":
+        return False                     # 默认关闭：避免对无 Ollama 的机器做无谓探测/阻塞
+    return v.lower() not in ("0", "off", "false", "no")
+
+
+def _local_gw():
+    if not _local_enabled():
+        return None
+    now = _now()
+    if _LOCAL_CACHE["gw"] is not None and now - _LOCAL_CACHE["ts"] < _LOCAL_CACHE["ttl"]:
+        return _LOCAL_CACHE["gw"]
+    st, _, body, _ = _req_json(_LOCAL_BASE.rstrip("/") + "/v1", "/models", None, timeout=2)
+    gw = None
+    if st == 200 and isinstance(body, dict):
+        ids = [m.get("id") for m in (body.get("data") or []) if m.get("id")]
+        gw = {"name": "local", "base": _LOCAL_BASE.rstrip("/") + "/v1", "key": "",
+              "anon": False, "local": True,
+              "default_model": ids[0] if ids else _LOCAL_MODEL}
+    _LOCAL_CACHE.update(gw=gw, ts=now)
+    return gw
+
+
 def discover_gateways():
     gws = []
     # OFM
@@ -102,6 +136,10 @@ def discover_gateways():
                     "key": a["key"], "anon": True,
                     "default_model": a.get("default_model"),
                     "note": a.get("note", "")})
+    # 本地离线兜底（Ollama 兼容）——永远排最后，远程免费层优先
+    lg = _local_gw()
+    if lg:
+        gws.append(lg)
     return gws
 
 
@@ -759,6 +797,39 @@ def _chat_once(gw, payload, timeout):
     return None, err, None, 0, cls, reason, retry_after_s
 
 
+# ---------- 网关层上下文压缩（RTK / Caveman 思路，OmniRoute·9router 同款） ----------
+# 免费层额度小、上下文窗窄；在网关出口处把工具结果等冗余内容压缩，让免费额度更耐用、
+# 更少撞 context 上限。纯本地、零网络依赖。OmniRoute 称省 15–95%，9router −40%，
+# 核心是压缩工具输出 + 长上下文。这里走保守安全版：level 0=关；1=结构化内容去空白
+# （JSON/array minify，语义不变）；2=再去空白后超长截断（安全网，默认 cap 16K）。
+def _compress_messages(messages, level=1, cap=16000):
+    if not level or not messages:
+        return list(messages), 0
+    saved = 0
+    out = []
+    for m in messages:
+        m = dict(m)
+        c = m.get("content")
+        if isinstance(c, str) and len(c) > 400:
+            s = c.strip()
+            if s[:1] in ("{", "["):
+                try:
+                    obj = json.loads(c)
+                    mini = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+                    saved += len(c) - len(mini)
+                    c = mini
+                except Exception:
+                    pass
+            if level >= 2 and len(c) > cap:
+                drop = len(c) - cap - 36
+                if drop > 0:
+                    c = c[:cap] + "\n…[llmgw: truncated %d chars]" % drop
+                    saved += drop
+            m["content"] = c
+        out.append(m)
+    return out, saved
+
+
 # ---------- 候选排序（bandit + model bench + cooldown 过滤） ----------
 def _build_candidates(gws, models, session=None, sticky_pref=None):
     """构建按 bandit 得分排序的候选列表，过滤 cooldown 和 model bench。"""
@@ -780,6 +851,8 @@ def _build_candidates(gws, models, session=None, sticky_pref=None):
                 "gw": g, "model": m, "score": score,
                 "cooldown_source": source,
             })
+    # 先按 local 标志升序（非本地在前），再按 bandit 分降序（稳定排序：同分时本地仍压最后）
+    candidates.sort(key=lambda c: c["gw"].get("local", False))
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates
 
@@ -929,7 +1002,16 @@ def _h_chat(cap, args, dev):
         if not models:
             return R.error(cap, "未指定 model 且拿不到模型清单", device=dev.name, via=dev.via)
 
-    payload_base = {"messages": messages, "max_tokens": max_tokens}
+    # 网关层上下文压缩（默认开，level 1=结构化去空白；0 关闭）：让免费层额度更耐用
+    compress_level = args.get("compress", 1)
+    if isinstance(compress_level, str):
+        compress_level = 0 if compress_level.lower() in ("0", "false", "off", "no") else 1
+    try:
+        compress_level = int(compress_level)
+    except (TypeError, ValueError):
+        compress_level = 1
+    comp_msgs, comp_saved = _compress_messages(messages, level=compress_level)
+    payload_base = {"messages": comp_msgs, "max_tokens": max_tokens}
     if temperature is not None:
         payload_base["temperature"] = temperature
 
@@ -961,6 +1043,7 @@ def _h_chat(cap, args, dev):
             "model": m, "routed_via": routed, "latency_s": lat,
             "fallback_attempts": attempts, "session": session,
             "cooldown_source": c.get("cooldown_source"),
+            "compress_saved_chars": comp_saved,
         })
 
     # hedge 也试过的候选若失败：记录冷却 + 进 attempts（避免重复打、让错误报告有内容）
@@ -1002,6 +1085,7 @@ def _h_chat(cap, args, dev):
                 "model": m, "routed_via": routed, "latency_s": lat,
                 "fallback_attempts": attempts, "session": session,
                 "cooldown_source": c.get("cooldown_source"),
+                "compress_saved_chars": comp_saved,
             })
         cls = _classify_error(0, err)
         reason = {"timeout": "timeout", "transport": "timeout"}.get(cls, "5xx")
@@ -1213,6 +1297,20 @@ def _family(model):
     return m.split("-")[0].split(":")[0]
 
 
+def _h_compress(cap, args, dev):
+    messages = args.get("messages") or []
+    level = args.get("level", 1)
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        level = 1
+    cap_n = int(args.get("cap", 16000) or 16000)
+    out, saved = _compress_messages(messages, level=level, cap=cap_n)
+    return R.success(cap, dev.name, via=dev.via, data={
+        "messages": out, "saved_chars": saved,
+        "level": level, "count": len(out)})
+
+
 _HANDLERS = {
     "llmgw.endpoints": _h_endpoints,
     "llmgw.models": _h_models,
@@ -1221,6 +1319,7 @@ _HANDLERS = {
     "llmgw.probe": _h_probe,
     "llmgw.cooldowns": _h_cooldowns,
     "llmgw.sticky": _h_sticky,
+    "llmgw.compress": _h_compress,
 }
 
 
@@ -1340,7 +1439,18 @@ def _selftest():
         # ⑩ sticky clear
         rcl = d.invoke("llmgw.sticky", {"action": "clear", "session": "s1"})
         assert rcl.ok
-        print("llmgw_device 自测：10 组全过")
+        # ⑪ 网关层压缩：结构化内容去空白 + 超长截断（level 2）
+        big = '{\n  "status": "ok",\n  "data": [1, 2, 3, 4, 5]\n}\n' + "z" * 500
+        rcx = d.invoke("llmgw.compress", {"messages": [{"role": "tool", "content": big}],
+                                          "level": 2, "cap": 120})
+        assert rcx.ok, "compress 应成功: %s" % rcx.err
+        dx = rcx.as_dict()["data"]
+        assert dx["saved_chars"] > 0, "应省出字符: %s" % dx
+        assert dx["messages"][0]["content"].startswith("{"), "minify 后结构保留"
+        # 默认 level=1 对短消息不压缩
+        rs0 = d.invoke("llmgw.compress", {"messages": [{"role": "user", "content": "hi"}]})
+        assert rs0.ok and rs0.as_dict()["data"]["saved_chars"] == 0
+        print("llmgw_device 自测：11 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
