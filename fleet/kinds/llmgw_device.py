@@ -208,6 +208,47 @@ KEYED_ENDPOINTS = [
              "gpt-5.6-sol(倍率2) gpt-6.1-sol(2) gpt-6-astra(4) claude-opus-5-5(3, 仅 test/svip 分组)。"
              "注意 co.agentrouter.org 是文档写的接入域名，但与主站的令牌库**不是同一套**（实测 401），"
              "要用 https://agentrouter.org/v1。"},
+
+    # ------- 以下三家是 DeepSeek V4 Flash 的正经免费供货源（2026-11-01 核实） -------
+    # 共同点：都是**厂商自己的算力**做生态补贴，不是二道贩子转卖；免费但有日额度，
+    # 单看任何一家都不是「无限」—— 无限只能由链层冗余造出来（见 MODEL_CLASSES["flash"]）。
+    # 全部「有 key 才进候选」，没 key 静默跳过，绝不假装能用。
+    {"name": "amd", "base": "https://developer.amd.com.cn/radeon/api/v1",
+     "env": "LLMW_AMD_KEY", "secret": "amd",
+     "default_model": "DeepSeek-V4-Flash", "cost": 0.15,
+     "models": ["DeepSeek-V4-Flash", "DeepSeek-V4-Flash-Vision-Exp",
+                "Qwen3.8-Flash-Next", "MiniCPM5-1B"],
+     "note": "AMD Radeon Cloud Token Factory（developer.amd.com.cn/radeon/tokenfactory）。"
+             "国内直连、免绑卡、邮箱或 GitHub 一键登录，key 以 rc- 开头、所有公共免费模型共用一把。"
+             "OpenAI 兼容 /v1/chat/completions，同时原生支持 Anthropic /v1/messages。"
+             "DeepSeek-V4-Flash 是 284B MoE + 1,048,576 上下文 —— 免费档里没有第二家给 1M。"
+             "额度：每日预算$1（部分活动号$10，每天 8:00 重置）、30 RPM、单 key 并发 8、单 IP 120 RPM。"
+             "两个已知短板：① 慢，TTFT 实测约 22s、输出 28~30 tok/s，适合吞长文档不适合高频；"
+             "② 请求体只认白名单字段，名单外的（stop/seed/logit_bias/top_k/repetition_penalty）"
+             "被静默丢掉、不报错；thinking 参数会 400，要改用 reasoning_effort。"},
+
+    {"name": "sensenova", "base": "https://token.sensenova.cn/v1",
+     "env": "LLMW_SENSENOVA_KEY", "secret": "sensenova",
+     "default_model": "deepseek-v4-flash", "cost": 0.15,
+     "models": ["deepseek-v4-flash", "glm-5.2", "sensenova-6.7-flash-lite"],
+     "note": "商汤 SenseNova Token Plan（sensenova.cn/token-plan）。**5 小时滚动刷新**额度，"
+             "不像 AMD 是「一天一桶、用完等明天」—— 高强度连续用时这个特性比总量更重要。"
+             "门槛比 AMD 高：手机号 + 实名认证。坑：控制台「当前窗口调用余量」页面可能"
+             "不显示 glm-5.2 字样，但直接调 model=glm-5.2 是通的（底层已全量，前端没跟上）。"},
+
+    {"name": "nvidia", "base": "https://integrate.api.nvidia.com/v1",
+     "env": "LLMW_NVIDIA_KEY", "secret": "nvidia",
+     # 模型名写死会死：`deepseek-ai/deepseek-v4-flash-0731` 已于 2026-09-21 EOL，
+     # 现在打它返回 410 Gone（不是 404，别把 410 当成「端点挂了」）。
+     # 现行名是 `deepseek-ai/deepseek-v4.1-flash` —— 取名字永远以 /v1/models 为准。
+     "default_model": "deepseek-ai/deepseek-v4.1-flash", "cost": 0.1,
+     "models": ["deepseek-ai/deepseek-v4.1-flash",
+                "nvidia/nemotron-3-ultra-550b-a55b"],
+     "note": "NVIDIA NIM（build.nvidia.com）。**不按 token 计费、只限 40 RPM**，"
+             "所以它的价值不是快而是「量大不心疼」—— 实测 DeepSeek V4 Flash 只有 27.3 tok/s，"
+             "慢，但随便刷。注册要邮箱 + 手机验证（+86 可用，区号要手动改），key 以 nvapi- 开头。"
+             "模型名必须带厂商前缀（deepseek-ai/…），这点和 AMD 直写名字不同。"
+             "推理开关要放 extra_body.chat_template_kwargs.enable_thinking，放顶层无效。"},
 ]
 # 密钥来源：环境变量 → ~/.fleet/upstreams.json（不进 git、不进日志、不进能力输出）
 UPSTREAMS_SECRET = os.path.join(os.path.expanduser("~"), ".fleet", "upstreams.json")
@@ -245,12 +286,16 @@ MODEL_CLASSES = {
         "desc": "纯写代码 / 补全（专训代码模型优先）",
         "chain": [("kiro", "qwen3-coder-next"),
                   ("kilo", "cohere/north-mini-code:free"),
+                  # 与上一跳同模型不同源：zen-gate 那份实测 real 字段自报
+                  # cohere/north-mini-code:free、3.78s，是真指针（zen 22 个名里只有 4 个是真的）
+                  ("zen-gate", "cohere/north-mini-code:free"),
                   ("llm7", "codestral-latest"),
                   ("ofm", "buddy/kimi-k3.1-pro")],
     },
     "big": {
         "desc": "参数最大的开源权重（要广度不要速度）",
         "chain": [("kilo", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+                  ("zen-gate", "nvidia/nemotron-3-ultra-550b-a55b:free"),
                   ("ovh", "Qwen3.5-397B-A17B"),
                   ("ovh", "gpt-oss-120b"),
                   ("ovh", "Meta-Llama-3_3-70B-Instruct")],
@@ -267,6 +312,32 @@ MODEL_CLASSES = {
         "desc": "读图（截图理解 / OCR 后处理 / 界面判断）",
         "chain": [("ovh", "Qwen2.5-VL-72B-Instruct"),
                   ("kilo", "nvidia/nemotron-3.5-super-vl:free")],
+    },
+    "flash": {
+        # 主人日常主力就是这一款（DeepSeek V4 Flash），所以单独成类，链要够厚。
+        # 定名「flash」不叫 deepseek：这一类的语义是**又快又够用的日常主力档**，
+        # 不是「DeepSeek 家的模型」—— 哪天主力换成别家同档的，链改掉、名字不用动。
+        "desc": "DeepSeek V4 Flash 常驻主力（快、便宜、够用；链最厚，专供日常高频）",
+        "chain": [
+            # 第一跳必须是**稳定**的那条，不是最快的那条。
+            # 教训（11-01 实测）：`opencode/deepseek-v4.1-flash-free` 3.76s 跑通一次，
+            # 几分钟后再打就 429「Free usage limit reached」—— OpenCode 的免费池是抢来的，
+            # 随时清零，不能当主力。buddy 走的是 CodeBuddy 自家账号池，稳定 1.38~2.09s。
+            ("ofm", "buddy/deepseek-v4.1-flash"),
+            ("ofm", "opencode/deepseek-v4.1-flash-free"),   # 有额度时用它，没有就 429 退下一跳
+            # 三跳是真厂商免费层，都要 key（没 key 静默跳过，不占位）
+            ("amd", "DeepSeek-V4-Flash"),              # 1M 上下文，慢但稳
+            ("sensenova", "deepseek-v4-flash"),        # 5 小时滚动刷新，抗连续用
+            ("nvidia", "deepseek-ai/deepseek-v4.1-flash"),  # 40RPM 不计 token
+            # 聚合层，需要它们自己的 key
+            ("kilo", "deepseek/deepseek-v4.1-flash"),
+            ("llm7", "deepseek-v4.1-flash"),
+            # 兜底：zen-gate 的 `deepseek-v4.1-flash-free` 是**假名**——实测返回体自报
+            # `reflection/beam-free`，背后不是 DeepSeek 权重。所以这里直接写真名 beam-free：
+            # 反正路由到同一台机器，写假名只会让人以为自己在用 DeepSeek。
+            # 留它只因为快（1.87s）且几乎总活着，能答话总比报错强，但排最后。
+            ("zen-gate", "reflection/beam-free"),
+        ],
     },
 }
 
@@ -1904,6 +1975,25 @@ def _chat_once(gw, payload, timeout):
     if err0 and st == 0:
         return None, err0, None, 0, "transport", "timeout", None
     if st == 200 and isinstance(body, dict) and "choices" in body:
+        # 「有 choices 就算成功」是个陷阱。实测（11-01，ofm buddy/deepseek-v4.1-flash）：
+        # 推理模型的思维链会把 max_tokens 吃光，返回
+        #   {"message":{"content":null},"finish_reason":"length",
+        #    "usage":{"completion_tokens_details":{"reasoning_tokens":64}}}
+        # —— HTTP 200、有 choices、但**一个字都没有**。客户端拿到一片空白还以为网关坏了。
+        # 这就是「HTTP 200 ≠ 发生了一件事」的又一例。
+        # 判据：必须有 content 或 tool_calls 才算真答了话；只有 reasoning_content
+        # 不算（客户端界面上看不见，等于空白）。这种按「上游给不出话」处理，
+        # 让链退下一跳 —— 退下去至少能答，比返回空白体面。
+        _ch0 = (body.get("choices") or [{}])[0] or {}
+        _msg0 = _ch0.get("message") or {}
+        if not (_msg0.get("content") or _msg0.get("tool_calls")):
+            _reasoning_only = bool(_msg0.get("reasoning_content") or _msg0.get("reasoning"))
+            return (None,
+                    "上游返回空回答（finish_reason=%s，%s）"
+                    % (_ch0.get("finish_reason") or "?",
+                       "只有思维链、没有正文，max_tokens 被思考吃光"
+                       if _reasoning_only else "正文与工具调用都为空"),
+                    None, 0, "server", "5xx", None)
         via = (hdrs or {}).get("X-Routed-Via") or gw["name"]
         body["_routed_via"] = via
         tokens = (body.get("usage") or {}).get("total_tokens", 0)
@@ -2100,6 +2190,10 @@ def _hedge_send(candidates, payload_base, timeout, max_fanout=HEDGE_FANOUT):
         return (None, "no candidate", None, 0, "transport", "timeout", None), -1, set(), {}
     if len(top_idx) <= 1:
         i = top_idx[0]
+        # 计时起点必须在这里埋，而不是靠候选自带：候选里从来没有 `_t0`，
+        # 上层那句 `lat = _now() - c.get("_t0")` 于是恒等于 0 —— latency_s 一直是假的。
+        # 这个字段喂给 bandit 的速度分和客户端的路由展示，报 0 等于把「多快」這件事丢了。
+        candidates[i]["_t0"] = _now()
         res, _ = _chat_once_top(candidates[i], payload_base, timeout)
         return res, i, {i}, {i: res}
 
@@ -2115,6 +2209,7 @@ def _hedge_send(candidates, payload_base, timeout, max_fanout=HEDGE_FANOUT):
             c = candidates[idx]
             p = dict(payload_base)
             p["model"] = c["model"]
+            c["_t0"] = _now()   # 同上：并发分支也要埋计时起点，否则中标者的 latency 仍是 0
             fut = executor.submit(_chat_once, c["gw"], p, attempt_timeout)
             fut_to_idx[fut] = idx
             tried.add(idx)
