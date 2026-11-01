@@ -49,6 +49,12 @@ import threading
 import time
 import urllib.parse
 
+# GBK 防线（2026-11-01 铁律）：中文 Windows 控制台默认 cp936，
+# 打印任何 GBK 外字符（· ⇒ 等）会 UnicodeEncodeError 直接炸死。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 CONNECT_TIMEOUT = 15
