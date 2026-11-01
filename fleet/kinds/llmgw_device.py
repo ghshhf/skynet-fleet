@@ -112,6 +112,10 @@ def _kiro_gateway():
     return {"name": "kiro", "base": "", "key": "", "anon": False,
             # 走 Kiro 私有协议（AWS Event Stream），不是 OpenAI chat，需要专门分支
             "auth": "kiro", "api_style": "kiro",
+            # CodeWhisperer 协议没有 function calling（实测：给 tools 也不回 tool_calls，
+            # 模型只会在正文里「说」要调工具）。所以带工具请求必须绕开它，
+            # 否则客户端拿到一段「我来帮你查」的空话，还以为是模型不听话。
+            "supports_tools": False,
             "models": [m for m, _ in KIRO_MODELS],
             "default_model": "claude-sonnet-4.5",
             # 免费层有每周配额，但不是包月固定成本 → 排在真·匿名端点之后、
@@ -2249,6 +2253,20 @@ def _h_models(cap, args, dev):
     })
 
 
+def _tool_capable(gws, models, chain):
+    """带 tools 时能用哪批端点。返回 (可用端点列表, degraded)。
+
+    判据是「链过滤后还剩几个候选」，**不是**「还有没有支持工具的端点」。
+    前者才对：claude 链上 agentrouter 支持工具，但它的 claude-opus-5-5 按窗投放，
+    default 分组平时无渠道 —— 端点存在、候选为空。第一版按端点判，结果一路走到
+    「所有候选均在 cooldown 或 model bench 中」才炸，错得极隐蔽。
+    """
+    tool_gws = [g for g in gws if g.get("supports_tools", True)]
+    if tool_gws and (not chain or _build_candidates(tool_gws, models, chain=chain)):
+        return tool_gws, False
+    return None, True
+
+
 def _h_chat(cap, args, dev):
     messages = args.get("messages")
     if not messages:
@@ -2320,6 +2338,30 @@ def _h_chat(cap, args, dev):
         return R.unavailable(cap, "无可用网关（OFM/zen-gate 未装且匿名端点不可达）",
                              device=dev.name, via=dev.via)
 
+    # 带 tools 的请求只发支持 function calling 的上游。
+    # 实测踩到（11-01）：客户端带 tools 走 class="claude"，链首 kiro 的 CodeWhisperer
+    # 协议没有 tools 概念，模型只在正文里「说」要调工具、不回 tool_calls ——
+    # 客户端于是认为模型不听话，实际是这个上游根本没这个能力。能聊天 ≠ 能干活。
+    #
+    # 判据必须是「链过滤后还剩几个候选」，不能是「还有没有支持工具的端点」：
+    # claude 链上 agentrouter 确实支持工具，但它的 claude-opus-5-5 按窗投放、
+    # default 分组平时无渠道 → 端点存在、候选为空。第一版用端点判，结果一路
+    # 走到「所有候选均在 cooldown」才发现，错得很隐蔽。
+    degraded_tools = False
+    if args.get("tools"):
+        tool_gws, degraded_tools = _tool_capable(gws, models, chain)
+        if tool_gws:
+            gws = tool_gws
+        else:
+            # 降级：分类链上没有一个「既支持工具、现在又能用」的上游。
+            # 退到所有支持工具的端点，但必须在返回里标 degraded ——
+            # 用户以为 Claude 在答、其实是别家，这叫冒充，不叫降级。
+            gws = [g for g in discover_gateways() if g.get("supports_tools", True)]
+            models, chain = [], []
+            if not gws:
+                return R.error(cap, "带 tools 的请求没有可用上游：所有端点都不支持 function calling",
+                               device=dev.name, via=dev.via)
+
     # sticky：优先复用上次成功的 (gw, model)
     if session and session in _STICKY:
         st = _STICKY[session]
@@ -2369,6 +2411,14 @@ def _h_chat(cap, args, dev):
     payload_base = {"messages": comp_msgs, "max_tokens": max_tokens}
     if temperature is not None:
         payload_base["temperature"] = temperature
+    # 工具调用透传：客户端（agent 类）不带 tools 就只是个聊天框，带了才有手脚。
+    # 原样透传不改写 —— 各上游支持度不一，能支持的自己会回 tool_calls，不支持的自然忽略。
+    if args.get("tools"):
+        payload_base["tools"] = args["tools"]
+        if args.get("tool_choice") is not None:
+            payload_base["tool_choice"] = args["tool_choice"]
+    if args.get("top_p") is not None:
+        payload_base["top_p"] = args["top_p"]
 
     # 候选排序：bandit 得分 + cooldown/model bench 过滤
     candidates = _build_candidates(gws, models, chain=chain)
@@ -2421,6 +2471,7 @@ def _h_chat(cap, args, dev):
             "fallback_attempts": attempts, "session": session,
             "cooldown_source": c.get("cooldown_source"),
             "compress_saved_chars": comp_saved,
+            "degraded_tools": degraded_tools,
         })
 
     # hedge 也试过的候选若失败：记录冷却 + 进 attempts（避免重复打、让错误报告有内容）
@@ -2465,6 +2516,7 @@ def _h_chat(cap, args, dev):
                 "fallback_attempts": attempts, "session": session,
                 "cooldown_source": c.get("cooldown_source"),
                 "compress_saved_chars": comp_saved,
+                "degraded_tools": degraded_tools,
             })
         cls = _classify_error(0, err)
         reason = {"timeout": "timeout", "transport": "timeout"}.get(cls, "5xx")
@@ -3714,7 +3766,27 @@ def _selftest():
                                               "messages": _msg}, _D)
         assert not r_both.ok and "二选一" in (r_both.as_dict().get("err") or ""), r_both.as_dict()
 
-        print("llmgw_device 自测：27 组全过")
+        # ㉘ 带 tools 必须绕开不支持 function calling 的上游（kiro 走 CodeWhisperer 协议）。
+        #    真机教训：客户端带 tools 走 class="claude"，kiro 只在正文里写「我来帮你查」
+        #    却不回 tool_calls，客户端以为模型不听话，其实是这上游没这能力。
+        #    更坑的是降级判据：用「还有没有支持工具的端点」判会漏 —— agentrouter 支持工具，
+        #    但 claude-opus-5-5 按窗投放、平时无渠道，端点存在候选为空，
+        #    一路走到「所有候选均在 cooldown」才炸。正解是判「链过滤后还剩几个候选」。
+        #    用 stub_* 假端点名，避免污染真实端点的冷却/健康状态（那些是写盘的）。
+        _stub_no = {"name": "stub_notool", "base": "", "key": "", "api_style": "kiro",
+                    "supports_tools": False, "models": ["m1"], "default_model": "m1"}
+        _stub_ok = {"name": "stub_tool", "base": "http://127.0.0.1:1/v1", "key": "",
+                    "supports_tools": True, "models": ["m1"], "default_model": "m1"}
+        assert g0["_tool_capable"]([dict(_stub_no)], ["m1"], [("stub_notool", "m1")]) == (None, True), \
+            "只有不支持工具的端点时必须降级"
+        _got, _deg = g0["_tool_capable"]([dict(_stub_no), dict(_stub_ok)], ["m1"],
+                                         [("stub_notool", "m1")])
+        assert _deg is True and _got is None, \
+            "链上只指向不支持工具的端点时必须降级（不能因为另有一个支持工具的端点就算了）"
+        _got2, _deg2 = g0["_tool_capable"]([dict(_stub_ok)], ["m1"], [("stub_tool", "m1")])
+        assert _deg2 is False and [g["name"] for g in _got2] == ["stub_tool"], (_got2, _deg2)
+
+        print("llmgw_device 自测：28 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
