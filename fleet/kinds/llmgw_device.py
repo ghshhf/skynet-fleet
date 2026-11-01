@@ -25,7 +25,7 @@
   llmgw.probe       — 单模型首字延迟（TTFB）
   llmgw.cooldowns   — 查看当前冷却中的端点/模型（带 source 标记）
   llmgw.sticky      — 查看/清除粘性会话
-  llmgw.egress      — 出口代理状态（HTTPS_PROXY 是否设置、远程端点是否经代理出网）
+  llmgw.egress      — 网络出口状态（免费端点直连即可用；环境若设了 HTTPS_PROXY 则透明走，非必需）
 """
 import json
 import math
@@ -731,12 +731,13 @@ def _in_flight_for(gw, model):
         return sum(1 for (g, m, _t, _c) in _LEASES.values() if g == gw and m == mk)
 
 
-# ---------- 出口代理（让免费端点在国内「有希望」可达） ----------
-# 免费端点分两类：本地网关（OFM/zen-gate，127.0.0.1，国内稳）和匿名国外端点
-# （pollinations/llm7/kilo/ovh，国内直连有的能通、有的被墙）。本模块**不自带翻墙**——
-# 真要翻全流量，是用户侧的事：设标准环境变量 HTTPS_PROXY / HTTP_PROXY 指向自己的
-# 全局代理 / VPN / 或把 WS 中继暴露成的 HTTP 代理即可，urllib 会自动走它。
-# 我们只在「非本地 + 有代理环境变量 + 未显式禁用」时把请求交给它；本地网关永远直连。
+# ---------- 出口：免费端点直连即可用，代理只是可选增强 ----------
+# 免费端点分两类：本地网关（OFM/zen-gate，127.0.0.1，国内稳）和匿名端点
+# （pollinations/llm7/kilo/ovh）。后者正是 FreeLLMAPI / Free-GPT4-WEB-API 直连使用的那种
+# ——它们自建开源权重或公开服务，国内直连就能用（实测 pollinations/llm7 建连 <1s，
+# chat 端到端返回正常）。本模块**默认直连**，这就是那两个开源项目的玩法。
+# HTTPS_PROXY / HTTP_PROXY 只是「可选透明增强」：用户自有全局代理 / VPN 时设上，
+# urllib 自动走它（例如某些网络下 ovh 解析不稳时可绕）；但它**不是**免费端点可用的前提。
 # 不接 gitport：它只接管 GitHub/arxiv 等受管域名，LLM 端点不在其列，导过去也是 DIRECT。
 _EGRESS_CACHE = {"addr": None, "ts": 0.0, "ttl": 30.0}
 
@@ -784,7 +785,8 @@ def _req_json(base, path, key, timeout=15, method="GET", body=None,
     url = base.rstrip("/") + path
     host = (_urlparse.urlparse(base).hostname or "").lower()
     local = host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
-    # 本地网关直连；其余若设了出口代理环境变量则走代理（标准 HTTPS_PROXY 机制）。
+    # 本地网关直连；远程默认直连（免费端点直连即可用，正是 FreeLLMAPI/Free-GPT4-WEB-API 的玩法），
+    # 若环境设了 HTTPS_PROXY 则透明走（可选增强，非可用性前提）。
     handlers = []
     px = None
     if not local:
@@ -1341,17 +1343,18 @@ def _h_cooldowns(cap, args, dev):
 
 
 def _h_egress(cap, args, dev):
-    """出口代理状态：远程免费端点是否经 HTTPS_PROXY 出网。"""
+    """网络出口状态：免费端点直连即可用；环境若设了 HTTPS_PROXY 则透明走（可选增强）。"""
     disabled = os.environ.get("LLMW_NO_PROXY", "").lower() in ("1", "on", "true", "yes")
     addr = _egress_proxy_addr()
     return R.success(cap, dev.name, via=dev.via, data={
         "proxy_addr": addr,
         "proxy_active": bool(addr),
         "disabled": disabled,
-        "note": "远程匿名端点在设了 HTTPS_PROXY/HTTP_PROXY 时自动经该代理出网；"
-                "本地网关(OFM/zen-gate)始终直连。gitport 只接管 GitHub/arxiv 等受管域名，"
-                "不接它。要让免费端点真在国内可用，把全局代理/VPN 或 WS 中继暴露成的 "
-                "HTTP 代理设进 HTTPS_PROXY 即可。",
+        "direct_ok": True,
+        "note": "免费端点（pollinations/llm7/kilo/ovh）直连即可用，无需任何代理——"
+                "这正是 FreeLLMAPI/Free-GPT4-WEB-API 的玩法（实测建连 <1s、chat 端到端正常）。"
+                "HTTPS_PROXY/HTTP_PROXY 只是可选透明增强：用户自有全局代理时设上会自动走，"
+                "但非可用性前提。本地网关(OFM/zen-gate)始终直连。",
     })
 
 
@@ -1547,7 +1550,8 @@ def _selftest():
         # 默认 level=1 对短消息不压缩
         rs0 = d.invoke("llmgw.compress", {"messages": [{"role": "user", "content": "hi"}]})
         assert rs0.ok and rs0.as_dict()["data"]["saved_chars"] == 0
-        # ⑫ 出口代理机制（不依赖真实网络）：尊重标准 HTTPS_PROXY，不接 gitport
+        # ⑫ 可选代理增强机制（不依赖真实网络）：免费端点默认直连，环境设了
+        #     HTTPS_PROXY 则透明走；LLMW_NO_PROXY 强制直连。逻辑正确，仅验证开关。
         # 先清掉可能从运行环境继承来的代理变量，保证测试确定性
         _pk = [k for k in os.environ if k.upper() in ("HTTPS_PROXY", "HTTP_PROXY")]
         _pv = {k: os.environ[k] for k in _pk}
