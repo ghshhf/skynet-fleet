@@ -1261,7 +1261,10 @@ def _responses_once(gw, payload, timeout):
     }
     # Codex 后端不收 max_output_tokens / metadata（FCC 里叫 omitted_request_fields）
     if not codex:
-        req_body["max_output_tokens"] = int(payload.get("max_tokens") or 1024)
+        # reasoning 型上游会先烧 reasoning_tokens：预算给小了正文直接是空字符串
+        # （实测 agentrouter gpt-5.6-sol max_tokens=60 → reasoning 吃满，content 为 ""）。
+        # 所以这里给个下限，而不是把调用方的 max_tokens 原样透传。
+        req_body["max_output_tokens"] = max(512, int(payload.get("max_tokens") or 1024))
     if instructions:
         req_body["instructions"] = instructions
     if payload.get("temperature") is not None:
@@ -1322,9 +1325,10 @@ def _sse_once(gw, payload, timeout, on_delta=None):
     style = gw.get("api_style") or "chat"
     if style == "responses":
         instructions, turns = _to_resp_input(payload.get("messages") or [])
-        req_body = {"model": payload.get("model"), "input": turns,
-                    "max_output_tokens": int(payload.get("max_tokens") or 1024),
-                    "stream": True}
+        req_body = {"model": payload.get("model"), "input": turns, "stream": True}
+        # 同 _responses_once：reasoning 型上游预算给小了正文会空，给下限
+        if gw.get("auth") != "codex":
+            req_body["max_output_tokens"] = max(512, int(payload.get("max_tokens") or 1024))
         if instructions:
             req_body["instructions"] = instructions
         if payload.get("temperature") is not None:
@@ -2965,7 +2969,8 @@ def _selftest():
             assert seen["path"] == "/v1/responses", seen
             assert seen["ua"] and "codex" in seen["ua"].lower(), seen
             assert seen["body"]["instructions"] == "S", seen["body"]
-            assert seen["body"]["max_output_tokens"] == 64, seen["body"]
+            # reasoning 型上游给 64 会被 reasoning 吃光导致正文为空 → 必须有下限
+            assert seen["body"]["max_output_tokens"] >= 512, seen["body"]
             assert seen["body"]["input"][0]["content"][0]["type"] == "input_text"
         finally:
             g0["_req_json"] = fake_req
