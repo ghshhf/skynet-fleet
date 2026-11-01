@@ -308,6 +308,42 @@ def main():
         check(cap in names, f"catalog 里有 {cap}")
     check("tun.open" in names and "tun.upgrade" in names, "tun.* 仍在（没被顶掉）")
 
+    # ---------------------------------------------------------------- ⑩ 端到端
+    print("【⑩ 端到端：两条真隧道经真中继互通（不是替身）】")
+    sid = T.new_session_id()
+
+    def _mk_tunnel():
+        return T.Tunnel(
+            session_id=sid,
+            steps=T.cascade("port-restricted", "port-restricted", ipv6="none"),
+            relay_factory=lambda s: RP.PairRelay(pair_url, s, SECRET))
+
+    A, B = _mk_tunnel(), _mk_tunnel()
+    res = {}
+    ta2 = threading.Thread(target=lambda: res.update(A=A.open_relay()))
+    ta2.start()
+    time.sleep(0.3)                       # A 先进等待态
+    tb2 = threading.Thread(target=lambda: res.update(B=B.open_relay()))
+    tb2.start()
+    ta2.join(15)
+    tb2.join(15)
+
+    check(res.get("A", {}).get("ok") and res.get("B", {}).get("ok"),
+          "两条隧道都建立成功")
+    check(A.state == "relayed" and B.state == "relayed",
+          "都处在 relayed（此刻已经可用）")
+
+    if A.relay and B.relay:
+        sent = A.send(b"hello-over-real-relay")
+        check(sent.get("ok") and sent.get("via") == "relay", "A 经中继发出")
+        check(B.relay.recv(65536) == b"hello-over-real-relay", "B 收到 A 的原文")
+        B.send(b"reply-back")
+        check(A.relay.recv(65536) == b"reply-back", "A 收到 B 的回复（反向也通）")
+
+    A.close()
+    B.close()
+    check(A.state == "closed" and B.state == "closed", "两端都收干净")
+
     print()
     if FAIL:
         print("T57 红：%d 项" % len(FAIL))
