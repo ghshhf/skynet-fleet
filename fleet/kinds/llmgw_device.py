@@ -215,17 +215,27 @@ KEYED_ENDPOINTS = [
     # 全部「有 key 才进候选」，没 key 静默跳过，绝不假装能用。
     {"name": "amd", "base": "https://developer.amd.com.cn/radeon/api/v1",
      "env": "LLMW_AMD_KEY", "secret": "amd",
-     "default_model": "DeepSeek-V4-Flash", "cost": 0.15,
-     "models": ["DeepSeek-V4-Flash", "DeepSeek-V4-Flash-Vision-Exp",
-                "Qwen3.8-Flash-Next", "MiniCPM5-1B"],
+     "default_model": "DeepSeek-V4.1-Flash", "cost": 0.15,
+     # 清单是 11-01 用真 key 打 /v1/models 拉的（15 个），不是抄的文案。
+     # 只登记能走 /v1/chat/completions 的；d3 / d3-flash 是 VLLM-SR 判决模型，
+     # 只吃 /v1/systemone（打 chat 直接 400 "is not a chat model"），登记进来等于埋雷。
+     "models": ["DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash",
+                "GLM-5.3-Flash", "MiMo-V2.6-Flash",
+                "Qwen3.8-Flash-Next", "Qwen3.8-27B",
+                "Gemma-4-31B-IT", "MiniCPM5-2B",
+                "MiniCPM-V-4.7-1B", "MiniCPM-V-4.7-35B-A3B"],
      "note": "AMD Radeon Cloud Token Factory（developer.amd.com.cn/radeon/tokenfactory）。"
-             "国内直连、免绑卡、邮箱或 GitHub 一键登录，key 以 rc- 开头、所有公共免费模型共用一把。"
+             "国内直连、免绑卡、GitHub 一键登录，key 以 rc- 开头、所有公共免费模型共用一把。"
              "OpenAI 兼容 /v1/chat/completions，同时原生支持 Anthropic /v1/messages。"
-             "DeepSeek-V4-Flash 是 284B MoE + 1,048,576 上下文 —— 免费档里没有第二家给 1M。"
-             "额度：每日预算$1（部分活动号$10，每天 8:00 重置）、30 RPM、单 key 并发 8、单 IP 120 RPM。"
-             "两个已知短板：① 慢，TTFT 实测约 22s、输出 28~30 tok/s，适合吞长文档不适合高频；"
-             "② 请求体只认白名单字段，名单外的（stop/seed/logit_bias/top_k/repetition_penalty）"
-             "被静默丢掉、不报错；thinking 参数会 400，要改用 reasoning_effort。"},
+             "额度（控制台风控面板实读）：每日 1.000000 点、转速限制 20 RPM、按点扣（"
+             "DeepSeek-V4.1-Flash 输入 0.28分/百万币、输出 0.56分/百万币 ⇒ 一天约 1.8M 输出 token）。"
+             "**11-01 真机实测推翻了三处传闻**："
+             "① 不慢 —— DeepSeek-V4.1-Flash 1.43s 出正文、带 tools 只要 1.07s，"
+             "之前那句『TTFT 22s』是拿旧版 DeepSeek-V4-Flash 量的（那个确实 4.99s），别混为一谈；"
+             "② 支持 function calling —— 实测 DeepSeek-V4.1-Flash / GLM-5.3-Flash / Qwen3.8-Flash-Next "
+             "三家都真回 tool_calls，不是只在正文里『说』要调；"
+             "③ 并发不是 8 —— GLM-5.3-Flash 报的是 concurrency limit (32)，限的是单模型并发不是整 key。"
+             "预留坑：V4.1 与 V4 是两个不同模型（两个都活着、都是 1M 上下文），名字差一个点别写错。"},
 
     {"name": "sensenova", "base": "https://token.sensenova.cn/v1",
      "env": "LLMW_SENSENOVA_KEY", "secret": "sensenova",
@@ -279,6 +289,12 @@ MODEL_CLASSES = {
                   ("ofm", "buddy/glm-5.3"),
                   ("ofm", "buddy/deepseek-v4-pro"),
                   ("ofm", "buddy/minimax-m3"),
+                  # AMD 免费层里三个真国产权重（11-01 实测 3.05~4.45s）。
+                  # 放 buddy 之后接盘：buddy 是 CodeBuddy 自家池，抖起来整条 cn 会全黑，
+                  # 这三跳跨的是完全不同的机器（AMD GPU 云），冗余度才算真的。
+                  ("amd", "MiMo-V2.6-Flash"),
+                  ("amd", "GLM-5.3-Flash"),
+                  ("amd", "Qwen3.8-27B"),
                   ("kiro", "glm-5"),
                   ("kiro", "deepseek-3.2")],
     },
@@ -311,7 +327,13 @@ MODEL_CLASSES = {
     "vision": {
         "desc": "读图（截图理解 / OCR 后处理 / 界面判断）",
         "chain": [("ovh", "Qwen2.5-VL-72B-Instruct"),
-                  ("kilo", "nvidia/nemotron-3.5-super-vl:free")],
+                  ("kilo", "nvidia/nemotron-3.5-super-vl:free"),
+                  # AMD 两个真视觉权重（11-01 实测：1B 版 0.36s 准确读出图上 6472）。
+                  # 35B-A3B 更聪明但常撞 32 并发上限，所以排在 1B 前面 ——
+                  # 撞限只是这一跳失败、自动往下退，不影响整体。
+                  # 注意 MiniCPM5-2B 是**纯文本**模型，塞图给它是 400，别往视觉链里放。
+                  ("amd", "MiniCPM-V-4.7-35B-A3B"),
+                  ("amd", "MiniCPM-V-4.7-1B")],
     },
     "flash": {
         # 主人日常主力就是这一款（DeepSeek V4 Flash），所以单独成类，链要够厚。
@@ -324,14 +346,24 @@ MODEL_CLASSES = {
             # 几分钟后再打就 429「Free usage limit reached」—— OpenCode 的免费池是抢来的，
             # 随时清零，不能当主力。buddy 走的是 CodeBuddy 自家账号池，稳定 1.38~2.09s。
             ("ofm", "buddy/deepseek-v4.1-flash"),
+            # 11-01 拿到 AMD key 后实测：V4.1（注意是 .1，不是 V4）1.43s 出正文、
+            # 带 tools 只要 1.07s，比 buddy 的 2.26s 还快 —— 而且它是**真 DeepSeek 权重**，
+            # 不像 buddy 那层是聚合池。放第二跳：平时打不到它，buddy 一抖就轮到它，
+            # 而且它带工具，是整个 flash 链上唯一「既快又能干活」的一跳。
+            ("amd", "DeepSeek-V4.1-Flash"),
             ("ofm", "opencode/deepseek-v4.1-flash-free"),   # 有额度时用它，没有就 429 退下一跳
             # 三跳是真厂商免费层，都要 key（没 key 静默跳过，不占位）
-            ("amd", "DeepSeek-V4-Flash"),              # 1M 上下文，慢但稳
+            ("amd", "DeepSeek-V4-Flash"),              # 旧版 V4，4.99s，留着当 AMD 内部第二跳
             ("sensenova", "deepseek-v4-flash"),        # 5 小时滚动刷新，抗连续用
             ("nvidia", "deepseek-ai/deepseek-v4.1-flash"),  # 40RPM 不计 token
             # 聚合层，需要它们自己的 key
             ("kilo", "deepseek/deepseek-v4.1-flash"),
-            ("llm7", "deepseek-v4.1-flash"),
+            # 这里本来还有一跳 ("llm7", "deepseek-v4.1-flash")，11-01 实测删掉：
+            # llm7 的 /v1/models 确实列出 67 个模型（含 deepseek-v4.1-flash、claude-opus-5-5、
+            # gpt-6.1-sol），但匿名层只放行 gpt-oss:20b 那几个，deepseek 这条直接 401
+            # 「Your API key is invalid, expired, or revoked」—— 名单上有不等于你能用。
+            # 留着它就是「链上有一跳永远失败」，白占一次重试、还把平均延迟拖高。
+            # 想用 llm7 的 DeepSeek/Claude 得去 dash.llm7.io 注册拿 key，那是另一件事。
             # 兜底：zen-gate 的 `deepseek-v4.1-flash-free` 是**假名**——实测返回体自报
             # `reflection/beam-free`，背后不是 DeepSeek 权重。所以这里直接写真名 beam-free：
             # 反正路由到同一台机器，写假名只会让人以为自己在用 DeepSeek。
@@ -3881,7 +3913,30 @@ def _selftest():
         _got2, _deg2 = g0["_tool_capable"]([dict(_stub_ok)], ["m1"], [("stub_tool", "m1")])
         assert _deg2 is False and [g["name"] for g in _got2] == ["stub_tool"], (_got2, _deg2)
 
-        print("llmgw_device 自测：28 组全过")
+        # ㉙ 链上的模型名必须真在端点的声明清单里 —— 光判「端点存在」不够。
+        #    11-01 真机踩到：AMD 同时有 DeepSeek-V4.1-Flash 和 DeepSeek-V4-Flash，
+        #    两个都活着、都是 1M 上下文，名字只差一个点。写错了照样 200、照样答话，
+        #    只是答话的是旧版（4.99s 而不是 1.43s）—— 这种错没有任何报错会提醒你。
+        #    所以拿声明表反查：真名拼错 = 断言失败，而不是等某天觉得「怎么变慢了」。
+        #    只查**静态声明**的端点；ofm / zen-gate 的模型清单是运行时从本机软件拉的，
+        #    离线自测里拿不到，硬查等于让断言依赖「你必须装着 OFM」。
+        _decl = {e["name"]: list(e.get("models") or []) for e in ANON_ENDPOINTS}
+        for e in KEYED_ENDPOINTS:
+            _decl[e["name"]] = list(e.get("models") or [])
+        _decl["kiro"] = [m for m, _ in KIRO_MODELS]
+        for cname, cdef in MODEL_CLASSES.items():
+            for ep_name, model in cdef["chain"]:
+                if not _decl.get(ep_name):
+                    # 两种都要跳过，理由不同：
+                    # ① 运行时挂载（ofm/zen-gate）：清单从本机软件拉，离线拿不到；
+                    # ② 清单留空的端点（kilo）：它的模型是拿 free_only 现筛的，
+                    #    声明表里本来就没有 —— 有清单才叫「声明」，空清单不是「没有」。
+                    continue
+                assert model in _decl[ep_name], (
+                    "分类 %s 指向 %s 的模型 %r 不在声明清单里；清单是 %s"
+                    % (cname, ep_name, model, _decl[ep_name]))
+
+        print("llmgw_device 自测：29 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
