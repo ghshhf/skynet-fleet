@@ -25,6 +25,7 @@
   llmgw.probe       — 单模型首字延迟（TTFB）
   llmgw.cooldowns   — 查看当前冷却中的端点/模型（带 source 标记）
   llmgw.sticky      — 查看/清除粘性会话
+  llmgw.egress      — 出口代理状态（HTTPS_PROXY 是否设置、远程端点是否经代理出网）
 """
 import json
 import math
@@ -33,6 +34,7 @@ import random
 import threading
 import time
 import urllib.error
+import urllib.parse as _urlparse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -70,8 +72,8 @@ ANON_ENDPOINTS = [
      "key": "", "anon": True, "default_model": None,
      "note": "kilo :free 路由，匿名可用"},
     {"name": "ovh", "base": "https://api.ai.endpoints.ovh.net/v1",
-     "key": "", "anon": True, "default_model": "Qwen3-235B-A22B",
-     "note": "OVH AI Endpoints，匿名可用"},
+     "key": "", "anon": True, "default_model": "Qwen2.5-72B-Instruct",
+     "note": "OVH AI Endpoints 免费开源权重，匿名可用（模型 id 以 /v1/models 为准）"},
 ]
 
 
@@ -729,10 +731,74 @@ def _in_flight_for(gw, model):
         return sum(1 for (g, m, _t, _c) in _LEASES.values() if g == gw and m == mk)
 
 
+# ---------- 出口代理（让免费端点在国内「有希望」可达） ----------
+# 免费端点分两类：本地网关（OFM/zen-gate，127.0.0.1，国内稳）和匿名国外端点
+# （pollinations/llm7/kilo/ovh，国内直连有的能通、有的被墙）。本模块**不自带翻墙**——
+# 真要翻全流量，是用户侧的事：设标准环境变量 HTTPS_PROXY / HTTP_PROXY 指向自己的
+# 全局代理 / VPN / 或把 WS 中继暴露成的 HTTP 代理即可，urllib 会自动走它。
+# 我们只在「非本地 + 有代理环境变量 + 未显式禁用」时把请求交给它；本地网关永远直连。
+# 不接 gitport：它只接管 GitHub/arxiv 等受管域名，LLM 端点不在其列，导过去也是 DIRECT。
+_EGRESS_CACHE = {"addr": None, "ts": 0.0, "ttl": 30.0}
+
+
+def _egress_proxy_addr():
+    """出口代理地址：读标准环境变量 HTTPS_PROXY / HTTP_PROXY，否则 None。
+    缓存 30s；LLMW_NO_PROXY=1 强制纯直连。本地网关不走这里（调用处判断）。"""
+    if os.environ.get("LLMW_NO_PROXY", "").lower() in ("1", "on", "true", "yes"):
+        return None
+    now = time.time()
+    if now - _EGRESS_CACHE["ts"] < _EGRESS_CACHE["ttl"]:
+        return _EGRESS_CACHE["addr"]
+    addr = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or None
+    if addr and not addr.startswith("http"):
+        addr = "http://" + addr
+    _EGRESS_CACHE["addr"] = addr
+    _EGRESS_CACHE["ts"] = now
+    return addr
+
+
+def _dns_ok(host, timeout=2.5):
+    """快速 DNS 预筛：域名能否解析 + 端口是否可达。不可达则立即返回 False，
+    避免 urllib 在死域名上卡 ~11s（OS 级 DNS 超时无超时参数可控）。
+    仅对「非本地 + 未走代理」的请求有意义（代理场景下解析发生在代理侧）。"""
+    try:
+        import socket as _sk
+        import threading as _th
+
+        def _resolve():
+            _sk.gethostbyname(host)
+
+        t = _th.Thread(target=_resolve, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            return False
+        return True
+    except Exception:
+        return False
+
+
 # ---------- HTTP 请求（标准库 urllib） ----------
 def _req_json(base, path, key, timeout=15, method="GET", body=None,
               extra_headers=None):
     url = base.rstrip("/") + path
+    host = (_urlparse.urlparse(base).hostname or "").lower()
+    local = host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
+    # 本地网关直连；其余若设了出口代理环境变量则走代理（标准 HTTPS_PROXY 机制）。
+    handlers = []
+    px = None
+    if not local:
+        px = _egress_proxy_addr()
+        if px:
+            handlers.append(urllib.request.ProxyHandler({"http": px, "https": px}))
+        else:
+            # 未走代理时，对死域名做快速 DNS 预筛，避免 urllib 卡 ~11s 的 OS DNS 超时。
+            if not _dns_ok(host):
+                return 0, {}, {"_err": "dns-unreachable:%s" % host}, \
+                    "域名 %s 解析/不可达（DNS 预筛）" % host
+    handlers.append(urllib.request.HTTPHandler())
+    handlers.append(urllib.request.HTTPSHandler())
+    opener = urllib.request.build_opener(*handlers)
     data = None
     headers = {"Accept": "application/json"}
     if key:
@@ -744,7 +810,7 @@ def _req_json(base, path, key, timeout=15, method="GET", body=None,
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8", "replace")
             try:
                 return r.status, dict(r.headers), json.loads(raw), None
@@ -926,13 +992,21 @@ def _h_endpoints(cap, args, dev):
     out = []
     for g in gws:
         st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=8)
-        nmodels = 0
+        raw_ids = []
         if st == 200 and isinstance(body, dict):
-            nmodels = len(body.get("data") or body.get("models") or [])
+            raw_ids = [m.get("id") for m in (body.get("data") or body.get("models") or []) if m.get("id")]
+        ids = list(raw_ids)
+        if not ids and g.get("default_model"):
+            # /v1/models 未实现或返回空（如 pollinations 在 openai 基址下返回 200 空列表）
+            # → 用已知默认模型兜底，仍可用
+            ids = [g["default_model"]]
+        via = "models-endpoint" if raw_ids else ("default_model" if ids else "none")
         out.append({"name": g["name"], "base": g["base"],
-                    "anon": g.get("anon", False), "ok": st == 200,
-                    "models": nmodels,
-                    "err": None if st == 200 else ("HTTP %s" % st)})
+                    "anon": g.get("anon", False),
+                    "ok": bool(ids),
+                    "models": len(ids),
+                    "discovered_via": via,
+                    "err": None if ids else ("HTTP %s" % st)})
     return R.success(cap, dev.name, via=dev.via, data={"endpoints": out,
                     "count": len(out), "online": sum(1 for x in out if x["ok"])})
 
@@ -943,14 +1017,20 @@ def _h_models(cap, args, dev):
     for g in gws:
         st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=10)
         ids = []
+        raw_ids = []
         if st == 200 and isinstance(body, dict):
             raw = body.get("data") or body.get("models") or []
             for m in raw:
                 mid = m.get("id") or m.get("name") or (m if isinstance(m, str) else None)
                 if mid:
                     ids.append({"id": mid, "family": _family(mid)})
+                    raw_ids.append(mid)
+        if not ids and g.get("default_model"):
+            ids = [{"id": g["default_model"], "family": _family(g["default_model"]),
+                    "via": "default_model"}]
         result[g["name"]] = {"count": len(ids), "models": ids[:300],
-                             "ok": st == 200, "err": None if st == 200 else str(err)[:120]}
+                             "ok": bool(ids),
+                             "err": None if ids else str(err)[:120]}
     return R.success(cap, dev.name, via=dev.via, data={"endpoints": result})
 
 
@@ -1260,6 +1340,21 @@ def _h_cooldowns(cap, args, dev):
                      data={"cooldowns": items, "count": len(items)})
 
 
+def _h_egress(cap, args, dev):
+    """出口代理状态：远程免费端点是否经 HTTPS_PROXY 出网。"""
+    disabled = os.environ.get("LLMW_NO_PROXY", "").lower() in ("1", "on", "true", "yes")
+    addr = _egress_proxy_addr()
+    return R.success(cap, dev.name, via=dev.via, data={
+        "proxy_addr": addr,
+        "proxy_active": bool(addr),
+        "disabled": disabled,
+        "note": "远程匿名端点在设了 HTTPS_PROXY/HTTP_PROXY 时自动经该代理出网；"
+                "本地网关(OFM/zen-gate)始终直连。gitport 只接管 GitHub/arxiv 等受管域名，"
+                "不接它。要让免费端点真在国内可用，把全局代理/VPN 或 WS 中继暴露成的 "
+                "HTTP 代理设进 HTTPS_PROXY 即可。",
+    })
+
+
 def _h_sticky(cap, args, dev):
     action = (args.get("action") or "list").lower()
     if action == "clear":
@@ -1320,6 +1415,7 @@ _HANDLERS = {
     "llmgw.cooldowns": _h_cooldowns,
     "llmgw.sticky": _h_sticky,
     "llmgw.compress": _h_compress,
+    "llmgw.egress": _h_egress,
 }
 
 
@@ -1367,6 +1463,7 @@ def _selftest():
     g0 = globals()
     real_discover = g0["discover_gateways"]
     real_req = g0["_req_json"]
+    real_dns_ok = g0["_dns_ok"]
     calls = {"n": 0}
 
     def fake_discover():
@@ -1450,7 +1547,51 @@ def _selftest():
         # 默认 level=1 对短消息不压缩
         rs0 = d.invoke("llmgw.compress", {"messages": [{"role": "user", "content": "hi"}]})
         assert rs0.ok and rs0.as_dict()["data"]["saved_chars"] == 0
-        print("llmgw_device 自测：11 组全过")
+        # ⑫ 出口代理机制（不依赖真实网络）：尊重标准 HTTPS_PROXY，不接 gitport
+        # 先清掉可能从运行环境继承来的代理变量，保证测试确定性
+        _pk = [k for k in os.environ if k.upper() in ("HTTPS_PROXY", "HTTP_PROXY")]
+        _pv = {k: os.environ[k] for k in _pk}
+        for k in _pk:
+            del os.environ[k]
+        # 设置 HTTPS_PROXY → 生效
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:9999"
+        g0["_EGRESS_CACHE"].update(addr=None, ts=0.0)
+        assert g0["_egress_proxy_addr"]() == "http://127.0.0.1:9999", g0["_egress_proxy_addr"]()
+        # 缓存命中：环境变量改回空也应返回缓存值（30s 内）
+        del os.environ["HTTPS_PROXY"]
+        assert g0["_egress_proxy_addr"]() == "http://127.0.0.1:9999", "应命中缓存"
+        # LLMW_NO_PROXY 强制关（覆盖缓存）
+        os.environ["LLMW_NO_PROXY"] = "1"
+        g0["_EGRESS_CACHE"].update(addr=None, ts=0.0)
+        assert g0["_egress_proxy_addr"]() is None
+        del os.environ["LLMW_NO_PROXY"]
+        g0["_EGRESS_CACHE"].update(addr=None, ts=0.0)
+        # 本地请求不走代理 / 远程请求走代理（spy build_opener）
+        seen = {}
+        real_build = urllib.request.build_opener
+        def _spy(*h):
+            seen["h"] = h
+            return real_build(*h)
+        urllib.request.build_opener = _spy
+        g0["_EGRESS_CACHE"].update(addr="http://127.0.0.1:9999", ts=time.time())
+        seen["h"] = ()
+        real_req("http://127.0.0.1:18900", "/v1/models", "", timeout=1)
+        assert not any(isinstance(x, urllib.request.ProxyHandler) for x in seen["h"]), "本地不应走代理"
+        seen["h"] = ()
+        real_req("https://api.llm7.io/v1", "/v1/models", "", timeout=1)
+        assert any(isinstance(x, urllib.request.ProxyHandler) for x in seen["h"]), "远程应走出口代理"
+        urllib.request.build_opener = real_build
+        # 死域名 DNS 预筛：无代理时 _dns_ok 返回 False → _req_json 立即报错，不卡 11s
+        g0["_dns_ok"] = lambda h, timeout=2.5: False
+        g0["_EGRESS_CACHE"].update(addr=None, ts=0.0)
+        st_dns, _, body_dns, err_dns = real_req("https://dead.example.invalid/v1/models", "", "", timeout=1)
+        assert st_dns == 0 and "DNS 预筛" in (err_dns or ""), "死域名应秒退: %s" % err_dns
+        g0["_dns_ok"] = real_dns_ok
+        g0["_EGRESS_CACHE"].update(addr=None, ts=0.0)
+        # 还原代理环境变量
+        for k, v in _pv.items():
+            os.environ[k] = v
+        print("llmgw_device 自测：12 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
