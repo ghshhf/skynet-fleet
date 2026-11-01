@@ -14,8 +14,13 @@ lane 协议（会话铸造/指纹门，zen-gate internal/lane 约 2.1 万行 Go�
 from .core import Capability, Param
 
 def _discover_ok(reg, dev):
-    from .kinds.llmgw_device import discover_gateways
-    return bool(discover_gateways()), "未发现任何本地网关（OFM/zen-gate 均未装或未运行过）"
+    from .kinds.llmgw_device import discover_gateways, ANON_ENDPOINTS
+    gws = discover_gateways()
+    if gws:
+        return True, ""
+    if ANON_ENDPOINTS:
+        return True, "无本地网关（OFM/zen-gate），但匿名端点（pollinations/llm7/kilo/OVH）可用"
+    return False, "未发现任何网关"
 
 
 LLMGW_CAPABILITIES = [
@@ -43,8 +48,22 @@ LLMGW_CAPABILITIES = [
     Capability("llmgw.probe", "单模型体检：可用性 + 首字延迟（学 zen-gate 的探测口径）",
                params=(Param("model", "str", True, "模型 id"),
                        Param("endpoint", "str", doc="缺省逐个端点试到通为止"),
-                       Param("key", "str", doc="自定义端点 key"),
-                       Param("timeout", "int", doc="秒，默认 60")),
+                       Param("timeout", "int", doc="秒，默认 30")),
                side_effect=True, check=_discover_ok,
                note="[LLMGW] 流式请求测 TTFB，只发一句 ping"),
+    Capability("llmgw.embeddings", "向量嵌入（OpenAI /v1/embeddings）。家族内 failover：不同模型向量不混",
+               params=(Param("input", "json", True, "字符串或字符串列表"),
+                       Param("model", "str", doc="embeddings 模型 id；缺省自动挑"),
+                       Param("endpoint", "str", doc="端点名；缺省全部"),
+                       Param("timeout", "int", doc="秒，默认 60")),
+               side_effect=True, check=_discover_ok,
+               note="[LLMGW] embeddings 跨模型家族 failover 会被拒（向量维度/语义空间不兼容）"),
+    Capability("llmgw.cooldowns", "查看当前冷却中的 (网关,模型) 对（429/5xx/timeout/auth 后自动冷却）",
+               params=(), side_effect=False, check=_discover_ok,
+               note="[LLMGW] FreeLLMAPI 模式：per-key cooldown + 自动解冻"),
+    Capability("llmgw.sticky", "粘性会话：同一 session_id 30 分钟内复用同一 (网关,模型)，避免 mid-conversation 模型切换",
+               params=(Param("action", "str", doc="list（默认）或 clear"),
+                       Param("session", "str", doc="会话 id（clear 时指定；不给则清全部）")),
+               side_effect=False, check=_discover_ok,
+               note="[LLMGW] FreeLLMAPI sticky session 模式"),
 ]
