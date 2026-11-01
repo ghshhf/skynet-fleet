@@ -209,6 +209,70 @@ KEYED_ENDPOINTS = [
 UPSTREAMS_SECRET = os.path.join(os.path.expanduser("~"), ".fleet", "upstreams.json")
 
 
+# ── 模型分类（class）───────────────────────────────────────────────────────────
+# 为什么要这一层：78 个模型名里大部分是**同一批上游的不同写法**（kilo / ofm / zen-gate
+# 三家共用同一批免费池，121 条归并后只剩 75 个真名，各家再往下还是同一台机器），
+# 所以「按端点选模型」是假选择，真正该选的是**要哪一类智力**。
+# 链 = 有序候选：第一家挂了/限流/额度尽，自动退下一个；class 内部顺序恒定，不交给 bandit，
+# 否则便宜的小模型会把 Claude 顶掉（这正是「默认模型永远落 pollinations」的老毛病）。
+MODEL_CLASSES = {
+    "claude": {
+        "desc": "长文写作 / 复杂推理 / 代码审阅（Anthropic 官方权重）",
+        "chain": [("kiro", "claude-sonnet-4.5"),
+                  ("kiro", "claude-haiku-4.5"),
+                  ("agentrouter", "claude-opus-5-5")],
+    },
+    "gpt": {
+        "desc": "GPT 订阅号池（比按量 API 新的那些型号）",
+        "chain": [("agentrouter", "gpt-6.1-sol"),
+                  ("agentrouter", "gpt-6-astra"),
+                  ("agentrouter", "gpt-5.6-sol")],
+    },
+    "cn": {
+        "desc": "中文最顺手的国产旗舰（Kimi / GLM / DeepSeek / MiniMax）",
+        "chain": [("ofm", "buddy/kimi-k3.1-pro"),
+                  ("ofm", "buddy/glm-5.3"),
+                  ("ofm", "buddy/deepseek-v4-pro"),
+                  ("ofm", "buddy/minimax-m3"),
+                  ("kiro", "glm-5"),
+                  ("kiro", "deepseek-3.2")],
+    },
+    "coder": {
+        "desc": "纯写代码 / 补全（专训代码模型优先）",
+        "chain": [("kiro", "qwen3-coder-next"),
+                  ("kilo", "cohere/north-mini-code:free"),
+                  ("llm7", "codestral-latest"),
+                  ("ofm", "buddy/kimi-k3.1-pro")],
+    },
+    "big": {
+        "desc": "参数最大的开源权重（要广度不要速度）",
+        "chain": [("kilo", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+                  ("ovh", "Qwen3.5-397B-A17B"),
+                  ("ovh", "gpt-oss-120b"),
+                  ("ovh", "Meta-Llama-3_3-70B-Instruct")],
+    },
+    "fast": {
+        "desc": "低延迟小模型（分类、抽取、路由这类不需要智商的活）",
+        "chain": [("pollinations", "openai-fast"),
+                  ("kilo", "nvidia/nemotron-3.5-lightning:free"),
+                  ("ovh", "gpt-oss-20b"),
+                  ("llm7", "gpt-oss:20b"),
+                  ("ovh", "Qwen3.5-9B")],
+    },
+    "vision": {
+        "desc": "读图（截图理解 / OCR 后处理 / 界面判断）",
+        "chain": [("ovh", "Qwen2.5-VL-72B-Instruct"),
+                  ("kilo", "nvidia/nemotron-3.5-super-vl:free")],
+    },
+}
+
+
+def _class_chain(name):
+    """分类名 → 有序 (端点, 模型) 链；未知名返回空列表（调用方报错，不静默降级）。"""
+    c = MODEL_CLASSES.get(str(name or "").strip().lower())
+    return list(c["chain"]) if c else []
+
+
 def _load_json(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -1948,8 +2012,12 @@ def _fanout_pick(candidates, n):
 
 
 # ---------- 候选排序（bandit + model bench + cooldown 过滤） ----------
-def _build_candidates(gws, models, session=None, sticky_pref=None):
-    """构建按 bandit 得分排序的候选列表，过滤 cooldown 和 model bench。"""
+def _build_candidates(gws, models, session=None, sticky_pref=None, chain=None):
+    """构建按 bandit 得分排序的候选列表，过滤 cooldown 和 model bench。
+
+    chain：模型分类链（有序 (端点, 模型) 对）。给了就只保留链上的组合并按链序返回，
+    bandit 分退化成记录字段、不再决定顺序 —— 见 MODEL_CLASSES 的注释。
+    """
     now = _now()
     candidates = []
     intel_models = list(models) if models else []
@@ -1989,6 +2057,25 @@ def _build_candidates(gws, models, session=None, sticky_pref=None):
     # 先按 local 标志升序（非本地在前），再按 bandit 分降序（稳定排序：同分时本地仍压最后）
     candidates.sort(key=lambda c: c["gw"].get("local", False))
     candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    # 分类链：一旦给了 chain，顺序由人定，bandit 不得改写。
+    # 理由：class 问的是「我要哪一类智力」，不是「哪个便宜」。让 bandit 参与排序，
+    # claude 链里 haiku 会盖过 sonnet，fast 链又会被免费端点顶满 —— 分类就白分了。
+    if chain:
+        order = {}
+        for i, (ep_name, model) in enumerate(chain):
+            order.setdefault((ep_name, model), i)
+        kept = [c for c in candidates if (c["gw"]["name"], c["model"]) in order]
+        # 同一 (端点,模型) 只留一条，链序升序；顺带把链序号塞进去便于排查
+        uniq, seen = [], set()
+        for c in sorted(kept, key=lambda c: order[(c["gw"]["name"], c["model"])]):
+            k = (c["gw"]["name"], c["model"])
+            if k in seen:
+                continue
+            seen.add(k)
+            c["chain_idx"] = order[k]
+            uniq.append(c)
+        return uniq
     return candidates
 
 
@@ -2065,7 +2152,12 @@ def _h_endpoints(cap, args, dev):
     gws = discover_gateways()
     out = []
     for g in gws:
-        st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=8)
+        # 私有协议端点（kiro / AWS Event Stream）没有 /v1/models：base 为空时必须跳过联网探测，
+        # 否则会拼出 "/v1/models" 抛 unknown url type（11-01 实测踩到，llmgw.endpoints 直接 500）。
+        if g.get("base"):
+            st, _, body, err = _req_json(g["base"], "/v1/models", g["key"], timeout=8)
+        else:
+            st, body, err = 0, None, "私有协议端点，无 /v1/models"
         raw_ids = []
         if st == 200 and isinstance(body, dict):
             raw_ids = [m.get("id") for m in (body.get("data") or body.get("models") or []) if m.get("id")]
@@ -2148,6 +2240,12 @@ def _h_models(cap, args, dev):
         "total_model_rows": total_rows,
         "distinct_models": len(all_origins),
         "duplication": (round(total_rows / len(all_origins), 2) if all_origins else 0),
+        # 分类目录：调用方不用记模型名，直接 class="claude" 这类走链（llmgw.chat 的 class 参数）
+        "classes": {k: {"desc": v["desc"],
+                        "chain": ["%s:%s" % (ep, m) for ep, m in v["chain"]]}
+                    for k, v in MODEL_CLASSES.items()},
+        "class_hint": 'llmgw.chat 传 class="claude"/"gpt"/"cn"/"coder"/"big"/"fast"/"vision"，'
+                      "链内按序兜底；不传则 auto（bandit + 免费优先）",
     })
 
 
@@ -2169,6 +2267,39 @@ def _h_chat(cap, args, dev):
     timeout = int(args.get("timeout") or 120)
 
     gws = discover_gateways()
+
+    # 模型分类：class="claude" / "cn" / "fast" … 用链条挑模型，不用记模型名。
+    # 这条路径的意义：单看任一上游都是「有限免费」（匿名端点并发 3~6 就 429、额度站按窗投放），
+    # 但一条 class 链把「同类智力的不同供货源」串起来，前面挂了自动退下一个 ⇒ 对一个人的
+    # 用量而言才是真的够用。链条顺序是人工定的，bandit 不参与（见 _build_candidates）。
+    cls = str(args.get("class") or args.get("cls") or "").strip().lower()
+    chain = []
+    if cls and cls != "auto":
+        if models:
+            return R.error(cap, "class 与 model 二选一：class 已经决定模型链了",
+                           device=dev.name, via=dev.via)
+        if endpoint_pref:
+            return R.error(cap, "class 与 endpoint 二选一：class 自带端点",
+                           device=dev.name, via=dev.via)
+        chain = _class_chain(cls)
+        if not chain:
+            return R.error(cap, "未知的模型分类 %s（可选：%s / auto）"
+                           % (cls, " / ".join(MODEL_CLASSES)),
+                           device=dev.name, via=dev.via)
+        want = []
+        for ep_name, _m in chain:
+            if ep_name not in want:
+                want.append(ep_name)
+        gws = [g for g in gws if g["name"] in want]
+        gws.sort(key=lambda g: want.index(g["name"]))
+        if not gws:
+            return R.unavailable(cap, "分类 %s 的端点现在都不可用：%s"
+                                 % (cls, ",".join(want)), device=dev.name, via=dev.via)
+        models = []
+        for _ep, m in chain:
+            if m not in models:
+                models.append(m)
+
     if endpoint_pref:
         matched = [g for g in gws if g["name"] == endpoint_pref]
         if not matched:
@@ -2179,7 +2310,12 @@ def _h_chat(cap, args, dev):
             if endpoint_pref in off:
                 return R.error(cap, f"上游 {endpoint_pref} 已停用：{off[endpoint_pref]}",
                                device=dev.name, via=dev.via)
-        gws = matched or gws
+            # 拼错端点名同样不能静默回落到全部上游（否则「我指定了 X」变成「随便谁答的」）
+            return R.error(cap, "未知的上游 %s（可选：%s）"
+                           % (endpoint_pref, ", ".join(g["name"] for g in gws)),
+                           device=dev.name, via=dev.via)
+        gws = matched
+
     if not gws:
         return R.unavailable(cap, "无可用网关（OFM/zen-gate 未装且匿名端点不可达）",
                              device=dev.name, via=dev.via)
@@ -2235,7 +2371,7 @@ def _h_chat(cap, args, dev):
         payload_base["temperature"] = temperature
 
     # 候选排序：bandit 得分 + cooldown/model bench 过滤
-    candidates = _build_candidates(gws, models)
+    candidates = _build_candidates(gws, models, chain=chain)
 
     attempts = []
     if not candidates:
@@ -2244,9 +2380,11 @@ def _h_chat(cap, args, dev):
 
     # 免费优先，额度型只做兜底 —— 不逮着一只羊薅。
     # 第一轮（hedge/流式）只发 cost==0 的免费端点；它们全挂了，串行 fallback
-    # 才会轮到带 key 的额度型上游。显式 endpoint= 指定时不做这层过滤（你点名要谁就是谁）。
+    # 才会轮到带 key 的额度型上游。显式 endpoint= 或 class= 时不做这层过滤：
+    # 你点名要 Claude，就不能因为 kiro 带 cost 就把它拦下来换个小模型糊弄。
     free_c = [c for c in candidates if not (c["gw"].get("cost") or 0) > 0]
-    allow_paid = bool(endpoint_pref) or not free_c or args.get("allow_paid") is True
+    allow_paid = (bool(endpoint_pref) or bool(chain) or not free_c
+                  or args.get("allow_paid") is True)
     first_round = candidates if allow_paid else free_c
 
     # 流式：不并发（两路流没法合流），按分串行；首字节前失败换下一个候选。
@@ -2257,7 +2395,12 @@ def _h_chat(cap, args, dev):
                                    deeper=candidates if not allow_paid else None)
 
     # hedge 并发：对前 N 个候选并发发送（单次尝试有超时上限，不阻塞退出）
-    res, chosen_idx, tried, results = _hedge_send(first_round, payload_base, timeout)
+    # class 模式必须 fanout=1：并发是「谁先回用谁」，而分类链是「先要最好的，不行才退」。
+    # 实测踩到（11-01）：给 fanout=3 时 claude 链要的 sonnet 被更快的 haiku 抢掉，
+    # cn 链的 kimi 被 glm 抢掉 —— 链序白定，分类就失去意义了。
+    res, chosen_idx, tried, results = _hedge_send(
+        first_round, payload_base, timeout,
+        max_fanout=1 if chain else HEDGE_FANOUT)
 
     if res[0] is not None:
         body, err, via, tokens, cls, reason, retry_after = res
@@ -3530,7 +3673,48 @@ def _selftest():
         finally:
             g0["_req_json"] = _real_m
 
-        print("llmgw_device 自测：26 组全过")
+        # ㉗ 模型分类（class）链：只做离线断言，不联网。
+        #    要钉住四件事，全是真机踩过的：
+        #    ① 链上每个 (端点, 模型) 必须真存在 —— 名字打错不该到运行时才发现是死链；
+        #    ② 链序就是优先级，bandit 不得改写（否则便宜的 haiku 会盖掉 sonnet）；
+        #    ③ 未知分类/未知端点必须报错，不许静默回落到全部上游；
+        #    ④ class 模式下并发扇出必须是 1（并发=谁先回用谁，会绕掉链序）。
+        known_eps = {e["name"] for e in ANON_ENDPOINTS} | {e["name"] for e in KEYED_ENDPOINTS}
+        # 这四个不是常量表里的，是运行时动态挂的：kiro/codex 看凭据，ofm/zen-gate 看本机软件装没装。
+        # 第一版断言漏了它们，自测当场报「分类 cn 指向不存在的端点 ofm」—— 断言把模型写死成
+        # 常量表就等于假设「所有上游都是我们声明的」，而实际一半上游是外部进程。
+        known_eps |= {"kiro", "codex", "ofm", "zen-gate"}
+        for cname, cdef in MODEL_CLASSES.items():
+            assert cdef.get("chain"), "分类 %s 没有链" % cname
+            for ep_name, model in cdef["chain"]:
+                assert ep_name in known_eps, ("分类 %s 指向不存在的端点 %s" % (cname, ep_name))
+                assert model and isinstance(model, str), ("分类 %s 有空模型名" % cname)
+        assert _class_chain("claude")[0][1] == "claude-sonnet-4.5", "claude 链首必须是 sonnet"
+        assert _class_chain("nonsense") == [], "未知分类该返回空链"
+
+        # ② 链序：造两条候选，bandit 分故意倒挂，验证排序仍按链序
+        _gs = [{"name": "kiro", "base": "", "cost": 0.2, "models": ["claude-sonnet-4.5",
+                                                                   "claude-haiku-4.5"]},
+               {"name": "agentrouter", "base": "https://x/v1", "cost": 1.0,
+                "models": ["claude-opus-5-5"]}]
+        _ch = [("kiro", "claude-sonnet-4.5"), ("kiro", "claude-haiku-4.5"),
+               ("agentrouter", "claude-opus-5-5")]
+        _cb = g0["_build_candidates"](_gs, ["claude-sonnet-4.5", "claude-haiku-4.5",
+                                            "claude-opus-5-5"], chain=_ch)
+        assert [c["model"] for c in _cb] == [m for _, m in _ch], \
+            ("链序被打乱", [c["model"] for c in _cb])
+        assert [c["chain_idx"] for c in _cb] == [0, 1, 2]
+
+        # ③ class 与 model 二选一、未知分类报错（都不该真发请求，靠 early return）
+        _D = type("D", (), {"name": "t", "via": "t"})()
+        _msg = [{"role": "user", "content": "x"}]
+        r_bad = g0["_h_chat"]("llmgw.chat", {"class": "nope", "messages": _msg}, _D)
+        assert not r_bad.ok and "未知的模型分类" in (r_bad.as_dict().get("err") or ""), r_bad.as_dict()
+        r_both = g0["_h_chat"]("llmgw.chat", {"class": "claude", "model": "x",
+                                              "messages": _msg}, _D)
+        assert not r_both.ok and "二选一" in (r_both.as_dict().get("err") or ""), r_both.as_dict()
+
+        print("llmgw_device 自测：27 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
