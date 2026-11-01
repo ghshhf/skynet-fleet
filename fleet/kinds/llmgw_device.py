@@ -21,10 +21,11 @@
 实时可用性图谱 + bandit 路由 + hedge 并发 —— 目标是「模型随时可用」：
 无论哪个上游挂/限流，自动切到其他健康上游，用户无感。
 
-能力（12 项）：
-  llmgw.endpoints   — 列出所有可用网关（OFM/zen-gate/匿名）+ 健康探测
+能力（13 项）：
+  llmgw.endpoints   — 列出所有可用网关（OFM/zen-gate/匿名/codex/带 key）+ 健康探测
   llmgw.models      — 按网关列出模型清单（含 family 分类）
   llmgw.chat        — OpenAI 兼容 chat，跨网关·跨模型 fallback + cooldown + bandit 路由 + hedge 并发
+                      stream=true 走 SSE：首字节前失败换上游，首字节后断流保留已得内容
   llmgw.embeddings  — embeddings，家族内 failover（不同模型向量不混）
   llmgw.probe       — 单模型首字延迟（TTFB）
   llmgw.cooldowns   — 查看当前冷却中的端点/模型（带 source 标记）
@@ -33,6 +34,7 @@
   llmgw.health      — 可用性图谱（各端点模型实时健康状态，坏的降权/过滤 → 模型随时可用）
   llmgw.quota       — 额度总览（借用 OFM/zen-gate 自己探上游的结论 + 自建健康图谱，零配额成本）
   llmgw.discover    — new-api 系公益站公开元数据（模型/倍率/赠送额度/投放窗口，零登录零额度）
+  llmgw.codex_login — ChatGPT 订阅号 device-code 授权（无浏览器）；连上后 codex 后端进路由池
   llmgw.egress      — 网络出口状态（免费端点直连即可用；环境若设了 HTTPS_PROXY 则透明走，非必需）
 """
 import json
@@ -49,6 +51,42 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..core import BaseDevice, DeviceResult as R
 from ..vendored_llmgw import LLMGW_CAPABILITIES
+from .. import codex_auth as _codex
+
+
+def _codex_access(force_refresh=False):
+    """取 Codex 订阅号的 access token + account_id（快过期会自动续）。"""
+    try:
+        return _codex.access_and_account(force_refresh=force_refresh)
+    except Exception as e:
+        return None, None, str(e)[:120]
+
+
+def _codex_headers(account_id):
+    try:
+        return _codex.headers(account_id)
+    except Exception:
+        return {}
+
+
+def _codex_gateway():
+    """已连上 ChatGPT 订阅号时，把 codex 后端当一个真实上游加进池子。"""
+    try:
+        stt = _codex.status()
+    except Exception:
+        return None
+    if not stt.get("connected"):
+        return None
+    return {"name": "codex", "base": _codex.CODEX_BASE, "key": "", "anon": False,
+            "auth": "codex", "api_style": "responses",
+            "responses_path": "/responses",
+            "ua": _codex.USER_AGENT,
+            # 订阅是包月固定成本 → 边际成本接近 0，但仍排在本机网关之后：
+            # 号池有风控，能走本机网关就不去撞它。
+            "cost": 0.05,
+            "default_model": None,
+            "note": "ChatGPT 订阅号直连（chatgpt.com/backend-api/codex，Responses 协议）。"
+                    "凭据是自己账号的 device-code OAuth，走 llmgw.codex_login 授权。"}
 
 # ---------- 路径 / 编码 ----------
 try:
@@ -226,6 +264,10 @@ def discover_gateways():
                     "api_style": e.get("api_style") or "chat",
                     "ua": e.get("ua") or "",
                     "note": e.get("note", "")})
+    # Codex 订阅号直连（只有真授权过才加，没连就静默跳过）
+    cg = _codex_gateway()
+    if cg:
+        gws.append(cg)
     # 本地离线兜底（Ollama 兼容）——永远排最后，远程免费层优先
     lg = _local_gw()
     if lg:
@@ -1212,11 +1254,14 @@ def _from_resp_body(d):
 def _responses_once(gw, payload, timeout):
     """用 Responses 协议打一次，返回与 _chat_once 相同的 7 元组。"""
     instructions, turns = _to_resp_input(payload.get("messages") or [])
+    codex = gw.get("auth") == "codex"
     req_body = {
         "model": payload.get("model"),
         "input": turns,
-        "max_output_tokens": int(payload.get("max_tokens") or 1024),
     }
+    # Codex 后端不收 max_output_tokens / metadata（FCC 里叫 omitted_request_fields）
+    if not codex:
+        req_body["max_output_tokens"] = int(payload.get("max_tokens") or 1024)
     if instructions:
         req_body["instructions"] = instructions
     if payload.get("temperature") is not None:
@@ -1224,9 +1269,17 @@ def _responses_once(gw, payload, timeout):
     if payload.get("stream"):
         req_body["stream"] = True
     hdrs = {"Accept": "application/json"}
-    if gw.get("ua"):
+    key = gw.get("key")
+    if codex:
+        tok, acc, err_c = _codex_access()
+        if not tok:
+            return None, err_c or "codex 未连接", None, 0, "auth", "auth", None
+        key = tok
+        hdrs.update(_codex_headers(acc))
+    elif gw.get("ua"):
         hdrs["User-Agent"] = gw["ua"]
-    st, hd, body, err0 = _req_json(gw["base"], "/v1/responses", gw["key"],
+    path = gw.get("responses_path") or "/v1/responses"
+    st, hd, body, err0 = _req_json(gw["base"], path, key,
                                    timeout=timeout, method="POST", body=req_body,
                                    extra_headers=hdrs)
     if err0 and st == 0:
@@ -2404,6 +2457,35 @@ def _h_discover(cap, args, dev):
     })
 
 
+def _h_codex_login(cap, args, dev):
+    """ChatGPT 订阅号的 device-code 授权：无浏览器、一条能力走完全程。
+
+    action=start  → 拿 user_code，你去 verification_url 输码
+    action=poll   → 轮询换 token（403/404 = 还没输完，不算错）
+    action=status → 看连没连、多久过期
+    action=logout → 撤销并删除本地凭据
+    """
+    action = (args.get("action") or "status").lower()
+    if action in ("start", "login", "begin"):
+        r = _codex.login_start()
+    elif action in ("poll", "wait", "finish"):
+        r = _codex.login_poll(wait_s=int(args.get("wait") or 0))
+    elif action in ("status", "state"):
+        r = _codex.status()
+    elif action in ("logout", "revoke", "disconnect"):
+        r = _codex.logout()
+    else:
+        return R.error(cap, "action 只能是 start/poll/status/logout", device=dev.name,
+                       via=dev.via)
+    if action in ("status", "state"):
+        g = _codex_gateway()
+        r["gateway_active"] = bool(g)
+    note = ("凭据只存在本机 ~/.fleet/codex_auth.json，能力输出永不回显 token。"
+            "Codex 后端要求 originator + ChatGPT-Account-ID 两个头，"
+            "并且不接受 max_output_tokens / metadata —— 这些已在适配层处理。")
+    return R.success(cap, dev.name, via=dev.via, data={"action": action, **r, "note": note})
+
+
 _HANDLERS = {
     "llmgw.endpoints": _h_endpoints,    "llmgw.models": _h_models,
     "llmgw.chat": _h_chat,
@@ -2416,6 +2498,7 @@ _HANDLERS = {
     "llmgw.health": _h_health,
     "llmgw.quota": _h_quota,
     "llmgw.discover": _h_discover,
+    "llmgw.codex_login": _h_codex_login,
 }
 
 
@@ -2942,7 +3025,58 @@ def _selftest():
                                   -g0["bandit_score"](t[1]["name"], t[0])))
         assert picks[0][0] == "free-model", picks
 
-        print("llmgw_device 自测：23 组全过")
+        # ㉔ Codex 订阅号网关：没凭据就静默跳过（不假装可用）；有凭据必须是
+        #    Responses 协议 + 专门的 responses_path（Codex 的路径不带 /v1）。
+        import base64 as _b64
+        import shutil as _sh
+        import tempfile as _tf
+        ca = g0["_codex"]
+        old_auth, old_pending, old_req = ca.AUTH_PATH, ca.PENDING_PATH, ca._req
+        _td = _tf.mkdtemp()
+        try:
+            ca.AUTH_PATH = os.path.join(_td, "codex_auth.json")
+            ca.PENDING_PATH = os.path.join(_td, "codex_pending.json")
+            assert g0["_codex_gateway"]() is None, "没凭据不该挂 codex 网关"
+
+            def _jwt(payload):
+                seg = _b64.urlsafe_b64encode(
+                    json.dumps(payload).encode()).decode().rstrip("=")
+                return "eyJhbGciOiJub25lIn0." + seg + ".sig"
+
+            acc = "acc-selftest"
+            at = _jwt({"https://api.openai.com/auth": {"chatgpt_account_id": acc},
+                       "exp": int(time.time()) + 3600})
+            it = _jwt({"email": "t@example.com"})
+            with open(ca.AUTH_PATH, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "access_token": at, "refresh_token": "rt",
+                           "id_token": it, "account_id": acc,
+                           "email": "t@example.com",
+                           "expires_at": int(time.time()) + 3600}, f)
+            gw_c = g0["_codex_gateway"]()
+            assert gw_c and gw_c["name"] == "codex", gw_c
+            assert gw_c["api_style"] == "responses", gw_c
+            assert gw_c["responses_path"] == "/responses", gw_c
+            assert gw_c["auth"] == "codex" and gw_c["cost"] >= 0, gw_c
+
+            # ㉕ codex_login：status 认得连上了，logout 清干净，
+            #    并且任何返回里都不许出现 token 原文（凭据不外泄是硬要求）。
+            ca._req = lambda *a, **k: (200, {}, None)
+            r1 = d.invoke("llmgw.codex_login", {"action": "status"})
+            dd1 = r1.as_dict()["data"]
+            assert dd1["connected"] is True and dd1["gateway_active"] is True, dd1
+            assert dd1.get("email") == "t@example.com", dd1
+            blob = json.dumps(r1.as_dict(), ensure_ascii=False)
+            assert at not in blob and "rt" != blob, "能力输出回显了 token"
+            r2 = d.invoke("llmgw.codex_login", {"action": "logout"})
+            assert r2.ok and not os.path.isfile(ca.AUTH_PATH), r2.as_dict()
+            assert g0["_codex_gateway"]() is None
+            r3 = d.invoke("llmgw.codex_login", {"action": "nonsense"})
+            assert not r3.ok, "非法 action 该报错"
+        finally:
+            ca.AUTH_PATH, ca.PENDING_PATH, ca._req = old_auth, old_pending, old_req
+            _sh.rmtree(_td, ignore_errors=True)
+
+        print("llmgw_device 自测：25 组全过")
     finally:
         # 还原模块级状态与函数，避免影响后续 import
         g["discover_gateways"] = real_discover
