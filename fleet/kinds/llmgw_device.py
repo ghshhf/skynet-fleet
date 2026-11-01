@@ -149,16 +149,18 @@ KEYED_ENDPOINTS = [
      #     但认不出来就是认不出来，这不是加密，只是约定。
      #  ② 协议只吃 Responses：打 /v1/chat/completions 报 "does not support, please use
      #     /v1/responses" —— 因为上游本来就是 Codex 订阅后端，原生说 Responses。
-     # ③ 2026-11-01 19:45 起**全站被阿里云验证码 2.0（SLIDING）拦住**：
-     #     任何路径都返回 16125 字节 JS 挑战页（HTTP 200，坑），要求过滑块才放行。
-     #     验证码 2.0 是三层判据（设备指纹 deviceToken 54 字段 / 轨迹 mm / 服务端评分），
-     #     实测空白 profile 的自动化浏览器 + 5 种轨迹全 F001；真 Edge 手工一拖能过，
-     #     但 cookie 落库为 v20（App-Bound Encryption），非提权解不开，自动化无法复现。
-     #     ⇒ 主人决定放弃（11-01 19:41）：解锁成本 ≈ 持续对抗，产出只有每天 $20，
-     #       「就算解锁了能得到啥呢」。留 key 不删，只把上游标 disabled，**不再白耗算力去撞墙**。
-     #       恢复条件：若哪天它撤掉验证码，删掉下面 disabled 一行即可，别的不动。
-     "disabled": True,
-     "disabled_note": "阿里云验证码 2.0 滑块墙（三层判据），11-01 放弃；撤墙后删 disabled 即恢复",
+     # ③ 2026-11-01 19:45 曾判「全站被阿里云验证码 2.0 拦住、任何路径都返回 16125 字节挑战页」
+     #     —— **这个结论是错的，20:00 当场推翻，别再照它行动**。真因是三件事被我看成一件：
+     #       a. 挑战页 HTTP 状态码是 200 不是 403 → 会被误当成功去解析（这条是真的，判据要防）。
+     #       b. 空白 profile 的自动化浏览器（Playwright Chromium，有头/无头/5 种轨迹）设备指纹
+     #          不干净 → 永远 F001。换成**真 Edge + 干净持久化 profile 首次访问直接放行**，
+     #          连滑块都不用拖（20:53 实测：窗口一开就是 JSON）。原判断把「指纹脏」错记成「墙硬」。
+     #       c. 放行凭证就是一个会话 cookie `acw_tc`：带上它 + 编程客户端 UA，
+     #          最朴素的 urllib/OpenSSL 也照样 200 ⇒ **TLS 指纹/JA3 不是判据**，
+     #          不用再装 curl_cffi、不用碰验证码算法、不用过滑块。
+     #     ⇒ 正解 = 一次性导出 acw_tc（`tools/ar_login.py` 开受控真 Edge，人手动点一下或直接放行），
+     #       之后网关长期带 cookie 调用，**零对抗、零维护**。已恢复启用。
+     "cookie_file": os.path.join(os.path.expanduser("~"), ".fleet", "agentrouter_cookies.json"),
      "api_style": "responses",
      "ua": "codex_cli_rs/0.51.0 (Windows 11; x86_64) Windows",
      # 可替代的客户端 UA（同一把钥匙，任选其一即可过①）
@@ -192,6 +194,32 @@ def _keyed_key(ep):
     if isinstance(f, dict):
         return str(f.get(ep.get("secret") or ep.get("name")) or "").strip()
     return ""
+
+
+def _keyed_cookie(ep):
+    """取上游需要的 WAF 放行 cookie（如 agentrouter 的 acw_tc），返回 "k=v; k2=v2" 或空串。
+
+    背景（11-01 20:00 实测纠正）：agentrouter 那堵墙**不是全站封禁**，也不是要破验证码算法。
+    墙只看两件事：① 有没有 WAF 放行的会话 cookie（acw_tc）② UA 是不是编程客户端。
+    TLS 指纹（JA3）实测**不是**判据 —— 同样的 cookie+UA，urllib/OpenSSL 一样 200。
+    ⇒ 拿一次放行 cookie 就能长期用，不需要任何对抗。
+
+    cookie 来源：`tools/ar_login.py` 开受控真 Edge 窗口，人手动过一次滑块后导出
+    （自动化轨迹过不了，真鼠标天然合格；这是唯一稳定来源，不是破解）。
+    没有 cookie 文件时返回空串：不阻断上游，等墙自己撤或等人补一次。
+    """
+    path = ep.get("cookie_file")
+    if not path:
+        return ""
+    d = _load_json(path)
+    if not isinstance(d, dict):
+        return ""
+    parts = []
+    for c in (d.get("cookies") or []):
+        n, v = (c or {}).get("name"), (c or {}).get("value")
+        if n and v:
+            parts.append("%s=%s" % (n, v))
+    return "; ".join(parts)
 
 
 # 免费模型 id 标记：`:free` / `-free` / `/free` 结尾（`kilo-auto/free`、`nvidia/x:free`、
@@ -285,6 +313,8 @@ def discover_gateways():
                     "keyed": True,
                     "api_style": e.get("api_style") or "chat",
                     "ua": e.get("ua") or "",
+                    # WAF 放行 cookie（如 agentrouter 的 acw_tc）。没有就空串，不阻断。
+                    "cookie": _keyed_cookie(e),
                     "note": e.get("note", "")})
     # Codex 订阅号直连（只有真授权过才加，没连就静默跳过）
     cg = _codex_gateway()
@@ -1143,6 +1173,29 @@ def _join_url(base, path):
     return b + p
 
 
+def _host_auth_hdrs(base):
+    """按 host 反查该上游声明的 UA / WAF cookie，供 _req_json 统一注入。
+
+    为什么按 host 而不传 gw：_req_json 有十几处调用（chat / models / embeddings /
+    discover / pricing），只改进 chat 一处会出现「对话能通、探模型被拦」的半通状态，
+    排查时极难看出来。按 host 自动补，改一处全通。
+    """
+    host = (_urlparse.urlparse(base or "").hostname or "").lower()
+    if not host:
+        return {}
+    h = {}
+    for e in KEYED_ENDPOINTS:
+        eh = (_urlparse.urlparse(e.get("base") or "").hostname or "").lower()
+        if eh and eh == host:
+            if e.get("ua"):
+                h["User-Agent"] = e["ua"]
+            ck = _keyed_cookie(e)
+            if ck:
+                h["Cookie"] = ck
+            break
+    return h
+
+
 def _req_json(base, path, key, timeout=15, method="GET", body=None,
               extra_headers=None):
     url = _join_url(base, path)
@@ -1166,6 +1219,9 @@ def _req_json(base, path, key, timeout=15, method="GET", body=None,
     opener = urllib.request.build_opener(*handlers)
     data = None
     headers = {"Accept": "application/json"}
+    if not local:
+        # 上游声明的 UA / WAF cookie 自动带上（见 _host_auth_hdrs 注释）
+        headers.update(_host_auth_hdrs(base))
     if key:
         headers["Authorization"] = "Bearer " + key
     if extra_headers:
@@ -1303,6 +1359,9 @@ def _responses_once(gw, payload, timeout):
         hdrs.update(_codex_headers(acc))
     elif gw.get("ua"):
         hdrs["User-Agent"] = gw["ua"]
+    if gw.get("cookie"):
+        # WAF 放行 cookie。跟 UA 是两条独立闸，缺一条都是 401 或挑战页。
+        hdrs["Cookie"] = gw["cookie"]
     path = gw.get("responses_path") or "/v1/responses"
     st, hd, body, err0 = _req_json(gw["base"], path, key,
                                    timeout=timeout, method="POST", body=req_body,
@@ -1380,6 +1439,8 @@ def _sse_once(gw, payload, timeout, on_delta=None):
         headers["Authorization"] = "Bearer " + gw["key"]
     if gw.get("ua"):
         headers["User-Agent"] = gw["ua"]
+    if gw.get("cookie"):
+        headers["Cookie"] = gw["cookie"]
     req = urllib.request.Request(url, data=json.dumps(req_body).encode("utf-8"),
                                  headers=headers, method="POST")
 
@@ -2399,6 +2460,9 @@ def _h_quota(cap, args, dev):
             # 停用的上游要如实报出来，避免「配置了 key 却不进候选」被误当成 bug
             "enabled": not bool(e.get("disabled")),
             "disabled_note": e.get("disabled_note", ""),
+            # 有没有 WAF 放行 cookie（只报有没有，不回显值）：诊断「401 / 挑战页」的第一问
+            "cookie_configured": bool(_keyed_cookie(e)),
+            "cookie_file": e.get("cookie_file") or "",
         } for e in KEYED_ENDPOINTS],
         # 额度投放窗口：撞到 402 的冷却时长就是「到下一个窗口」
         "quota_window": {
@@ -2881,63 +2945,79 @@ def _selftest():
         # ⑰ 带 key 的额度型上游：有凭据才进候选（没 key 不假装可用），凭据不许出现在能力输出里
         real_secret = g0["UPSTREAMS_SECRET"]
         tmpf = os.path.join(os.environ.get("TEMP") or "/tmp", "llmgw_selftest_upstreams.json")
-        # 11-01：agentrouter 因阿里云验证码 2.0 停用。这里把 disabled 暂时摘掉测「key 生效」，
-        # 同时守住「disabled 就算配了 key 也不进候选」——两个行为哪个破了都是回归。
+        tmpck = os.path.join(os.environ.get("TEMP") or "/tmp", "llmgw_selftest_cookies.json")
         e0 = g0["KEYED_ENDPOINTS"][0]
-        saved_flag = {k: e0[k] for k in ("disabled", "disabled_note") if k in e0}
+        real_cookie_file = e0.get("cookie_file")
         try:
             if os.path.isfile(tmpf):
                 os.remove(tmpf)
+            if os.path.isfile(tmpck):
+                os.remove(tmpck)
             g0["UPSTREAMS_SECRET"] = tmpf
+            e0["cookie_file"] = tmpck
+            # 没 key：不进候选，不假装可用
             assert "agentrouter" not in [x["name"] for x in real_discover()], \
                 "没 key 不该出现在端点清单"
             with open(tmpf, "w", encoding="utf-8") as f:
                 json.dump({"agentrouter": "sk-selftest"}, f)
             assert g0["_keyed_key"](e0) == "sk-selftest"
-            # 停用状态下：配了 key 也不许进候选（否则每次调用白耗一次撞墙）；
-            # 但 quota 输出要如实报「配了 key / 已停用」，别让停用被误读成没配。
-            assert "agentrouter" not in [x["name"] for x in real_discover()], \
-                "disabled 的上游配了 key 也不许进候选"
-            qd0 = d.invoke("llmgw.quota", {}).as_dict()["data"]
-            ku0 = {x["name"]: x for x in qd0["keyed_upstreams"]}
-            assert ku0["agentrouter"]["configured"] is True
-            assert ku0["agentrouter"]["enabled"] is False, ku0["agentrouter"]
-            assert ku0["agentrouter"]["disabled_note"], ku0["agentrouter"]
-            # 解禁后：key 生效，成本 / 模型透传正确
-            e0.pop("disabled", None)
-            e0.pop("disabled_note", None)
-            gws = real_discover()
-            ag = [x for x in gws if x["name"] == "agentrouter"]
+            # 有 key、没 cookie 文件：照样进候选（墙可能已撤），但 cookie 必须为空，不许编造；
+            # UA 仍在 —— 两道闸是独立的，少哪道都得如实体现，不能糊成一道。
+            ag = [x for x in real_discover() if x["name"] == "agentrouter"]
             assert ag and ag[0]["key"] == "sk-selftest", ag
+            assert ag[0]["cookie"] == "", "没有 cookie 文件时不该编造 cookie"
+            assert ag[0]["ua"].startswith("codex_cli_rs"), ag[0]["ua"]
             assert ag[0]["cost"] == 1.0 and ag[0].get("keyed") is True
             assert ag[0]["models"] == e0["models"]
+            # 有 cookie 文件：读出来拼成 header 形态（多条 cookie 用 "; " 连接）
+            with open(tmpck, "w", encoding="utf-8") as f:
+                json.dump({"ok": True, "cookies": [{"name": "acw_tc", "value": "v1"},
+                                                   {"name": "extra", "value": "v2"}]}, f)
+            ag = [x for x in real_discover() if x["name"] == "agentrouter"]
+            assert ag[0]["cookie"] == "acw_tc=v1; extra=v2", ag[0]["cookie"]
+            # 按 host 自动注入 —— 这一条守住「不只是 chat 带 cookie，models/embeddings/
+            # discover 那十几处 _req_json 调用也带」，否则会出现「对话能通、探模型被拦」的半通状态。
+            hh = g0["_host_auth_hdrs"](e0["base"])
+            assert hh.get("User-Agent", "").startswith("codex_cli_rs"), hh
+            assert hh.get("Cookie") == "acw_tc=v1; extra=v2", hh
+            assert g0["_host_auth_hdrs"]("https://example.com/v1") == {}, "不相干的 host 不该被注头"
+            assert g0["_host_auth_hdrs"]("") == {}
             # 环境变量优先于密钥文件
             os.environ["LLMW_AGENTROUTER_KEY"] = "sk-env"
             assert g0["_keyed_key"](e0) == "sk-env"
-            # 能力输出里只有「配没配」，没有凭据本身
+            # 能力输出里只有「配没配」，没有凭据本身，也没有 cookie 值
             qd2 = d.invoke("llmgw.quota", {}).as_dict()["data"]
             ku = {x["name"]: x for x in qd2["keyed_upstreams"]}
             assert ku["agentrouter"]["configured"] is True
-            assert "sk-env" not in json.dumps(qd2) and "sk-selftest" not in json.dumps(qd2)
+            assert ku["agentrouter"]["enabled"] is True, ku["agentrouter"]
+            dump_q = json.dumps(qd2)
+            assert "sk-env" not in dump_q and "sk-selftest" not in dump_q
+            assert "acw_tc" not in dump_q, "cookie 值不许进能力输出"
             assert qd2["quota_window"]["next_reset"], qd2["quota_window"]
+            # 停用态（临时塞标记，不依赖真实状态）：配了 key 也不进候选，
+            # 且点名必须显式报错 —— 不许静默换一家还报 ok。
+            e0["disabled"] = True
+            e0["disabled_note"] = "selftest-only"
+            assert "agentrouter" not in [x["name"] for x in real_discover()], \
+                "disabled 的上游配了 key 也不许进候选"
+            rq = d.invoke("llmgw.chat", {"messages": [{"role": "user", "content": "x"}],
+                                         "endpoint": "agentrouter", "max_tokens": 32})
+            assert not rq.ok, "点名停用上游不该返回成功"
+            assert "已停用" in str(rq.err), rq.err
+            ku3 = {x["name"]: x
+                   for x in d.invoke("llmgw.quota", {}).as_dict()["data"]["keyed_upstreams"]}
+            assert ku3["agentrouter"]["enabled"] is False, ku3["agentrouter"]
+            assert ku3["agentrouter"]["disabled_note"] == "selftest-only"
         finally:
             os.environ.pop("LLMW_AGENTROUTER_KEY", None)
             g0["UPSTREAMS_SECRET"] = real_secret
             e0.pop("disabled", None)
             e0.pop("disabled_note", None)
-            e0.update(saved_flag)
-            if os.path.isfile(tmpf):
-                os.remove(tmpf)
-
-        # ⑱ 点名「已停用」的上游必须明确报错，不许静默换一家还报 ok
-        #     实测踩到：指定 endpoint=agentrouter 却拿到 pollinations 的 openai-fast 并报 ok，
-        #     调用方会误以为它在工作。这类「200 但不是那件事」必须变成显式失败。
-        off_name = next((e["name"] for e in g0["KEYED_ENDPOINTS"] if e.get("disabled")), None)
-        if off_name:
-            rq = d.invoke("llmgw.chat", {"messages": [{"role": "user", "content": "x"}],
-                                         "endpoint": off_name, "max_tokens": 32})
-            assert not rq.ok, f"点名停用上游 {off_name} 不该返回成功"
-            assert "已停用" in str(rq.err), rq.err
+            if real_cookie_file:
+                e0["cookie_file"] = real_cookie_file
+            for p in (tmpf, tmpck):
+                if os.path.isfile(p):
+                    os.remove(p)
 
         # ⑱ 成本折价只压「真花额度」的上游：免费端点因子恒为 1（老排序一字不变），
         # 同分时免费的先上，额度型上游留到没有免费路可走的时刻。
