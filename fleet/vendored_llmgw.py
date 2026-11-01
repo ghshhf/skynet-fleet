@@ -66,4 +66,29 @@ LLMGW_CAPABILITIES = [
                        Param("session", "str", doc="会话 id（clear 时指定；不给则清全部）")),
                side_effect=False, check=_discover_ok,
                note="[LLMGW] FreeLLMAPI sticky session 模式"),
+    # ↓ 以下 5 项 handler 早已落地但一直没进 catalog（规划器看不见 = 等于不存在），
+    #   这里补齐：能力清单与 _HANDLERS 必须一一对应（依赖清单 ↔ 生产代码互相盯）。
+    Capability("llmgw.compress", "网关层上下文压缩：结构化内容去空白 + 超长截断，省 token 少撞上下文上限",
+               params=(Param("messages", "json", True, "OpenAI 格式消息列表"),
+                       Param("level", "int", doc="0=关 1=结构化去空白 2=再截断（默认 1）"),
+                       Param("cap", "int", doc="level=2 时的单条字符上限，默认 16000")),
+               side_effect=False, check=_discover_ok,
+               note="[LLMGW] 纯本地零网络；RTK/Caveman 同思路的保守安全版"),
+    Capability("llmgw.egress", "网络出口状态：免费端点直连即可用；环境若有 HTTPS_PROXY 则透明走（可选增强）",
+               params=(), side_effect=False, check=_discover_ok,
+               note="[LLMGW] 代理不是出网的前提，只是可选加速；LLMW_NO_PROXY=1 强制忽略"),
+    Capability("llmgw.health", "可用性图谱：各 (网关,模型) 实时健康状态（流量驱动，已知死的降权/过滤）",
+               params=(), side_effect=False, check=_discover_ok,
+               note="[LLMGW] 连续失败≥3 且无近期成功 → 降权；一次成功即自愈"),
+    Capability("llmgw.quota", "额度总览：借 OFM/zen-gate 自己探上游的结论 + 自建健康图谱，零配额成本",
+               params=(Param("refresh", "bool", doc="强制重读外部文件（依然不发网络请求）"),),
+               side_effect=False, check=_discover_ok,
+               note="[LLMGW] 只读 ~/.our-free-model/availability.json 与 %APPDATA%/zen-gate/quota.json；"
+                    "另报额度型上游「配没配 key」与投放窗口，不回显凭据"),
+    Capability("llmgw.discover", "扫 new-api 系聚合站的公开元数据：模型清单/倍率/赠送额度/有无充值/投放窗口。零登录零额度",
+               params=(Param("sites", "json", doc="站点列表，默认 agentrouter.org；可传多个"),
+                       Param("timeout", "int", doc="秒，默认 10")),
+               side_effect=False, check=_discover_ok,
+               note="[LLMGW] 只读公开的 /api/status 与 /api/pricing，不碰账号与 key；"
+                    "公告里的投放窗口会被解析成小时列表，喂给 quota 冷却"),
 ]
