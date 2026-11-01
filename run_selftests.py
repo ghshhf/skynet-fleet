@@ -120,6 +120,11 @@ CASES = [
     # endpoints·models 盘点 / probe 计速 / sticky clear。
     # 真联网的活（打 OFM·zen-gate·匿名端点）不进门禁——门禁不许依赖外网。
     ("fleet_llmgw", ["-m", "fleet.kinds.llmgw_device"], HERE, 30),
+    # 网关进程本身（2026-11-01）：**同端口只许一个实例**。
+    # 网关挂上 Windows 计划任务后，自愈与手动拉起撞车是常态；两个进程同时听 8790 时
+    # Windows 会把连接随机分给其中一个（SO_REUSEADDR 的语义和 POSIX 完全不同），
+    # 报的错互相打架。全离线：只绑 127.0.0.1 的临时端口，不碰真网关、不打外网。
+    ("fleet_llmgw_srv", ["-m", "fleet.llmgw_server", "--selftest"], HERE, 30),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
