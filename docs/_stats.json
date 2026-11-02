@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-11-02 22:34:27",
-  "gates_registered": 144,
-  "eval_files": 81,
+  "generated_at": "2026-11-02 23:27:45",
+  "gates_registered": 145,
+  "eval_files": 82,
   "orphan_evals": [],
   "doc_md": 8,
   "app_build": "49",
-  "capabilities_declared": 415,
-  "capabilities_owned": 406,
+  "capabilities_declared": 425,
+  "capabilities_owned": 416,
   "capabilities_live": null,
   "capabilities_gated": 149,
-  "devices": 41,
+  "devices": 42,
   "devices_live": null,
   "domains": {
     "rea": {
@@ -58,6 +58,11 @@
       "gated": 0
     },
     "register": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 0
+    },
+    "fp": {
       "declared": 10,
       "owned": 10,
       "gated": 0

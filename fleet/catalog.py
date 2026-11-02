@@ -21,6 +21,7 @@ from .vendored_email import EMAIL_CAPABILITIES
 from .vendored_register import REGISTER_CAPABILITIES
 from .vendored_protocol import PROTOCOL_CAPABILITIES
 from .vendored_slider import SLIDER_CAPABILITIES
+from .vendored_fp import FP_CAPABILITIES
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
@@ -55,6 +56,7 @@ from .kinds.email_device import EmailDevice
 from .kinds.register_device import RegisterDevice
 from .kinds.protocol_device import ProtocolDevice
 from .kinds.slider_device import SliderDevice
+from .kinds.fp_device import FpDevice
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1257,6 +1259,7 @@ CAPABILITIES.extend(EMAIL_CAPABILITIES)
 CAPABILITIES.extend(REGISTER_CAPABILITIES)
 CAPABILITIES.extend(PROTOCOL_CAPABILITIES)
 CAPABILITIES.extend(SLIDER_CAPABILITIES)
+CAPABILITIES.extend(FP_CAPABILITIES)
 
 
 def build(path=None, gate=None, ttl=5.0, with_nodes=True):
@@ -1294,6 +1297,11 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 滑块：人机验证第一战场。视觉找缺口 + 造像人轨迹 + CDP 逐点拖动。
     # 卡的不是身份也不是会话，是「你像不像人」——零件和别处完全不同，所以单独一族。
     reg.add(SliderDevice())
+    # 指纹层：无感验证不是一道题，是一次整机汇报的评分。检测方看「汇报什么」
+    # 和「用什么连接」是否自洽 —— 所以这里的正品不是"改属性"，是「把矛盾喊出来」。
+    # 沙箱（profile 目录 + 出口绑定）比伪装高一级：伪装是假装另一台机器，会被抓矛盾；
+    # 沙箱是真的重新出生一次，矛盾天然不存在。
+    reg.add(FpDevice())
     reg.add(Internet())
     reg.add(AI())
     reg.add(Host())
