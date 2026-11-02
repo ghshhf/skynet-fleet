@@ -458,6 +458,11 @@ CASES = [
     # 守「宏按中文边界渲染 / 世界书按 scan_depth 与 selectiveLogic 选 / 变量事务失败
     # 一点不改 / 正则两档分明且 EJS 显式跳过 / 坏卡不拖垮卡库」五条。
     ("eval_t73_persona_bus", ["evals/t73_persona_bus.py"], HERE, 180),
+    # 落盘层（11-03，学 CodeAssist 的 durable 纪律）：全仓 23 处各自拼 tmp+replace，
+    # 共享临时名会让两个写者交错成「A 的头 + B 的尾」，仍是合法 JSON，坏得没人发现。
+    # 守「旧写法确实坏 / 新写法必是完整 payload / 失败不毁旧文件 / 1.5 万条往返一致
+    # / 三个真实写点接线到位 / 并发不留残留」六条。
+    ("eval_t74_durable", ["evals/t74_durable.py"], HERE, 180),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),
