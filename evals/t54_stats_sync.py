@@ -38,6 +38,10 @@ from tools import gen_stats                                # noqa: E402
 
 FAIL = []
 
+# 每次现算都会变的字段：它们描述「这次跑的时刻」或「此刻环境」，不是代码事实。
+# 拿它们做相等断言等于让门禁恒红，红得没有信息量。
+VOLATILE = ("generated_at", "capabilities_live", "devices_live", "live_sampled_at")
+
 
 def check(cond, msg):
     if not cond:
@@ -62,25 +66,37 @@ def main():
 
     live = gen_stats.collect()
 
-    # ---- 逐字段相等：入库的每个数字都要跟现算的一致 ----
-    for k, v in live.items():
-        check(k in saved, "入库数字缺字段 %s（现算=%r）" % (k, v))
-        if k in saved:
-            check(str(saved[k]) == str(v),
+    # ---- 逐字段相等：入库的每个数字都要跟现算的一致（易变字段豁免）----
+    live_stable = {k: v for k, v in live.items() if k not in VOLATILE}
+    saved_stable = {k: v for k, v in saved.items() if k not in VOLATILE}
+    for k, v in live_stable.items():
+        check(k in saved_stable, "入库数字缺字段 %s（现算=%r）" % (k, v))
+        if k in saved_stable:
+            check(str(saved_stable[k]) == str(v),
                   "数字漂移：%s 入库=%r / 现算=%r（改完代码要跑 python tools/gen_stats.py）"
-                  % (k, saved[k], v))
-    for k in saved:
-        check(k in live, "入库多出字段 %s（gen_stats 已不再产出这一项）" % k)
+                  % (k, saved_stable[k], v))
+    for k in saved_stable:
+        check(k in live_stable, "入库多出字段 %s（gen_stats 已不再产出这一项）" % k)
 
     # ---- 口径不能悄悄退回：能力数必须盖住 vendored_* 与 kinds/ ----
-    caps = live.get("capabilities_catalog") or 0
+    caps = live.get("capabilities_declared") or 0
     vendored = 0
     for fn in os.listdir(os.path.join(ROOT, "fleet")):
         if fn.startswith("vendored_") and fn.endswith(".py"):
             vendored += 1
     check(caps > vendored * 10,
-          "能力数 %d 明显低于 vendored_* 文件数（%d 个），计数口径可能退回只数 catalog.py"
+          "能力声明数 %d 明显低于 vendored_* 文件数（%d 个），计数口径可能退回只数 catalog.py"
           % (caps, vendored))
+
+    # ---- 四层口径必须都在，且不许自相矛盾 ----
+    own = live.get("capabilities_owned")
+    gat = live.get("capabilities_gated")
+    check(isinstance(own, int), "capabilities_owned 不是整数（注册表没建起来？现算=%r）" % (own,))
+    check(isinstance(gat, int) and gat >= 0, "capabilities_gated 不是整数（%r）" % (gat,))
+    if isinstance(own, int) and caps:
+        check(own <= caps, "有主能力 %d 大于声明 %d —— 口径串了" % (own, caps))
+    if isinstance(gat, int) and isinstance(own, int):
+        check(gat <= own, "有门禁能力 %d 大于有主 %d —— 门禁在测不存在的能力？" % (gat, own))
 
     print("现算：%s" % json.dumps(live, ensure_ascii=False))
     print("入库：%s" % json.dumps(saved, ensure_ascii=False))

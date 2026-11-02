@@ -47,11 +47,21 @@ def main():
     from fleet import tts_runner as tr
     from fleet import voicebank as vb
 
-    # ---------- ① 引擎表：每个引擎都能拼出合法参数 ----------
+    # ---------- ① 引擎表：每个 sherpa 引擎都能拼出合法参数 ----------
     # 从 ENGINES 派生而不是写死引擎名：写死过一版（melo/matcha/zhll/zipv），
     # 砍引擎时这里就成了"漏改的第四处"。引擎表变，门禁自动跟着变。
+    #
+    # 但「全部引擎」不等于「全部走同一条路」：proot 引擎（kind=proot）不拼 sherpa 参数，
+    # 丢进 _phone_args 必抛错。下面那段注释 2026-11 就写了这句，循环却没照做 ——
+    # 于是 indextts2 一加进来，这条门禁就恒红，红到最后它自己被摘出 CASES 没人跑。
+    # 按 kind 分流，别按引擎名硬编码。
+    proot_engines = [k for k, v in tr.ENGINES.items() if v.get("kind") == "proot"]
+    check(len(proot_engines) == 1,
+          "proot 类引擎恰好 1 个（实际 %s）；多了说明 ①b 只验了一个，得扩" % (proot_engines,))
     for eng in tr.ENGINES:
         e = tr.ENGINES[eng]
+        if e.get("kind") == "proot":
+            continue
         ref = list(e.get("refs", {}))[0] if e.get("refs") else None
         rtxt = list(e.get("refs", {}).values())[0] if e.get("refs") else None
         try:
@@ -111,21 +121,24 @@ def main():
     # ---------- ④ 真实合成（PC 端，模型在 _contrib/tts 时生效；否则跳过）----------
     tmp = tempfile.mkdtemp(prefix="fleet-t50-")
     pc_matcha = os.path.join(tr._tts_dir(), "matcha-icefall-zh-baker")
+    pc_melo = os.path.join(tr._tts_dir(), "vits-melo-tts-zh_en")
     if os.path.isdir(pc_matcha):
         try:
             out = os.path.join(tmp, "m.wav")
             p, sec, _ = tr._pc_synth("测试一句话。", out, engine="matcha", threads=4)
-            with wave.open(p, "rb") as w:
-                ok_fmt = (w.getnchannels() == 1 and w.getsampwidth() == 2
-                          and w.getnframes() > 0)
+            with wave.open(p, "rb") as fh:
+                ok_fmt = (fh.getnchannels() == 1 and fh.getsampwidth() == 2
+                          and fh.getnframes() > 0)
             check(ok_fmt, "PC 端 matcha 真合成出 16bit 单声道 WAV（%.2fs）" % sec)
         except Exception as ex:
             check(False, "PC 端 matcha 合成失败: %s" % ex)
     else:
-        skip("PC 无 melo 模型（_contrib/tts/vits-melo-tts-zh_en），跳过真实合成")
+        skip("PC 无 matcha 模型（_contrib/tts/matcha-icefall-zh-baker），跳过真实合成")
 
-    # ---------- voicebank 预合成 + 命中（PC 端可用时）----------
-    if os.path.isdir(pc_melo):
+    # ---------- voicebank 预合成 + 命中（PC 端任一本地模型在场时才跑）----------
+    # 判据取「模型在不在」而不是「上一次合成成没成」：模型不在是环境原因（skip），
+    # 模型在却合不出来才是代码缺陷（必须红）。
+    if os.path.isdir(pc_melo) or os.path.isdir(pc_matcha):
         try:
             lines = ["灯是在1947年点起来的。", "一共闪了三下。"]
             res = vb.prewarm("旁白-女", lines, backend="pc_sherpa")
