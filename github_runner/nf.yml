@@ -1,0 +1,106 @@
+name: netforce
+
+# 天网 · 完整发现引擎（本地 netforce 那套原样上云，零本地数据依赖）
+# ------------------------------------------------------------------
+# 运行模型 = **接力跑**，不是定时跑：
+#   GitHub 单 job 硬上限 6 小时，这个绕不过去；所以每轮一开始就把下一轮 dispatch 进队列，
+#   靠 concurrency 的排队语义实现「本轮结束 → 下轮立刻开始」的零间隙衔接，等于 24 小时连续。
+#   cron 保留只作兜底：万一接力这一步挂了（token 失效等），6 小时内还能自己爬起来。
+#
+# 为什么接力必须用 PAT 而不是 GITHUB_TOKEN：
+#   GitHub 明令禁止由 GITHUB_TOKEN 触发的 workflow 再去触发新 workflow（防无限递归），
+#   所以接力必须走一个独立的个人 token，已存在仓库 secret `NF_PAT` 里。
+#
+# 云端不携带任何本地存量：resources.json 从空开始，靠引擎自己长。
+on:
+  schedule:
+    - cron: '7 */6 * * *'      # 仅兜底，正常由接力驱动
+  workflow_dispatch:
+    inputs:
+      max_seconds:
+        description: '本轮时间预算（秒）'
+        required: false
+        default: '20400'
+
+# 同一引擎绝不并行：排队但不取消 —— 接力完全依赖这个语义。
+concurrency:
+  group: netforce
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    # 平台硬上限 6 小时，留 5 分钟收尾
+    timeout-minutes: 355
+    steps:
+      # 接力必须是第一步：本轮就算中途崩了、或被 355 分钟超时强杀，下一轮也已经排在队列里。
+      # 放最后一步的话，job 被 kill 时根本没机会执行，链就断了。
+      - name: 排下一轮（接力不断）
+        continue-on-error: true
+        env:
+          NF_PAT: ${{ secrets.NF_PAT }}
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $NF_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/netforce.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"max_seconds":"20400"}}')
+          echo "接力请求 HTTP=$code（204 = 已排队，等待本轮让出）"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 引擎本体：纯标准库，不装任何依赖。
+      # NETFORCE_PROXY 必须为空 —— 云端没有本机代理，留空才会走直连通道。
+      - name: 资源发现（自举扩散）
+        env:
+          NETFORCE_OUT: data
+          NETFORCE_PROXY: ''
+          RUN_BUDGET_S: ${{ github.event.inputs.max_seconds || '20400' }}
+        run: python -u nf/resource_finder.py
+
+      # 分类是增量的：只处理 classified.json 里还没有的新域名
+      - name: 增量分类
+        if: always()
+        env:
+          NETFORCE_OUT: data
+          NETFORCE_PROXY: ''
+        run: python nf/classify.py
+
+      # SQLite 的 WAL 不 checkpoint 就提交，下一轮读到的可能是半截状态
+      - name: 去重库收尾
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, sqlite3
+          p = 'data/_visited.db'
+          if os.path.exists(p):
+              try:
+                  c = sqlite3.connect(p)
+                  c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                  c.close()
+              except Exception as e:
+                  print('checkpoint failed:', e)
+              for ext in ('-wal', '-shm'):
+                  f = p + ext
+                  if os.path.exists(f):
+                      os.remove(f)
+              print('visited.db', os.path.getsize(p), 'bytes')
+          PY
+
+      - name: 提交数据
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data
+          git add -A data/
+          git diff --staged --quiet || git commit -m "netforce: $(date -u +%FT%TZ)"
+          git pull --rebase --autostash
+          git push
