@@ -284,6 +284,58 @@ def main():
                   % (fn, bad.strip()))
     print("  · 三模块顶层无第三方 import（playwright 只在真调用时延迟 import）")
 
+    # ---------------------------------------------------------------- 8
+    sec("8 出口体检：探不出来必须报「不知道」，不许当通过")
+    from fleet import fp_egress as EG
+    for name, url, parse in EG._SOURCES:
+        r = parse({"ip": "1.2.3.4", "country_iso": "JP", "country": "Japan",
+                   "countryCode": "JP", "asn": "AS2516 KDDI", "as": "AS2516 KDDI",
+                   "asn_org": "KDDI", "isp": "KDDI", "query": "1.2.3.4"})
+        check(r.get("ip") == "1.2.3.4", "%s 归一化后应有 ip" % name)
+        check(str(r.get("country") or "").upper() == "JP", "%s 归一化后应有国家" % name)
+    check(EG.looks_residential("AS16509 Amazon.com, Inc.", "Amazon") == "datacenter",
+          "AWS 应判机房")
+    check(EG.looks_residential("AS2516 KDDI CORPORATION", "KDDI") == "residential",
+          "KDDI 应判住宅")
+    check(EG.looks_residential(None, None) is None,
+          "什么都不知道时必须返回 None —— 判不出来就说不出来，不许猜")
+
+    # 两头都要守：走代理必须显式建 ProxyHandler，直连必须显式传空
+    # （本机注入过 HTTP_PROXY=127.0.0.1:3067，不显式传空会探成一条谁都不知道的线路）
+    src = io.open(os.path.join(ROOT, "fleet", "fp_egress.py"), encoding="utf-8").read()
+    check('ProxyHandler({"http": proxy, "https": proxy})' in src,
+          "走代理时必须显式构造 ProxyHandler")
+    check("ProxyHandler({})" in src, "直连必须显式传空 ProxyHandler（否则会吃环境变量）")
+
+    # 核心：探不到 ≠ 没问题
+    tmp2 = tempfile.mkdtemp(prefix="t69e-")
+    real2 = SB.SANDBOX_DIR
+    SB.SANDBOX_DIR = os.path.join(tmp2, "sandbox")
+    real_probe = EG.probe
+    try:
+        sbe = SB.create(platform="win", geo="CN", seed="t69-egress")
+        SB.bind_egress(sbe["id"], proxy="http://127.0.0.1:7891", country="CN")
+        EG.probe = lambda **kw: {"ok": False, "error": "假装网络不通"}
+        iss = SB.check(sbe["id"], auto=True)
+        check(any(i["rule"] == "egress_unknown" for i in iss),
+              "探不到出口必须报 egress_unknown，实得 %s" % [i["rule"] for i in iss])
+        check(not any(i["rule"] == "egress_drift" for i in iss),
+              "探不到的时候**不许**报漂移 —— 那是编出来的结论")
+        # 反向：探到了不一致就必须报
+        EG.probe = lambda **kw: {"ok": True, "ip": "5.6.7.8", "country": "SG",
+                                 "asn": "AS16509", "isp": "AMAZON-02",
+                                 "proxy": "http://127.0.0.1:7891"}
+        iss2 = SB.check(sbe["id"], auto=True)
+        check(any(i["rule"] == "egress_drift" for i in iss2),
+              "探到 CN→SG 必须报 egress_drift，实得 %s" % [i["rule"] for i in iss2])
+        check(any(i["rule"] == "egress_datacenter" for i in iss2),
+              "探到机房线路必须报出来（不是不能过，是要知道代价）")
+        SB.destroy(sbe["id"])
+    finally:
+        EG.probe = real_probe
+        SB.SANDBOX_DIR = real2
+        shutil.rmtree(tmp2, ignore_errors=True)
+
     print("\n=== t69: %d 过 / %d 败 ===" % (_OK, _FAIL))
     return _FAIL == 0
 

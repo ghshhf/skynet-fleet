@@ -82,10 +82,21 @@ FP_CAPABILITIES = [
         "fp.sandbox_check",
         "体检某个沙箱还能不能用（重点：出口有没有漂）",
         params=(Param("id", "str", True, "沙箱 id"),
-                Param("live_country", "str", False, "当前实际出口的国家码"),
-                Param("live_proxy", "str", False, "当前实际出口的代理")),
+                Param("auto", "bool", False, "自己走网络探一次出口（推荐）"),
+                Param("live_country", "str", False, "当前实际出口的国家码（不给就按 auto）"),
+                Param("live_proxy", "str", False, "当前实际出口的代理"),
+                Param("timeout", "float", False, "探测超时（默认 8 秒）")),
         note="最要紧的一条是出口漂移：profile 攒的历史是给某个国家的人攒的，"
-             "IP 一换国家就变成「同一台机器突然搬家」，比新访客更可疑。",
+             "IP 一换国家就变成「同一台机器突然搬家」，比新访客更可疑。"
+             "auto=True 时探不出来会单独报 egress_unknown —— 不知道不等于没问题。",
+    ),
+    Capability(
+        "fp.egress_probe",
+        "探一次真实出口：IP / 国家 / ASN / 住宅还是机房",
+        params=(Param("proxy", "str", False, "指定代理；不传走 net.resolve_proxy()"),
+                Param("timeout", "float", False, "超时秒数（默认 8）")),
+        note="这是「出口漂移」唯一的自动来源。两个源互为冗余（ifconfig.co / ip-api.com），"
+             "全挂才报错。探不出来返回失败 —— **不等于没问题，等于不知道**。",
     ),
     Capability(
         "fp.sandbox_bind",
