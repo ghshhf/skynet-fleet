@@ -40,6 +40,7 @@ from .kinds.rendezvous_layer import RendezvousLayer
 from .kinds.rdv_auto_layer import RdvAutoLayer
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
+from .kinds.download import Download
 from .kinds.reverse import Reverse
 from .kinds.rea_device import ReaDevice
 from .kinds.crawler_device import CrawlerDevice
@@ -337,6 +338,29 @@ CAPABILITIES = [
                params=(Param("domain", "str", True, "域名，如 example.com"),
                        Param("history", "bool", doc="读上一次快照对比（delta），默认 False")),
                note="只读：内化 OpenOSINT exposure 评分模型，全免费源；A≥90 B≥80 C≥65 D≥50，critical 压到 D；仅查自有/授权域名"),
+    # ---- 下载层（把「下载」整个领域内化进源码：直链/网盘/分片/续传/多源/代理，零外部 daemon）----
+    Capability("download.direct", "直链/多源下载：分片多线程、断点续传、代理、并发闸、hash 校验（吸收 aria2 设计，urllib 零依赖）",
+               params=(Param("urls", "str", True, "下载地址，多源用逗号分隔"),
+                       Param("dest", "str", doc="落盘路径，默认 downloads/out.bin"),
+                       Param("concurrency", "int", doc="并发片数，默认 4"),
+                       Param("multi_source", "bool", doc="多 url 轮流承担切片（镜像源），默认 False"),
+                       Param("proxy", "str", doc="代理 http://host:port"),
+                       Param("resume", "bool", doc="断点续传，默认 True"),
+                       Param("verify", "str", doc="校验 algo:hexdigest，如 sha256:abc...")),
+               note="只读落盘：从公开直链拉文件；多源需同源内容一致；不破解任何限速"),
+    Capability("download.pan", "网盘下载（吸收 QuarkPanTool）：夸克官方 API 拿直链 → 引擎下载；分享链接/自有文件均可",
+               params=(Param("pan", "str", doc="网盘，默认 quark（其余家待内化）"),
+                       Param("mode", "str", doc="share=分享链接 / file=自有 fids"),
+                       Param("share_url", "str", doc="分享链接（mode=share）"),
+                       Param("password", "str", doc="分享提取码"),
+                       Param("fids", "str", doc="文件 fid，逗号分隔（mode=file）"),
+                       Param("cookie", "str", doc="网盘登录态 cookie；缺省读 QUARK_COOKIE 或 cookies.txt"),
+                       Param("dest", "str", doc="落盘目录，默认 downloads")),
+               note="仅用官方 API 拿直链，不破解限速；限速取决于账号（会员满速）。需你提供登录态，不外传"),
+    Capability("download.task", "下载任务管理：列表/进度/暂停/续传/移除",
+               params=(Param("action", "str", True, "list/status/pause/resume/remove"),
+                       Param("task_id", "str", doc="任务 id（status/pause/resume/remove 需要）")),
+               note="内存任务表；pause 设暂停标志，resume 从断点续传"),
     # ---- 远程 shell 通道（D4：把别人的机器当设备管；只连你拥有/获授权的机器）----
     Capability("ssh.banner", "SSH 版本探测：真读 SSH-2.0 版本行，确认 22 端口上跑的是 sshd",
                params=(Param("host", "str", True, "主机/IP"),
@@ -1209,6 +1233,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(ReachLayer())
     reg.add(NatTraversal())
     reg.add(Osint())
+    reg.add(Download())
     reg.add(Reverse())
     reg.add(ReaDevice())
     reg.add(CrawlerDevice())
