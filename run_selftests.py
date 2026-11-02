@@ -418,6 +418,9 @@ CASES = [
     # 全离线：短链抽取/平台识别/无水印trick/三重签名/SM3向量 锁死框架正确性；
     # 再用真实 invoke(parse.resolve, download=True) 端到端打本地 Range server → 下载引擎落盘。
     ("eval_t60_parse", ["evals/t60_parse.py"], HERE, 90),
+    # ---- T61：代码转化（LLM 机器转 + 语法/编译机器验）----
+    # 全离线：mock llmgw，锁死 去围栏 / python 语法校验 / 端到端转译 / 网关失败透传。
+    ("eval_t61_code_convert", ["evals/t61_code_convert.py"], HERE, 90),
     # ---- 下载层门禁：解析层的下游（直链/多源/续传/hash校验/任务接口）----
     # 全离线（本地 Range server），与 t60 同源登记，避免「写了不跑=没写」。
     ("eval_t55_download", ["evals/t55_download.py"], HERE, 120),
