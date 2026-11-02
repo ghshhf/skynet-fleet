@@ -22,7 +22,7 @@
   总日志（输出页）永远收一份；论文的活额外喂给「论文」页、联网的活额外喂给
   「联网」页，这两屏才是长任务时人真正盯着的地方。
 
-  标签页（顶部横排，仿网页）：设备 / 联网(netforce) / 论文 / AI / 主机 / 输出 / 结果。
+  标签页（顶部横排，仿网页）：设备 / 网络 / 联网(netforce) / 论文 / AI / 主机 / 输出 / 结果。
   「论文」页上半行显示今日论文数与来源分布，下面是全屏 RichLog，web.papers
   跑起来这一屏就一行行长出来；「联网」页左侧站群表、右侧收获流；
   「AI」页顶部列可用免费后端、下方全屏对话流，提问框回车即向所有后端并发提问；
@@ -82,6 +82,10 @@ ProgressBar { height: 1; }
 TabbedContent { height: 100%; }
 TabPane { padding: 0; }
 #pane_dev, #pane_web { layout: horizontal; }
+#pane_net { layout: vertical; }
+#netline { height: 1; padding: 0 1; color: #8b949e; background: #161b22; }
+#netrow { height: 1fr; }
+#netchan { width: 58; }
 #pane_paper { layout: vertical; }
 #pane_ai { layout: vertical; }
 #ailine { height: 1; padding: 0 1; color: #8b949e; background: #161b22; }
@@ -114,6 +118,7 @@ class FleetTUI(App):
     BINDINGS = [
         ("ctrl+e", "focus_cmd", "命令行"),
         ("ctrl+d", "focus_devices", "设备"),
+        ("ctrl+n", "focus_net", "网络"),
         ("ctrl+w", "focus_web", "联网"),
         ("ctrl+p", "focus_papers", "论文"),
         ("ctrl+a", "focus_ai", "AI"),
@@ -167,6 +172,13 @@ class FleetTUI(App):
                 with Horizontal():
                     yield DataTable(id="devices", zebra_stripes=True)
                     yield DataTable(id="caps", zebra_stripes=True)
+            with TabPane("网络", id="pane_net"):
+                with Vertical():
+                    yield Static("网络页：取 net.status（只读，默认不出网）",
+                                 id="netline")
+                    with Horizontal(id="netrow"):
+                        yield DataTable(id="netchan", zebra_stripes=True)
+                        yield DataTable(id="netgrid", zebra_stripes=True)
             with TabPane("联网", id="pane_web"):
                 with Horizontal():
                     yield DataTable(id="sites", zebra_stripes=True)
@@ -363,11 +375,13 @@ class FleetTUI(App):
         gate = lambda *a: (True, "")     # 这两个是只读能力，不该过闸门
         sites = self.shell.reg.call("web.sites", args={}, gate=gate)
         papers = self.shell.reg.call("web.frontier", args={}, gate=gate)
-        self.call_from_thread(self._paint_all, rows, sites, papers)
+        netst = self.shell.reg.call("net.status", args={}, gate=gate)
+        self.call_from_thread(self._paint_all, rows, sites, papers, netst)
         self._tick_status()
 
-    def _paint_all(self, rows, sites, papers):
+    def _paint_all(self, rows, sites, papers, netst=None):
         self._paint_devices(rows)
+        self._paint_net(netst)
         self._paint_web(sites, papers)
         self._paint_ai()
 
@@ -381,6 +395,65 @@ class FleetTUI(App):
             t.add_row(r["name"], r.get("kind", ""),
                       "● 在线" if r.get("ok") else "○ 离线")
         self._tick_status()
+
+    def _paint_net(self, st):
+        """网络页：只画 `net.status` 给的东西，界面里**不另算一份**。
+
+        为什么不在这一层自己探端口：那就会出现「面板说有、能力说没有」的两份真相，
+        主人对着哪一份判断都可能是错的。一处来源（能力），多处显影（界面）。
+
+        取不到就明说取不到——面板空着比填个「正常」诚实。
+        """
+        line = self.query_one("#netline", Static)
+        c = self.query_one("#netchan", DataTable)
+        g = self.query_one("#netgrid", DataTable)
+        c.clear(columns=True)
+        g.clear(columns=True)
+
+        if not (st and st.ok):
+            why = (st.err if st is not None else "net:face 没登记")
+            line.update(Text("网络页取不到：%s" % (why or "net.status 失败"),
+                             style="bold #f85149"))
+            c.add_columns("通道", "地址", "状态", "说明")
+            g.add_columns("项", "值")
+            return
+
+        d = st.data or {}
+        line.update(Text("网络页：%s" % (d.get("verdict") or ""), style="bold #58a6ff"))
+
+        c.add_columns("通道", "地址", "状态", "说明")
+        for ch in (d.get("egress", {}).get("channels") or []):
+            alive = ch.get("alive")
+            mark = "● 通" if alive else ("○ 死" if alive is False else "· 未测")
+            c.add_row(ch.get("name", ""), str(ch.get("url") or "—"), mark,
+                      (ch.get("note") or "")[:30])
+
+        core = d.get("core") or {}
+        rules = d.get("rules") or {}
+        p2p = d.get("p2p") or {}
+        if core.get("ok"):
+            core_txt = ("装了 v%s" % core.get("version")) if core.get("installed") else "没装二进制"
+        else:
+            core_txt = core.get("err") or "读不到"
+        nodes = core.get("config_nodes")
+        rdv = (p2p.get("rdv_auto") or {})
+        g.add_columns("项", "值")
+        for k, v in (
+            ("内核", core_txt),
+            ("内核进程", "在跑" if core.get("running") else "没起"),
+            ("配置内节点", ("%s 个" % nodes) if nodes is not None
+             else (core.get("config_nodes_why") or "—")),
+            ("系统代理", {True: "开", False: "关", None: "未知"}.get(core.get("system_proxy_on"), "未知")),
+            ("TUN 接管", {True: "开", False: "关"}.get(core.get("tun"), "未知")),
+            ("分流规则", "%s · %s 域名 / %s 后缀" % (rules.get("source") or "?",
+                                                    rules.get("domains", "?"),
+                                                    rules.get("suffixes", "?"))),
+            ("打洞/隧道", "%s / %s 会话" % (p2p.get("nat_sessions", "?"),
+                                            p2p.get("tun_sessions", "?"))),
+            ("会合循环", {True: "在跑", False: "没跑"}.get(rdv.get("running"), "未知")),
+            ("此刻选路", str((d.get("egress") or {}).get("route") or "直连")),
+        ):
+            g.add_row(k, str(v))
 
     def _paint_caps(self):
         t = self.query_one("#caps", DataTable)
@@ -694,6 +767,10 @@ class FleetTUI(App):
     def action_focus_devices(self):
         self.query_one("TabbedContent", TabbedContent).active = "pane_dev"
         self.query_one("#devices", DataTable).focus()
+
+    def action_focus_net(self):
+        self.query_one("TabbedContent", TabbedContent).active = "pane_net"
+        self.query_one("#netchan", DataTable).focus()
 
     def action_focus_web(self):
         self.query_one("TabbedContent", TabbedContent).active = "pane_web"

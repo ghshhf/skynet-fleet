@@ -66,6 +66,7 @@ from .kinds.ssh_shell import SshShell
 from .kinds.windows_pc import WindowsPC
 from .kinds.proxy_mgr import ProxyMgr
 from .kinds.proxy_core import ProxyCore
+from .kinds.net_face import NetFace
 from .transports import get as get_transport
 
 DEVICES_PATH = os.environ.get("FLEET_DEVICES", os.path.join(
@@ -481,6 +482,22 @@ CAPABILITIES = [
     Capability("net.scan", "局域网端口指纹扫描",
                params=(Param("quick", "bool", doc="跳过 NBT/mDNS"),
                        Param("timeout_ms", "int"))),
+    # ---- 网络层「一张脸」（2026-11-03）----
+    # 这一族存在的理由：出向/内核/分流/P2P 的事实分别散在 net.py、proxycore.py、
+    # proxymgr.py、nat_traversal.py、tunnel_layer.py、rdv_auto.py 六处，
+    # 每一处都有实现、但都只对各自的调用者可见 ⇒ 问一句「现在什么状态」得翻源码。
+    # 这两条不实现探测，只做**汇总**与**解释**——所以默认零外网、零副作用。
+    Capability("net.status", "网络层总览：出向三路死活 / 代理内核 / 分流规则集 / P2P 会话 / 会合循环",
+               params=(Param("probe", "bool",
+                             doc="是否真发一个包确认出口 IP（默认 False，纯本地）"),
+                       Param("timeout", "int", doc="probe=True 时的超时秒数，默认 8")),
+               note="只读：默认不出网。probe=True 会打真实目标确认出口 IP/ASN，"
+                    "花时间也花流量——别塞进默认刷新"),
+    Capability("net.route", "问一条路：这个 host 现在走哪条通道、内核起来后规则表会怎么分流",
+               params=(Param("host", "str", doc="目标域名，如 github.com"),
+                       Param("url", "str", doc="也可以直接给 URL，取其 host")),
+               note="只读：把「此刻实际通道」与「规则表预设」分两栏报，"
+                    "内核没起时不许把预设说成事实"),
     Capability("net.nearby", "身边全景（IP + 无线 + 蓝牙三层）",
                params=(Param("no_lan", "bool"), Param("no_wifi", "bool"),
                        Param("no_bt", "bool"))),
@@ -1314,6 +1331,10 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(Host())
     reg.add(ProxyMgr())
     reg.add(ProxyCore())
+    # 网络层总览：不实现任何探测，只把散在六处的状态收成一张脸。
+    # 为什么需要它：net.diagnose() 早就写好了，但它是 CLI 函数、没挂成能力
+    # ⇒ 面板看不见、模型看不见、门禁也测不到。缺的从来不是探测，是出口。
+    reg.add(NetFace())
     reg.add(AdbWifi())
     reg.add(PcControl())
     reg.add(VoiceDevice())
