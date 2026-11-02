@@ -27,7 +27,7 @@ import math
 import random
 import sys
 
-# 🔴 这两个依赖**不许顶层硬 import**（2026-11-03 补）。
+# 🔴 这两个依赖**不许顶层硬 import**（2026-11-02 补）。
 # 原因不是洁癖：`catalog.py` 在模块顶层 `from .kinds.slider_device import ...`，
 # 而 slider_device 又顶层 import 本模块 —— 于是「本机没装 Pillow」会一路炸到
 # `import fleet.catalog`，把**全部 415 条能力**一起带走，连 `/api/caps` 都返不出东西。
