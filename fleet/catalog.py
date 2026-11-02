@@ -59,6 +59,10 @@ from .kinds.protocol_device import ProtocolDevice
 from .kinds.slider_device import SliderDevice
 from .kinds.fp_device import FpDevice
 from .kinds.signup_device import SignupDevice
+from .kinds.paper_device import PaperDevice
+from .kinds.domain_device import DomainDevice
+from .kinds.doc_device import DocDevice
+from .kinds.image_ops import ImageOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -739,6 +743,49 @@ CAPABILITIES = [
     Capability("web.sites", "站群活站清单（只读，不联网）",
                check=_netforce_reason,
                note="看的是本地已攒的那本账，跑 web.diffuse 才会涨"),
+    # ---- 本地资料库（2026-11-03）：数据面攒出来的东西，接进总线才能被 agent 调 ----
+    # 只读、纯本地、不联网；不建索引（主人：按需解析，不做预建全文检索）。
+    Capability("paper.stats", "本地论文库规模（篇数 / 方向 / 来源 / 磁盘）",
+               note="只统计元数据，不解析正文"),
+    Capability("paper.search", "在本地论文库里搜题目/摘要/作者/编号（纯本地，不联网）",
+               params=(Param("q", "str", doc="关键词，空格分隔多个词"),
+                       Param("tag", "str", doc="方向标签：compression / agent / memory-rag"),
+                       Param("limit", "int", doc="默认 20"),
+                       Param("offset", "int", doc="默认 0"))),
+    Capability("paper.get", "取一篇论文的完整元数据",
+               params=(Param("id", "str", True, "arXiv 编号，如 2501.01234")),),
+    Capability("paper.recent", "最近入库的论文",
+               params=(Param("limit", "int", doc="默认 20"),)),
+    Capability("paper.tags", "论文库方向标签分布"),
+    Capability("paper.path", "论文 PDF 的本地路径（只给位置，不解析）",
+               params=(Param("id", "str", True),),
+               note="按需解析的接缝：谁要正文谁拿这个路径去转"),
+    Capability("paper.text", "按需把一篇论文 PDF 转成 Markdown 正文（MarkItDown，开源）",
+               params=(Param("id", "str", True),
+                       Param("max_chars", "int", doc="最多返回多少字符，默认 20000")),
+               note="不缓存、不落索引：只在被调用的这一刻读一个文件"),
+    Capability("domain.stats", "本地域名库规模（总数 / 已分类率 / 类别数）"),
+    Capability("domain.search", "在本地域名库里搜域名/标题/描述/类别（纯本地）",
+               params=(Param("q", "str", doc="关键词"),
+                       Param("category", "str", doc="按类别过滤（子串匹配）"),
+                       Param("limit", "int", doc="默认 20"),
+                       Param("offset", "int", doc="默认 0"))),
+    Capability("domain.get", "取一个域名的完整档案（类别/标题/发现渠道）",
+               params=(Param("domain", "str", True),)),
+    Capability("domain.categories", "域名库类别分布"),
+    Capability("domain.by_category", "按类别列域名",
+               params=(Param("category", "str", True),
+                       Param("limit", "int", doc="默认 50"))),
+    Capability("domain.recent", "最近发现的域名",
+               params=(Param("limit", "int", doc="默认 20"),)),
+    Capability("doc.convert", "任意本地文档转 Markdown（PDF/Word/PPT/Excel/HTML/EPUB，MarkItDown）",
+               params=(Param("path", "str", True, "本地文件路径"),
+                       Param("max_chars", "int", doc="最多返回多少字符，默认 40000")),
+               note="按需转换单文件：不扫全库、不缓存、不建索引"),
+    Capability("doc.read", "任意本地文档转纯文本（同上，去 Markdown 标记）",
+               params=(Param("path", "str", True),
+                       Param("max_chars", "int", doc="默认 40000"))),
+    Capability("doc.formats", "文档转换器支持哪些格式、用的是什么引擎"),
     # ---- 采集内核 skynet（netforce 仓库里的子包）：搜索 / 取正文 / 判活 / 探结构 ----
     Capability("web.search", "多引擎聚合搜索（skynet，带意图校验）",
                params=(Param("query", "str", True),
@@ -858,6 +905,24 @@ CAPABILITIES = [
                        Param("model", "str", doc="模型名，留给桥接层")),
                side_effect=True,
                note="出图落手机 Pictures/fleet/；本节点没接 android_bridge 时如实说「后端未配置」"),
+    # 内容生成的第二条腿（2026-11-03）：手机不在场时用免 key 公网端点兜底。
+    # 之前只有「手机 SdBridge」一条腿，手机一断整块瘫——谁在谁上。
+    Capability("image.free", "免 key 出图（Pollinations，零配置不要 token）",
+               params=(Param("prompt", "str", True, "画面描述"),
+                       Param("width", "int", doc="默认 1024"),
+                       Param("height", "int", doc="默认 1024"),
+                       Param("model", "str", doc="默认 flux"),
+                       Param("out", "str", doc="落盘路径；不给则落 cwd/tmp/")),
+               side_effect=True,
+               note="选路走天网 7891 → 系统代理 → 直连；按魔术字节认格式（实测常回 JPEG）"),
+    Capability("image.info", "看一张 PNG 的尺寸/通道/字节（纯本地只读）",
+               params=(Param("path", "str", True),)),
+    Capability("image.resize", "等比缩一张 PNG（最近邻，够看清布局）",
+               params=(Param("path", "str", True),
+                       Param("out", "str", doc="输出路径；默认原目录 _<w>x<h>"),
+                       Param("max_w", "int", doc="默认 720"),
+                       Param("max_h", "int", doc="默认 1600")),
+               side_effect=True),
     # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
     Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
@@ -1346,6 +1411,12 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(VideoWatch())
     reg.add(JobBoard())
     reg.add(PhoneNode())
+    # 本地资料库三台（2026-11-03）：论文元数据 / 域名分类 / 任意格式文档转换。
+    # 共同点：纯本地只读、按需、不建索引——数据面已经付过带宽成本，缺的只是出口。
+    reg.add(PaperDevice())
+    reg.add(DomainDevice())
+    reg.add(DocDevice())
+    reg.add(ImageOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())
