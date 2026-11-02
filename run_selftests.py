@@ -425,6 +425,17 @@ CASES = [
     # 全离线：自建本地 server 当目标 + 指向死端口的假代理（自己造毒，不依赖本机当前状态）。
     # 锁死：默认直连 / 死代理必报错不静默回退 / 毒环境下 net.urlopen 仍通 / import fleet 全局兜底生效。
     ("eval_t62_net", ["evals/t62_net.py"], HERE, 150),
+    # ---- 补登（2026-11-02 统一图景时清账）----
+    # 这两个脚本写了很久但一直没进 CASES：`_stats.json` 的 orphan_evals 一直报 2，
+    # 没人管。t50 红是因为它自己坏了（pc_melo 未定义 + 引擎循环没按 kind 分流），
+    # 坏掉的脚本没人登记 → 更没人跑 → 一直坏。这就是「写了不跑 = 没写」的活样本。
+    ("eval_t50_voice_synth", ["evals/t50_voice_synth.py"], HERE, 300),
+    # t59 号已被 eval_t59_groups 占了（两支线并行写的），这里用 t59b 不撞号。
+    ("eval_t59b_pinhole", ["evals/t59_pinhole.py"], HERE, 120),
+    # ---- T63：文档 ↔ 代码对齐（统一图景的守门人）----
+    # t54 管「代码 → _stats.json」，t63 管「_stats.json → 正文 + 正文引用是否落地」。
+    # 锁死：自动块必须存在且同步 / 正文不许写累加绝对值 / 引用的文件必须真在 / 游离门禁 0。
+    ("eval_t63_docs_sync", ["evals/t63_docs_sync.py"], HERE, 120),
     # ---- 下载层门禁：解析层的下游（直链/多源/续传/hash校验/任务接口）----
     # 全离线（本地 Range server），与 t60 同源登记，避免「写了不跑=没写」。
     ("eval_t55_download", ["evals/t55_download.py"], HERE, 120),

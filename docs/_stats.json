@@ -1,7 +1,317 @@
 {
-  "gates_registered": 127,
-  "eval_files": 67,
-  "capabilities_catalog": 384,
-  "doc_md": 5,
-  "app_build": "49"
+  "generated_at": "2026-11-02 21:06:59",
+  "gates_registered": 136,
+  "eval_files": 73,
+  "orphan_evals": [],
+  "doc_md": 7,
+  "app_build": "49",
+  "capabilities_declared": 404,
+  "capabilities_owned": 395,
+  "capabilities_live": null,
+  "capabilities_gated": 140,
+  "devices": 39,
+  "devices_live": null,
+  "domains": {
+    "rea": {
+      "declared": 140,
+      "owned": 140,
+      "gated": 0
+    },
+    "pcctl": {
+      "declared": 15,
+      "owned": 15,
+      "gated": 15
+    },
+    "web": {
+      "declared": 14,
+      "owned": 14,
+      "gated": 9
+    },
+    "adb": {
+      "declared": 14,
+      "owned": 14,
+      "gated": 14
+    },
+    "crawl": {
+      "declared": 13,
+      "owned": 13,
+      "gated": 0
+    },
+    "llmgw": {
+      "declared": 13,
+      "owned": 13,
+      "gated": 0
+    },
+    "tun": {
+      "declared": 12,
+      "owned": 12,
+      "gated": 12
+    },
+    "rdv": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 10
+    },
+    "proxy": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 0
+    },
+    "register": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 0
+    },
+    "osint": {
+      "declared": 8,
+      "owned": 8,
+      "gated": 0
+    },
+    "host": {
+      "declared": 8,
+      "owned": 8,
+      "gated": 8
+    },
+    "re": {
+      "declared": 7,
+      "owned": 7,
+      "gated": 3
+    },
+    "pentest": {
+      "declared": 7,
+      "owned": 7,
+      "gated": 0
+    },
+    "nat": {
+      "declared": 6,
+      "owned": 6,
+      "gated": 6
+    },
+    "video": {
+      "declared": 6,
+      "owned": 4,
+      "gated": 1
+    },
+    "card": {
+      "declared": 6,
+      "owned": 6,
+      "gated": 3
+    },
+    "phone": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 2
+    },
+    "net": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 0
+    },
+    "lan": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 5
+    },
+    "job": {
+      "declared": 4,
+      "owned": 4,
+      "gated": 4
+    },
+    "ai": {
+      "declared": 4,
+      "owned": 4,
+      "gated": 4
+    },
+    "render": {
+      "declared": 4,
+      "owned": 4,
+      "gated": 4
+    },
+    "memory": {
+      "declared": 4,
+      "owned": 4,
+      "gated": 3
+    },
+    "email": {
+      "declared": 4,
+      "owned": 4,
+      "gated": 0
+    },
+    "pc": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 1
+    },
+    "radio": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 0
+    },
+    "input": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 3
+    },
+    "ir": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 0
+    },
+    "life": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 0
+    },
+    "proximity": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 0
+    },
+    "download": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 1
+    },
+    "parse": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 1
+    },
+    "mqtt": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 3
+    },
+    "reach": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 2
+    },
+    "artifact": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 3
+    },
+    "voice": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 3
+    },
+    "devfix": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 0
+    },
+    "screen": {
+      "declared": 2,
+      "owned": 2,
+      "gated": 2
+    },
+    "app": {
+      "declared": 2,
+      "owned": 2,
+      "gated": 1
+    },
+    "scene": {
+      "declared": 2,
+      "owned": 2,
+      "gated": 0
+    },
+    "privacy": {
+      "declared": 2,
+      "owned": 2,
+      "gated": 0
+    },
+    "code": {
+      "declared": 2,
+      "owned": 2,
+      "gated": 2
+    },
+    "ssh": {
+      "declared": 2,
+      "owned": 2,
+      "gated": 2
+    },
+    "file": {
+      "declared": 2,
+      "owned": 0,
+      "gated": 2
+    },
+    "skynet": {
+      "declared": 2,
+      "owned": 0,
+      "gated": 2
+    },
+    "audio": {
+      "declared": 2,
+      "owned": 2,
+      "gated": 2
+    },
+    "tree": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 0
+    },
+    "apps": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 1
+    },
+    "notify": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 1
+    },
+    "state": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 1
+    },
+    "bt": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 1
+    },
+    "thermal": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 0
+    },
+    "sentinel": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 0
+    },
+    "hotspot": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 0
+    },
+    "relay": {
+      "declared": 1,
+      "owned": 0,
+      "gated": 0
+    },
+    "shell": {
+      "declared": 1,
+      "owned": 0,
+      "gated": 1
+    },
+    "fleet": {
+      "declared": 1,
+      "owned": 0,
+      "gated": 1
+    },
+    "image": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 1
+    },
+    "device": {
+      "declared": 1,
+      "owned": 1,
+      "gated": 0
+    }
+  },
+  "declared_error": ""
 }

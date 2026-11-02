@@ -1,20 +1,48 @@
 #!/usr/bin/env python
-"""统计数字生成器：门禁数 / eval 文件数 / 能力数 / 文档数 / App build。
+"""统计数字生成器：全项目唯一的数字来源。
 
-总纲 §三 P3-17 与 §六 数字纪律：文档里的一切进度数字必须由本脚本产出，
-禁止手写。手填的进度表必然过期（漂移史：门禁 52/58/67/74 四数并存、
-文档 30+/71/75、能力 87/109/121）。
+总纲 §六 数字纪律：文档里的一切进度数字必须由本脚本产出，禁止手写。
+手填的进度表必然过期（漂移史：门禁 52/58/67/74 四数并存、文档 30+/71/75、
+能力 87/109/121/151/160/380/384）。
 
 用法：
-    python tools/gen_stats.py            # 打印 + 写 docs/_stats.json
-    python tools/gen_stats.py --json     # 只打印 JSON（给人 CI/脚本读）
+    python tools/gen_stats.py                 # 打印 + 写 docs/_stats.json
+    python tools/gen_stats.py --json          # 只打印 JSON
+    python tools/gen_stats.py --probe         # 额外探测「此刻能跑」数（慢、随环境漂移）
+    python tools/gen_stats.py --write-docs    # 刷新 README/总纲 里的自动块
+    python tools/gen_stats.py --check         # 只校验文档自动块是否与代码一致（给门禁用）
+
+--- 为什么口径改了（2026-11-02）---
+
+旧版用 AST 数 `Capability(` 构造器出现次数，得 427；而 `len(catalog.CAPABILITIES)`
+是 404。差的 23 个是「写了构造器但没进清单」的——AST 数的是**打字次数**，
+不是**注册成功的条数**。数字纪律要的是后者，所以改成真 import 后实测。
+
+--- 四层口径（每一层都有可核验来源，不许互相冒充）---
+
+| 层 | 含义 | 来源 | 会随环境漂移吗 |
+|---|---|---|---|
+| declared 声明 | 能力表里挂了多少 | `len(catalog.CAPABILITIES)` | 否（改代码才变） |
+| owned    有主 | 至少一台设备声明支持它 | `registry.owners(name)` | 否（改代码才变） |
+| live     在场 | 此刻 owner 设备 probe 通过 | `registry.availability()` | **是**，须带采样时间 |
+| gated    有门禁 | evals/ 里被真跑过的证据 | 扫 evals/*.py 文本 | 否 |
+
+**「有实现」这个说法本脚本不给数**——它没法自动判，硬给就是自欺。
+想判断「是不是空壳」看 owned 与 gated 的差、再人肉看那个域的代码厚度。
 """
 import ast
 import json
 import os
 import sys
+import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATS_PATH = os.path.join(ROOT, "docs", "_stats.json")
+
+# 文档里自动块的标记。改标记等于改契约，门禁 t63 盯着。
+BEGIN = "<!--STATS:BEGIN-->"
+END = "<!--STATS:END-->"
+DOC_FILES = ["README.md", os.path.join("docs", "总纲_唯一推进依据_2026-10-25.md")]
 
 
 def _read(path):
@@ -22,16 +50,45 @@ def _read(path):
         return f.read()
 
 
-def gate_count():
-    """run_selftests.py 里实注册的用例数（AST 读 CASES，不执行它）。"""
+def _read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------- 门禁侧
+
+def _cases():
+    """run_selftests.py 里 CASES 的字面量（AST 读，不执行）。
+
+    返回 [(name, argv, cwd, timeout), ...]，读不出来返回 []。
+    """
     path = os.path.join(ROOT, "run_selftests.py")
-    tree = ast.parse(_read(path), filename=path)
+    try:
+        tree = ast.parse(_read(path), filename=path)
+    except (OSError, SyntaxError):
+        return []
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
                 getattr(t, "id", "") == "CASES" for t in node.targets):
-            if isinstance(node.value, ast.List):
-                return len(node.value.elts)
-    return 0
+            if not isinstance(node.value, ast.List):
+                continue
+            out = []
+            for el in node.value.elts:
+                if not isinstance(el, ast.Tuple) or len(el.elts) < 2:
+                    continue
+                name = getattr(el.elts[0], "value", "?")
+                argv_node = el.elts[1]
+                argv = []
+                if isinstance(argv_node, ast.List):
+                    argv = [getattr(e, "value", "") for e in argv_node.elts
+                            if isinstance(e, ast.Constant)]
+                out.append((name, argv))
+            return out
+    return []
+
+
+def gate_count():
+    return len(_cases())
 
 
 def eval_file_count():
@@ -42,6 +99,124 @@ def eval_file_count():
         return 0
 
 
+def orphan_evals():
+    """evals/ 里有、但 CASES 没登记的脚本——「写了门禁没人跑」= 等于没写。"""
+    d = os.path.join(ROOT, "evals")
+    try:
+        files = {f for f in os.listdir(d) if f.endswith(".py")}
+    except OSError:
+        return []
+    registered = set()
+    for _name, argv in _cases():
+        for a in argv:
+            a = a.replace("\\", "/")
+            if a.startswith("evals/"):
+                registered.add(os.path.basename(a))
+    return sorted(files - registered)
+
+
+def _eval_text():
+    d = os.path.join(ROOT, "evals")
+    buf = []
+    try:
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".py"):
+                buf.append(_read_bytes(os.path.join(d, fn)))
+    except OSError:
+        pass
+    return "\n".join(buf)
+
+
+# ---------------------------------------------------------------- 能力侧
+
+def _load_registry(probe=False):
+    """真 import 注册表。失败返回 (None, 错误原因)——门禁要能看出降级。"""
+    sys.path.insert(0, ROOT)
+    try:
+        from fleet import catalog
+        reg = catalog.build()
+        return reg, ""
+    except Exception as e:                                  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _declared_names():
+    """catalog.CAPABILITIES 里的名字（不建注册表也能拿到，最稳的一层）。"""
+    sys.path.insert(0, ROOT)
+    try:
+        from fleet import catalog
+        return [c.name for c in catalog.CAPABILITIES], ""
+    except Exception as e:                                  # noqa: BLE001
+        return [], f"{type(e).__name__}: {e}"
+
+
+def capability_layers(probe=False):
+    """四层口径。拿不到注册表时 owned/live 置 None（不是 0——0 会被当成事实）。"""
+    names, err = _declared_names()
+    out = {
+        "capabilities_declared": len(names),
+        "capabilities_owned": None,
+        "capabilities_live": None,
+        "capabilities_gated": None,
+        "devices": None,
+        "devices_live": None,
+        "domains": {},
+        "declared_error": err,
+    }
+    if not names:
+        return out
+
+    gated_text = _eval_text()
+    gated = [n for n in names if n in gated_text]
+    out["capabilities_gated"] = len(gated)
+
+    # 域明细：声明 / 有主 / 有门禁三列一起给，薄域一眼看得出来
+    reg, reg_err = _load_registry()
+    domains = {}
+    for n in names:
+        d = n.split(".", 1)[0]
+        row = domains.setdefault(d, {"declared": 0, "owned": 0, "gated": 0})
+        row["declared"] += 1
+        if n in gated_text:
+            row["gated"] += 1
+
+    if reg is not None:
+        owned = 0
+        for n in names:
+            try:
+                if reg.owners(n):
+                    owned += 1
+                    domains[n.split(".", 1)[0]]["owned"] += 1
+            except Exception:                               # noqa: BLE001
+                pass
+        out["capabilities_owned"] = owned
+        try:
+            out["devices"] = len(reg.devices())
+        except Exception:                                   # noqa: BLE001
+            pass
+
+        if probe:
+            live = 0
+            devices_live = 0
+            try:
+                for row in reg.availability():
+                    if row.get("ok"):
+                        devices_live += 1
+                        live += len(row.get("caps") or [])
+            except Exception:                               # noqa: BLE001
+                live = None
+            out["capabilities_live"] = live
+            out["devices_live"] = devices_live
+            out["live_sampled_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        out["registry_error"] = reg_err
+
+    out["domains"] = dict(sorted(domains.items(), key=lambda kv: -kv[1]["declared"]))
+    return out
+
+
+# ---------------------------------------------------------------- 其它
+
 def doc_count():
     d = os.path.join(ROOT, "docs")
     try:
@@ -51,54 +226,168 @@ def doc_count():
 
 
 def app_build():
-    try:
-        return _read(os.path.join(ROOT, "tianwang_android", "version.txt")).strip()
-    except OSError:
-        return "?"
+    for rel in (os.path.join("tianwang_android", "version.txt"),
+                os.path.join("tianwang_app", "version.txt")):
+        try:
+            return _read(os.path.join(ROOT, rel)).strip()
+        except OSError:
+            continue
+    return "?"
 
 
-def capability_count():
-    """catalog.py 里登记的 Capability(...) 条数（AST 计数，不 import 设备）。"""
-    total = 0
-    fleet_dir = os.path.join(ROOT, "fleet")
-    for dirpath, _, files in os.walk(fleet_dir):
-        for fn in files:
-            if not fn.endswith(".py") or fn.startswith("."):
-                continue
-            path = os.path.join(dirpath, fn)
-            try:
-                tree = ast.parse(_read(path), filename=path)
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Capability":
-                    total += 1
-    return total
-
-
-def collect():
-    return {
+def collect(probe=False):
+    st = {
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "gates_registered": gate_count(),
         "eval_files": eval_file_count(),
-        "capabilities_catalog": capability_count(),
+        "orphan_evals": orphan_evals(),
         "doc_md": doc_count(),
         "app_build": app_build(),
     }
+    st.update(capability_layers(probe=probe))
+    return st
 
+
+# ---------------------------------------------------------------- 文档自动块
+
+def render_block(st):
+    """自动块正文。**这里不许出现落款日期以外的自由文字**——它就是一张表。"""
+    def n(v):
+        return "—" if v is None else str(v)
+
+    lines = [
+        BEGIN,
+        "> 本块由 `python tools/gen_stats.py --write-docs` 生成，**手改会被门禁 t63 打红**。",
+        "> 判断依据写在 `tools/gen_stats.py` 顶部；原始 JSON 在 `docs/_stats.json`。",
+        "",
+        "| 项 | 值 | 口径 |",
+        "|---|---|---|",
+        f"| 声明能力 | **{n(st.get('capabilities_declared'))}** | 能力表里挂了多少 |",
+        f"| 有主能力 | **{n(st.get('capabilities_owned'))}** | 至少一台设备声明支持它 |",
+        f"| 有门禁能力 | **{n(st.get('capabilities_gated'))}** | `evals/` 里有真跑过的证据 |",
+        f"| 设备种类实例 | **{n(st.get('devices'))}** | 注册表里的设备对象数（非型号数） |",
+        f"| 门禁登记 | **{n(st.get('gates_registered'))}** 条 | `run_selftests.py` 的 `CASES` |",
+        f"| eval 文件 | **{n(st.get('eval_files'))}** 份 | `evals/*.py` |",
+        f"| 游离门禁 | **{len(st.get('orphan_evals') or [])}** 份 | 写了但没登记，等于没写 |",
+        f"| 文档 | **{n(st.get('doc_md'))}** 份 | `docs/*.md` |",
+        f"| App build | **{n(st.get('app_build'))}** | `tianwang_android/version.txt` |",
+    ]
+    # 两个缺口也由脚本算——它们是「该去解释的东西」，不是让人记住的数字
+    dec, own, gat = (st.get("capabilities_declared"), st.get("capabilities_owned"),
+                     st.get("capabilities_gated"))
+    lines += ["", "| 缺口 | 条 | 含义 |", "|---|---|---|"]
+    if isinstance(dec, int) and isinstance(own, int):
+        lines.append(f"| 声明 → 有主 | **{dec - own}** | 挂了名字但没有设备认领，调必失败 |")
+    else:
+        lines.append("| 声明 → 有主 | — | 注册表没建起来，这一格不给数 |")
+    if isinstance(own, int) and isinstance(gat, int):
+        lines.append(f"| 有主 → 有门禁 | **{own - gat}** | 有设备说支持，但没有门禁真跑过它（未验 ≠ 坏） |")
+    else:
+        lines.append("| 有主 → 有门禁 | — | 注册表没建起来，这一格不给数 |")
+    orph = st.get("orphan_evals") or []
+    if orph:
+        lines.append("")
+        lines.append("游离未登记：" + "、".join(f"`{x}`" for x in orph))
+    if st.get("capabilities_live") is not None:
+        lines.append("")
+        lines.append(f"在场能力 **{st['capabilities_live']}** 条 / 活设备 **{st.get('devices_live')}** 台"
+                     f"（采样于 {st.get('live_sampled_at')}，随环境漂移，别当契约）。")
+    lines.append("")
+    lines.append(END)
+    return "\n".join(lines)
+
+
+def _splice(text, block):
+    """把 text 里 BEGIN..END 之间整个换掉。找不到标记返回 None。"""
+    i = text.find(BEGIN)
+    if i < 0:
+        return None
+    j = text.find(END, i)
+    if j < 0:
+        return None
+    return text[:i] + block + text[j + len(END):]
+
+
+def write_docs(st):
+    block = render_block(st)
+    touched, missing = [], []
+    for rel in DOC_FILES:
+        path = os.path.join(ROOT, rel)
+        try:
+            text = _read(path)
+        except OSError:
+            missing.append(rel)
+            continue
+        new = _splice(text, block)
+        if new is None:
+            missing.append(rel)          # 没有标记 = 还没接进来，不是错误
+            continue
+        if new != text:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+        touched.append(rel)
+    return touched, missing
+
+
+def check_docs(st):
+    """返回不一致的文档列表；空 = 都同步。"""
+    block = render_block(st)
+    bad = []
+    for rel in DOC_FILES:
+        path = os.path.join(ROOT, rel)
+        try:
+            text = _read(path)
+        except OSError:
+            continue
+        i = text.find(BEGIN)
+        if i < 0:
+            continue                     # 没接自动块的文档不管
+        j = text.find(END, i)
+        if j < 0 or text[i:j + len(END)] != block:
+            bad.append(rel)
+    return bad
+
+
+# ---------------------------------------------------------------- main
 
 def main():
-    st = collect()
+    probe = "--probe" in sys.argv
+    st = collect(probe=probe)
+
+    if "--check" in sys.argv:
+        bad = check_docs(st)
+        if bad:
+            print("文档自动块与代码不一致（改代码后忘了刷新，或有人手改）：")
+            for b in bad:
+                print(f"  - {b}")
+            print("修：python tools/gen_stats.py --write-docs")
+            return 1
+        print("文档自动块与代码一致。")
+        return 0
+
     if "--json" in sys.argv:
         print(json.dumps(st, ensure_ascii=False, indent=2))
         return 0
-    out = os.path.join(ROOT, "docs", "_stats.json")
-    with open(out, "w", encoding="utf-8") as f:
+
+    with open(STATS_PATH, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=2)
         f.write("\n")
+
     print("天网数字（脚本生成，勿手填）：")
-    for k, v in st.items():
-        print(f"  {k}: {v}")
-    print(f"  已写入 {os.path.relpath(out, ROOT)}")
+    for k in ("capabilities_declared", "capabilities_owned", "capabilities_live",
+              "capabilities_gated", "devices", "devices_live",
+              "gates_registered", "eval_files", "doc_md", "app_build"):
+        v = st.get(k)
+        print(f"  {k}: {'—' if v is None else v}")
+    orph = st.get("orphan_evals") or []
+    print(f"  orphan_evals: {len(orph)}" + (f" {orph}" if orph else ""))
+    print(f"  已写入 {os.path.relpath(STATS_PATH, ROOT)}")
+
+    if "--write-docs" in sys.argv:
+        touched, missing = write_docs(st)
+        print(f"  已刷新自动块: {', '.join(touched) if touched else '无'}")
+        if missing:
+            print(f"  未接自动块（跳过）: {', '.join(missing)}")
     return 0
 
 
