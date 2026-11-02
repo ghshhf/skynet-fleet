@@ -50,6 +50,11 @@ def check(cond, msg):
 _SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", "tmp", "build", "build-sd",
     "dist", "out", "shots", ".gradle", ".venv", "venv", "cards", "audio_out",
+    # cargo 的编译产物目录，**不入 Git**（`git ls-files vendor/gitport-accel/target`
+    # 是空的）。里面 .fingerprint/*.json 记的是「上次编译时 clang 在哪」，
+    # 天然是绝对路径 —— 拿它当「代码里写死了盘符」来判是误报。
+    # 2026-11-02 实测：这条误报贡献了 17 处里的 2 处，把真问题淹在噪音里。
+    "target",
 }
 
 #: 只看这些扩展名。别的（png/jsonl 产物）不是「代码」
