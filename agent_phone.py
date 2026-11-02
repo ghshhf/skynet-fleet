@@ -16,6 +16,17 @@ import urllib.request
 import android_device as A
 import phone_ops as P
 
+# 批次1（2026-11-02）：卡死守卫 + 节奏控制。纯标准库依赖，零重依赖。
+try:
+    from fleet.guards import StallGuard, screen_fingerprint
+    from fleet.pacing import OutwardPacing, AppPacing
+except ImportError:
+    # 从仓库根以外运行时也能找到 fleet 包
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from fleet.guards import StallGuard, screen_fingerprint
+    from fleet.pacing import OutwardPacing, AppPacing
+
 MODEL = "dots-studio/dots-3-note-preview:free"
 MODEL_CACHE = os.path.join(os.path.expanduser("~"), ".fleet", "agent_model.json")
 DEFAULT_PORT = 18900
@@ -370,11 +381,14 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
         models = [model] + [m for m in models if m != model]
     log, done_steps = [], []
     feedback = "（还没开始）"
-    repeat = 0
-    fail_streak = 0
-    prev_act = None
+    # 批次1（2026-11-02）：卡死守卫 + 节奏控制
+    guard = StallGuard()
+    pacing_out = OutwardPacing()
+    pacing_app = AppPacing()
+    guard_hint = ""
     for step in range(1, max_steps + 1):
         fg, items, value, rerr = screen_brief(serial)
+        fp = screen_fingerprint(fg, items)
         if not items:
             # 读不到界面就停：没有清单，模型只能瞎猜，跟着瞎点比不点更糟
             log.append({"step": step, "err": "读不到界面，停止", "detail": rerr[:160]})
@@ -385,7 +399,8 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
                 f"已做过的动作：{history}\n"
                 f"可见控件：\n" + "\n".join(items[:40]) +
                 f"\n上一步结果：{feedback}\n"
-                f"先根据输入框内容判断进展到哪了，别重复已经做过的动作。\n"
+                + (f"⚠️ 守卫提醒：{guard_hint}\n" if guard_hint else "")
+                + f"先根据输入框内容判断进展到哪了，别重复已经做过的动作。\n"
                 f"下一步动作（只输出 JSON）：")
         msg = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
         raw, used, errs = "", models[0], []
@@ -427,13 +442,8 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
         if str(act.get("action", "")).lower() == "done":
             log.append({"step": step, "done": act.get("answer", ""), "model": used})
             break
-        # 同一个动作连着来两遍、界面又没变化，就是卡住了，别再烧 token
-        repeat = repeat + 1 if act == prev_act else 0
-        prev_act = act
-        if repeat >= 2:
-            log.append({"step": step, "err": "同一动作重复 3 次，判为卡死，停止",
-                        "action": act})
-            break
+        # 对外节奏：动作打到设备前先按间隔等（防风控烧钱）
+        pacing_out.wait_before()
         r = do(serial, act)
         ok = bool(r.get("ok"))
         changed = r.get("changed")
@@ -441,20 +451,26 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
                    ("，界面已变化" if changed else "，界面没变化（这一下可能没点到）")
         if r.get("note"):
             feedback += "（" + str(r["note"]) + "）"
+        # 卡死守卫：喂入 (指纹, 动作, 是否成功, 界面是否变化)
+        decision = guard.observe(fp, act, ok, bool(changed))
         step_desc = act.get("action", "")
         for k in ("label", "id", "target", "text", "percent", "direction", "package"):
             if act.get(k):
                 step_desc += " " + str(act[k])
         done_steps.append(step_desc.strip())
-        log.append({"step": step, "action": act, "ok": ok, "changed": changed,
-                    "model": used, "note": feedback})
-        # 单步失败不判死：动作多了以后「这次没找到」是很正常的反馈，
-        # 该让模型看了错误自己换招。连错 3 次才是真卡住。
-        fail_streak = 0 if ok else fail_streak + 1
-        if fail_streak >= 3:
-            log.append({"step": step, "err": f"连续 {fail_streak} 次动作失败，停止"})
+        if decision.status == "stop":
+            log.append({"step": step, "action": act, "ok": ok, "changed": changed,
+                        "model": used, "note": feedback, "guard": decision.reason})
             break
-        time.sleep(0.3)
+        if decision.status == "warn":
+            log.append({"step": step, "action": act, "ok": ok, "changed": changed,
+                        "model": used, "note": feedback, "guard_warn": decision.reason})
+            guard_hint = decision.hint
+        else:
+            guard_hint = ""
+        # 屏幕停留节奏：同屏短停、新屏长停（CAREFUL 档新屏更久）
+        is_new = str(act.get("action", "")).lower() in ("back", "home", "open") or bool(changed)
+        pacing_app.pause(fp, is_new=is_new, careful=False)
     return log
 
 
