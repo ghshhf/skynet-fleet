@@ -454,6 +454,10 @@ CASES = [
     # 另含内容生成补强（免 key 出图 + 图片看/缩）。守「可搜、按需解析不落索引、
     # 空库不崩、坏行不整库废」四条。
     ("eval_t72_library_bus", ["evals/t72_library_bus.py"], HERE, 180),
+    # 角色设备接总线（11-03，融合 ElecKoi）：卡不只是一段提示词，是一局有状态的世界。
+    # 守「宏按中文边界渲染 / 世界书按 scan_depth 与 selectiveLogic 选 / 变量事务失败
+    # 一点不改 / 正则两档分明且 EJS 显式跳过 / 坏卡不拖垮卡库」五条。
+    ("eval_t73_persona_bus", ["evals/t73_persona_bus.py"], HERE, 180),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),
