@@ -444,6 +444,11 @@ CASES = [
     ("eval_t68_slider_deps", ["evals/t68_slider_deps.py"], HERE, 120),
     # 指纹层三件套：档案自洽 / 注入正确 / 沙箱隔离（含 23 种矛盾注入的反向验证）
     ("eval_t69_fingerprint", ["evals/t69_fingerprint.py"], HERE, 150),
+    # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
+    # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
+    ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),
+    ("eval_t_ghcode", ["evals/t_ghcode.py"], HERE, 60),
+    ("eval_t_selfindex", ["evals/t_selfindex.py"], HERE, 60),
     # 并行支线（7659e49 卡死守卫 + 节奏控制）写的两个门禁：写了但没登记 = 没写。
     # t63 的「游离门禁 0」当场抓到它们，这正是那条断言存在的意义。
     ("eval_t_guard_stall", ["evals/t_guard_stall.py"], HERE, 120),
