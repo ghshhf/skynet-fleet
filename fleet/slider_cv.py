@@ -27,8 +27,33 @@ import math
 import random
 import sys
 
-import numpy as np
-from PIL import Image
+# 🔴 这两个依赖**不许顶层硬 import**（2026-11-03 补）。
+# 原因不是洁癖：`catalog.py` 在模块顶层 `from .kinds.slider_device import ...`，
+# 而 slider_device 又顶层 import 本模块 —— 于是「本机没装 Pillow」会一路炸到
+# `import fleet.catalog`，把**全部 415 条能力**一起带走，连 `/api/caps` 都返不出东西。
+# 仓库里 vision.py / motion.py / host.py 全用函数内延迟 import，就是这个原因；
+# 本文件是唯一破例的，破的还是最贵的那条路。
+# 现在：模块永远可 import，缺依赖只在真调用时报一句人话。
+try:
+    import numpy as np
+    from PIL import Image
+    _DEPS_ERR = ""
+except Exception as _e:                                  # noqa: BLE001
+    np = None
+    Image = None
+    _DEPS_ERR = ("缺 Pillow/numpy（%s）。装：pip install Pillow numpy"
+                 % (_e,))
+
+
+def deps_ok():
+    """依赖齐不齐。能力声明照旧在（能看见），只是调不动 —— 与 probe 的口径一致。"""
+    return not _DEPS_ERR
+
+
+def _require():
+    if _DEPS_ERR:
+        raise RuntimeError(_DEPS_ERR)
+
 
 # ---------------------------------------------------------------- 阈值（改这里，别散落在函数里）
 
@@ -150,6 +175,7 @@ def detect_gap(bg_img, tile_img, probe=None):
     实测 7x7 MinFilter 后掩码仍剩 1688/1936 px，白边框（245）混进匹配，
     真值窗口 std 从 13 涨到 65、相关系数掉到 0.30。手工砍边最可靠。
     """
+    _require()
     tile_rgba = tile_img.convert("RGBA")
     alpha = np.array(tile_rgba.split()[-1])
     ys, xs = np.nonzero(alpha > 32)
@@ -245,6 +271,7 @@ def detect(bg_img, tile_img, viewport_width=None, probe=None):
     viewport_width 是**关键换算**：极验/腾讯的背景图常是 2x 像素密度
     （图 680px 显示 340px），按图片坐标去拖会差一倍。传了显示宽度就自动换算。
     """
+    _require()
     r = detect_gap(bg_img, tile_img, probe=probe)
     x, basis, conf = solve_gap(r)
     ratio = 1.0
@@ -335,6 +362,7 @@ def to_cdp_events(pts, ts, x0=0.0, y0=0.0, button="left"):
 
 def load_image(src):
     """把路径 / bytes / base64(data-url 也行) 变成 PIL.Image。"""
+    _require()
     if isinstance(src, Image.Image):
         return src
     if isinstance(src, (bytes, bytearray)):
@@ -367,6 +395,7 @@ def _synth(mode="shadow", seed=7, true_x=187, tile=44, w=277, h=160):
       ② sin/cos 图案   → 严格周期，伪峰 0.95 压过真峰，margin 只剩 0.02（真实照片不长这样）
       ③ 正确做法       → 马赛克色块 + 双三次放大 + 高频噪声（≈自然照片频谱，无重复结构）
     """
+    _require()
     rng = np.random.default_rng(seed)
     small = rng.integers(30, 225, size=(h // 8 + 2, w // 8 + 2, 3)).astype(np.uint8)
     base = Image.fromarray(small).resize((w, h), Image.BICUBIC)
