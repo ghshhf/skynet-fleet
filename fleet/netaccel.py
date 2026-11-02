@@ -510,7 +510,12 @@ def _reg_proxy(on, pac_path=None):
             else:
                 winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 0)
                 winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, "")
-                return True, "系统代理已关闭"
+                # ProxyServer 必须一起清空（2026-11-02 事故）：
+                # Python 的 urllib.request.getproxies() 只看 ProxyServer 键「存不存在」，
+                # 不看 ProxyEnable。只关 enable 不清这个值，等于给所有 urllib 请求
+                # 埋一颗地雷 —— 代理进程一停，全站请求 10061 目标计算机积极拒绝。
+                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, "")
+                return True, "系统代理已关闭（并清掉 ProxyServer 残留）"
     except OSError as e:
         return False, f"注册表写入失败（可能需要管理员）：{e}"
 

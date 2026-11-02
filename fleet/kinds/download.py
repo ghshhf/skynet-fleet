@@ -29,6 +29,7 @@ import socketserver
 import http.server
 
 from ..core import BaseDevice, DeviceResult as R
+from .. import net   # 出向唯一正道（网盘 API 也要躲开僵尸 HTTP_PROXY）
 
 
 # ============================ 下载引擎 ============================
@@ -246,7 +247,7 @@ class QuarkClient(PanClient):
         req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'),
                                      headers=self._headers(), method='POST')
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with net.urlopen(req, timeout=60) as r:
                 return json.loads(r.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             try:
