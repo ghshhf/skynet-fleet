@@ -22,6 +22,7 @@ from .vendored_register import REGISTER_CAPABILITIES
 from .vendored_protocol import PROTOCOL_CAPABILITIES
 from .vendored_slider import SLIDER_CAPABILITIES
 from .vendored_fp import FP_CAPABILITIES
+from .vendored_signup import SIGNUP_CAPABILITIES
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
@@ -57,6 +58,7 @@ from .kinds.register_device import RegisterDevice
 from .kinds.protocol_device import ProtocolDevice
 from .kinds.slider_device import SliderDevice
 from .kinds.fp_device import FpDevice
+from .kinds.signup_device import SignupDevice
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1260,6 +1262,7 @@ CAPABILITIES.extend(REGISTER_CAPABILITIES)
 CAPABILITIES.extend(PROTOCOL_CAPABILITIES)
 CAPABILITIES.extend(SLIDER_CAPABILITIES)
 CAPABILITIES.extend(FP_CAPABILITIES)
+CAPABILITIES.extend(SIGNUP_CAPABILITIES)
 
 
 def build(path=None, gate=None, ttl=5.0, with_nodes=True):
@@ -1302,6 +1305,10 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 沙箱（profile 目录 + 出口绑定）比伪装高一级：伪装是假装另一台机器，会被抓矛盾；
     # 沙箱是真的重新出生一次，矛盾天然不存在。
     reg.add(FpDevice())
+    # 注册流水线：邮箱 -> 站点画像 -> 人机交接 -> 接码兜底。
+    # 上一轮用浏览器一次一次点，失败一次猜一次原因，三次还在原地；
+    # 拆成可单独验证的段之后，失败能落到具体是哪一段（L1~L4）。
+    reg.add(SignupDevice())
     reg.add(Internet())
     reg.add(AI())
     reg.add(Host())
