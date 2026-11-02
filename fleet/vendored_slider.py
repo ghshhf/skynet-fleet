@@ -18,12 +18,13 @@
     P3  穿透   滑块在 iframe 里        ← slider.frame（待做：没有跨 iframe 的坐标换算）
     P4  协议   极验 w / 腾讯 collect   ← 不在本族（要跑厂商官方 JS，单独一轮）
 
-能力族 slider.*（4 个）：
+能力族 slider.*（5 个）：
 
-  slider.detect   给背景图 + 滑块图，算出缺口在哪、要拖多远、有多大把握
-  slider.track    给距离，生成一条像人的轨迹（贝塞尔 + Fitts + 钟形速度 + 过冲 + 手抖）
-  slider.drag     把轨迹真发出去（CDP 逐点 dispatchMouseEvent，不是瞬移）
-  slider.auto     detect + track + drag 串起来：给两张图和滑块选择器，一步到位
+  slider.detect     给背景图 + 滑块图，算出缺口在哪、要拖多远、有多大把握
+  slider.track      给距离，生成一条像人的轨迹（贝塞尔 + Fitts + 钟形速度 + 过冲 + 手抖）
+  slider.drag       把轨迹真发出去（CDP 逐点 dispatchMouseEvent，不是瞬移）
+  slider.auto       detect + track + drag 串起来：给两张图和滑块选择器，一步到位
+  slider.solve_page 打真实页面：认墙 → 定位（含 iframe）→ 截图 → 算缺口 → 拖 → **再认墙**
 
 边界（写死）：
 
@@ -91,4 +92,20 @@ SLIDER_CAPABILITIES = [
                 Param("executor", "json", doc="可注入的执行器（门禁用）")),
         side_effect=True,
         note="[SLIDER] 有副作用：会真实拖动页面上的滑块"),
+
+    Capability(
+        "slider.solve_page",
+        "打真实页面的一条龙：认墙 → 定位滑块（含跨域 iframe）→ 截图算缺口 → 拖动 → "
+        "**再认墙确认到底过没过**",
+        params=(Param("port", "int", doc="CDP 端口，默认 9222"),
+                Param("vendor", "str", doc="指定厂商 geetest/tencent/aliyun；不传=自动认"),
+                Param("min_confidence", "str", doc="最低把握，默认 medium"),
+                Param("dry_run", "bool", doc="true=算出来但不拖"),
+                Param("seed", "int", doc="随机种子"),
+                Param("settle", "float", doc="拖完后等页面反应的秒数，默认 2.5"),
+                Param("page", "json", doc="可注入 page 对象（门禁用，注入后不开浏览器）"),
+                Param("executor", "json", doc="可注入的执行器（门禁用）")),
+        side_effect=True,
+        note="[SLIDER] 有副作用：会在真实页面上拖动滑块并提交。"
+             "**passed 三态（true/false/null）如实上报，不把「拖完了」当「过了」**"),
 ]

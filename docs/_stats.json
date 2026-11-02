@@ -1,14 +1,14 @@
 {
-  "generated_at": "2026-11-02 22:07:17",
-  "gates_registered": 140,
-  "eval_files": 77,
+  "generated_at": "2026-11-02 22:21:31",
+  "gates_registered": 142,
+  "eval_files": 79,
   "orphan_evals": [],
   "doc_md": 8,
   "app_build": "49",
-  "capabilities_declared": 414,
-  "capabilities_owned": 405,
+  "capabilities_declared": 415,
+  "capabilities_owned": 406,
   "capabilities_live": null,
-  "capabilities_gated": 147,
+  "capabilities_gated": 149,
   "devices": 41,
   "devices_live": null,
   "domains": {
@@ -117,6 +117,11 @@
       "owned": 5,
       "gated": 5
     },
+    "slider": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 5
+    },
     "job": {
       "declared": 4,
       "owned": 4,
@@ -141,11 +146,6 @@
       "declared": 4,
       "owned": 4,
       "gated": 0
-    },
-    "slider": {
-      "declared": 4,
-      "owned": 4,
-      "gated": 3
     },
     "pc": {
       "declared": 3,

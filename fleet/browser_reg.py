@@ -26,6 +26,7 @@ Playwright 的 sync API 不能跨线程/跨事件循环使用，而天网设备�
 本文件既是库（给 register_device 用），也是 CLI：
     python -m fleet.browser_reg goto '{"url": "https://..."}'
 """
+import base64
 import json
 import os
 import glob
@@ -54,15 +55,30 @@ _ERROR_SELECTORS = ("#main-frame-error", "div.neterror", "#error-information-pop
 
 # 本机常见代理端口，按「越可能是规则代理越优先」排：规则代理能自动分流，
 # 挂上去等于国内直连+国外走节点，比全局代理干净。
-_PROXY_PORTS = (7890, 7897, 10808, 3067, 10809, 1080, 2080)
+# 7891 排第一 —— 那是**天网自有**的 sing-box（proxycore.MIXED_PORT），
+# 不是外部软件。自家内核起来了却不用，等于白起（2026-11-02 踩过）。
+_PROXY_PORTS = (7891, 7890, 7897, 10808, 3067, 10809, 1080, 2080)
 
 
 def detect_proxy():
-    """找本机在听的代理。找不到返回 None（那就直连，如实标注）。"""
-    for env in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY"):
-        v = os.environ.get(env)
-        if v:
-            return v.strip()
+    """找本机该用的代理。找不到返回 None（那就直连，如实标注）。
+
+    **委托给 `net.resolve_proxy()`，这里不再自己实现一套选路。**
+
+    2026-11-02 的教训：`net.py` 曾经「一律直连」，把天网自己起的 sing-box
+    （127.0.0.1:7891）当僵尸配置；同一时刻浏览器层又有一套自己的扫端口逻辑。
+    两套选路各说各话，就会出现「出向层不走代理、浏览器走了、或者反过来」的分叉。
+    选路只该有一个来源。
+    """
+    try:
+        from . import net
+        url, _why = net.resolve_proxy()
+        if url:
+            return url
+        return None                      # net 判定直连 —— 那就直连，别自作主张
+    except Exception:
+        pass
+    # net 不可用时的兜底：按端口扫。7891 排第一，那是天网自有的内核。
     for port in _PROXY_PORTS:
         if _port_busy(port):
             return "http://127.0.0.1:%d" % port
@@ -371,7 +387,32 @@ class Session(object):
         self.browser = self._pw.chromium.connect_over_cdp("http://127.0.0.1:%d" % self.port)
         self.ctx = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        self.ua_fixed = self._fix_headless_ua()
         return self
+
+    def _fix_headless_ua(self):
+        """headless 模式的 UA 里带 "HeadlessChrome"，等于在门口挂块牌子写「我是机器人」。
+
+        过墙本身靠有头（launch 的注释写了 headless 必败），但没理由再自曝一次。
+        这里读浏览器**真实**的 UA，只把 HeadlessChrome 换成 Chrome 再覆盖回去 ——
+        版本号跟着浏览器走，不写死。写死的版本号半年后就是新的破绽。
+
+        注意：`Emulation.setUserAgentOverride` 才能改 navigator.userAgent，
+        `Network.setUserAgentOverride` 只改请求头，页面脚本照样读得到 Headless。
+        """
+        try:
+            ua = self.page.evaluate("() => navigator.userAgent")
+            if not ua or "Headless" not in ua:
+                return False
+            fixed = ua.replace("HeadlessChrome", "Chrome").replace("Headless", "")
+            cdp = self.ctx.new_cdp_session(self.page)
+            cdp.send("Emulation.setUserAgentOverride", {"userAgent": fixed})
+            # **不能 detach**：覆盖是绑在这个 CDP 会话上的，一断开就还原
+            # （实测过：detach 之后 navigator.userAgent 又变回 HeadlessChrome）。
+            self._ua_cdp = cdp
+            return True
+        except Exception:
+            return False                    # 改不了也不能让会话起不来
 
     def __exit__(self, *exc):
         # 只断开：绝不调 browser.close()，那是真关浏览器
@@ -397,6 +438,229 @@ _CHALLENGE_SELECTORS = (
 _BLOCK_TITLES = ("just a moment", "attention required", "请稍候", "安全检查", "ddos-guard")
 
 _RE_ERR = re.compile(r"ERR_[A-Z_]{4,40}")
+
+
+# ---------------------------------------------------------------- 人机验证识别
+
+# 厂商识别表。判据**全部是专用结构**：iframe 域名片段 + 专有 class/id。
+# 绝不认正文关键词 —— 2026-11-02 那次 HF 页面 JS 里到处是 verify/checked，
+# 一判一个假通过。结构是客观的，文案是可变的。
+#
+# 每项：(vendor, kind, iframe 域名片段, 主文档选择器)
+#   kind 决定「怎么打」：
+#     slider         滑块 → slider.detect/track/drag 直接上
+#     click          点选 → 要跑厂商官方 JS 或人工，滑块能力打不了
+#     invisible      无感 → 后台打分，**没有"解"只有"养"**
+#     js_challenge   JS 挑战 → 只能有头浏览器等它自己过
+_VERIFY_RULES = (
+    # Cloudflare 整页挑战排在第一位：它是拦截性的，别的判定都在它之后才轮得到。
+    # **这一条只能靠主文档 DOM，不能靠 iframe 域名**：Turnstile 的 iframe 也在
+    # challenges.cloudflare.com 下、路径同样含 challenge-platform，靠 iframe 分不开，
+    # 会把「一个嵌了 Turnstile 的正常页面」误判成整页被拦（实测踩到）。
+    ("cloudflare_challenge", "js_challenge",
+     (),
+     ("#challenge-form", "#cf-challenge-running", "#challenge-running", "#challenge-stage")),
+    ("cloudflare_turnstile", "invisible",
+     ("challenges.cloudflare.com",),
+     ("div.cf-turnstile", "#cf-turnstile")),
+    ("geetest", "slider",
+     ("geetest.com", "gcaptcha4.geetest.com", "static.geetest.com"),
+     (".geetest_holder", ".geetest_panel", ".geetest_slider", ".geetest_box",
+      "div[class^='geetest_']")),
+    ("tencent", "slider",
+     ("captcha.qq.com", "turing.captcha.qcloud.com", "t.captcha.qq.com"),
+     (".tcaptcha-transform", "#tcaptcha_iframe", ".tcaptcha-body", ".tcaptcha-popup-wrap")),
+    ("aliyun", "slider",
+     # 别用 "aliyun.com" —— 满站都是 aliyun CDN，会把正常页面全判成有墙
+     ("aliyunwaf", "cf.aliyun.com/nocaptcha", "baxia"),
+     ("#nc_1_wrapper", ".nc-container", "#nocaptcha", ".nc_scale", "#baxia-dialog-content")),
+    ("hcaptcha", "click",
+     ("hcaptcha.com",),
+     (".h-captcha", "#hcaptcha")),
+    ("recaptcha", "click",
+     ("recaptcha/api2", "recaptcha/enterprise", "google.com/recaptcha"),
+     (".g-recaptcha",)),
+)
+
+_KIND_ADVICE = {
+    "slider": "滑块：用 slider.detect 算缺口 + slider.drag 拖过去"
+              "（若墙在 iframe 里，先做坐标换算）",
+    "click": "点选：需要跑厂商官方 JS 或人工点选，滑块能力打不了这一类",
+    "invisible": "无感打分：没有可解的东西，只能靠环境与行为「养」，"
+                 "别指望一次通过 —— 这是能力边界，不是失败",
+    "js_challenge": "JS 挑战：只能有头浏览器等它自己过（headless 必败），"
+                    "等 wait_pass 连续稳定",
+}
+
+
+def verify_state(page, max_frames=40):
+    """认出页面上有没有人机验证、是哪一家、什么类型、该怎么打。
+
+    为什么要分类而不是只回一个 blocked：**不同类型走完全不同的解法**。
+    只回 blocked=True，调用方还得再猜一遍自己面对的是什么，等于把问题往后推。
+
+    返回：
+        found    bool     有没有认出来
+        vendor   str      哪一家（认不出为 ""）
+        kind     str      slider / click / invisible / js_challenge / ""
+        advice   str      下一步该干什么（能直接照做的一句话）
+        signals  [str]    命中的具体证据（选择器 / iframe src 片段），可核查
+        matches  [str]    全部命中的 vendor（一个页面可能既有整页挑战又有小组件）
+        frames   [str]    页面上所有 iframe 的 src —— 穿透 iframe 要用（P3）
+    """
+    frames = []
+    try:
+        for el in (page.query_selector_all("iframe") or [])[:max_frames]:
+            try:
+                src = el.get_attribute("src") or ""
+                if src:
+                    frames.append(src)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    blob = " ".join(frames).lower()
+    matches, signals = [], []
+    vendor, kind, advice = "", "", ""
+
+    for vd, kd, src_marks, sels in _VERIFY_RULES:
+        hit = ""
+        for m in src_marks:
+            if m.lower() in blob:
+                hit = "iframe:%s" % m
+                break
+        if not hit:
+            for sel in sels:
+                try:
+                    if page.query_selector(sel):
+                        hit = "dom:%s" % sel
+                        break
+                except Exception:
+                    continue
+        if hit:
+            matches.append(vd)
+            signals.append("%s → %s" % (vd, hit))
+            if not vendor:                     # 规则顺序即优先级
+                vendor, kind = vd, kd
+                advice = _KIND_ADVICE.get(kd, "")
+
+    return dict(found=bool(vendor), vendor=vendor, kind=kind, advice=advice,
+                signals=signals, matches=matches, frames=frames)
+
+
+# ---------------------------------------------------------------- 滑块元素定位（含 iframe）
+
+# 各家的滑块零件选择器。顺序就是试的顺序：先精确的，后兜底的。
+# 为什么需要这张表：`slider.detect` 要两张图（背景 + 滑块块），
+# 而这两张图长得完全取决于厂商，没有通用选择器。
+_SLIDER_HINTS = {
+    "geetest": {
+        # v3 用 canvas 画，v4 用 div 背景图；两代都要覆盖
+        "bg": (".geetest_canvas_bg", "canvas.geetest_canvas_bg", ".geetest_bg"),
+        "slice": (".geetest_canvas_slice", "canvas.geetest_canvas_slice", ".geetest_slice"),
+        "handle": (".geetest_slider_button", ".geetest_btn", ".geetest_slider_btn"),
+    },
+    "tencent": {
+        "bg": (".tcaptcha-bg", "#tcaptcha-bg", ".tcaptcha-normal-bg"),
+        "slice": (),
+        "handle": (".tcaptcha-slider-btn", ".tcaptcha-slider", "#tcaptcha-slider"),
+    },
+    "aliyun": {
+        "bg": ("#nc_1__bg", ".nc-lang-cnt", ".nc_scale"),
+        "slice": (),
+        "handle": ("#nc_1_n1z", ".nc_iconfont.btn_slide", ".nc-slide-block"),
+    },
+}
+
+
+def _safe(fn, default=None):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _frames_of(page):
+    """主 frame 排第一，其余 iframe 按出现顺序。去重靠对象身份。"""
+    out = []
+    main = _safe(lambda: page.main_frame)
+    if main is not None:
+        out.append(main)
+    for f in (_safe(lambda: list(page.frames), []) or []):
+        if f is not main:
+            out.append(f)
+    return out
+
+
+def _elem_box(el):
+    b = _safe(lambda: el.bounding_box())
+    if not b:
+        return None
+    return {"x": round(float(b["x"]), 2), "y": round(float(b["y"]), 2),
+            "w": round(float(b["width"]), 2), "h": round(float(b["height"]), 2)}
+
+
+def locate_slider(page, vendor=None, want_png=False):
+    """在页面（**含跨域 iframe**）里找到滑块的背景图、缺口图、拖动把手。
+
+    为什么必须支持 iframe：极验 v4、腾讯 TCaptcha 的滑块层都在跨域 iframe 里。
+    只查主文档会得出「页面上没有滑块」的假结论 —— 而它其实就长在那儿，只隔了一层。
+    这是 P3，也是 P1 的能力真正能用起来的前提。
+
+    want_png=True 时顺带把两张图截成 base64 返回，可以直接喂给 `slider.detect`。
+    用 base64 而不是 PIL 对象，是为了让结果能被 JSON 序列化（跨进程、进日志都能活）。
+
+    返回里 `in_iframe` 会明确告诉你坐标是哪套坐标系：
+      · False → 主文档的坐标，可直接用
+      · True  → playwright 的 bounding_box 已经换算到主 frame 视口，也能直接用
+                 （这一点实测过：ElementHandle.bounding_box 返回相对主 frame 的坐标，
+                  不需要自己加 iframe 偏移。自己再加一次就错位了。）
+    """
+    vendor = vendor or ""
+    hints = _SLIDER_HINTS.get(vendor)
+    if not hints:
+        # 没指定厂商就按表里全部试一遍
+        merged = {"bg": (), "slice": (), "handle": ()}
+        for h in _SLIDER_HINTS.values():
+            for k in merged:
+                merged[k] = tuple(merged[k]) + tuple(h.get(k, ()))
+        hints = merged
+
+    for idx, frame in enumerate(_frames_of(page)):
+        found = {}
+        for role in ("bg", "slice", "handle"):
+            for sel in hints.get(role, ()):
+                el = _safe(lambda: frame.query_selector(sel))
+                if el is None:
+                    continue
+                box = _elem_box(el)
+                if not box or box["w"] <= 0 or box["h"] <= 0:
+                    continue
+                found[role] = {"selector": sel, "box": box}
+                if want_png:
+                    raw = _safe(lambda: el.screenshot())
+                    if raw:
+                        found[role]["png_b64"] = base64.b64encode(raw).decode("ascii")
+                break
+        if found.get("bg") or found.get("handle"):
+            return {
+                "ok": True,
+                "vendor": vendor or "(auto)",
+                "in_iframe": idx > 0,
+                "frame_url": (_safe(lambda: frame.url, "") or "")[:200],
+                "bg": found.get("bg"),
+                "slice": found.get("slice"),
+                "handle": found.get("handle"),
+                "hint": ("在 iframe 内找到（bounding_box 已是主 frame 视口坐标，"
+                         "不要再自己加偏移）") if idx > 0 else "在主文档找到",
+            }
+
+    return {"ok": False, "vendor": vendor or "(auto)",
+            "err": "没找到滑块元素（遍历了 %d 个 frame）" % len(_frames_of(page)),
+            "tried": {k: list(v) for k, v in hints.items()}}
+
+
 
 
 def wall_state(page):
@@ -440,6 +704,13 @@ def wall_state(page):
             except Exception:
                 continue
 
+    # 厂商级识别。这一步是 2026-11-02 盘点补上的：原来只认 Cloudflare 的 DOM，
+    # 遇到极验/腾讯/阿里的滑块层会判成「没墙」—— 等于闭着眼撞上去，还白白报了「通过」。
+    verify = verify_state(page)
+    if verify["found"] and not blocked:
+        blocked = True
+        reason = "人机验证 %s（%s）" % (verify["vendor"], verify["signals"][0])
+
     # 「还没渲染完」独立成一态：Chromium 导航途中会挂一个 "Loading <url>" 的壳，
     # 页面确实薄，但那不是墙，等一等就好。
     loading = html_len < _MIN_HTML or low.startswith("loading ")
@@ -466,7 +737,7 @@ def wall_state(page):
         reason = "页面是错误页：%s" % err
 
     return dict(blocked=blocked, reason=reason, url=url, error=err, loading=loading,
-                title=title.strip()[:120], html_len=html_len)
+                title=title.strip()[:120], html_len=html_len, verify=verify)
 
 
 def wait_pass(page, timeout=180, poll=2.5, need_stable=2):
