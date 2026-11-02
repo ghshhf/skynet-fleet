@@ -677,6 +677,31 @@ def doaj_pump(kw):
         return []
 
 
+def paperseed_pump(_arg=None):
+    """论文种子泵（2026-11-03）：arXiv 官方 RSS 当种子，零关键词零搜索。
+
+    论文全是公开的，起步根本不用猜关键词——官方 RSS 每天自动更新，
+    单 feed 数百篇最新论文，摘要里还自带最新代码仓库链接（实测 cs.LG
+    单 feed 337 abs + 一批 github 仓库）。产出 abs 页 URL 进队列被爬，
+    abs 页出链（alphaxiv/huggingface/replicate/作者主页等论文生态站）
+    由 consider() 提域入册——种子→论文→生态站三级闭环。
+    """
+    out = []
+    for cat in ("cs.LG", "cs.CL", "cs.AI", "cs.CV", "cs.RO", "stat.ML"):
+        try:
+            h = fetch("https://export.arxiv.org/rss/" + cat, timeout=10)
+            if not h:
+                continue
+            # RSS 是 <link>https://arxiv.org/abs/xxx</link> 标签（无 href 属性）
+            for m in re.finditer(r'<link>https?://arxiv\.org(/abs/[^<\s]+)', h):
+                out.append("https://arxiv.org" + m.group(1))
+            for m in re.finditer(r'github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)', h):
+                out.append("https://github.com/" + m.group(1))
+        except Exception:
+            continue
+    return out[:400]          # 6 feed 全量可达 2000+，截断防队列被论文页灌爆
+
+
 # 英文源（HN/Crossref）必须用英文关键词，中文词命中 0
 KEYWORDS_EN = [k for k in KEYWORDS if not re.search(r"[\u4e00-\u9fff]", k)]
 # 大学站方向关键词：搜"大学官网 + 论文/实验室/开放获取"，命中页再交给爬虫顺着官网往外挖
@@ -1080,6 +1105,7 @@ PUMPS = [
     ("paper_arxiv", arxiv_pump, PAPER_KEYWORDS),
     ("paper_s2", s2_pump, PAPER_KEYWORDS),
     ("paper_doaj", doaj_pump, PAPER_KEYWORDS),
+    ("paper_seed", paperseed_pump, None),   # arXiv RSS 当种子：不用关键词，每天自动新鲜
     ("hn", hn_pump, GH_TOOL_KEYWORDS[:8]),    # HN 只对"项目/工具"类故事有产出
     ("ddg", ddg_pump, KEYWORDS),
     ("tieba", tieba_pump, ZH_RESOURCE_KEYWORDS),
@@ -1102,6 +1128,12 @@ PUMPS = [
     # —— 🔴 GitHub 代码挖域名（2026-11-02 加）：挖自建站/NAS/免费主机，见 ghcode_pump ——
     ("ghcode", ghcode_pump, GHCODE_TARGETS),
 ]
+
+# 产出=「该被爬的页面」的泵：结果注入队列等队列分支 fetch+抽链接，
+# 而不是走 consider() 入册。原因：arXiv abs 页的域名 arxiv.org 入册一次就够了，
+# 但 abs 页**出链**（alphaxiv/huggingface/作者主页/项目站）才是真金——只有爬了
+# abs 页才拿得到。github.com 链接同理：它在 SKIP 黑名单里，走 consider 整批丢弃。
+QUEUE_PUMPS = {"paper_arxiv", "paper_seed"}
 
 
 URL_RE = re.compile(r'https?://[^\s\)\]\>"\'`]+', re.I)
@@ -1772,11 +1804,11 @@ def main():
             # 🔴 泵选择= 加权轮转（借鉴 Scrapy 调度器的自适应思想）：命中率低的源自动降权，
             #    但保留最低出现概率（防止把冷门但独活的源饿死）。这是"命中率优化"的自动化手段。
             name, fn, pool = pick_pump()
-            if fn is gh_pump:
-                # 🔴 GitHub 类泵（github / gh_agi / gh_skill / zh_robot …）的产出是
-                #   "raw.githubusercontent.com/.../README.md" 这类**目录页**，而 raw 域名在
-                #   SKIP 黑名单里 ⇒ 走 consider() 会被整批丢弃（实测每轮 200 条命中 → 0 产出）。
-                #   正确姿势：直接注入队列当种子，等队列分支去爬它、顺藤摸出里面的仓库站。
+            if fn is gh_pump or name in QUEUE_PUMPS:
+                # 🔴 GitHub 类泵（github / gh_agi / gh_skill / zh_robot …）与论文种子泵的
+                #   产出是**该被爬的页面**（raw README / arXiv abs 页），不是资源站本身。
+                #   走 consider() 会被 SKIP/域名去重整批丢弃，正确姿势：直接注入队列当
+                #   种子，等队列分支去爬它、顺藤摸出里面的真实站点。
                 if name == 'github':
                     q = GH_QUERIES[qi % len(GH_QUERIES)]
                     got = fn(q, pg)
@@ -1784,11 +1816,14 @@ def main():
                     if pg > 10:                   # GitHub 搜索最多 1000 条 = 10 页
                         pg, qi = 1, qi + 1
                     label = "%s p%d" % (q, pg - 1)
-                else:
+                elif fn is gh_pump:
                     q = pool[qi % len(pool)]
                     qi += 1
                     got = fn(q, 1)
                     label = str(q)[:40]
+                else:
+                    got = fn()                    # paper_seed：零参数，RSS 自己就是关键词
+                    label = "arxiv-rss"
                 fresh_seed = []
                 with lock:
                     for u in got:
