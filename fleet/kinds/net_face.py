@@ -13,7 +13,7 @@
 
 ## 两条能力
 
-    net.status   只读   一屏看全：出向三路 / 代理内核 / 规则集 / P2P 会话 / 会合
+    net.status   只读   一屏看全：半步圆满层(7891) / 外部拐杖(3067) / 兜底直连 / 代理内核 / 规则集 / P2P 会话 / 会合
     net.route    只读   给一个 host，说清它**会**走哪条、凭什么这么判
 
 ## 纪律（写在这里，因为这里最容易破）
@@ -26,6 +26,10 @@
    都不能让这台设备哑掉——它报的恰恰是「什么都没有」这种状态。
 4. **不改任何状态**。不拉起内核、不写注册表、不点开系统代理。
    要动手的是 `proxy.deploy` / `proxy.core_stop`，不是这里。
+5. **半步圆满是头条，不是并列通道**。天网自有内核(7891) = 半步圆满层 =
+   天网该自起的数据面；系统代理(3067 karing)是外部拐杖（主人开才活），直连是兜底。
+   本设备只报「半步圆满达成与否」，不把 7891 当成「出向三路里平等的一条」。
+   端口探测只在能探到本机回环时才可信——本 shell 探不到回环，判活一律以代码为准。
 
 ## 跟别台的边界（别重复造）
 
@@ -140,14 +144,18 @@ class NetFace(BaseDevice):
             route, route_why = f_route.result()
         registry = NET.reg_proxy_raw()
 
+        # 半步圆满层 = 天网自有数据面（7891），是头条，不是「三路之一」。
+        # 系统代理 3067(karing) 是外部拐杖，直连是兜底——两者都不是天网本事。
         channels = [
-            {"name": "天网自有内核", "url": self_url, "alive": self_alive,
-             "note": None if self_alive else "没起（proxy.deploy 可拉起）"},
-            {"name": "系统代理", "url": sys_url, "alive": sys_alive,
-             "note": sys_note},
+            {"name": "天网自有内核(半步圆满层)", "url": self_url, "alive": self_alive,
+             "note": (None if self_alive
+                      else "半步圆满未达成：需 proxy.deploy 把网接上"
+                           "（节点→7891→系统代理接管），不靠 karing")},
+            {"name": "系统代理(外部拐杖·karing)", "url": sys_url, "alive": sys_alive,
+             "note": (sys_note or "外部软件，主人开才活；不是天网本事")},
             # 直连的 alive 永远是 None：它的「可用性」只能靠真发一个包才知道，
             # 而这层默认不出网。写 None 比写 True 诚实。
-            {"name": "直连", "url": None, "alive": None,
+            {"name": "直连(兜底)", "url": None, "alive": None,
              "note": "兜底通道；不探测就不声明它通"},
         ]
 
@@ -245,22 +253,58 @@ class NetFace(BaseDevice):
                 data["probe"] = {"ok": False,
                                  "error": "%s: %s" % (type(e).__name__, e)}
 
+        # ---- 6. 半步圆满（头条，不是并列通道）：天网自有数据面自举是否达成
+        installed = core.get("installed")
+        sys_on = core.get("system_proxy_on")
+        tun = core.get("tun")
+        missing = []
+        if not installed:
+            missing.append("sing-box 没下载（download_singbox 从 GitHub 拉内核大文件，本身要出网）")
+        elif not self_alive:
+            missing.append("内核装了但没起（proxy.deploy 拉起 7891）")
+        elif not (sys_on or tun):
+            missing.append("7891 起了但系统代理/tun 没接管（deploy 的 enable_proxy）")
+        data["half_ban"] = {
+            "name": "半步圆满",
+            "definition": "天网自有代理数据面(7891)自举成功：不靠 karing，无限下载无限用，除 YouTube 外全通",
+            "achieved": not missing,
+            "missing": missing or None,
+            "egress_verified": ("端到端验证通过（probe 实发出网）"
+                                if (data.get("probe") or {}).get("ok") else None),
+        }
+
         return R.success("net.status", self.name, via=self.via, data=data,
                          ms=round((time.monotonic() - t0) * 1000, 1))
 
     @staticmethod
     def _verdict(self_alive, sys_alive, sys_url, core):
-        """一句话结论。只陈述事实，不给「建议怎么做」——建议是人的事。"""
-        if self_alive:
-            if core.get("installed"):
-                return "7891 在监听，出向走家底"
-            return ("7891 在监听，但 sing-box 二进制没装 —— 监听方不是天网内核，"
-                    "是别的程序占了口")
-        if sys_alive:
-            return "自有内核没起，出向回落系统代理 %s" % sys_url
-        if sys_url:
-            return "自有内核没起；系统代理 %s 是死端口（不挡直连）" % sys_url
-        return "自有内核没起，系统也没设代理 → 只剩直连"
+        """头条讲「半步圆满达成与否」——这是天网该自起的主链路，不是并列通道。
+
+        半步圆满 = 7891 起 + 内核在 + 系统代理/tun 接管；达成后不靠 karing，
+        无限下载无限用，除 YouTube 外全通。只陈述事实，不给「建议怎么做」。
+        """
+        installed = core.get("installed")
+        sys_on = core.get("system_proxy_on")
+        tun = core.get("tun")
+        # 头条：半步圆满达成
+        if self_alive and installed and (sys_on or tun):
+            return "半步圆满达成：7891 起、系统代理接管，不靠 karing"
+        # 7891 在听但不是天网内核（端口被占）
+        if self_alive and not installed:
+            return "7891 在听但不是天网内核（sing-box 没装，端口被别的程序占了）"
+        # 首要缺：内核没下载
+        if not installed:
+            return ("半步圆满未达成：sing-box 还没下载（download_singbox 从 GitHub 拉"
+                    "内核大文件，本身要出网）")
+        # 内核装了但没起
+        if not self_alive:
+            return "半步圆满未达成：内核装了但没起（proxy.deploy 拉起 7891 即可，不靠 karing）"
+        # 起了但没接管
+        if not (sys_on or tun):
+            return "半步圆满差最后一步：7891 起了但系统代理/tun 没接管（deploy 的 enable_proxy=True）"
+        # 兜底表述
+        return ("出向：半步圆满未达成，靠 karing 拐杖顶着" if sys_alive
+                else "出向：半步圆满未达成，只剩直连")
 
     # ------------------------------------------------------------ net.route
 
