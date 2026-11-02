@@ -41,6 +41,7 @@ from .kinds.rdv_auto_layer import RdvAutoLayer
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.download import Download
+from .kinds.parse import Parse
 from .kinds.reverse import Reverse
 from .kinds.rea_device import ReaDevice
 from .kinds.crawler_device import CrawlerDevice
@@ -361,6 +362,24 @@ CAPABILITIES = [
                params=(Param("action", "str", True, "list/status/pause/resume/remove"),
                        Param("task_id", "str", doc="任务 id（status/pause/resume/remove 需要）")),
                note="内存任务表；pause 设暂停标志，resume 从断点续传"),
+    # ---- 解析层（下载层的前置：分享链接 → 直链 + 元数据；把抖音解析开源核心吸收进源码，
+    #      零外部 daemon、零黑盒 exe；X-Bogus/A-Bogus/websign 纯 Python 实现，SM3 用本机 hashlib）----
+    Capability("parse.douyin", "抖音分享链接解析：口令/短链/HTML → aweme_id → 多清晰度无水印直链 + 元数据（吸收 douyin_parse + Douyin_TikTok_Download_API）",
+               params=(Param("share", "str", True, "抖音分享口令/短链/网页 URL，如 https://v.douyin.com/xxxx/"),
+                       Param("cookie", "str", doc="登录态 cookie；缺省读 DOUYIN_COOKIE 或 cookies.txt（无水印直链需有效登录态）"),
+                       Param("download", "bool", doc="解析后直接调下载引擎落盘，默认 False（仅返回直链）"),
+                       Param("dest", "str", doc="download=True 时落盘路径")),
+               note="无水印 trick：play_addr.url_list 中 playwm→play 即得无水印直链（公开方法，非破解）；"
+                    "真实解析需联网 + 有效 cookie。X-Bogus/A-Bogus/websign 三重签名纯 Python 实现"),
+    Capability("parse.resolve", "通用分享链接解析入口：自动识别平台（douyin/tiktok/bilibili/direct）→ 路由到对应解析器",
+               params=(Param("share", "str", True, "任意平台分享链接/口令"),
+                       Param("platform", "str", doc="强制指定平台，跳过自动识别"),
+                       Param("download", "bool", doc="解析后直接下载，默认 False")),
+               note="direct 类型（已是直链）直接 passthrough；tiktok/bilibili 仅登记端点待深读，未编造 API"),
+    Capability("parse.tiktok", "TikTok 分享链接解析（端点已登记，待深读 Douyin_TikTok_Download_API 的 tiktok 分支）",
+               params=(Param("share", "str", True, "TikTok 分享链接"),
+                       Param("download", "bool", doc="解析后下载，默认 False")),
+               note="pending：当前仅登记能力，不返回伪造数据"),
     # ---- 远程 shell 通道（D4：把别人的机器当设备管；只连你拥有/获授权的机器）----
     Capability("ssh.banner", "SSH 版本探测：真读 SSH-2.0 版本行，确认 22 端口上跑的是 sshd",
                params=(Param("host", "str", True, "主机/IP"),
@@ -1234,6 +1253,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(NatTraversal())
     reg.add(Osint())
     reg.add(Download())
+    reg.add(Parse())
     reg.add(Reverse())
     reg.add(ReaDevice())
     reg.add(CrawlerDevice())
