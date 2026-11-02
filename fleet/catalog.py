@@ -42,6 +42,7 @@ from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.download import Download
 from .kinds.parse import Parse
+from .kinds.code_convert import CodeConvert
 from .kinds.reverse import Reverse
 from .kinds.rea_device import ReaDevice
 from .kinds.crawler_device import CrawlerDevice
@@ -380,6 +381,22 @@ CAPABILITIES = [
                params=(Param("share", "str", True, "TikTok 分享链接"),
                        Param("download", "bool", doc="解析后下载，默认 False")),
                note="pending：当前仅登记能力，不返回伪造数据"),
+    # ---- 代码转化层（把「人工照抄参考码」换成「LLM 机器转 + 语法/编译机器验」）----
+    Capability("code.convert", "任意语言参考码 → 目标语言（默认 Python）：复用 llmgw.chat 转译，再跑语法/编译校验",
+               params=(Param("code", "str", True, "源代码文本"),
+                       Param("src", "str", doc="源语言，默认 auto"),
+                       Param("dst", "str", doc="目标语言，默认 python"),
+                       Param("name", "str", doc="源文件名（进 prompt，帮助模型判断语言）"),
+                       Param("model", "str", doc="指定模型；不填则用 class"),
+                       Param("class", "str", doc="模型分类，默认 coder"),
+                       Param("max_tokens", "int", doc="默认 8192"),
+                       Param("timeout", "int", doc="默认 180 秒")),
+               note="LLM 转译，语义等价不保证；verify 仅语法/编译级，拦不住「悄悄改常数」。"
+                    "用在哈希/加密上必须再过标准测试向量门禁"),
+    Capability("code.verify", "代码语法/编译校验（当前支持 python：ast.parse + py_compile）",
+               params=(Param("code", "str", True, "要校验的代码"),
+                       Param("lang", "str", doc="语言，默认 python")),
+               note="只做语法/编译级校验，不做语义证明"),
     # ---- 远程 shell 通道（D4：把别人的机器当设备管；只连你拥有/获授权的机器）----
     Capability("ssh.banner", "SSH 版本探测：真读 SSH-2.0 版本行，确认 22 端口上跑的是 sshd",
                params=(Param("host", "str", True, "主机/IP"),
@@ -1254,6 +1271,7 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(Osint())
     reg.add(Download())
     reg.add(Parse())
+    reg.add(CodeConvert())
     reg.add(Reverse())
     reg.add(ReaDevice())
     reg.add(CrawlerDevice())
