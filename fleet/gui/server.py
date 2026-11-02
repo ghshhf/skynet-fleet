@@ -759,6 +759,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(self._approvals())
         if path == "/api/host":
             return self._json(self._host_panel())
+        if path == "/api/net":
+            # ?probe=1 才真发一个包确认出口 IP/ASN（走网络、要几秒），
+            # 默认纯本地毫秒级 —— 打开面板就往外发包是流量黑洞。
+            q = parse_qs(urlparse(self.path).query)
+            probe = q.get("probe", ["0"])[0] in ("1", "true", "yes")
+            return self._json(self._net_panel(probe=probe))
         if path == "/api/shot":
             return self._shot_png()
         if path == "/api/doctor":
@@ -1691,6 +1697,21 @@ class _Handler(BaseHTTPRequestHandler):
                 "history": hist, "reason": ""}
 
     # ---------------- W3 设备页（主机可视化）----------------
+
+    def _net_panel(self, probe=False):
+        """网络页聚合：直接吐 `net.status` 的 data，界面**不另算一份**。
+
+        跟 `_host_panel` 同一条纪律：状态只有一处来源（能力），前端只负责画。
+        在界面层再探一次端口，就会出现「面板说通、能力说死」的两份真相 ——
+        那时主人对着哪一份判断都可能是错的。
+
+        probe=True 会真的出网确认出口 IP（`?probe=1`），默认只读本地。
+        """
+        gate = lambda *a: (True, "")     # 只读能力，不过闸门
+        args = {"probe": True} if probe else {}
+        r = self.fleet.registry.call("net.status", args=args, gate=gate)
+        return {"ok": r.ok, "err": r.err, "code": r.code, "ms": r.ms,
+                "data": r.data or {}}
 
     def _host_panel(self):
         """设备页的聚合数据：资源条 / 进程表 / 应用清单 / 屏幕预览。

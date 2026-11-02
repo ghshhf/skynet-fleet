@@ -446,6 +446,10 @@ CASES = [
     ("eval_t69_fingerprint", ["evals/t69_fingerprint.py"], HERE, 150),
     # 注册流水线：四段分开 / 失败不互相掩盖 / 不产生假成功（11-03 一轮浏览器乱点换来的）
     ("eval_t70_signup_kit", ["evals/t70_signup_kit.py"], HERE, 150),
+    # 网络层总览（11-03）：不是新探测，是把散在六处的状态收成一条能力。
+    # 守的是「只读不留痕 / 默认不出网 / 缺数据不填默认值 / 一侧炸不塌」这四条，
+    # 外加顶层不许 import 可选依赖（铁律 10 的第五次复发防线）。
+    ("eval_t71_net_face", ["evals/t71_net_face.py"], HERE, 150),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),
