@@ -35,6 +35,12 @@ import socket
 import sys
 import time
 
+ROOT = __import__("os").path.dirname(__import__("os").path.dirname(
+    __import__("os").path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from fleet import text as _fleet_text  # noqa: E402  外部命令输出统一走判定链
+
 OPEN = "OPEN"          # 有人接
 REFUSED = "REFUSED"    # 路通、无人接（RST）
 DROP = "DROP"          # 无响应（丢包 / 主机不在）
@@ -120,15 +126,11 @@ def local_adapters():
     try:
         # 两个坑一起躲：
         # ① 不能直接 text=True —— 中文 Windows 下 PowerShell 吐的是 GBK，
-        #    按 utf-8 解会在读线程里抛 UnicodeDecodeError（还把整个调用带崩）。
-        # ② 所以先拿 bytes，再按 utf-8 → gbk 顺序试。
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, timeout=25)
-        raw = r.stdout or b""
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            text = raw.decode("gbk", errors="replace")
+        #    按 utf-8 解会在读线程里抛 UnicodeDecodeError，stdout 直接变 None。
+        # ② 原来这里按 utf-8 → gbk 两级硬试，解不了就 replace 成问号；现在统一走
+        #    fleet.text：严格 UTF-8 优先，解不了再按评分在 gb18030 / utf-16 之间选。
+        r = _fleet_text.run(["powershell", "-NoProfile", "-Command", ps], timeout=25)
+        text = r.stdout or ""
     except Exception:
         return []
     rows = []

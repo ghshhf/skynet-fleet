@@ -11,6 +11,8 @@ import tempfile
 
 from ..core import DeviceResult as R
 
+from .. import text as _fleet_text
+
 
 def _run(cmd, timeout=120, cwd=None):
     """跑命令，返回 (out, err, code)。首元素若是无扩展名包装器（.cmd/.bat），
@@ -21,8 +23,7 @@ def _run(cmd, timeout=120, cwd=None):
         if _w:
             cmd[0] = _w
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=timeout, errors="replace", cwd=cwd)
+        p = _fleet_text.run(cmd, timeout=timeout, errors="replace", cwd=cwd)
     except subprocess.TimeoutExpired:
         return None, "timeout(%ss)" % timeout, 124
     except Exception as e:

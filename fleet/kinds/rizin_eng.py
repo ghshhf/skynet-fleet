@@ -21,6 +21,8 @@ import subprocess
 
 from ..core import DeviceResult as R
 
+from .. import text as _fleet_text
+
 
 def _rizin_bin():
     for c in ("rizin",):
@@ -49,8 +51,7 @@ def _run(cmds, path, timeout=120):
     flags = ["-e", "bin.relocs.apply=true", "-q"]
     cmdline = [binp] + flags + ["-c", ";".join(cmds), path]
     try:
-        proc = subprocess.run(cmdline, capture_output=True, text=True,
-                              timeout=timeout, errors="replace")
+        proc = _fleet_text.run(cmdline, timeout=timeout, errors="replace")
     except subprocess.TimeoutExpired:
         return None, "rizin 超时(%ss)" % timeout, 124
     return proc.stdout, proc.stderr, proc.returncode
@@ -133,8 +134,8 @@ def _h_objdump(dev, cap, args):
         return R.error(cap, "缺参数 path（待分析文件）", device=dev.name, via=dev.via)
     flags = (args.get("flags") or "-d").strip()
     try:
-        proc = subprocess.run([objdump] + flags.split() + [path],
-                              capture_output=True, text=True, timeout=120,
+        proc = _fleet_text.run([objdump] + flags.split() + [path],
+                              timeout=120,
                               errors="replace")
     except subprocess.TimeoutExpired:
         return R.error(cap, "objdump 超时", device=dev.name, via=dev.via)

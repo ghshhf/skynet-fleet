@@ -50,6 +50,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from ..core import BaseDevice, DeviceResult as R
 
+from .. import text as _fleet_text
+
 # ---------------------------------------------------------------- 只读 shell 白名单
 #
 # 为什么按「首词 + 允许的参数形态」两级放行：只放行首词不够——
@@ -161,7 +163,7 @@ def _run_cmd(cmd, timeout=ADB_TIMEOUT):
     门禁把本函数换掉即可——所以这里不许有任何「直接 subprocess.run」旁路。
     """
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = _fleet_text.run(cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
         return 124, f"命令超时（{timeout}s）：{' '.join(cmd[:3])}"
     except FileNotFoundError as e:

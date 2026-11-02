@@ -21,6 +21,8 @@ import tempfile
 
 from ..core import BaseDevice, DeviceResult as R
 
+from .. import text as _fleet_text
+
 PROMPT_TMPL = """你是严谨的源代码转译器。把下面这段 {src} 代码转成 {dst}。
 
 硬性要求：
@@ -65,8 +67,8 @@ def _verify_python(code):
         with open(path, "w", encoding="utf-8") as f:
             f.write(code)
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
-        p = subprocess.run([sys.executable, "-m", "py_compile", path],
-                           capture_output=True, text=True, timeout=30, env=env)
+        p = _fleet_text.run([sys.executable, "-m", "py_compile", path],
+                           timeout=30, env=env)
         if p.returncode != 0:
             return False, "py_compile 失败: %s" % ((p.stderr or p.stdout or "")[:400])
         return True, "python 语法/编译通过"

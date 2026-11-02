@@ -37,6 +37,8 @@ import subprocess
 import threading
 import time
 
+from . import text as _fleet_text
+
 # ---------------------------------------------------------------- 常量
 
 #: 策略阶梯的固定顺序：**先便宜后贵**。
@@ -222,17 +224,11 @@ def _win_firewall_state():
         return None
 
     # netsh 的输出编码跟着系统区域走：中文 Windows 是 GBK，英文是 cp1252。
-    # 用 text=True 会让 Python 按当前 locale 猜，在 git-bash 下猜成单字节编码，
-    # 中文全变乱码、一个字段都匹配不上（实测过，返回 None 就是这个原因）。
-    # 所以先拿 bytes，再按候选编码逐个试。
-    raw = out.stdout or b""
-    txt = ""
-    for enc in ("gbk", "utf-8", "cp1252"):
-        try:
-            txt = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
+    # 这里原来按 gbk → utf-8 → cp1252 顺序试，**顺序是反的**：GBK 的合法区间极宽
+    # （首 0x81-0xFE / 次 0x40-0xFE），任何 UTF-8 中文都能被它「假成功」解出来，
+    # 于是 utf-8 那一步永远走不到，英文系统上照样全是乱码。
+    # 统一交给 text 层：严格 UTF-8 优先，解不了才按评分在 gb18030 / utf-16 之间选。
+    txt = _fleet_text.decode(out.stdout or b"")
 
     prof, cur = {}, None
     for ln in txt.splitlines():

@@ -41,6 +41,8 @@ from urllib.parse import parse_qs, urlparse
 # 让脚本直接 `python fleet/agent_server.py` 也能 import 同包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fleet import text as _fleet_text  # noqa: E402  外部命令输出统一走判定链
+
 # 🔴 中文 Windows 控制台是 GBK，print 里一个 `⇒` 就能让整个服务起不来。
 # 2026-11-01 真事故：闸门那行提示文案带 `⇒`，`python -m fleet.agent_server`
 # 直接 UnicodeEncodeError 退出，手机端所有 API 全断（表现为「手机连不上」，
@@ -486,8 +488,11 @@ class FleetAgentServer:
 
         def _git(*a):
             try:
-                return subprocess.check_output(
-                    ["git", "-C", root, *a], text=True, timeout=8).strip()
+                # 原来是 subprocess.check_output(..., text=True)：解错时不报错，
+                # stdout 变 None，.strip() 抛 AttributeError 被 except 吞掉 → 静默返回 ""，
+                # 表现就是「git 明明有输出，这里却永远空」。统一走 text 层。
+                return _fleet_text.run(["git", "-C", root, *a], timeout=8,
+                                       check=True).stdout.strip()
             except Exception:
                 return ""
 

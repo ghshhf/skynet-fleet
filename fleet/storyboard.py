@@ -39,6 +39,8 @@ import subprocess
 import tempfile
 import time as _t
 
+from . import text as _fleet_text
+
 # ---------------------------------------------------------------------------
 # 画布
 # ---------------------------------------------------------------------------
@@ -293,7 +295,7 @@ def encode_frames(paths, fps, out_path, size=None):
     cmd += ["-r", str(fps), "-c:v", "libx264", "-preset", "veryfast",
             "-pix_fmt", "yuv420p", "-crf", "20", "-movflags", "+faststart",
             out_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    proc = _fleet_text.run(cmd, timeout=1800)
     try:
         shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
@@ -401,9 +403,9 @@ def tts_local(text, out_wav, voice=None, engine=None, ref=None, ref_text=None,
     ff = _ffmpeg()
     if not ff:
         raise RuntimeError("转 wav 需要 ffmpeg")
-    proc = subprocess.run([ff, "-y", "-i", src, "-ar", "24000", "-ac", "1",
+    proc = _fleet_text.run([ff, "-y", "-i", src, "-ar", "24000", "-ac", "1",
                            "-c:a", "pcm_s16le", out_wav],
-                          capture_output=True, text=True, timeout=timeout)
+                          timeout=timeout)
     try:
         if os.path.abspath(src) != os.path.abspath(out_wav):
             os.remove(src)
@@ -470,7 +472,7 @@ def _edge_tts(text, out_wav, voice=None, rate="+0%", timeout=60, local_err=None)
         raise RuntimeError("edge-tts 合成失败（多半是断网）：%s: %s%s"
                            % (type(e).__name__, e, _note_local(local_err)))
     cmd = [ff, "-y", "-i", mp3, "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", out_wav]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    proc = _fleet_text.run(cmd, timeout=timeout)
     try:
         os.remove(mp3)
     except Exception:
@@ -852,7 +854,7 @@ def _build_audio(b, voices, work, out_path):
     else:
         cmd = [ff, "-y", "-i", voice_track, "-ar", "24000", "-ac", "1",
                "-c:a", "aac", "-b:a", "128k", out_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    proc = _fleet_text.run(cmd, timeout=600)
     if proc.returncode != 0 or not os.path.isfile(out_path):
         raise RuntimeError("混音失败：%s" % (proc.stderr or "")[-240:])
     return out_path
@@ -891,7 +893,7 @@ def _mux(video, audio, out_path):
     ff = _ffmpeg()
     cmd = [ff, "-y", "-i", video, "-i", audio, "-c:v", "copy", "-c:a", "aac",
            "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    proc = _fleet_text.run(cmd, timeout=600)
     if proc.returncode != 0:
         raise RuntimeError("合成音视频失败：%s" % (proc.stderr or "")[-240:])
     return out_path

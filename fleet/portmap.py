@@ -35,6 +35,8 @@ import subprocess
 import sys
 import time
 
+from . import text as _fleet_text
+
 IS_WIN = sys.platform.startswith("win")
 
 NATPMP_PORT = 5351
@@ -62,7 +64,7 @@ def default_gateway():
                 if ip != "0.0.0.0" and ip not in gws:
                     gws.append(ip)
         else:
-            r = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=8)
+            r = _fleet_text.run(["ip", "route"], timeout=8)
             for line in r.stdout.splitlines():
                 if line.startswith("default"):
                     m = re.search(r"via\s+((?:\d{1,3}\.){3}\d{1,3})", line)
