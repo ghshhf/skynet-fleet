@@ -438,6 +438,10 @@ CASES = [
     ("eval_t63_docs_sync", ["evals/t63_docs_sync.py"], HERE, 120),
     ("eval_t64_protocol", ["evals/t64_protocol.py"], HERE, 180),
     ("eval_t65_slider", ["evals/t65_slider.py"], HERE, 180),
+    # 并行支线（7659e49 卡死守卫 + 节奏控制）写的两个门禁：写了但没登记 = 没写。
+    # t63 的「游离门禁 0」当场抓到它们，这正是那条断言存在的意义。
+    ("eval_t_guard_stall", ["evals/t_guard_stall.py"], HERE, 120),
+    ("eval_t_pacing", ["evals/t_pacing.py"], HERE, 120),
     # ---- 下载层门禁：解析层的下游（直链/多源/续传/hash校验/任务接口）----
     # 全离线（本地 Range server），与 t60 同源登记，避免「写了不跑=没写」。
     ("eval_t55_download", ["evals/t55_download.py"], HERE, 120),
