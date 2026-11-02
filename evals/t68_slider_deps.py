@@ -3,7 +3,7 @@
 
 **这条门禁是给一个真实的坑立的碑。**
 
-2026-11-03 核最后一环时发现：`fleet/slider_cv.py` 是全仓库**唯一**在模块顶层
+2026-11-02 核最后一环时发现：`fleet/slider_cv.py` 是全仓库**唯一**在模块顶层
 硬 import numpy/PIL 的文件（vision.py / motion.py / host.py 全在函数内延迟 import）。
 而 `catalog.py` 顶层就 `from .kinds.slider_device import SliderDevice`，slider_device
 又顶层 import slider_cv —— 于是「这台机器没装 Pillow」不会只让滑块不可用，而是
