@@ -62,6 +62,7 @@ from .kinds.signup_device import SignupDevice
 from .kinds.paper_device import PaperDevice
 from .kinds.domain_device import DomainDevice
 from .kinds.doc_device import DocDevice
+from .kinds.persona_device import PersonaDevice
 from .kinds.image_ops import ImageOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
@@ -786,6 +787,72 @@ CAPABILITIES = [
                params=(Param("path", "str", True),
                        Param("max_chars", "int", doc="默认 40000"))),
     Capability("doc.formats", "文档转换器支持哪些格式、用的是什么引擎"),
+    # ---- 角色卡（kind=persona）：读卡 / 起局 / 世界状态 / 正则 / 快照 ----
+    # 来源：ElecKoi（AGPL-3.0）的 MVU 变量与世界书语义，按天网口径重写成零依赖 Python。
+    # 为什么单独一族：card.* 是「找卡/下卡/入库」（卡片商店），persona.* 是「把卡跑起来」
+    # （状态、设定注入、显示规则）——两件事混一起，权限与闸门就没法分开。
+    Capability("persona.cards", "列出本地角色卡（卡库路径 / 张数 / 哪张读不出来）"),
+    Capability("persona.card", "读一张卡的结构化档案（字段字数 / 世界书 / 正则 / 初始状态键）",
+               params=(Param("card", "str", doc="卡 id 或文件名；不给则用 active"),
+                       Param("opening", "int", doc="按第几个开场白算初始态，默认 0")),
+               note="只读；初始态是从 [InitVar] + <initvar> + <json_patch> 算出来的，不改盘"),
+    Capability("persona.lint", "给一张卡做体检（世界书死键 / 坏正则 / 空条目 / 重复关键词）",
+               params=(Param("card", "str", doc="默认 active"),)),
+    Capability("persona.system", "拼这一轮的 system prompt：人设 + 命中设定 + 世界状态（宏已渲染）",
+               params=(Param("card", "str", doc="默认 active"),
+                       Param("messages", "json", doc="最近对话（字符串或字符串数组），用于世界书匹配"),
+                       Param("opening", "int", doc="用第几个开场白，默认 0"),
+                       Param("budget", "int", doc="世界书 token 预算，默认 1500"),
+                       Param("user_name", "str", doc="用户称呼，默认「主人」"),
+                       Param("extra", "str", doc="额外要追加的一段话")),
+               note="不调模型，只产出上下文；世界书按 scan_depth 命中并按预算裁剪，"
+                    "被丢掉的条目会在 dropped 里说明原因"),
+    Capability("persona.state", "看当前世界状态（给 path 取单值，不给给树和摘要）",
+               params=(Param("card", "str", doc="默认 active"),
+                       Param("path", "str", doc="如 stat_data.好感"),
+                       Param("opening", "int", doc="首次起局用第几个开场白")),
+               note="只读：不会创建也不会改动状态文件（首次会按卡算出开局态）"),
+    Capability("persona.patch", "改世界状态（事务：要么全成、要么一点不动）",
+               params=(Param("card", "str", doc="默认 active"),
+                       Param("ops", "json", True, "[{op:replace|add|remove|increment|append|merge, path, value}]"),
+                       Param("note", "str", doc="这次改动的原因，回退时用来找")),
+               side_effect=True,
+               note="写 var/persona_states/：这是可重建的运行态，不是 cards/（她是谁那层）"),
+    Capability("persona.rollback", "回退上一次状态改动（按 note 找最近的记录）",
+               params=(Param("card", "str", doc="默认 active"),
+                       Param("note", "str", doc="只回退含这个关键词的那次")),
+               side_effect=True),
+    Capability("persona.snapshot", "存 / 列 / 恢复状态快照（回到第几条消息时的世界）",
+               params=(Param("card", "str", doc="默认 active"),
+                       Param("action", "str", doc="save（默认）/ list / restore"),
+                       Param("note", "str", doc="快照备注"),
+                       Param("index", "int", doc="restore 用，默认 -1（最后一张）")),
+               side_effect=True),
+    Capability("persona.regex", "按卡里的正则脚本改一段文本（显示档 / 提示词档分开跑）",
+               params=(Param("card", "str", doc="从这张卡取规则；不给则要传 rules"),
+                       Param("text", "str", True),
+                       Param("placement", "int", doc="1 用户输入 / 2 AI 输出（默认）/ 3 斜杠 / 5 世界书 / 6 推理"),
+                       Param("for_prompt", "bool", doc="true=提示词档（默认），false=显示档"),
+                       Param("rules", "json", doc="直接给规则数组，不依赖卡")),
+               note="不执行 EJS：replace 里带 <% %> 的规则会显式跳过并报告，不静默半执行"),
+    Capability("persona.tools", "角色创作要动哪些东西（ElecKoi 创作能力矩阵的中文对照）"),
+    Capability("persona.lore", "让角色自己查设定库（目录 / 搜索 / 读单条，不用等关键词命中）",
+               params=(Param("card", "str", doc="默认 active"),
+                       Param("action", "str", doc="list（默认，给目录）/ search（按词搜）/ read（取正文）"),
+                       Param("q", "str", doc="search 用"),
+                       Param("name", "str", doc="read 用：条目名或其中一段"),
+                       Param("limit", "int", doc="list/search 最多几条，默认 30"),
+                       Param("max_chars", "int", doc="read 正文上限，默认 4000")),
+               note="分层的意义：目录几十 token，正文用到才取——几百条设定的长卡也不炸上下文"),
+    Capability("persona.export", "把卡 + 当前状态 + 世界书 + 正则打成可迁移的作品包",
+               params=(Param("card", "str", doc="默认 active"),
+                       Param("include_state", "bool", doc="是否带上这一局的变量状态，默认 true"),
+                       Param("inline", "bool", doc="是否把整包放进返回值，默认 true")),
+               note="只打包不落盘：要写文件交给 file.write，路径由调用方定"),
+    Capability("persona.import", "读一个作品包并校验（不落盘，入库走 card.ingest 的闸门）",
+               params=(Param("package", "json", doc="JSON 字符串 / 对象"),
+                       Param("path", "str", doc="或给本地文件路径")),
+               note="校验 kind / 卡名 / state 结构；这一步不过闸门，因为它不写任何文件"),
     # ---- 采集内核 skynet（netforce 仓库里的子包）：搜索 / 取正文 / 判活 / 探结构 ----
     Capability("web.search", "多引擎聚合搜索（skynet，带意图校验）",
                params=(Param("query", "str", True),
@@ -1416,6 +1483,9 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(PaperDevice())
     reg.add(DomainDevice())
     reg.add(DocDevice())
+    # 角色卡运行时（2026-11-03）：card.* 是找卡/下卡，persona.* 是把卡跑起来。
+    # 分开注册：状态写入只发生在 var/，跟 cards/ 那层审批闸门不是一回事。
+    reg.add(PersonaDevice())
     reg.add(ImageOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())

@@ -33,6 +33,8 @@ import re
 import struct
 import zlib
 
+import persona_macro  # 宏渲染（中文边界 / 变量 / 显示标记），见 persona_macro.py
+
 # 允许进 system prompt 的字段白名单（其余一律不进）
 _ALLOWED = ("name", "nickname", "description", "personality", "scenario",
             "first_mes", "mes_example", "system_prompt", "post_history_instructions",
@@ -435,36 +437,46 @@ def build_system(data, state=None, extra="", user_name="主人"):
     nick = _clean(data.get("nickname"))
     parts = []
 
+    def _mac(t):
+        """卡里所有正文都过一遍宏。
+
+        🔴 上一版只给 mes_example 做了 {{char}}/{{user}} 替换，description 与
+        system_prompt 里的占位符原样进了提示词，模型会跟着念「大括号 char 大括号」。
+        而 mes_example 那处是裸 `str.replace`：中文卡「{{char}} 说」会变成「她 说」，
+        多出来的空格会让模型跟着断句。统一走 persona_macro.resolve_identity
+        （ElecKoi 的中文边界算法）。
+        """
+        return persona_macro.resolve_identity(_clean(t), char=name, user=user_name)
+
     parts.append(f"你现在扮演「{name}」"
                  + (f"（昵称：{nick}）" if nick else "")
                  + f"，对方是「{user_name}」。")
     parts.append("保持人设：不要跳出角色，不要解释你在扮演，不要旁白动作。")
 
-    desc = _clean(data.get("description"))
+    desc = _mac(data.get("description"))
     if desc:
         parts.append("【你是谁】\n" + desc)
 
-    per = _clean(data.get("personality"))
+    per = _mac(data.get("personality"))
     if per:
         parts.append("【性格】\n" + per)
 
-    sc = _clean(data.get("scenario"))
+    sc = _mac(data.get("scenario"))
     if sc:
         parts.append("【当前情境】\n" + sc)
 
     ex = str(data.get("mes_example") or "").strip()
     if ex:
-        # 把 {{user}}/{{char}} 换成实际名字，否则模型看到占位符会跟着念占位符
-        ex = ex.replace("{{user}}", user_name).replace("{{char}}", name)
-        ex = ex.replace("{{USER}}", user_name).replace("{{CHAR}}", name)
+        # 宏统一在 _mac 里处理（含中文边界）；这处保留原始换行，不走 _clean
+        ex = persona_macro.resolve_identity(ex, char=name, user=user_name)
         parts.append("【说话风格示例】\n" + ex)
 
     # 角色卡自带的 system_prompt：只作为「人设补充」放进内容区，不作为最高指令
-    sp = _clean(data.get("system_prompt"))
+    sp = _mac(data.get("system_prompt"))
     if sp:
         parts.append("【人设补充】\n" + sp)
 
-    phi = _clean(data.get("post_history_instructions"))
+    phi = _mac(data.get("post_history_instructions"))
     if phi:
         parts.append("【对话后期望】\n" + phi)
 
