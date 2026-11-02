@@ -19,6 +19,7 @@ from .vendored_llmgw import LLMGW_CAPABILITIES
 from .vendored_devfix import DEVFIX_CAPABILITIES
 from .vendored_email import EMAIL_CAPABILITIES
 from .vendored_register import REGISTER_CAPABILITIES
+from .vendored_protocol import PROTOCOL_CAPABILITIES
 from .gui.voice import VoiceDevice
 from .kinds.android_phone import AndroidPhone
 from .kinds.ai import AI
@@ -51,6 +52,7 @@ from .kinds.llmgw_device import LlmGwDevice
 from .kinds.devfix_device import DevFixDevice
 from .kinds.email_device import EmailDevice
 from .kinds.register_device import RegisterDevice
+from .kinds.protocol_device import ProtocolDevice
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1251,6 +1253,7 @@ CAPABILITIES.extend(LLMGW_CAPABILITIES)
 CAPABILITIES.extend(DEVFIX_CAPABILITIES)
 CAPABILITIES.extend(EMAIL_CAPABILITIES)
 CAPABILITIES.extend(REGISTER_CAPABILITIES)
+CAPABILITIES.extend(PROTOCOL_CAPABILITIES)
 
 
 def build(path=None, gate=None, ttl=5.0, with_nodes=True):
@@ -1282,6 +1285,9 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 会话层：邮箱解决「拿什么地址」，注册解决「把表单填完过验证码」。两台分开，
     # 谁挂了都不牵连对方——这就是可续。
     reg.add(RegisterDevice())
+    # 协议层：前两级之外不开浏览器的那条腿。造身份→注册/登录→拿会话全走 HTTP，
+    # 是渗透（pentest）+ 逆向（rea）+ 爬虫的汇合点——前三个各自为战，这一层把它们合成一条。
+    reg.add(ProtocolDevice())
     reg.add(Internet())
     reg.add(AI())
     reg.add(Host())
