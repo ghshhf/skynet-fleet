@@ -53,6 +53,8 @@ import sys
 import threading
 import time
 
+from . import text as _fleet_text
+
 MAGIC = 0x2112A442                      # RFC 5389 固定魔数，用来识别「这是 STUN 包」
 MAGIC_B = struct.pack("!I", MAGIC)
 
@@ -797,7 +799,7 @@ def local_ipv4():
     if not out:
         try:
             import subprocess
-            r = subprocess.run(["ipconfig"], capture_output=True, text=True, timeout=5,
+            r = _fleet_text.run(["ipconfig"], timeout=5,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             import re
             for m in re.finditer(r"IPv4[^:]*:\s*((?:\d{1,3}\.){3}\d{1,3})", r.stdout):

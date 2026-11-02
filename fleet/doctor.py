@@ -22,6 +22,8 @@ import urllib.request
 
 from .deps import CAP_DEPS, PROJECT_DEPS, GUI_DEPS, Dep
 
+from . import text as _fleet_text
+
 
 def _default_checker(d: Dep):
     if d.kind == "pip":
@@ -266,7 +268,7 @@ def fix_pips(rep, runner=None):
         return [], None
     cmd = [sys.executable, "-m", "pip", "install"] + pkgs
     if runner is None:
-        runner = lambda c: subprocess.run(c, capture_output=True, text=True)
+        runner = lambda c: _fleet_text.run(c)
     return cmd, runner(cmd)
 
 

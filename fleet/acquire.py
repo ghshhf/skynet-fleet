@@ -24,6 +24,8 @@ from collections import Counter
 import android_device as A
 from .core import DeviceResult as R
 
+from . import text as _fleet_text
+
 # 本机 VLM 端点（手机 llama-server，带 mmproj 即视觉模型）。直连内网、不走系统代理。
 PHONE_VLM_BASE = os.environ.get("PHONE_LLM_BASE", "http://192.168.137.40:8080")
 _VLM_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -391,10 +393,9 @@ def net_survey(duration=20, iface=None):
     caplet = (f"net.recon on; ble.recon on; sleep {int(duration)}; "
               "net.recon off; ble.recon off; net.show; ble.show")
     try:
-        p = subprocess.run([bc, "-iface", iface or _default_iface(),
+        p = _fleet_text.run([bc, "-iface", iface or _default_iface(),
                             "-eval", caplet],
-                           capture_output=True,
-                           timeout=int(duration) + 30, text=True)
+                           timeout=int(duration) + 30)
     except Exception as e:
         return {"ok": False, "err": f"bettercap 运行失败: {e}"}
     txt = (p.stdout or "") + (p.stderr or "")

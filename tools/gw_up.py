@@ -33,6 +33,10 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from fleet import text as _fleet_text  # noqa: E402  外部命令输出统一走判定链
+
 PORT = 8790
 LOG = os.path.join(ROOT, "tmp", "gw8790.log")
 
@@ -94,21 +98,13 @@ def healthy(port=PORT, timeout=4.0):
 def _run_text(cmd, timeout=20):
     """跑个命令拿文本输出。
 
-    **不能直接 text=True**：中文 Windows 的 netstat / tasklist 输出是 GBK，
-    Python 3.12 默认按 utf-8 解码会抛 UnicodeDecodeError（实测 0xbb 就炸），
-    而异常被上层吞掉后表现为「没找到进程」—— 于是 --restart 静默不生效。
-    这正是 GBK 铁律的一个新变种：读外部命令输出也要按系统编码解。
+    历史：这里原本自己按 `locale → utf-8 → gbk` 顺序试解码。用 locale 打头等于把
+    「从哪个终端启动」这个偶然因素重新引进来（Git Bash 下 locale 是 utf-8，cmd 下是
+    cp936），同一份代码两种结果。现已统一交给 fleet.text 的判定链。
     """
-    import locale
-    enc = locale.getpreferredencoding(False) or "utf-8"
-    r = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    out = r.stdout or b""
-    for e in (enc, "utf-8", "gbk"):
-        try:
-            return out.decode(e)
-        except Exception:
-            continue
-    return out.decode("utf-8", "replace")
+    r = _fleet_text.run(cmd, timeout=timeout)
+    return r.stdout or ""
+
 
 
 def find_pids(port=PORT):

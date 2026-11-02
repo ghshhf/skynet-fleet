@@ -15,6 +15,12 @@ import ssl
 import subprocess
 import time
 
+import sys as _sys
+_ROOT = __import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+from fleet import text as _fleet_text
+
 TARGETS = ["34.102.136.180", "34.120.208.123", "35.244.181.201", "74.125.24.190"]
 SNIS = ["www.google.com", "www.youtube.com", "pypi.org", "cloudflare.com"]
 
@@ -47,11 +53,9 @@ def quic_curl(url: str) -> str:
     if not exe:
         return "无 curl"
     try:
-        r = subprocess.run(
-            [exe, "-sS", "--http3-only", "--max-time", "10", "-o", "/dev/null",
+        r = _fleet_text.run([exe, "-sS", "--http3-only", "--max-time", "10", "-o", "/dev/null",
              "-w", "code=%{http_code}", url],
-            capture_output=True, text=True, timeout=15,
-        )
+            timeout=15)
         out = (r.stdout or "") + (r.stderr or "")
         if "not supported" in out or "unrecognized" in out or "unknown" in out.lower():
             return "curl 不支持 h3（无法判定）"

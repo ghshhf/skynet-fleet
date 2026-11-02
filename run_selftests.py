@@ -463,6 +463,7 @@ CASES = [
     # 守「旧写法确实坏 / 新写法必是完整 payload / 失败不毁旧文件 / 1.5 万条往返一致
     # / 三个真实写点接线到位 / 并发不留残留」六条。
     ("eval_t74_durable", ["evals/t74_durable.py"], HERE, 180),
+    ("eval_t75_text_clock", ["evals/t75_text_clock.py"], HERE, 240),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),

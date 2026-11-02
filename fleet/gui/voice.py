@@ -69,6 +69,7 @@ from ..core import BaseDevice, DeviceResult as R
 from ..core.registry import (CANCEL_WORDS, CONFIRM_WORDS, VOICE_CONFIRM_KEY,
                               VOICE_ROUND_KEY, VOICE_SOURCE_KEY,
                               VOICE_SOURCE_ROUND_KEY, classify_voice_confirmation)
+from .. import text as _fleet_text
 
 # ---------------------------------------------------------------- 路径与常量
 
@@ -301,8 +302,7 @@ def _run_polaris(wav_path, mode, timeout=300, extra=None):
     if extra:
         cmd.extend(extra)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=env)
+        p = _fleet_text.run(cmd, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         raise VoiceError("语音%s超时（%d 秒）：模型可能还在首次加载（CPU 上首次约 5~15 秒），或音频太长"
                          % ("识别" if mode == "hear" else "合成", timeout))

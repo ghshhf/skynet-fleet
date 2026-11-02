@@ -31,6 +31,8 @@ import socket
 import subprocess
 import sys
 
+from . import text as _fleet_text
+
 # GBK 防线（2026-11-01 铁律）：本文件输出含 ✓ ✗ 【】→ 等 GBK 外字符，
 # 中文 Windows 控制台默认 cp936，一个编码不到的字符就把整个命令炸死。
 # 统一在入口重配为 UTF-8，替换模式兜底，永不因打印字符崩。
@@ -175,24 +177,17 @@ def is_running():
 
 
 def _safe_run(cmd, timeout=10, cwd=None):
-    """跑命令，安全解码输出（中文 Windows 的 netstat/taskkill 是 GBK，不能 text=True 硬解）。"""
+    """跑命令拿文本（netstat / taskkill 在中文 Windows 上吐 GBK）。
+
+    历史：这里原本自己按 `utf-8 → gbk → cp936` 顺序试解，解不出来就留空串，
+    调用方拿到空串后表现成「没找到进程」。现在统一走 fleet.text。
+    """
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=cwd)
+        r = _fleet_text.run(cmd, timeout=timeout, cwd=cwd)
     except Exception as e:
         return -1, "", str(e)
-    out = ""
-    for enc in ("utf-8", "gbk", "cp936"):
-        try:
-            out = r.stdout.decode(enc, "strict") if r.stdout else ""
-            break
-        except UnicodeDecodeError:
-            continue
-    if r.stderr:
-        try:
-            out += r.stderr.decode("gbk", "replace")
-        except Exception:
-            pass
-    return r.returncode, out, ""
+    return r.returncode, (r.stdout or "") + (r.stderr or ""), ""
+
 
 
 def _find_pid_on_port(port):
@@ -373,17 +368,13 @@ def git_proxy(on):
     try:
         if val:
             for k in ("http.proxy", "https.proxy"):
-                subprocess.run(
-                    ["git", "config", "--global", k, val],
-                    capture_output=True, text=True, timeout=10, check=True,
-                )
+                _fleet_text.run(["git", "config", "--global", k, val],
+                    timeout=10, check=True)
             return True, f"git 代理已设 {val}（仅 GitHub 系域名经 gitport）"
         else:
             for k in ("http.proxy", "https.proxy"):
-                subprocess.run(
-                    ["git", "config", "--global", "--unset", k],
-                    capture_output=True, text=True, timeout=10,
-                )
+                _fleet_text.run(["git", "config", "--global", "--unset", k],
+                    timeout=10)
             return True, "git 代理已清除"
     except (OSError, subprocess.SubprocessError, subprocess.CalledProcessError) as e:
         return False, f"git 配置失败：{e}"
@@ -543,10 +534,8 @@ def status():
 
 def _git_proxy_state():
     try:
-        r = subprocess.run(
-            ["git", "config", "--global", "--get", "http.proxy"],
-            capture_output=True, text=True, timeout=10,
-        )
+        r = _fleet_text.run(["git", "config", "--global", "--get", "http.proxy"],
+            timeout=10)
         v = (r.stdout or "").strip()
         return v if v else None
     except (OSError, subprocess.SubprocessError):

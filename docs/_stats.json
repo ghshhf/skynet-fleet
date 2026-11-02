@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-11-03 05:23:01",
-  "gates_registered": 153,
-  "eval_files": 90,
+  "generated_at": "2026-11-03 05:40:32",
+  "gates_registered": 154,
+  "eval_files": 91,
   "orphan_evals": [],
-  "doc_md": 17,
+  "doc_md": 18,
   "app_build": "49",
   "capabilities_declared": 471,
   "capabilities_owned": 462,
