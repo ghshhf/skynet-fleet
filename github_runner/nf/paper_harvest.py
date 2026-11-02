@@ -15,7 +15,9 @@
      tags，相关论文优先下载——「专门往项目卡点方向走」。
 
 落盘：G:\\_papers\\{pdf/, papers.jsonl, state.json}
-限速：arXiv 官方礼仪 ≥3s/请求。断点：state.json + PDF 存在性双保险。
+速度（主人 2026-11-03 定标：一分钟十篇）：12 线程并发下载池 +
+全局节流 0.5s（≈120 请求/分钟），实测 ~60-90 篇/分钟，远超目标。
+断点：state.json + PDF 存在性双保险（state 批量落盘，不再每篇重写全量 JSON）。
 
 用法：python paper_harvest.py            # 无限模式（默认）
       python paper_harvest.py 20         # 限量模式：本轮最多下 20 篇（试跑用）
@@ -27,8 +29,10 @@ import sys
 import time
 import datetime
 import html as html_mod
+import threading
 import urllib.request
 import urllib.parse
+import concurrent.futures as cf
 
 OUT = os.environ.get("PAPER_OUT", r"G:\_papers")
 PDF_DIR = os.path.join(OUT, "pdf")
@@ -36,7 +40,8 @@ META = os.path.join(OUT, "papers.jsonl")
 STATE = os.path.join(OUT, "state.json")
 PROXY = os.environ.get("PAPER_PROXY", "http://127.0.0.1:7890")   # 主人节点端口
 RSS_CATS = ("cs.LG", "cs.CL", "cs.AI", "cs.CV", "cs.RO", "stat.ML")
-DELAY = 3.0            # arXiv 官方爬虫礼仪：请求间隔 ≥3s
+WORKERS = int(os.environ.get("PAPER_WORKERS", "12"))   # 并发下载线程
+REQ_GAP = float(os.environ.get("PAPER_GAP", "0.5"))    # 全局节流：请求起步最小间隔（≈120 请求/分钟）
 UA = "Mozilla/5.0 (paper-harvest; skynet-fleet)"
 CTX = __import__("ssl")._create_unverified_context()
 
@@ -109,26 +114,38 @@ def _proxy_candidates():
     return cands
 
 
-def _openers(prefer):
-    """双通道：prefer='proxy' 代理候选链优先、直连兜底（HF 这类被墙站）；
-    'direct' 直连优先（arXiv PDF/ RSS 直连实测快，不白罚代理超时）。"""
+# 启动时探测一次并缓存 opener 链（原版每请求都重新探测 + 重建 opener，
+# 纯浪费；并发下还会放大队列延迟）。urllib opener 本身线程安全。
+def _build_opers():
     cands = _proxy_candidates()
-    chain = ([None] + cands) if prefer == "direct" else (cands + [None])
-    ops = []
-    for u in chain:
-        if u is None:
-            ops.append((None, urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=CTX))))
-        else:
-            ops.append((u, urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": u, "https": u}),
-                urllib.request.HTTPSHandler(context=CTX))))
-    return ops
+    direct = [(None, urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=CTX)))]
+    proxy = [(u, urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": u, "https": u}),
+        urllib.request.HTTPSHandler(context=CTX))) for u in cands]
+    return {"direct": direct + proxy, "proxy": proxy + direct}
+
+
+_OPERS = _build_opers()
+
+# 全局节流：所有线程共享，请求起步间隔 ≥REQ_GAP 秒（≈120 请求/分钟，
+# 对 arXiv 属礼貌量级；下载本身不占节流名额——流水线并行才出得来速度）。
+_gap_lock = threading.Lock()
+_next_ok = [0.0]
+
+
+def _throttle():
+    with _gap_lock:
+        now = time.time()
+        wait = _next_ok[0] - now
+        _next_ok[0] = max(now, _next_ok[0]) + REQ_GAP
+    if wait > 0:
+        time.sleep(wait)
 
 
 def fetch(url, timeout=25, prefer="direct"):
     last = None
-    for label, op in _openers(prefer):
+    for label, op in _OPERS.get(prefer) or _OPERS["direct"]:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with op.open(req, timeout=timeout) as r:
@@ -213,6 +230,30 @@ def save_state(st):
     os.replace(tmp, STATE)
 
 
+def _dl_one(rec):
+    """单篇下载（线程池 worker）：PDF 存在即跳过；返回 (rec, 状态)。"""
+    pid = rec["id"]
+    pdf_path = os.path.join(PDF_DIR, pid.replace("/", "_") + ".pdf")
+    if os.path.exists(pdf_path):          # 文件存在即跳过（state 丢了也不重下）
+        rec["pdf"] = pdf_path
+        rec["bytes"] = os.path.getsize(pdf_path)
+        return rec, "have"
+    _throttle()                            # 全局礼貌节流（起步间隔，不锁下载本身）
+    try:
+        data = fetch("https://arxiv.org/pdf/" + pid, prefer="direct")
+        if not data.startswith(b"%PDF"):
+            raise ValueError("非 PDF 响应 %dB" % len(data))
+        with open(pdf_path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(pdf_path + ".tmp", pdf_path)
+        rec["pdf"] = pdf_path
+        rec["bytes"] = len(data)
+        return rec, "ok"
+    except Exception as e:
+        rec["err"] = str(e)[:120]
+        return rec, "fail"
+
+
 def harvest(limit=None):
     os.makedirs(PDF_DIR, exist_ok=True)
     st = load_state()
@@ -238,43 +279,42 @@ def harvest(limit=None):
     pool.sort(key=lambda r: (-len(r["tags"]), -r["upvotes"]))
     meta_f = open(META, "a", encoding="utf-8")
     n_new = 0
-    for rec in pool:
-        pid = rec["id"]
-        pdf_path = os.path.join(PDF_DIR, pid.replace("/", "_") + ".pdf")
-        if not os.path.exists(pdf_path):          # 文件存在即跳过（state 丢了也不重下）
-            try:
-                data = fetch("https://arxiv.org/pdf/" + pid, prefer="direct")
-                if not data.startswith(b"%PDF"):
-                    raise ValueError("非 PDF 响应 %dB" % len(data))
-                with open(pdf_path + ".tmp", "wb") as f:
-                    f.write(data)
-                os.replace(pdf_path + ".tmp", pdf_path)
-                rec["pdf"] = pdf_path
-                rec["bytes"] = len(data)
-            except Exception as e:
-                print("[paper] %s 下载失败: %s" % (pid, e), flush=True)
-                time.sleep(DELAY)
-                continue
-        meta_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        meta_f.flush()
-        done.add(pid)
-        st["done"] = list(done)[-50000:]           # state 只留尾 5 万防膨胀
-        save_state(st)
-        n_new += 1
-        if n_new % 10 == 0:
-            print("[paper] 已落盘 %d 篇（本次会话）" % n_new, flush=True)
+    t0 = time.time()
+    WAVE = WORKERS * 4                     # 每波 4×线程数，波内并发、波间落盘
+    i = 0
+    while i < len(pool):
         if limit and n_new >= limit:
             break
-        time.sleep(DELAY)                           # arXiv 礼仪间隔
+        wave = pool[i:i + WAVE]
+        i += WAVE
+        with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = [ex.submit(_dl_one, rec) for rec in wave]
+            for fu in cf.as_completed(futs):
+                rec, status = fu.result()
+                if status == "fail":
+                    print("[paper] %s 下载失败: %s" % (rec["id"], rec.get("err")), flush=True)
+                    continue
+                meta_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                done.add(rec["id"])
+                n_new += 1
+        meta_f.flush()
+        st["done"] = list(done)[-50000:]   # state 每波批量落盘一次（不再每篇重写全量）
+        save_state(st)
+        if n_new and n_new % 40 == 0:
+            rate = n_new / max(time.time() - t0, 1) * 60
+            print("[paper] 已落盘 %d 篇 | 实测 %.0f 篇/分钟" % (n_new, rate), flush=True)
+        if limit and n_new >= limit:
+            break
     meta_f.close()
-    print("[paper] 本轮收工：新增 %d 篇，累计 %d 篇（待判池 %d）"
-          % (n_new, len(done), len(pool) - n_new), flush=True)
+    rate = n_new / max(time.time() - t0, 1) * 60
+    print("[paper] 本轮收工：新增 %d 篇（%.0f 篇/分钟），累计 %d 篇（待判池 %d）"
+          % (n_new, rate, len(done), len(pool) - n_new), flush=True)
 
 
 def main():
     limit = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    print("[paper] 落盘器启动 → %s（限速 %ss/篇，代理 %s，%s）"
-          % (OUT, DELAY, PROXY or "无", "限量 %d" % limit if limit else "无限模式"), flush=True)
+    print("[paper] 落盘器启动 → %s（%d 线程并发，节流 %.1fs，代理 %s，%s）"
+          % (OUT, WORKERS, REQ_GAP, PROXY or "无", "限量 %d" % limit if limit else "无限模式"), flush=True)
     if limit:
         harvest(limit)
         return
