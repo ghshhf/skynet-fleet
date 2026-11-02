@@ -122,10 +122,23 @@ class AutoLink:
                  verify_every=DEFAULT_VERIFY_EVERY, deep_every=DEFAULT_DEEP_EVERY,
                  republish_every=DEFAULT_REPUBLISH_EVERY, state_path=STATE_PATH,
                  publish_fn=None, verify_fn=None, clock=None, port=0,
-                 auto_pinhole=None, pinhole_fn=None):
+                 auto_pinhole=None, pinhole_fn=None, headers: dict = None):
         self.rdv = rdv or rdv_mod.Rendezvous()
         self.origin = (origin or os.environ.get("FLEET_WSRELAY") or "").strip()
         self.secret = (secret or os.environ.get("FLEET_WSRELAY_SECRET") or "").strip()
+        # 中继外面可能还套了一层网关（Daytona preview 自带一道 Bearer 鉴权）。
+        # 那是**外层**的凭据，和本层的 WSRELAY_SECRET 是两回事，不能混用。
+        # 用环境变量传（FLEET_WSRELAY_HEADERS，JSON），别硬编码在源码里。
+        self.headers = dict(headers or {})
+        if not self.headers:
+            try:
+                raw = os.environ.get("FLEET_WSRELAY_HEADERS", "").strip()
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        self.headers = {str(k): str(v) for k, v in parsed.items()}
+            except Exception:
+                self.headers = {}
         self.interval = float(interval)
         self.verify_every = float(verify_every)
         self.deep_every = float(deep_every)
@@ -389,12 +402,13 @@ class AutoLink:
             return self.publish_fn(self.rdv)
         # port 必须带上：只有 IP 的记录对端用不上，墙外自检也会变成无效实验
         return self.rdv.publish(self.origin, self.secret, deep=False, force=False,
-                                port=self.port)
+                                port=self.port, headers=self.headers)
 
     def _do_verify(self):
         if self.verify_fn is not None:
             return self.verify_fn(self.rdv)
-        return self.rdv.verify(self.origin, self.secret, port=self.port)
+        return self.rdv.verify(self.origin, self.secret, port=self.port,
+                               headers=self.headers)
 
     def _finish(self, now, ok, status, err="", events=None, published=None,
                 verify=None, note="", err_kind="", pinhole=None):
