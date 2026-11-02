@@ -22,6 +22,14 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+# 落盘统一走仓库的 store 层：唯一临时名（防两个写者交错）+ 分级 fsync。
+# 根目录插进 sys.path 才能 import fleet；这里显式 import sys，别依赖文件末尾那句。
+import sys as _sys
+_FLEET_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _FLEET_ROOT not in _sys.path:
+    _sys.path.insert(0, _FLEET_ROOT)
+from fleet import store as _store  # noqa: E402
+
 PROXY = os.environ.get("NETFORCE_PROXY", "")   # 置空字符串 = 全程直连
 # 云端（GitHub Actions）没有本机代理，默认直连；本地调试时设 NETFORCE_PROXY 即可复用同一份代码。
 CTX = ssl.create_default_context()
@@ -1554,11 +1562,12 @@ def main():
     dirty = {'t': time.time(), 'n': 0}  # 脏标记：定时/定量批量落盘，避免 O(N²) 写盘
 
     def flush_now():
-        tmp = out + '.tmp'
+        # 走 store：唯一临时名（旧写法用共享的 out+'.tmp'，两个写者会交错写出
+        # 「A 的头 + B 的尾」这种能解析但内容错的文件）。
+        # 这里 fsync=False 是故意的：热路径每 20 条就刷一次，真断电最多丢几秒，
+        # 下一次 flush 会重写；拿确定性换吞吐不划算。
         with lock:
-            json.dump(collected, open(tmp, 'w', encoding='utf-8'),
-                      ensure_ascii=False, indent=2)
-            os.replace(tmp, out)       # 原子替换，防中断留半截文件
+            _store.atomic_write_json(out, collected, indent=2, fsync=False)
             dirty['t'], dirty['n'] = time.time(), 0
 
     def maybe_flush(_n=None):

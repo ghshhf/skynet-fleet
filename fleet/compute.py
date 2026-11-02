@@ -57,6 +57,7 @@ import urllib.error
 import urllib.request
 
 from . import ai_backends as AB          # 复用失败分类（auth/rate/transient 已经有判据）
+from . import store as _store              # 统一落盘层（唯一临时名 + fsync）
 
 # ---------------------------------------------------------------------------
 # 存哪
@@ -233,17 +234,14 @@ def _read_json(path):
 
 
 def _write_json(path, obj, secret=False):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-    if secret:
-        # POSIX 上真收紧；Windows 上 chmod 基本无效，所以不假装它是道防线。
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+    """写 JSON —— 一律走 fleet.store。
+
+    2026-11-03 之前这里是「tmp = path + '.tmp' + os.replace」：临时名是**共享**的，
+    两个写者（后台任务 + 手动命令）同时写会交错成「A 的头 + B 的尾」，仍是合法 JSON，
+    坏得没人发现；而且没有 fsync，断电后可能拿半截文件顶掉好的那份。
+    secret=True 在 POSIX 上顺手收成 0600；Windows 上 chmod 基本无效，不假装它是防线。
+    """
+    _store.atomic_write_json(path, obj, indent=2, perm=0o600 if secret else None)
 
 
 def _load():
