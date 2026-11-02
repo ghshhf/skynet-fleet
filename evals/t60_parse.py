@@ -7,7 +7,9 @@
   3. 无水印 trick（playwm → play）
   4. 三重签名非空（X-Bogus / A-Bogus / websign）
   5. SM3 标准向量（"abc" → 66c7f0f4...，本机 hashlib 兜底）
-  6. 真实 invoke parse.resolve(download=True) 端到端：本地直链 → 下载引擎落盘字节数一致
+  6. 免登录：详情接口 URL 不含任何签名参数、默认不要求 cookie
+  7. 分享页兜底：_ROUTER_DATA 括号匹配 + item 节点定位
+  8. 真实 invoke parse.resolve(download=True) 端到端：本地直链 → 下载引擎落盘字节数一致
 """
 import os
 import sys
@@ -28,6 +30,8 @@ from fleet.kinds.parse import (
     Parse, extract_url, detect_platform, DouyinResolver,
     XBogus, ABogus, WebSign, _sm3,
 )
+
+NO_LOGIN_ENDPOINT = "https://api.amemv.com/aweme/v1/aweme/detail/"
 
 FAIL = []
 
@@ -88,6 +92,25 @@ check(len(ab) > 0, "A-Bogus 签名为空")
 check("x-secsdk-web-signature=" in ws, "websign 未生成 x-secsdk-web-signature")
 
 check(_sm3("abc") == SM3_ABC, "SM3 标准向量不匹配: %r" % _sm3("abc"))
+
+# 免登录：详情接口不依赖 cookie、不带任何签名参数（这才是抖音正路）
+r0 = DouyinResolver()                      # 显式不传 cookie
+durl = r0._detail_url("7498720869088513337")
+check(DouyinResolver.DETAIL_ENDPOINT == NO_LOGIN_ENDPOINT,
+      "详情接口端点漂移: %r" % DouyinResolver.DETAIL_ENDPOINT)
+check("aweme_id=7498720869088513337" in durl and "aid=6383" in durl,
+      "详情接口 URL 缺 aweme_id/aid: %r" % durl)
+check(all(s not in durl for s in ("a_bogus", "x_bogus", "x-secsdk", "msToken")),
+      "详情接口 URL 竟然带签名参数（说明又走回登录路）: %r" % durl)
+check(r0.cookie == "", "DouyinResolver 默认不该要求 cookie")
+
+# 分享页兜底：_ROUTER_DATA 括号匹配 + item 节点定位
+_html = ('x<script>window._ROUTER_DATA = {"a":{"b":{"desc":"hi",'
+         '"video":{"play_addr":{"url_list":["https://x/playwm/1.mp4"]}}}}}</script>')
+_rd = DouyinResolver._extract_router_data(_html)
+_node = DouyinResolver._find_item_node(_rd) if _rd else None
+check(isinstance(_rd, dict), "_ROUTER_DATA 括号匹配抽取失败")
+check(bool(_node and _node.get("desc") == "hi"), "分享页 item 节点定位失败")
 
 
 # ---------------------------------------------------------------- 真实 invoke 端到端（直连本地）

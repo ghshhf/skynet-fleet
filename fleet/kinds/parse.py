@@ -451,30 +451,32 @@ def follow_redirect(short_url, timeout=15, ua=None):
 
 
 class DouyinResolver:
-    BASE_PARAMS = {
-        "device_platform": "webapp",
+    """抖音免登录解析（吸收 jiuhunwl/short_videos + zouzanyan/douyin_crawl）。
+
+    主路径：api.amemv.com/aweme/v1/aweme/detail/ —— 免 Cookie、免签名
+    （a_bogus / x_bogus / websign 一律不需要），仅带 aweme_id + aid + device_platform + version
+    即可拿 aweme_detail JSON。兜底：分享页 iesdouyin.com/share/video/{id}/ 抠 window._ROUTER_DATA。
+
+    签名器（XBogus / ABogus / WebSign）保留给 TikTok / 强制签名场景复用，抖音主路径不调用。
+    """
+    # 免 Cookie 详情接口（公开作品无需登录即可读；吸收 jiuhunwl/short_videos DouyinParser.php）
+    DETAIL_ENDPOINT = "https://api.amemv.com/aweme/v1/aweme/detail/"
+    SHARE_PAGE = "https://www.iesdouyin.com/share/video/{aweme_id}/"
+    DETAIL_PARAMS = {
         "aid": "6383",
-        "channel": "channel_pc_web",
-        "pc_client_type": "1",
+        "device_platform": "web",
         "version_code": "190500",
         "version_name": "19.5.0",
-        "cookie_enabled": "true",
-        "browser_language": "zh-CN",
-        "browser_platform": "Win32",
-        "browser_name": "Edge",
-        "browser_online": "true",
-        "engine_name": "Blink",
-        "os_name": "Windows",
-        "os_version": "10",
-        "platform": "PC",
-        "screen_width": "1920",
-        "screen_height": "1080",
     }
+    MOBILE_UA = ("Mozilla/5.0 (Linux; Android 13; 2210132C Build/TKQ1.220829.002) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36")
+    DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
 
     def __init__(self, cookie="", ua=None):
-        self.ua = ua or ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        self.ua = ua or self.MOBILE_UA
         self.cookie = (cookie or "").strip()
+        # 签名器保留给 TikTok / 强制签名场景；抖音主路径不依赖 cookie 与签名
         self.xbogus = XBogus(self.ua)
         self.abogus = ABogus()
         self.websign = WebSign()
@@ -496,7 +498,8 @@ class DouyinResolver:
     def get_video_id(self, share_url):
         patterns = [
             r"/video/(\d+)", r"/aweme/detail/(\d+)", r"/note/(\d+)",
-            r"video_id=(\d+)", r"aweme_id=(\d+)", r"note_id=(\d+)",
+            r"video_id=(\d+)", r"aweme_id=(\d+)", r"modal_id=(\d+)",
+            r"note_id=(\d+)", r"/(\d{15,})",
         ]
         # 先试文本里直接带的 URL
         url = extract_url(share_url)
@@ -517,7 +520,8 @@ class DouyinResolver:
             try:
                 req = urllib.request.Request(real, headers={"User-Agent": self.ua})
                 html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
-                for pat in [r'"aweme_id":"(\d+)"', r'"itemId":"(\d+)"', r'aweme_id=(\d+)']:
+                for pat in [r'"aweme_id"\s*:\s*"?(\d{15,})', r'"itemId"\s*:\s*"?(\d{15,})',
+                            r'"awemeId"\s*:\s*"?(\d{15,})', r'aweme_id=(\d{15,})']:
                     m = re.search(pat, html)
                     if m and m.group(1).isdigit() and len(m.group(1)) >= 15:
                         return m.group(1)
@@ -534,22 +538,24 @@ class DouyinResolver:
 
     @staticmethod
     def extract_qualities(data):
-        """从 aweme_detail 抽多清晰度无水印直链（吸收 DLWangSan）。"""
+        """从 aweme_detail 抽多清晰度无水印直链（吸收 DLWangSan；snake/camel 双风格兼容）。"""
         aweme = (data.get("aweme_detail") or {}) if isinstance(data, dict) else {}
-        video = aweme.get("video") or {}
-        play_addr = video.get("play_addr") or {}
-        bit_rate = video.get("bit_rate") or []
-        uri = play_addr.get("uri")
+        video = aweme.get("video") or aweme.get("video") or {}
+        # 兼容 _ROUTER_DATA 的 camelCase（playAddr / bitRateList）
+        play_addr = video.get("play_addr") or video.get("playAddr") or {}
+        bit_rate = video.get("bit_rate") or video.get("bitRateList") or []
+        uri = (play_addr.get("uri") or video.get("uri") or
+               (bit_rate[0].get("play_addr", {}).get("uri") if bit_rate and isinstance(bit_rate[0], dict) else None))
         url_list = play_addr.get("url_list") or []
         qualities = []
         if bit_rate:
             for br in bit_rate:
                 if not isinstance(br, dict):
                     continue
-                pa = (br.get("play_addr") or {}).get("url_list") or []
-                gear = br.get("gear_name", "")
+                pa = ((br.get("play_addr") or br.get("playAddr")) or {}).get("url_list") or []
+                gear = br.get("gear_name", "") or br.get("gearName", "")
                 ratio = ""
-                qt = br.get("quality_type")
+                qt = br.get("quality_type") or br.get("qualityType")
                 if isinstance(qt, dict):
                     ratio = qt.get("name", "")
                 elif isinstance(qt, (int, str)):
@@ -561,12 +567,12 @@ class DouyinResolver:
                     if mm:
                         ratio = mm.group(1)
                 if not ratio:
-                    brv = br.get("bit_rate", 0)
+                    brv = br.get("bit_rate", 0) or br.get("bitRate", 0) or 0
                     ratio = ("1080p" if brv >= 2000000 else "720p" if brv >= 1000000
                              else "540p" if brv >= 500000 else "480p")
                 for u in pa:
                     qualities.append({"url": DouyinResolver._nwm(u), "ratio": ratio,
-                                      "bit_rate": br.get("bit_rate", 0), "gear_name": gear})
+                                      "bit_rate": br.get("bit_rate", 0) or br.get("bitRate", 0), "gear_name": gear})
         if not qualities and url_list:
             for u in url_list:
                 mm = re.search(r"ratio=(\d+p)", u.lower())
@@ -600,56 +606,139 @@ class DouyinResolver:
             "content_type": "image" if aweme.get("aweme_type") in (2, 68) or aweme.get("images") else "video",
         }
 
-    def _request(self, api_url, params):
-        """带三重签名请求抖音 API；任一签名成功即返回 json。"""
-        params = dict(self.BASE_PARAMS, **params)
-        headers = {
+    # ---- 免登录详情接口 URL（锁死：无 a_bogus / 无 x_bogus / 无 cookie）----
+    def _detail_url(self, vid):
+        params = dict(self.DETAIL_PARAMS, aweme_id=vid)
+        return self.DETAIL_ENDPOINT + "?" + urllib.parse.urlencode(params)
+
+    def _fetch_detail(self, vid):
+        """主路径：免 Cookie 详情接口，直接拿 aweme_detail JSON。"""
+        req = urllib.request.Request(self._detail_url(vid), headers={
             "User-Agent": self.ua,
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Referer": "https://www.douyin.com/",
-            "Origin": "https://www.douyin.com",
-        }
-        if self.cookie:
-            headers["Cookie"] = self.cookie
-        # A-Bogus
+        })
         try:
-            a_bogus = self.abogus.get_value(params)
-            p_a = dict(params, a_bogus=a_bogus)
-            q = urllib.parse.urlencode(p_a)
-            # web_sign（带 uifid）
-            uifid = self.websign.pick_uifid(self._cookie_map) or "000000000000000000000000"
-            signed_q, _, wsh = self.websign.sign(list(p_a.items()), uifid)
-            h = dict(headers, **wsh)
-            try:
-                resp = urllib.request.urlopen(urllib.request.Request(api_url + "?" + signed_q, headers=h), timeout=15)
-                d = resp.read().decode("utf-8", "replace")
-                return json.loads(d)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        # X-Bogus 兜底
-        try:
-            sp, _, _ = self.xbogus.get_xbogus(urllib.parse.urlencode(params))
-            resp = urllib.request.urlopen(urllib.request.Request(api_url + "?" + sp, headers=headers), timeout=15)
-            d = resp.read().decode("utf-8", "replace")
-            return json.loads(d)
+            d = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+            j = json.loads(d)
         except Exception:
             return None
+        if not isinstance(j, dict) or j.get("status_code") != 0:
+            return None
+        detail = j.get("aweme_detail")
+        if not isinstance(detail, dict) or not detail:
+            return None
+        return j
 
-    def resolve(self, share_url):
+    # ---- 末位兜底：分享页抠 window._ROUTER_DATA（zouzanyan/douyin_crawl 路线）----
+    # 诚实标注：2026-11-02 实测 iesdouyin 分享页常只返「空壳」（_ROUTER_DATA 里只有
+    # ua/webId/query 等元信息、无 play_addr），连试 3 次仍空壳 ⇒ 命中率低，仅作最后兜底。
+    def _fetch_share_page(self, vid):
+        url = self.SHARE_PAGE.format(aweme_id=vid)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": self.ua,
+                "Referer": "https://www.iesdouyin.com/",
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+            })
+            html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+        except Exception:
+            return None
+        data = self._extract_router_data(html)
+        if not data:
+            return None
+        node = self._find_item_node(data)
+        if not node:
+            return None
+        # 归一成「aweme_detail」外形，交给 extract_qualities / extract_meta 复用
+        return {"aweme_detail": node}
+
+    @staticmethod
+    def _extract_router_data(html):
+        """括号深度匹配提取 window._ROUTER_DATA 的 JSON。"""
+        marker = "window._ROUTER_DATA = "
+        idx = html.find(marker)
+        if idx < 0:
+            idx = html.find("_ROUTER_DATA")
+            if idx < 0:
+                return None
+            eq = html.find("=", idx)
+            if eq < 0:
+                return None
+            start = eq + 1
+        else:
+            start = idx + len(marker)
+        while start < len(html) and html[start].isspace():
+            start += 1
+        if start >= len(html) or html[start] != "{":
+            return None
+        depth = 0
+        in_str = False
+        escape = False
+        for i in range(start, len(html)):
+            c = html[i]
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(html[start:i + 1])
+                    except (ValueError, json.JSONDecodeError):
+                        return None
+        return None
+
+    @staticmethod
+    def _find_item_node(data):
+        """在 _ROUTER_DATA 树里找含 desc + (video 或 images) 的节点 ≈ aweme_detail。"""
+        if isinstance(data, list):
+            for v in data:
+                r = DouyinResolver._find_item_node(v)
+                if r:
+                    return r
+            return None
+        if not isinstance(data, dict):
+            return None
+        if isinstance(data.get("desc"), str) and (
+                isinstance(data.get("video"), dict) or isinstance(data.get("images"), list)):
+            return data
+        for v in data.values():
+            r = DouyinResolver._find_item_node(v)
+            if r:
+                return r
+        return None
+
+    def resolve(self, share_url, retries=2):
+        """解析：免登录详情接口优先（带重试），分享页末位兜底。全程不需要 cookie / 签名。"""
         vid = self.get_video_id(share_url)
         if not vid:
             return {"ok": False, "err": "无法提取视频 ID（口令/短链/链接均失败）"}
-        data = self._request(self.BASE_PARAMS and "https://www.douyin.com/aweme/v1/web/aweme/detail/",
-                             {"aweme_id": vid})
+        data = None
+        for _ in range(max(1, retries)):
+            data = self._fetch_detail(vid)
+            if data:
+                break
+        if not data:
+            data = self._fetch_share_page(vid)
         if not data or not data.get("aweme_detail"):
-            return {"ok": False, "err": "API 未返回 aweme_detail（可能需有效 Cookie / 风控拦截）", "video_id": vid}
+            return {"ok": False, "login_required": False,
+                    "err": "免登录解析失败（接口限流或作品已删除/私密）", "video_id": vid}
         meta = self.extract_meta(data)
         qualities = self.extract_qualities(data)
         nwm = qualities[0]["url"] if qualities else None
-        return {"ok": True, "video_id": vid, "nwm_url": nwm, "qualities": qualities, "meta": meta}
+        return {"ok": True, "video_id": vid, "login_required": False,
+                "nwm_url": nwm, "qualities": qualities, "meta": meta}
 
 
 # ============================ 解析设备（对齐 Download 骨架） ============================
@@ -659,7 +748,7 @@ class Parse(BaseDevice):
 
     def __init__(self, name="parse:resolver", **kw):
         super().__init__(name, via="internet", **kw)
-        self.meta.setdefault("note", "解析层全内化：分享链接→直链；抖音签名(a_bogus/x_bogus/web_sign)纯Python，零依赖")
+        self.meta.setdefault("note", "解析层全内化：分享链接→直链；抖音免登录（api.amemv.com 详情接口，零 cookie/零签名），分享页兜底")
 
     def probe(self):
         return True, ""
@@ -671,6 +760,7 @@ class Parse(BaseDevice):
         share = args.get("share") or args.get("url") or args.get("share_url")
         if not share:
             return {"ok": False, "err": "缺少 share"}
+        # 免登录：不读 cookie（cookie 仅保留可选，传给签名器备用，非必需）
         cookie = args.get("cookie") or os.environ.get("DOUYIN_COOKIE", "")
         return DouyinResolver(cookie=cookie).resolve(share)
 
@@ -743,6 +833,25 @@ def _selftest():
     }
     # 5. SM3 已知向量（"abc" → 标准 SM3）
     out["sm3_abc"] = _sm3("abc")
+    # 6. 免登录：详情接口 URL 不含任何签名参数，且不传 cookie 也能构造
+    _r = DouyinResolver()
+    _url = _r._detail_url("7498720869088513337")
+    out["nologin"] = {
+        "endpoint_ok": DouyinResolver.DETAIL_ENDPOINT == "https://api.amemv.com/aweme/v1/aweme/detail/",
+        "has_aweme_id": "aweme_id=7498720869088513337" in _url,
+        "has_aid": "aid=6383" in _url,
+        "no_signature": all(s not in _url for s in ("a_bogus", "x_bogus", "x-secsdk", "msToken")),
+        "cookie_not_required": _r.cookie == "",
+    }
+    # 7. 分享页兜底：_ROUTER_DATA 括号匹配 + item 节点定位
+    _html = ('x<script>window._ROUTER_DATA = {"a":{"b":{"desc":"hi",'
+             '"video":{"play_addr":{"url_list":["https://x/playwm/1.mp4"]}}}}}</script>')
+    _rd = DouyinResolver._extract_router_data(_html)
+    _node = DouyinResolver._find_item_node(_rd) if _rd else None
+    out["share_page_fallback"] = {
+        "router_ok": isinstance(_rd, dict),
+        "item_found": bool(_node and _node.get("desc") == "hi"),
+    }
     # 6. 对接下载引擎：用本地直链走 resolve(download=True) 端到端（platform=direct 绕过联网）
     class _H(http.server.BaseHTTPRequestHandler):
         DATA = b"PARSE_TEST_" * 50000
@@ -780,6 +889,8 @@ def _selftest():
                  out["signatures"]["xbogus_len"] > 0 and out["signatures"]["abogus_len"] > 0 and
                  out["signatures"]["websign_has_sig"] and
                  out["sm3_abc"] == "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0" and
+                 all(out["nologin"].values()) and
+                 out["share_page_fallback"]["router_ok"] and out["share_page_fallback"]["item_found"] and
                  out["resolve_download"]["downloaded_bytes"] == out["resolve_download"]["expect"])
     return out
 

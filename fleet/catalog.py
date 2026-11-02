@@ -363,14 +363,14 @@ CAPABILITIES = [
                        Param("task_id", "str", doc="任务 id（status/pause/resume/remove 需要）")),
                note="内存任务表；pause 设暂停标志，resume 从断点续传"),
     # ---- 解析层（下载层的前置：分享链接 → 直链 + 元数据；把抖音解析开源核心吸收进源码，
-    #      零外部 daemon、零黑盒 exe；X-Bogus/A-Bogus/websign 纯 Python 实现，SM3 用本机 hashlib）----
-    Capability("parse.douyin", "抖音分享链接解析：口令/短链/HTML → aweme_id → 多清晰度无水印直链 + 元数据（吸收 douyin_parse + Douyin_TikTok_Download_API）",
+    #      零外部 daemon、零黑盒 exe；抖音走免登录详情接口，签名器仅留 TikTok 备用）----
+    Capability("parse.douyin", "抖音分享链接解析（免登录）：口令/短链/HTML → aweme_id → 多清晰度无水印直链 + 元数据（吸收 jiuhunwl/short_videos + zouzanyan/douyin_crawl）",
                params=(Param("share", "str", True, "抖音分享口令/短链/网页 URL，如 https://v.douyin.com/xxxx/"),
-                       Param("cookie", "str", doc="登录态 cookie；缺省读 DOUYIN_COOKIE 或 cookies.txt（无水印直链需有效登录态）"),
+                       Param("cookie", "str", doc="可选登录态 cookie（非必需）；缺省读 DOUYIN_COOKIE，仅作签名器备用"),
                        Param("download", "bool", doc="解析后直接调下载引擎落盘，默认 False（仅返回直链）"),
                        Param("dest", "str", doc="download=True 时落盘路径")),
-               note="无水印 trick：play_addr.url_list 中 playwm→play 即得无水印直链（公开方法，非破解）；"
-                    "真实解析需联网 + 有效 cookie。X-Bogus/A-Bogus/websign 三重签名纯 Python 实现"),
+               note="免 Cookie、免签名：走 api.amemv.com/aweme/v1/aweme/detail/ 详情接口（公开作品无需登录），"
+                    "分享页 _ROUTER_DATA 抠 JSON 兜底；playwm→play 去水印（公开方法，非破解）。仅需联网"),
     Capability("parse.resolve", "通用分享链接解析入口：自动识别平台（douyin/tiktok/bilibili/direct）→ 路由到对应解析器",
                params=(Param("share", "str", True, "任意平台分享链接/口令"),
                        Param("platform", "str", doc="强制指定平台，跳过自动识别"),
