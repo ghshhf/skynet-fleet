@@ -139,9 +139,10 @@ def main():
         PC.find_exe = real_find
 
     # ---- 5. 直连通道不许自称活着
-    ch = {c["name"]: c for c in (d.get("egress", {}).get("channels") or [])}
-    check("直连" in ch, "出向三路里包含「直连」", "出向通道里没有「直连」这一项")
-    check(ch.get("直连", {}).get("alive") is None,
+    chs = (d.get("egress", {}).get("channels") or [])
+    direct = next((c for c in chs if "直连" in c["name"]), None)
+    check(direct is not None, "出向通道里包含「直连」兜底通道", "出向通道里没有「直连」这一项")
+    check((direct or {}).get("alive") is None,
           "直连通道 alive=None（不探测就不声明它通）",
           "直连通道被打了 alive=True/False（不探测就不许声明它通）")
 

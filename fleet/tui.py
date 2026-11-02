@@ -438,6 +438,11 @@ class FleetTUI(App):
         nodes = core.get("config_nodes")
         rdv = (p2p.get("rdv_auto") or {})
         g.add_columns("项", "值")
+        hb = d.get("half_ban") or {}
+        if hb:
+            miss = "；".join(hb.get("missing") or []) or "缺一步"
+            g.add_row("半步圆满", ("达成（不靠 karing）" if hb.get("achieved")
+                                    else ("未达成：" + miss)))
         for k, v in (
             ("内核", core_txt),
             ("内核进程", "在跑" if core.get("running") else "没起"),
