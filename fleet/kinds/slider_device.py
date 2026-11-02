@@ -80,31 +80,20 @@ def _h_track(cap, args, dev):
 
 # ---------------------------------------------------------------- 真发事件
 
-def _send_via_cdp(events, port=9222, handle=None, settle=0.05):
-    """用 CDP 逐点发送鼠标事件。**不用 page.mouse.move** —— 那是高层 API，
+def _dispatch(page, events, settle=0.05):
+    """在给定 page 上逐点发送鼠标事件。**不用 page.mouse.move** —— 那是高层 API，
     会自己插值，轨迹就废了。
 
     坐标是绝对的（生成时已加过起点），这里直接发。
     """
-    if browser_reg is None:
-        raise RuntimeError("browser_reg 不可用（缺 playwright）")
-    sent = 0
     prev_t = 0.0
-    with browser_reg.Session(port) as s:
-        page = s.page
-        box = None
-        if handle:
-            el = page.query_selector(handle)
-            if el is None:
-                raise RuntimeError("找不到滑块元素：%s" % handle)
-            box = el.bounding_box()
-            if not box:
-                raise RuntimeError("滑块元素不可见（bounding_box 为空）：%s" % handle)
-        cdp = page.context.new_cdp_session(page)
+    cdp = page.context.new_cdp_session(page)
+    sent = 0
+    try:
         for e in events:
             dt = e["t"] - prev_t
             if dt > 0:
-                time.sleep(min(dt, 0.25))       # 单步最多等 250ms，防止一条坏轨迹把任务挂死
+                time.sleep(min(dt, 0.25))   # 单步最多等 250ms，防一条坏轨迹把任务挂死
             prev_t = e["t"]
             cdp.send("Input.dispatchMouseEvent", {
                 "type": e["type"], "x": float(e["x"]), "y": float(e["y"]),
@@ -114,8 +103,32 @@ def _send_via_cdp(events, port=9222, handle=None, settle=0.05):
             })
             sent += 1
         time.sleep(max(0.0, settle))
-    return {"ok": True, "sent": sent, "handle": handle,
-            "start_box": box}
+    finally:
+        try:
+            cdp.detach()
+        except Exception:
+            pass
+    return sent
+
+
+def _send_via_cdp(events, port=9222, handle=None, settle=0.05, page=None):
+    """发事件。page 给了就用它（调用方已持有会话），否则自己起一个 Session。"""
+    if page is not None:                       # 复用调用方会话，不再另起一个
+        return {"ok": True, "sent": _dispatch(page, events, settle=settle),
+                "handle": handle, "start_box": None, "reused_page": True}
+    if browser_reg is None:
+        raise RuntimeError("browser_reg 不可用（缺 playwright）")
+    with browser_reg.Session(port) as s:
+        box = None
+        if handle:
+            el = s.page.query_selector(handle)
+            if el is None:
+                raise RuntimeError("找不到滑块元素：%s" % handle)
+            box = el.bounding_box()
+            if not box:
+                raise RuntimeError("滑块元素不可见（bounding_box 为空）：%s" % handle)
+        sent = _dispatch(s.page, events, settle=settle)
+    return {"ok": True, "sent": sent, "handle": handle, "start_box": box}
 
 
 def _handle_origin(port, handle):
@@ -134,10 +147,17 @@ def _handle_origin(port, handle):
         return (box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0, box)
 
 
-def _do_drag(distance, handle, port, seed, dry_run, executor, tile_width=44.0):
-    """轨迹 → 事件 → 发送。返回 (events, meta, sent_info)。"""
+def _do_drag(distance, handle, port, seed, dry_run, executor, tile_width=44.0,
+             origin=None, page=None):
+    """轨迹 → 事件 → 发送。返回 (events, meta, sent_info)。
+
+    origin 显式给了就用它（元素在 iframe 里时，主文档的 query_selector 找不到，
+    必须由调用方把已经算好的中心点传进来）。
+    """
     x0, y0, box = 0.0, 0.0, None
-    if not dry_run and not callable(executor):
+    if origin:
+        x0, y0 = float(origin[0]), float(origin[1])
+    elif not dry_run and not callable(executor):
         x0, y0, box = _handle_origin(port, handle)
     pts, ts, dur = SC.gen_track(distance, seed=seed, tile_width=tile_width)
     events = SC.to_cdp_events(pts, ts, x0=x0, y0=y0)
@@ -156,7 +176,7 @@ def _do_drag(distance, handle, port, seed, dry_run, executor, tile_width=44.0):
                               "result": info if isinstance(info, dict) else str(info)}
     if dry_run:
         return events, meta, {"ok": True, "mode": "dry_run", "sent": 0}
-    info = _send_via_cdp(events, port=port, handle=handle)
+    info = _send_via_cdp(events, port=port, handle=handle, page=page)
     info["mode"] = "cdp"
     return events, meta, info
 
@@ -217,6 +237,147 @@ def _h_auto(cap, args, dev):
                  "distance": round(float(distance), 2),
                  "drag": meta, "send": info})
     return R.success(cap, dev.name, via=dev.via, data=base)
+
+
+# ---------------------------------------------------------------- 打真实页面
+
+def _page_ctx(args, port):
+    """拿 page，返回 (page, close_fn)。注入的 page 不关（生命周期归调用方），自起的一定关。"""
+    page = args.get("page")
+    if page is not None:
+        return page, (lambda: None)
+    if browser_reg is None:
+        raise RuntimeError("browser_reg 不可用（缺 playwright）")
+    sess = browser_reg.Session(port)
+    page = sess.__enter__()
+
+    def _close():
+        try:
+            sess.__exit__(None, None, None)
+        except Exception:
+            pass
+    return page, _close
+
+
+@_reg("slider.solve_page")
+def _h_solve_page(cap, args, dev):
+    """认墙 → 定位 → 截图 → 算缺口 → 拖 → **再认墙**。
+
+    最后那一步是整个能力的灵魂：不做它，就等于把「我拖完了」当成「我进去了」。
+    滑块拖完只是提交了一次，过没过要看墙还在不在 —— 这是两件完全不同的事，
+    混起来会让人在风控已经降级的情况下还以为自己很顺。
+    """
+    min_conf = str(args.get("min_confidence") or "medium").lower()
+    if min_conf not in _CONF_ORDER:
+        raise ValueError("min_confidence 只能是 weak / medium / strong")
+    port = int(args.get("port") or 9222)
+    settle = float(args.get("settle") if args.get("settle") is not None else 2.5)
+    dry_run = bool(args.get("dry_run"))
+    executor = args.get("executor")
+    steps = []
+    out = {"steps": steps, "min_confidence": min_conf}   # 同一个 dict 引用，后面 append 就同步
+
+    def done(_unused=None):
+        return R.success(cap, dev.name, via=dev.via, data=out)
+
+    page, close = _page_ctx(args, port)
+    try:
+        # ① 认墙：先看清面对的是什么，别急着动手
+        wall = browser_reg.wall_state(page)
+        v = wall.get("verify") or {}
+        steps.append({"step": "wall", "blocked": wall.get("blocked"),
+                      "vendor": v.get("vendor"), "kind": v.get("kind")})
+        out["wall_before"] = wall
+
+        if not v.get("found"):
+            out.update({"ok": False, "passed": wall.get("blocked") is False,
+                        "why": "页面上没认到人机验证（verify.found=False）"})
+            return done(out)
+        if v.get("kind") != "slider":
+            out.update({"ok": False, "passed": None,
+                        "why": "不是滑块（%s / %s）。%s"
+                               % (v.get("vendor"), v.get("kind"), v.get("advice"))})
+            return done(out)
+
+        # ② 定位（含跨域 iframe）
+        loc = browser_reg.locate_slider(
+            page, vendor=args.get("vendor") or v.get("vendor"), want_png=True)
+        steps.append({"step": "locate", "ok": loc.get("ok"),
+                      "in_iframe": loc.get("in_iframe"),
+                      "frame": (loc.get("frame_url") or "")[:80]})
+        out["locate"] = loc
+        if not loc.get("ok"):
+            out.update({"ok": False, "passed": None, "why": loc.get("err")})
+            return done(out)
+        if not (loc.get("bg") or {}).get("png_b64"):
+            out.update({"ok": False, "passed": None, "why": "没截到背景图"})
+            return done(out)
+        if not (loc.get("slice") or {}).get("png_b64"):
+            # 诚实的边界：腾讯/阿里的位移式滑块只给一张整图，没有单独的缺口块，
+            # 我们现在的算法要两张图。整图分析还没做，就说还没做。
+            out.update({"ok": False, "passed": None,
+                        "why": "%s 没有单独的缺口图，当前算法需要「背景 + 缺口」两张；"
+                               "整图位移分析尚未实现" % v.get("vendor")})
+            return done(out)
+
+        # ③ 算缺口（viewport_width 用元素的显示宽度，自动处理 2x 截图）
+        bg_img = SC.load_image(loc["bg"]["png_b64"])
+        t_img = SC.load_image(loc["slice"]["png_b64"])
+        det = SC.detect(bg_img, t_img,
+                        viewport_width=(loc["bg"].get("box") or {}).get("w"))
+        steps.append({"step": "detect", "x": det["x"], "confidence": det["confidence"],
+                      "basis": det["basis"], "scale": det.get("scale")})
+        out["detect"] = det
+
+        # ④ 把握不够就不提交（滑块输一次只是换图，乱提交可能触发风控降级）
+        if _CONF_ORDER.get(det["confidence"], 0) < _CONF_ORDER[min_conf]:
+            out.update({"ok": False, "submitted": False,
+                        "why": "把握 %s 低于要求 %s，未提交（换张图重试比硬拖安全）"
+                               % (det["confidence"], min_conf)})
+            steps.append({"step": "abort", "why": "low_confidence"})
+            return done(out)
+
+        # ⑤ 拖（起点用把手中心，元素在 iframe 里也成立 —— box 已换算到主视口）
+        hb = (loc.get("handle") or {}).get("box")
+        origin = (hb["x"] + hb["w"] / 2.0, hb["y"] + hb["h"] / 2.0) if hb else None
+        distance = det.get("x_display")
+        if distance is None:
+            distance = det["x"]
+        _, meta, info = _do_drag(
+            distance=float(distance), handle=None, port=port,
+            seed=args.get("seed"), dry_run=dry_run, executor=executor,
+            origin=origin, tile_width=float((det.get("tile_size") or [44])[0]),
+            page=page)
+        steps.append({"step": "drag", "distance": meta["distance"],
+                      "mode": info.get("mode")})
+        out["drag"] = meta
+        out["send"] = info
+        out["submitted"] = info.get("mode") != "dry_run"
+
+        # ⑥ 再认墙 —— 拖完 ≠ 过了
+        if dry_run or callable(executor):
+            out.update({"ok": True, "passed": None,
+                        "why": "dry_run/executor 模式没有真提交，无从判断过没过"})
+            return done(out)
+        if settle > 0:
+            time.sleep(settle)
+        wall2 = browser_reg.wall_state(page)
+        v2 = wall2.get("verify") or {}
+        out["wall_after"] = wall2
+        if wall2.get("error"):
+            out.update({"ok": True, "passed": None,
+                        "why": "拖动后页面报错（%s），判断不了" % wall2.get("error")})
+        elif not wall2.get("blocked") and not v2.get("found"):
+            out.update({"ok": True, "passed": True,
+                        "why": "墙没了（verify.found=False），这一轮过了"})
+        else:
+            out.update({"ok": True, "passed": False,
+                        "why": "还挡着（%s / %s）—— 拖完了但没进去"
+                               % (v2.get("vendor"), v2.get("kind"))})
+        steps.append({"step": "verify", "passed": out["passed"]})
+        return done(out)
+    finally:
+        close()
 
 
 # ---------------------------------------------------------------- 设备
