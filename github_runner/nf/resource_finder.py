@@ -1822,8 +1822,14 @@ def main():
                     got = fn(q, 1)
                     label = str(q)[:40]
                 else:
-                    got = fn()                    # paper_seed：零参数，RSS 自己就是关键词
-                    label = "arxiv-rss"
+                    if pool:
+                        q = pool[qi % len(pool)]    # paper_arxiv：轮换 PAPER_KEYWORDS
+                        qi += 1
+                        got = fn(q)
+                        label = str(q)[:40]
+                    else:
+                        got = fn()                  # paper_seed：零参，RSS 自己就是关键词
+                        label = "arxiv-rss"
                 fresh_seed = []
                 with lock:
                     for u in got:
