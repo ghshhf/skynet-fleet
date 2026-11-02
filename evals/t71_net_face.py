@@ -146,6 +146,14 @@ def main():
           "直连通道 alive=None（不探测就不声明它通）",
           "直连通道被打了 alive=True/False（不探测就不许声明它通）")
 
+    # ---- 5b. 半步圆满定义守门（这次修正的灵魂）：不依赖 karing 的真实直连也算达成
+    # 防的是将来又把 half_ban 改回「只有 7891 起才算」——那是把 11-01 源头定义弄丢。
+    hb = d.get("half_ban") or {}
+    de = d.get("direct_egress") or {}
+    check(de.get("ok") is not True or hb.get("achieved") is True,
+          "半步圆满定义守门：真实直连层通 ⇒ achieved=True（不要求 7891 起）",
+          "direct_egress.ok=True 但 half_ban.achieved 不是 True（定义被改窄了）")
+
     # ---- 6. net.route：两栏分离
     rr = reg.call("net.route", args={"host": "github.com"})
     check(rr.ok, "net.route(github.com) 调用成功",
