@@ -1514,22 +1514,45 @@ def main():
                            ("graph", graph_pump, ["-"]),
                            ("boot", boot_pump, ["-"])]
 
-    # —— 泵的自适应调度（借鉴 Scrapy 调度器/AutoThrottle 的自适应思想）——
-    # 死板轮换会让零产出的源一直占着轮次（本轮实测 13/15 泵产出 0）。
-    # 做法：按"历史命中率"给每个源算权重 → 加权随机抽（保留 0.35 底权，冷门源不被饿死）。
+    # —— 泵的自适应调度（抖音推荐 E&E 思路：UCB 置信上界）——
+    # 旧版 ε-greedy（加权轮转 + 0.35 底权）：自举泵前期命中率低 → 权重被压到 0.35
+    #   → 随着 pump 数量增加被选中概率极低 → 饿死。底权是"固定探索比例"，不随不确定性变化。
+    # 旧版 Thompson Sampling：给每个泵 Beta(α,β) 采样。问题：一旦某泵命中率高（如 academic_o
+    #   13/3），Beta 分布集中在高值，冷门泵采样值几乎总是更低 → 仍被饿死（实测 2 分钟内
+    #   只跑了 academic_o，link/graph/boot 一次没轮到）。
+    # 新版 UCB1：score = mean + sqrt(2*ln(N)/n)。
+    #   · n=0 的泵 score = +∞ → **永远优先被轮到**（冷启动 arm 强制探索，这是 UCB 的核心）
+    #   · n 小的泵 sqrt 项大 → 自动获得探索机会（不会饿死）
+    #   · n 大且命中率低的泵 → sqrt 项衰减，自然被少选（利用）
+    #   · 噪声不计 hits ⇒ mean 低 ⇒ score 低，但 sqrt 项仍保证最低探索频率
+    # 这就是"真正的自适应"：探索强度由"轮次稀缺度"决定，而不是固定常数。
+    # 参考：抖音推荐公开资料提到 UCB/Thompson/ε-greedy 三种 E&E 算法；UCB 对冷启动
+    #   arm 的保证最强，最适合"自举泵需要先跑起来"的场景。
     PUMP_STATS = {p[0]: {'rounds': 0, 'hits': 0, 'noise': 0} for p in LOCAL_PUMPS}
 
-    def pump_weight(nm):
+    def pump_ucb(nm):
+        """UCB1 置信上界。"""
+        import math
         s = PUMP_STATS[nm]
-        if s['rounds'] < 2:                 # 样本不足时给中等权重，先观察
-            return 1.0
-        rate = s['hits'] / max(1, s['rounds'])
-        return 0.35 + 3.0 * min(1.0, rate * 5)   # 0 有效产出 → 0.35（低但不死）；高产 → 上限
+        n = s['rounds']
+        if n == 0:
+            return float('inf')          # 从未轮到 → 最高优先级，强制探索
+        total = sum(PUMP_STATS[p[0]]['rounds'] for p in LOCAL_PUMPS)
+        if total <= 0:
+            total = 1
+        mean = s['hits'] / n
+        return mean + math.sqrt(2.0 * math.log(total + 1) / n)
 
     def pick_pump():
         import random
-        ws = [pump_weight(p[0]) for p in LOCAL_PUMPS]
-        pick = random.choices(range(len(LOCAL_PUMPS)), weights=ws, k=1)[0]
+        # 先算所有 pump 的 UCB；inf 优先，inf 之间随机打散（避免永远先跑同一个）
+        scored = [(pump_ucb(p[0]), i) for i, p in enumerate(LOCAL_PUMPS)]
+        max_score = max(s for s, _ in scored)
+        candidates = [i for s, i in scored if s == max_score]
+        if len(candidates) > 1:
+            pick = random.choice(candidates)
+        else:
+            pick = candidates[0]
         return LOCAL_PUMPS[pick]
 
     def note_pump(nm, hits, noise=0):
