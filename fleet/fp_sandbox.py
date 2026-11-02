@@ -165,18 +165,39 @@ def touch(sid, egress=None):
 
 
 # ---------------------------------------------------------------- 体检（本模块的真正功能）
-def check(sid, live_country=None, live_proxy=None, now=None):
+def check(sid, live_country=None, live_proxy=None, now=None, auto=False, timeout=8):
     """这份沙箱还能不能用。返回问题清单，空 = 能上。
 
     最要紧的一条是**出口漂移**：profile 里攒的历史是给「某个国家的人」攒的，
     IP 一换国家，这套历史就变成「同一台机器突然搬了家」——
     那比一个全新访客更可疑。所以这一条单列，不用合并进别的结论。
+
+    auto=True 时自己走网络探一次出口（`fp_egress`）。
+    **探不出来会单独报 `egress_unknown`** —— 不知道不等于没问题，
+    静默放行就等于这条规则从来没生效过。
     """
     now = now or time.time()
     issues = []
     m = get(sid)
     if not m:
         return [{"rule": "no_sandbox", "why": "沙箱 %s 不存在" % sid}]
+
+    # 0) 自动探出口。探不到就是「不知道」，必须显式报，不许当通过。
+    probed = None
+    if auto and not live_country:
+        try:
+            from . import fp_egress as EG
+            probed = EG.probe(timeout=timeout)
+        except Exception as e:
+            probed = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        if probed.get("ok"):
+            live_country = probed.get("country")
+            if live_proxy is None:
+                live_proxy = probed.get("proxy")
+        else:
+            issues.append({"rule": "egress_unknown", "why":
+                           "探不出当前出口（%s）—— 不知道不等于没问题，"
+                           "这条不许当通过" % str(probed.get("error"))[:140]})
 
     # 1) 档案本身还自洽吗（可能被人手改过 meta）
     for bad in FP.contradictions(m.get("profile")):
@@ -209,6 +230,18 @@ def check(sid, live_country=None, live_proxy=None, now=None):
         if was and live_proxy and was != live_proxy:
             issues.append({"rule": "proxy_changed", "why":
                            "出口代理从 %s 换成了 %s —— 同一个 profile 换线路也等于换人" % (was, live_proxy)})
+    if probed and probed.get("ok"):
+        # 探到了就把住宅/机房也报出来：机房 IP 本身不是错，但要知道代价
+        try:
+            from . import fp_egress as EG
+            kind = EG.looks_residential(probed.get("asn"), probed.get("isp"))
+        except Exception:
+            kind = None
+        if kind == "datacenter":
+            issues.append({"rule": "egress_datacenter", "why":
+                           "出口是机房 IP（%s / %s）—— 不是不能过，是先天分低。"
+                           "无感打分看的是「像不像一个真人上网的线路」"
+                           % (probed.get("asn"), probed.get("isp"))})
     return issues
 
 

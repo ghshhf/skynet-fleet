@@ -143,7 +143,9 @@ def _h_sandbox_list(cap, args, dev):
 def _h_sandbox_check(cap, args, dev):
     sid = str(args["id"])
     issues = SB.check(sid, live_country=args.get("live_country"),
-                      live_proxy=args.get("live_proxy"))
+                      live_proxy=args.get("live_proxy"),
+                      auto=bool(args.get("auto")),
+                      timeout=float(args.get("timeout") or 8))
     return R.success(cap, dev.name, via=dev.via, data={
         "id": sid,
         "ok": not issues,
@@ -151,6 +153,22 @@ def _h_sandbox_check(cap, args, dev):
         "verdict": ("能用" if not issues else
                     "有 %d 个问题，其中一个可能是致命的（出口漂移最狠）" % len(issues)),
     })
+
+
+@_reg("fp.egress_probe")
+def _h_egress_probe(cap, args, dev):
+    from .. import fp_egress as EG
+    r = EG.probe(timeout=float(args.get("timeout") or 8),
+                 proxy=args.get("proxy") or "auto")
+    if not r.get("ok"):
+        # 探不出来必须说成「不知道」，不许说成「正常」
+        return R.error(cap, "探不出当前出口（**这不等于没问题，等于不知道**）：%s"
+                       % str(r.get("error"))[:200], device=dev.name, via=dev.via)
+    r["line_kind"] = EG.looks_residential(r.get("asn"), r.get("isp"))
+    r["verdict"] = ("住宅线路" if r["line_kind"] == "residential" else
+                    "机房线路 —— 不是不能过，是先天分低" if r["line_kind"] == "datacenter"
+                    else "线路性质判不出来（不猜）")
+    return R.success(cap, dev.name, via=dev.via, data=r)
 
 
 @_reg("fp.sandbox_bind")
