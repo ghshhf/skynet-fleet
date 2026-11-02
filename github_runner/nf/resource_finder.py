@@ -598,6 +598,85 @@ def crossref_pump(kw):
         return []
 
 
+# —— 论文爬取线（2026-11-03 加）：论文源 API 直连，不经过搜索引擎 ——
+# 论文是「高质量域名」的最佳引子：落地页背后是出版社/预印本平台/机构站，
+# 摘要里常自报家门代码仓库/项目主页，作者字段藏着学者个人主页与实验室。
+# abs 页进队列后 link_pump 会顺其出链往外挖——论文线与链接线在这里闭环。
+
+# 论文线关键词：arXiv/S2 都是英文源（中文词命中 0）。混合领域词 + 分类词
+# （cat:cs.LG 这类 arXiv 原生分类语法，arxiv_pump 原样透传）。
+PAPER_KEYWORDS = [
+    "large language model", "reinforcement learning", "diffusion model",
+    "graph neural network", "transformer architecture",
+    "retrieval augmented generation", "continual learning",
+    "model compression", "knowledge distillation", "mixture of experts",
+    "code generation", "embodied agent", "protein folding",
+    "federated learning", "causal inference", "adversarial robustness",
+    "cat:cs.LG", "cat:cs.CL", "cat:cs.AI", "cat:cs.CV",
+]
+
+def arxiv_pump(kw):
+    """arXiv API：预印本落地页 + 摘要里扒出的代码仓库链接。
+
+    Atom feed 用正则拆（零 XML 依赖）。kw 带 `cat:` 前缀就按 arXiv 原生
+    分类语法原样透传，否则按 all: 全字段搜。产出 abs 页 URL 交给 canon()
+    提域，照常入册去重。
+    """
+    q = kw if ":" in kw else "all:" + kw
+    u = ("https://export.arxiv.org/api/query?search_query=%s&max_results=100"
+         "&sortBy=submittedDate&sortOrder=descending" % urllib.parse.quote(q))
+    try:
+        h = fetch(u)
+        out = ["https://arxiv.org/abs/" + m.group(1)
+               for m in re.finditer(r"<id>https?://arxiv\.org/abs/([^<]+)</id>", h)]
+        # 摘要自报家门的代码仓库（"code: github.com/..."）
+        out += ["https://github.com/" + m.group(1)
+                for m in re.finditer(r"github\.com/([\w.-]+/[\w.-]+)", h)]
+        return out
+    except Exception:
+        return []
+
+
+def s2_pump(kw):
+    """Semantic Scholar API：论文页 + 开放获取 PDF 落地 → 出版社/仓储域名。
+
+    无 key 限流严（429 常态）：失败退避 4s 重试一次，仍拒就优雅返回 []。
+    """
+    u = ("https://api.semanticscholar.org/graph/v1/paper/search?query=%s&limit=100"
+         "&fields=url,externalIds,openAccessPdf" % urllib.parse.quote(kw))
+    try:
+        try:
+            data = json.loads(fetch(u))
+        except Exception:
+            time.sleep(4)
+            data = json.loads(fetch(u))
+        out = []
+        for p in data.get("data") or []:
+            if p.get("url"):
+                out.append(p["url"])
+            pdf = (p.get("openAccessPdf") or {}).get("url")
+            if pdf:
+                out.append(pdf)
+        return out
+    except Exception:
+        return []
+
+
+def doaj_pump(kw):
+    """DOAJ 开放获取期刊目录：论文全文落地页 → OA 期刊/出版社站。"""
+    u = "https://doaj.org/api/search/articles/%s?pageSize=100" % urllib.parse.quote(kw)
+    try:
+        data = json.loads(fetch(u))
+        out = []
+        for r in data.get("results", []):
+            for l in ((r.get("bibjson") or {}).get("link") or []):
+                if l.get("url"):
+                    out.append(l["url"])
+        return out
+    except Exception:
+        return []
+
+
 # 英文源（HN/Crossref）必须用英文关键词，中文词命中 0
 KEYWORDS_EN = [k for k in KEYWORDS if not re.search(r"[\u4e00-\u9fff]", k)]
 # 大学站方向关键词：搜"大学官网 + 论文/实验室/开放获取"，命中页再交给爬虫顺着官网往外挖
@@ -997,6 +1076,10 @@ PUMPS = [
     ("app", univ_pump, APP_KEYWORDS),
     ("academic_x", crossref_pump, ACADEMIC_KEYWORDS),   # 学术 API 喂学术词
     ("academic_o", openalex_pump, ACADEMIC_KEYWORDS),
+    # —— 论文线三泵（2026-11-03）：预印本/语义检索/OA 期刊直连，不走搜索引擎 ——
+    ("paper_arxiv", arxiv_pump, PAPER_KEYWORDS),
+    ("paper_s2", s2_pump, PAPER_KEYWORDS),
+    ("paper_doaj", doaj_pump, PAPER_KEYWORDS),
     ("hn", hn_pump, GH_TOOL_KEYWORDS[:8]),    # HN 只对"项目/工具"类故事有产出
     ("ddg", ddg_pump, KEYWORDS),
     ("tieba", tieba_pump, ZH_RESOURCE_KEYWORDS),
