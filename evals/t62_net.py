@@ -10,13 +10,18 @@
 而是**自己造一个毒**（起本地 server 当目标 + 指向死端口的假代理），完全离线可控。
 
 覆盖：
-  1. opener(None) 必须是「一个代理都不用」的直连 opener
+  1. 选路三态：自有 7891 活着必走它 / 自有优先于系统 / 全死必回直连
   2. 显式给死代理必须抛 ConnectionError，不许静默回退（防「我以为走了代理」的误判）
   3. 【核心回归】注入死代理的环境下：裸 urlopen 必挂，net.urlopen 必通
   4. 【核心回归】子进程里 import fleet 后，裸 urlopen 也恢复（全局兜底真的装了）
   5. is_proxy_alive 判活：真监听报 True、死端口报 False
   6. clean_registry_proxy：ProxyEnable=0 之外的场合绝不乱动（dry_run 不写盘）
   7. 解析层不回归：短链抽取 + SM3 标准向量
+
+为什么第 1 条要分三态（而是不是一句「默认直连」）：
+  天网自己就有代理层（proxymgr 订阅择优 → proxycore 起 sing-box 在 7891）。
+  把它当「系统脏数据」一律直连，等于自己家的内核起来也不认。但反过来无脑走代理
+  也不行 —— 内核没起时必须回落，否则又一次全站拖死。所以三种状态各钉一条。
 """
 import io
 import os
@@ -78,9 +83,49 @@ def main():
     # 造一个「僵尸代理」：拿到没人听的端口
     dead_proxy = "http://127.0.0.1:%d" % _free_port()
 
-    # ---- 1. 默认 opener 是直连
-    check(net.is_direct_opener(net.opener(None)),
-          "opener(None) 不是直连 opener（默认会被系统代理带跑）")
+    # ---- 1. 选路三态（这是「代理层面半步圆满」在出向层的兑现点）
+    #     用临时替换 is_proxy_alive 模拟「内核起了/没起」，不真起 sing-box：
+    #     门禁不许依赖外部二进制，否则一换环境就红。
+    mine = net.self_proxy_url()
+    real_alive = net.is_proxy_alive
+
+    # 1a. 自有活着 → 默认必须用它。这条红了就说明「内核起来也白起」。
+    try:
+        net.is_proxy_alive = lambda url, timeout=0.3: url == mine
+        check(net._proxy_target_of(net.opener(None)) == mine,
+              "自有代理活着时 opener(None) 没走它（内核起了出向不认 = 白起）")
+        check(net._proxy_target_of(net.opener("self")) == mine,
+              "opener('self') 没走自有代理")
+    finally:
+        net.is_proxy_alive = real_alive
+
+    # 1b. 自有优先于系统：两个都活也必须选自有的（不是「有代理就行」）
+    try:
+        net.is_proxy_alive = lambda url, timeout=0.3: True
+        check(net._proxy_target_of(net.opener(None)) == mine,
+              "自有与系统代理同时活着时，默认没优先用自有的")
+    finally:
+        net.is_proxy_alive = real_alive
+
+    # 1c. 全死 → 必须直连（不能被系统残留拖死；这也是「不靠代理也能用」）
+    try:
+        net.is_proxy_alive = lambda url, timeout=0.3: False
+        check(net.is_direct_opener(net.opener(None)),
+              "所有代理都死时 opener(None) 不是直连（会被系统残留拖死）")
+        check(net.is_direct_opener(net.opener("self")),
+              "所有代理都死时 opener('self') 不是直连")
+    finally:
+        net.is_proxy_alive = real_alive
+
+    # 1d. 自有死、系统活 → 回落系统代理（不是直接掉到直连）
+    sys_url, _ = net.system_proxy_url()
+    if sys_url:
+        try:
+            net.is_proxy_alive = lambda url, timeout=0.3: url == sys_url
+            check(net._proxy_target_of(net.opener(None)) == sys_url,
+                  "自有没起、系统代理活着时，默认没回落到系统代理")
+        finally:
+            net.is_proxy_alive = real_alive
 
     # ---- 2. 死代理必须报错，不许静默回退
     try:
@@ -177,7 +222,7 @@ def main():
         for f in FAIL:
             print("  - " + f)
         return 1
-    print("PASS: 出向网络层全过（默认直连/死代理必报错/毒环境下 net.urlopen 仍通/全局兜底生效/判活准确/解析层无回归）")
+    print("PASS: 出向网络层全过（选路三态/死代理必报错/毒环境下 net.urlopen 仍通/全局兜底生效/判活准确/解析层无回归）")
     return 0
 
 
