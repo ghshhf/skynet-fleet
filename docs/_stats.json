@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-11-03 01:31:22",
-  "gates_registered": 150,
-  "eval_files": 87,
+  "generated_at": "2026-11-03 04:27:07",
+  "gates_registered": 151,
+  "eval_files": 88,
   "orphan_evals": [],
-  "doc_md": 10,
+  "doc_md": 15,
   "app_build": "49",
-  "capabilities_declared": 439,
-  "capabilities_owned": 430,
+  "capabilities_declared": 458,
+  "capabilities_owned": 449,
   "capabilities_live": null,
-  "capabilities_gated": 162,
-  "devices": 44,
+  "capabilities_gated": 181,
+  "devices": 49,
   "devices_live": null,
   "domains": {
     "rea": {
@@ -87,12 +87,22 @@
       "owned": 7,
       "gated": 3
     },
+    "paper": {
+      "declared": 7,
+      "owned": 7,
+      "gated": 7
+    },
     "pentest": {
       "declared": 7,
       "owned": 7,
       "gated": 0
     },
     "nat": {
+      "declared": 6,
+      "owned": 6,
+      "gated": 6
+    },
+    "domain": {
       "declared": 6,
       "owned": 6,
       "gated": 6
@@ -143,6 +153,11 @@
       "gated": 4
     },
     "ai": {
+      "declared": 4,
+      "owned": 4,
+      "gated": 4
+    },
+    "image": {
       "declared": 4,
       "owned": 4,
       "gated": 4
@@ -211,6 +226,11 @@
       "declared": 3,
       "owned": 3,
       "gated": 2
+    },
+    "doc": {
+      "declared": 3,
+      "owned": 3,
+      "gated": 3
     },
     "artifact": {
       "declared": 3,
@@ -325,11 +345,6 @@
     "fleet": {
       "declared": 1,
       "owned": 0,
-      "gated": 1
-    },
-    "image": {
-      "declared": 1,
-      "owned": 1,
       "gated": 1
     },
     "device": {

@@ -13,8 +13,12 @@
 
 后端清单与探测见 `ai_backends.py`（四元组：id / protocol / base_url / model）。
 """
+import hashlib
+import os
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 from .. import ai_backends as AB
 from ..core import BaseDevice, DeviceResult as R
@@ -26,6 +30,21 @@ from ..core import BaseDevice, DeviceResult as R
 #   同样参数 1024/2048 → finish_reason=stop，正文正常。
 #   原默认 512 正好落在「够不着正文」的区间里 ⇒ 默认给 2048。
 DEFAULT_MAX_TOKENS = 2048
+
+
+def _img_fmt(data):
+    """按魔术字节认格式——Pollinations 说给 PNG，实测回 JPEG，别信扩展名。"""
+    if not data:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8"):
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return None
 
 
 class AI(BaseDevice):
@@ -44,7 +63,8 @@ class AI(BaseDevice):
         return True, ""
 
     def caps(self):
-        return ("ai.list", "ai.status", "ai.complete", "ai.chat", "image.gen")
+        return ("ai.list", "ai.status", "ai.complete", "ai.chat", "image.gen",
+                "image.free")
 
     def invoke(self, cap, args=None):
         args = args or {}
@@ -58,6 +78,8 @@ class AI(BaseDevice):
             return self._chat(args)
         if cap == "image.gen":
             return self._image_gen(args)
+        if cap == "image.free":
+            return self._image_free(args)
         return super().invoke(cap, args)
 
     # ---------------- 出图（经手机 SdBridge）----------------
@@ -222,6 +244,86 @@ class AI(BaseDevice):
                 on_line(f"[{b['id']}] {note}")
             return note
         return text
+
+    # ---------------- 出图（免 key 云端：Pollinations）----------------
+
+    def _image_free(self, args):
+        """免 key 出图：Pollinations 的 image 端点，零配置、不要 token。
+
+        和 `image.gen`（走手机 SdBridge）分工：
+          image.gen  —— 手边有手机、要它本地算（可控、不排队）
+          image.free —— 手机不在场时的兜底：公网免费端点，一条 URL 就是一次生成
+        为什么要它：内容生成这块只有一条腿（手机），手机一断就整块瘫——
+        多一条免 key 的公网腿，才能「谁在谁上」。
+
+        选路不写死端口：天网自有 7891 → 系统代理 → 直连，逐个试（与 paper_harvest 同源）。
+        """
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return R.error("image.free", "缺 prompt", device=self.name, via=self.via)
+        w = max(64, min(int(args.get("width") or 1024), 2048))
+        h = max(64, min(int(args.get("height") or 1024), 2048))
+        model = (args.get("model") or "flux").strip()
+        out = (args.get("out") or "").strip()
+        url = ("https://image.pollinations.ai/prompt/%s?width=%d&height=%d&nologo=true&model=%s"
+               % (urllib.parse.quote(prompt), w, h, urllib.parse.quote(model)))
+
+        data = None
+        last = None
+        for proxy in self._proxy_chain():
+            try:
+                if proxy:
+                    op = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+                else:
+                    op = urllib.request.build_opener()
+                req = urllib.request.Request(url, headers={"User-Agent": "fleet-image/1.0"})
+                with op.open(req, timeout=90) as r:
+                    data = r.read()
+                if data:
+                    break
+            except Exception as e:
+                last = e
+        if not data:
+            return R.error("image.free", "出图失败（三条路都不通）: %s" % last,
+                           device=self.name, via=self.via)
+
+        fmt = _img_fmt(data)
+        if not fmt:
+            return R.error("image.free", "回来的不是图片（%d 字节，头 %r）"
+                           % (len(data), data[:8]), device=self.name, via=self.via)
+        if not out:
+            tag = hashlib.md5(url.encode()).hexdigest()[:8]
+            out = os.path.join(os.getcwd(), "tmp", "img_%s.%s" % (tag, fmt))
+        else:
+            root, ext = os.path.splitext(out)
+            if ext.lower().lstrip(".") != fmt:      # 要的 .png、回来的是 jpg：以真实格式为准
+                out = root + "." + fmt
+        out = os.path.abspath(out)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(out + ".tmp", out)
+        return R.success("image.free", self.name, via=self.via, data={
+            "prompt": prompt, "model": model, "width": w, "height": h,
+            "file": out, "bytes": len(data), "format": fmt,
+            "source": "pollinations（免 key）",
+        })
+
+    def _proxy_chain(self):
+        """候选链：天网 7891 → 系统代理 → 直连（None）。取不到就只留直连。"""
+        cands = []
+        try:
+            from .. import net as N
+            url, _ = N.resolve_proxy()
+            if url:
+                cands.append(url)
+            surl, _ = N.system_proxy_url()
+            if surl and surl not in cands:
+                cands.append(surl)
+        except Exception:
+            pass
+        return cands + [None]
 
     def _pick(self, spec):
         # 「all」/空 → 只返回健康端点（冷却中的不打扰）；显式指定 → 按名过滤（尊重用户选择）
