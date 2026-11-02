@@ -24,7 +24,7 @@ class Osint(BaseDevice):
         return True, ""
 
     def caps(self):
-        return ("osint.crt", "osint.dns", "osint.rdap", "osint.shodan",
+        return ("osint.crt", "osint.dns", "osint.rdap", "osint.shodan", "osint.exposure",
                 "osint.phone", "osint.handle", "osint.identity")
 
     def invoke(self, cap, args=None):

@@ -332,7 +332,11 @@ CAPABILITIES = [
                        Param("handle", "str", doc="昵称"),
                        Param("email", "str", doc="邮箱（仅登记，不自动查重）"),
                        Param("ip", "str", doc="IP（城市级地理情报）")),
-               note="只读：各标识现查现拼，不建库；未做跨源实体消歧，同名可能指向不同人"),
+               note="只读：各标识现查现拼，不做囤积式数据库；未做跨源实体消歧，同名可能指向不同人"),
+    Capability("osint.exposure", "域名暴露面评测：DNS认证/注册/TLS/HTTP头 四类被动检查 → A-F 评级",
+               params=(Param("domain", "str", True, "域名，如 example.com"),
+                       Param("history", "bool", doc="读上一次快照对比（delta），默认 False")),
+               note="只读：内化 OpenOSINT exposure 评分模型，全免费源；A≥90 B≥80 C≥65 D≥50，critical 压到 D；仅查自有/授权域名"),
     # ---- 远程 shell 通道（D4：把别人的机器当设备管；只连你拥有/获授权的机器）----
     Capability("ssh.banner", "SSH 版本探测：真读 SSH-2.0 版本行，确认 22 端口上跑的是 sshd",
                params=(Param("host", "str", True, "主机/IP"),
