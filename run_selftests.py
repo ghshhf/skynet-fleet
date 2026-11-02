@@ -437,6 +437,7 @@ CASES = [
     # 锁死：自动块必须存在且同步 / 正文不许写累加绝对值 / 引用的文件必须真在 / 游离门禁 0。
     ("eval_t63_docs_sync", ["evals/t63_docs_sync.py"], HERE, 120),
     ("eval_t64_protocol", ["evals/t64_protocol.py"], HERE, 180),
+    ("eval_t65_slider", ["evals/t65_slider.py"], HERE, 180),
     # ---- 下载层门禁：解析层的下游（直链/多源/续传/hash校验/任务接口）----
     # 全离线（本地 Range server），与 t60 同源登记，避免「写了不跑=没写」。
     ("eval_t55_download", ["evals/t55_download.py"], HERE, 120),
