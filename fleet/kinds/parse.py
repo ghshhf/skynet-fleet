@@ -32,6 +32,7 @@ import http.server
 import threading
 
 from ..core import BaseDevice, DeviceResult as R
+from .. import net   # 出向唯一正道：默认直连，不被环境里的僵尸 HTTP_PROXY 带跑
 
 quote = urllib.parse.quote
 
@@ -440,7 +441,7 @@ def follow_redirect(short_url, timeout=15, ua=None):
                 "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
     req = urllib.request.Request(short_url, headers={"User-Agent": ua, "Referer": "https://www.douyin.com/"})
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp = net.urlopen(req, timeout=timeout)
         return resp.geturl()
     except urllib.error.HTTPError as e:
         if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
@@ -519,7 +520,7 @@ class DouyinResolver:
             # 从 HTML 抽 aweme_id
             try:
                 req = urllib.request.Request(real, headers={"User-Agent": self.ua})
-                html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+                html = net.urlopen(req, timeout=15).read().decode("utf-8", "replace")
                 for pat in [r'"aweme_id"\s*:\s*"?(\d{15,})', r'"itemId"\s*:\s*"?(\d{15,})',
                             r'"awemeId"\s*:\s*"?(\d{15,})', r'aweme_id=(\d{15,})']:
                     m = re.search(pat, html)
@@ -618,7 +619,7 @@ class DouyinResolver:
             "Accept": "application/json, text/plain, */*",
         })
         try:
-            d = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+            d = net.urlopen(req, timeout=15).read().decode("utf-8", "replace")
             j = json.loads(d)
         except Exception:
             return None
@@ -641,7 +642,7 @@ class DouyinResolver:
                 "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9",
             })
-            html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+            html = net.urlopen(req, timeout=15).read().decode("utf-8", "replace")
         except Exception:
             return None
         data = self._extract_router_data(html)

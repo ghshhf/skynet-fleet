@@ -421,6 +421,10 @@ CASES = [
     # ---- T61：代码转化（LLM 机器转 + 语法/编译机器验）----
     # 全离线：mock llmgw，锁死 去围栏 / python 语法校验 / 端到端转译 / 网关失败透传。
     ("eval_t61_code_convert", ["evals/t61_code_convert.py"], HERE, 90),
+    # ---- T62：出向网络层（僵尸代理不许拖死全站）----
+    # 全离线：自建本地 server 当目标 + 指向死端口的假代理（自己造毒，不依赖本机当前状态）。
+    # 锁死：默认直连 / 死代理必报错不静默回退 / 毒环境下 net.urlopen 仍通 / import fleet 全局兜底生效。
+    ("eval_t62_net", ["evals/t62_net.py"], HERE, 150),
     # ---- 下载层门禁：解析层的下游（直链/多源/续传/hash校验/任务接口）----
     # 全离线（本地 Range server），与 t60 同源登记，避免「写了不跑=没写」。
     ("eval_t55_download", ["evals/t55_download.py"], HERE, 120),
