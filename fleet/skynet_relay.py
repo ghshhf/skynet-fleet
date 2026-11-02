@@ -98,6 +98,18 @@ class SkyNetRelay:
         self._thread = None
         self._stop = threading.Event()
 
+    def _bind(self, port):
+        """开一个监听套并绑好。**单独抽出来是为了可测**（见 start 里那段注释）：
+        门禁要能注入「这个端口现在绑不上」，而不用真的去占一个保留段的端口。"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((self.host, port))
+        except OSError:
+            s.close()
+            raise
+        return s
+
     def start(self, host=None, port=None, token=None):
         """起守护线程里的 TCP server，返回实际监听端口。
 
@@ -119,9 +131,20 @@ class SkyNetRelay:
                 "传 token=... 或先调 new_token() 生成一枚。" % (self.host,))
         _ensure_path()                       # 确认 netforce 在，再绑端口
         from skynet import net as N        # noqa: F401（运行期才需要 net 模块）
-        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._srv.bind((self.host, self.port))
+        self.port_fallback = None
+        try:
+            self._srv = self._bind(self.port)
+        except OSError as _e:
+            # 🔴 存下来的端口**不保证还能用**（2026-11-02 实测，真踩到）：
+            # 上次 `port=0` 拿到 49194 落了盘，这次开机 Windows 把 49152–49251
+            # 划进保留段（Hyper-V / WinNAT 每次开机重划），bind 直接 WinError 10013。
+            # 固定端口只是「顺手的便利」，不是契约 —— 拿不到就退回系统分配，
+            # 别让整条中继死在一个数字上，更别让门禁因为一个数字变红。
+            if not self.port:
+                raise
+            self._srv = self._bind(0)
+            self.port_fallback = (self.port, self._srv.getsockname()[1], "%s" % (_e,))
+            self.port = self._srv.getsockname()[1]
         self._srv.listen(64)
         # 监听套超时：让 accept 循环能定期醒一次记心跳（没连接时也算活着）。
         self._srv.settimeout(30.0)

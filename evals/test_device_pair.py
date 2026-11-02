@@ -138,11 +138,17 @@ def main():
     st, j = req(base2, "/api/health", headers=dev)
     check(st == 200, "同一枚设备凭据在重启后依然通行")
     st, j = req(base2, "/api/health", headers=tok)
-    check(st == 403, "老令牌失效（符合预期，所以手机不该用令牌）")
+    # 401 不是 403：2026-10-29 按 RFC 7235 统一过一次口径 ——
+    # 「带了凭据但对不上」和「压根没带」都算**没有有效凭据** ⇒ 401；
+    # 403 留给「凭据有效但没权限」（例如已配对设备去敲只认本机令牌的管理口）。
+    # 这条门禁当时漏改，还按老口径要 403，于是一直红。要验的性质没变：
+    # **重启换了令牌，上一枚必须不认** —— 判 200 才算放行，401/403 都是拒。
+    check(st == 401, "老令牌失效（符合预期，所以手机不该用令牌）")
+    check(st != 200, "老令牌绝不许还通行（这条是性质，与状态码无关）")
 
     print("— 撤销即时且持久 —")
     st, j = req(base2, "/api/pair/devices", headers=tok)
-    check(st == 403, "重启后的服务不认上一轮令牌")
+    check(st == 401, "重启后的服务不认上一轮令牌")
     st, j = req(base2, "/api/pair/devices", headers={"X-Fleet-Token": srv2.token})
     check(st == 200 and len(j.get("devices") or []) == 1, "本机能看到已配对设备")
     st, j = req(base2, "/api/pair/devices/revoke", method="POST",

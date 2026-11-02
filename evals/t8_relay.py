@@ -149,6 +149,34 @@ def _selftest():
         except OSError:
             pass
 
+    # ⑦ 回归：盘里存下来的端口**现在绑不上**时，必须退回系统分配，不许直接死
+    #   2026-11-02 实测踩到：上次 port=0 拿到 49194 落盘，这次开机 Windows 把
+    #   49152–49251 划进保留段（Hyper-V/WinNAT 每次开机重划），bind 抛 WinError 10013。
+    #   原来那条路是「照搬盘里的端口」→ 中继永远起不来，而报错长得像环境问题。
+    #   注入方式：子类只在「传了非 0 端口」时抛 OSError —— 不真去占保留段端口。
+    class _StalePort(SR.SkyNetRelay):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.tries = []
+
+        def _bind(self, port):
+            self.tries.append(port)
+            if port:
+                raise OSError(10013, "以一种访问权限不允许的方式做了一个访问套接字的尝试")
+            return super()._bind(port)
+
+    st = _StalePort(host="127.0.0.1", port=49194)
+    try:
+        got = st.start()
+        assert st.tries == [49194, 0], "应当先试存下来的端口、失败后退回 0（实得 %r）" % (st.tries,)
+        assert got and got != 49194, "应换到一个真正能用的端口（实得 %r）" % (got,)
+        assert st.port_fallback and st.port_fallback[0] == 49194, \
+            "要把「从哪个端口退下来的」记下来给上层看（实得 %r）" % (st.port_fallback,)
+        print("  [7] 存下的端口绑不上 → 退回系统分配 OK（%d → %d）"
+              % (st.port_fallback[0], st.port_fallback[1]))
+    finally:
+        st.stop()
+
     # 收尾：把 relay 重新停干净（已是 stopped）
     relay.stop()
     file_srv.shutdown()
