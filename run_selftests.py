@@ -440,6 +440,8 @@ CASES = [
     ("eval_t65_slider", ["evals/t65_slider.py"], HERE, 180),
     ("eval_t66_wall", ["evals/t66_wall.py"], HERE, 120),
     ("eval_t67_solve_page", ["evals/t67_solve_page.py"], HERE, 180),
+    # 可选依赖越界：一个"没装 Pillow"能把 415 条能力一起带走（11-03 核最后一环时抓到）
+    ("eval_t68_slider_deps", ["evals/t68_slider_deps.py"], HERE, 120),
     # 并行支线（7659e49 卡死守卫 + 节奏控制）写的两个门禁：写了但没登记 = 没写。
     # t63 的「游离门禁 0」当场抓到它们，这正是那条断言存在的意义。
     ("eval_t_guard_stall", ["evals/t_guard_stall.py"], HERE, 120),
