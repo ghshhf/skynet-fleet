@@ -20,12 +20,14 @@ import phone_ops as P
 try:
     from fleet.guards import StallGuard, screen_fingerprint
     from fleet.pacing import OutwardPacing, AppPacing
+    from fleet.compress import Compressor
 except ImportError:
     # 从仓库根以外运行时也能找到 fleet 包
     import os as _os, sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     from fleet.guards import StallGuard, screen_fingerprint
     from fleet.pacing import OutwardPacing, AppPacing
+    from fleet.compress import Compressor
 
 MODEL = "dots-studio/dots-3-note-preview:free"
 MODEL_CACHE = os.path.join(os.path.expanduser("~"), ".fleet", "agent_model.json")
@@ -379,13 +381,16 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
     models = usable_models() or [MODEL]
     if model:
         models = [model] + [m for m in models if m != model]
-    log, done_steps = [], []
+    log = []
     feedback = "（还没开始）"
     # 批次1（2026-11-02）：卡死守卫 + 节奏控制
     guard = StallGuard()
     pacing_out = OutwardPacing()
     pacing_app = AppPacing()
     guard_hint = ""
+    # 批次2（2026-11-02）：确定性上下文压缩。任务原话作前缀（不折），工具往返折成一行。
+    comp = Compressor()
+    comp.set_task(task)
     for step in range(1, max_steps + 1):
         fg, items, value, rerr = screen_brief(serial)
         fp = screen_fingerprint(fg, items)
@@ -393,10 +398,10 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
             # 读不到界面就停：没有清单，模型只能瞎猜，跟着瞎点比不点更糟
             log.append({"step": step, "err": "读不到界面，停止", "detail": rerr[:160]})
             break
-        history = "；".join(done_steps[-8:]) or "（无）"
-        user = (f"任务：{task}\n当前应用：{fg}\n"
+        history = comp.render()
+        user = (f"当前应用：{fg}\n"
                 f"输入框当前内容：{value or '（空）'}\n"
-                f"已做过的动作：{history}\n"
+                f"已做过的动作（压缩日志）：\n{history}\n"
                 f"可见控件：\n" + "\n".join(items[:40]) +
                 f"\n上一步结果：{feedback}\n"
                 + (f"⚠️ 守卫提醒：{guard_hint}\n" if guard_hint else "")
@@ -453,11 +458,11 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
             feedback += "（" + str(r["note"]) + "）"
         # 卡死守卫：喂入 (指纹, 动作, 是否成功, 界面是否变化)
         decision = guard.observe(fp, act, ok, bool(changed))
-        step_desc = act.get("action", "")
+        parts = []
         for k in ("label", "id", "target", "text", "percent", "direction", "package"):
             if act.get(k):
-                step_desc += " " + str(act[k])
-        done_steps.append(step_desc.strip())
+                parts.append(f"{k}={act[k]}")
+        comp.add_step(step, str(act.get("action", "")), " ".join(parts), ok, changed)
         if decision.status == "stop":
             log.append({"step": step, "action": act, "ok": ok, "changed": changed,
                         "model": used, "note": feedback, "guard": decision.reason})
