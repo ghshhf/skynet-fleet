@@ -31,7 +31,7 @@
 | 门禁登记 | **145** 条 | `run_selftests.py` 的 `CASES` |
 | eval 文件 | **82** 份 | `evals/*.py` |
 | 游离门禁 | **0** 份 | 写了但没登记，等于没写 |
-| 文档 | **8** 份 | `docs/*.md` |
+| 文档 | **9** 份 | `docs/*.md` |
 | App build | **49** | `tianwang_android/version.txt` |
 
 | 缺口 | 条 | 含义 |
