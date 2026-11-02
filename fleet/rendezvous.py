@@ -362,7 +362,8 @@ class Rendezvous:
         return self.refresh(force=force).get("current")
 
     # ---- 上报（动态更新）
-    def publish(self, origin, secret, meta=None, deep=False, force=False, port=0):
+    def publish(self, origin, secret, meta=None, deep=False, force=False, port=0,
+                headers: dict = None):
         """把当前地址集写进中继地址簿。
 
         每次都整份写，不做增量：地址簿里存的是「**现在**在哪」，
@@ -371,6 +372,9 @@ class Rendezvous:
         `port` 是本机实际在监听的那个口。**必须带**：只有 IP 没有端口的记录，
         对端拿到也用不上，而墙外自检连 port=0 会得到「地址无效」——
         那既不是可达也不是不可达，纯粹是参数没给对。
+
+        `headers` 透传给底层 HTTP 客户端：中继外面若还套了一层网关
+        （Daytona preview 就自带一道 Bearer），那层要单独的头。
         """
         from tools.cloudnode import wsrelay as wsr
 
@@ -383,14 +387,15 @@ class Rendezvous:
 
         res = wsr.addr_put(origin, r["self_id"], addrs, secret,
                            meta={**(meta or {}), "current": r.get("current"),
-                                 "port": int(port or 0)})
+                                 "port": int(port or 0)},
+                           headers=headers)
         res["published"] = addrs
         res["self_id"] = r["self_id"]
         res["changed"] = r["changed"]
         return res
 
     # ---- 自检（从墙外回连）
-    def verify(self, origin, secret, port=0, only=None, timeout=8.0):
+    def verify(self, origin, secret, port=0, only=None, timeout=8.0, headers: dict = None):
         """让中继逐个回连这些地址，标出**真能进得来**的。
 
         这是本文件唯一能给出「入站可用」结论的地方。
@@ -406,22 +411,37 @@ class Rendezvous:
         # 私网地址让墙外连没有意义；**没有端口的候选则不构成一次可判定实验**：
         # 连 port=0 得到的是「地址无效」，不是「不可达」。把这种结果算进
         # 「全部不可达」会让结论从「测不了」变成「进不来」，进而误导人去改防火墙。
-        todo = [c for c in snap["candidates"]
+        #
+        # ⚠️ 两种「测不了」必须分开说（2026-11-02 修正）：
+        #   · 没有**公网**地址 → 墙外根本没有目标可连，问题是网络侧没给地址
+        #   · 有公网地址但**端口是 0** → 问题是本机还没开监听口
+        # 早先这两者都写成「没有可探测端口（port 都是 0）」，会把人引去改防火墙，
+        # 而真实原因在网络侧 —— 属于「把测不了说成进不来」的同类错。
+        pub = [c for c in snap["candidates"] if c["kind"] != "private4"]
+        todo = [c for c in pub
                 if (only is None or c["ip"] in only)
-                and c["kind"] != "private4"
                 and _p(c) > 0]
         if not todo:
+            if not pub:
+                return {"ok": False, "confident": False, "reachable": [], "all": [],
+                        "no_public_addr": True,
+                        "note": "本机当前没有公网地址（只有内网地址），墙外没有目标可连："
+                                "这是网络侧没给地址，不是「进不来」，也不是端口问题。"
+                                "IPv6 地址会按 RFC 4941 轮换、家宽重拨换前缀，"
+                                "所以「这会儿没有」不等于「失效」——"
+                                "要看的是 self_id → 当前地址 这个映射还在不在，"
+                                "以及地址一出现能不能自动上报。"}
             return {"ok": False, "confident": False, "reachable": [], "all": [],
                     "invalid_port": True,
-                    "note": "没有可探测端口（候选的 port 都是 0）：先在本机开一个监听口"
-                            "（例如 tun.open 之后），再来验入站。"
+                    "note": "有公网地址但没有可探测端口（候选的 port 都是 0）："
+                            "先在本机开一个监听口（例如 tun.open 之后），再来验入站。"
                             "这不是「进不来」，是「还没法测」"}
         out = []
         looped = []
         origin_local = _host_is_local(origin)
         for c in todo:
             r = wsr.probe_from_relay(origin, c["ip"], _p(c),
-                                     secret, timeout=timeout)
+                                     secret, timeout=timeout, headers=headers)
             src = r.get("from") or ""
             loc = _src_is_local(src, c["ip"])
             if loc is None and origin_local:

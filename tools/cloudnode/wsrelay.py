@@ -1119,26 +1119,27 @@ def connect_pair(url: str, room: str, secret: str, timeout: float = 30.0) -> Pai
 # 设备指纹不变，地址随时上报 —— 对端永远只问指纹，不问 IP。
 # 这就是主人口里那句「另类的固态」：对外是固定标识，对内随便漂。
 
-def addr_put(origin: str, fp: str, addrs, secret: str, meta=None, timeout: float = 8.0):
+def addr_put(origin: str, fp: str, addrs, secret: str, meta=None, timeout: float = 8.0,
+             headers: dict = None):
     """把「我现在在哪」写进中继的地址簿。地址变了就再写一次。"""
     body = json.dumps({"fp": fp, "addrs": addrs, "ts": time.time(),
                        "meta": meta or {},
                        "token": pair_token(f"put:{fp}", secret)}).encode("utf-8")
-    return _http_json(origin, "/addr", "POST", body, timeout=timeout)
+    return _http_json(origin, "/addr", "POST", body, timeout=timeout, headers=headers)
 
 
-def addr_get(origin: str, fp: str, timeout: float = 8.0):
+def addr_get(origin: str, fp: str, timeout: float = 8.0, headers: dict = None):
     """按设备指纹查「它现在在哪」。查不到如实返回 ok:false，不编一个地址出来。"""
     return _http_json(origin, "/addr?" + urllib.parse.urlencode({"fp": fp}),
-                      "GET", b"", timeout=timeout)
+                      "GET", b"", timeout=timeout, headers=headers)
 
 
-def addr_list(origin: str, timeout: float = 8.0):
-    return _http_json(origin, "/addr", "GET", b"", timeout=timeout)
+def addr_list(origin: str, timeout: float = 8.0, headers: dict = None):
+    return _http_json(origin, "/addr", "GET", b"", timeout=timeout, headers=headers)
 
 
 def probe_from_relay(origin: str, target: str, port: int, secret: str,
-                     timeout: float = 8.0):
+                     timeout: float = 8.0, headers: dict = None):
     """**从墙外回连我自己**，验证入站到底通不通。
 
     这是整套方案里唯一可信的入站判据：本机往自己的公网地址发包走 hairpin，
@@ -1148,16 +1149,22 @@ def probe_from_relay(origin: str, target: str, port: int, secret: str,
     qs = urllib.parse.urlencode({
         "target": target, "port": port,
         "token": pair_token(f"probe:{target}", secret)})
-    return _http_json(origin, "/probe?" + qs, "GET", b"", timeout=timeout)
+    return _http_json(origin, "/probe?" + qs, "GET", b"", timeout=timeout,
+                      headers=headers)
 
 
 def _http_json(origin: str, route: str, method: str, body: bytes = b"",
-               timeout: float = 8.0):
+               timeout: float = 8.0, headers: dict = None):
     """一次性 HTTP 请求，只返回解析后的 JSON。
 
     `origin` 只要 scheme://host:port，路径全由 route 决定 ——
     不让调用方拼路径，是避免「base 带了没带尾斜杠」这类低级不一致
     （上一版就是靠字符串包含判断，既绕又容易错）。
+
+    `headers` 是给「中继外面还套了一层网关」用的：比如 Daytona 的 preview
+    代理（daytonaproxy01.net）自己在前面加了一道 Bearer 鉴权，
+    不带就 401。它和本文件自己的 HMAC token（放在请求体里）是两层独立的东西，
+    互不替代 —— 所以这里做成透传参数，而不是写死某个平台的 token。
     """
     u = urllib.parse.urlsplit(origin)
     tls = u.scheme in ("wss", "https")
@@ -1169,10 +1176,12 @@ def _http_json(origin: str, route: str, method: str, body: bytes = b"",
     if tls:
         raw = ssl.create_default_context().wrap_socket(raw, server_hostname=thost)
     try:
+        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
         raw.sendall(
             (f"{method} {path} HTTP/1.1\r\nHost: {thost}\r\n"
              f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
-             f"Connection: close\r\nUser-Agent: skynet-wsrelay/2\r\n\r\n").encode() + body
+             f"Connection: close\r\nUser-Agent: skynet-wsrelay/2\r\n"
+             f"{extra}\r\n").encode() + body
         )
         buf = b""
         while True:
