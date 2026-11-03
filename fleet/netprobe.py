@@ -1,13 +1,22 @@
 # -*- coding: utf-8 -*-
-"""天网 · 网络观测与协议理解（抓包方向第一版，对应 V1.1 第六节 + 阶段 2/3）
+"""天网 · 网络观测与协议理解（抓包方向，对应 V1.1 第六节 + 阶段 2/3）
 
 不依赖底层抓包库（npcap / Wireshark），先落地「应用层协议观测」：
 任何一次 HTTP 请求，都产出结构化证据（耗时、重定向链、状态码、错误分类），
 并能在失败时给出故障诊断。这是比 PCAP 更轻、立刻能跑的第一步。
 
 后续若要真抓包，把采集器换成 npcap / tshark 即可，对上接口不变。
+
+状态机（执行侧）：
+    initiated → sent → received → success / failed / unknown_result
+    - success     ：拿到响应，业务是否成功是上层的事，这里只确认「通信成了」。
+    - failed      ：请求根本没到业务层（DNS/TLS/连接/协议/代理失败）。
+    - unknown_result（2026-11-03 新增）：请求已发出、连接已建，但响应未确认。
+                  计划书硬规矩——「没收到结果 ≠ 一定失败」，可能是结果未知，
+                  此时盲目重试有副作用，必须先查状态。绝不当成 failed 处理。
 """
 from . import clock
+from . import netdiag  # 诊断模板与 KB（纯模块，无循环依赖）
 
 try:
     import httpx
@@ -15,7 +24,8 @@ except ImportError:  # 无 httpx 环境：分类退化为纯文本嗅探
     httpx = None
 
 __all__ = [
-    "classify_error", "RequestTrace", "probe_url", "diagnose", "run_diagnosis",
+    "classify_error", "infer_terminal_state", "RequestTrace",
+    "probe_url", "diagnose", "run_diagnosis",
 ]
 
 
@@ -59,65 +69,47 @@ def classify_error(exc):
     return "unknown"
 
 
-# ------------------------------------------------------------------- 诊断知识库
-# category -> (一句话原因, 置信度 high/med/low, 下一步建议列表)
-_DIAGNOSES = {
-    "dns": ("DNS 解析失败：域名无法解析为主机地址",
-            "high",
-            ["核对域名拼写", "本机查 DNS：nslookup <域名> / ipconfig /flushdns",
-             "若目标在代理后，确认是否需走特定通道解析"]),
-    "connection": ("连接被拒 / 网络不可达：TCP 三次握手未建立",
-                   "high",
-                   ["确认目标主机在线、端口开放", "检查防火墙 / 代理 / 本机出口",
-                    "若为内网地址确认是否在同一网络"]),
-    "timeout_connect": ("连接超时：握手在预算内未完成",
-                        "med",
-                        ["目标响应慢或链路拥塞", "增大 timeout 或走代理重试",
-                         "确认不是被限流 / 反爬拦截"]),
-    "timeout_read": ("读取超时：连接已建但响应迟迟不来",
-                     "med",
-                     ["服务端处理慢 / 挂起", "检查是否触发反爬返回空响应",
-                      "降低并发或改用分块读取"]),
-    "tls": ("TLS / 证书错误：加密握手失败",
-            "high",
-            ["确认系统根证书完整（本机曾删过 Windows Update 组件，证书库可能不全）",
-             "目标是否自签 / 过期", "代理是否做了中间人拦截"]),
-    "http_status": ("HTTP 状态码错误（4xx/5xx）",
-                    "med",
-                    ["4xx = 客户端问题（鉴权 / 参数 / 频率 / 权限）",
-                     "5xx = 服务端问题", "务必读响应体定位具体原因，别只看状态码"]),
-    "protocol": ("协议错误：响应不符合 HTTP 规范",
-                 "med",
-                 ["目标可能不是 HTTP 服务", "代理返回了非预期内容",
-                  "检查端口 / 协议是否匹配"]),
-    "proxy": ("代理错误：出口代理拒绝或失败",
-              "high",
-              ["确认代理地址 / 凭据", "换代理或直连对比", "查代理侧日志"]),
-    "http_error": ("HTTP 层错误（非上述具体类别）",
-                   "med",
-                   ["保留原始异常文本", "用 --deep 抓包拿更底层证据"]),
-    "unknown": ("未能从异常归类失败原因（证据不足）",
-                "low",
-                ["保留原始异常文本", "用更底层抓包拿证据", "不要臆造原因"]),
-}
+# ------------------------------------------------------------------- 终态推断
+# 这是「结果未知 ≠ 失败」的代码兑现点。given 一个异常 + 它发生在哪个阶段，
+# 推断终态是 failed（明确没到业务层）还是 unknown_result（可能到业务层了，只是没确认）。
+def infer_terminal_state(exc, sent):
+    """sent=True 表示 mark_sent 已调（连接层已发起）。
 
-# 状态机：请求生命周期。unknown 不在这条链上——unknown 只在「结果未知」时由诊断层标出。
-# 这里的状态是「执行侧」状态：发起 -> 已发送 -> 已接收 -> (成功 / 失败)。
-_STATE_FLOW = ("initiated", "sent", "received", "success", "failed")
+    判定规则（保守，宁漏勿错标）：
+    - timeout_read：连接已建、响应迟迟不来 → 服务端可能已处理 → unknown_result
+    - connection 且 sent=True 且非「连接被拒/不可达」：发出之后才断开（reset 等）
+      → 请求可能已抵达服务端 → unknown_result
+    - connection 但「未发出 / 被拒 / 不可达」：明确没建立，请求没出去 → failed
+    - 其余（DNS/TLS/代理/协议/超时未发）→ failed
+    """
+    cat = classify_error(exc)
+    s = str(exc).lower()
+    if cat == "timeout_read":
+        return "unknown_result"
+    if cat == "connection":
+        if not sent or "refused" in s or "unreachable" in s or "10061" in s:
+            return "failed"          # 连接被拒/不可达：明确没发出去
+        return "unknown_result"      # 已发且中途断开：可能已抵达
+    return "failed"
+
+
+# 状态机：请求生命周期。unknown_result 与 failed 平级，都是「未成功」，但语义不同。
+_STATE_FLOW = ("initiated", "sent", "received", "success", "failed", "unknown_result")
 
 
 class RequestTrace:
     """一次请求的结构化证据。所有时间走 clock（perf_counter），不碰墙钟算时长。"""
 
     __slots__ = (
-        "url", "method", "state", "_t0", "_t1",
+        "url", "method", "task_id", "state", "_t0", "_t1",
         "status", "final_url", "redirects", "error", "category",
         "bytes", "headers", "body", "body_truncated",
     )
 
-    def __init__(self, url, method="GET"):
+    def __init__(self, url, method="GET", task_id=None):
         self.url = url
         self.method = method
+        self.task_id = task_id
         self.state = "initiated"
         self._t0 = clock.now()
         self._t1 = None
@@ -165,7 +157,8 @@ class RequestTrace:
         self._t1 = clock.now()
         self.error = str(exc)
         self.category = classify_error(exc)
-        self.state = "failed"
+        sent = self.state in ("sent", "received")
+        self.state = infer_terminal_state(exc, sent)
 
     def dur_ms(self):
         if self._t1 is None:
@@ -177,6 +170,7 @@ class RequestTrace:
         return {
             "url": self.url,
             "method": self.method,
+            "task_id": self.task_id,
             "final_url": self.final_url,
             "status": self.status,
             "state": self.state,
@@ -195,14 +189,15 @@ class RequestTrace:
 
 
 def probe_url(url, method="GET", headers=None, timeout=30,
-              follow_redirects=True, body_limit=200000, client=None):
+              follow_redirects=True, body_limit=200000, client=None,
+              task_id=None):
     """发一次真实请求并产出 RequestTrace。client 可注入（测试用），否则自动建/关。
 
     只做观测 + 取首段 body，不做任何解析/落盘——那是上层爬虫 handler 的事。
     """
     import httpx  # 局部导入：本模块可被「无 httpx」环境静态加载（能力注册阶段）
 
-    tr = RequestTrace(url, method)
+    tr = RequestTrace(url, method, task_id=task_id)
     tr.mark_sent()
     own = client is None
     if own:
@@ -222,9 +217,12 @@ def probe_url(url, method="GET", headers=None, timeout=30,
 
 
 def diagnose(trace):
-    """基于 trace 给诊断。返回 {category, reason, confidence, next_steps, evidence}。"""
+    """基于 trace 给诊断。返回 {category, reason, confidence, next_steps, evidence, state}。
+
+    诊断模板来自 netdiag 知识库（可持久化、可累积）；未命中类别回落 unknown 模板。
+    """
     cat = trace.category or "unknown"
-    reason, conf, steps = _DIAGNOSES.get(cat, _DIAGNOSES["unknown"])
+    reason, conf, steps = netdiag.lookup(cat)
     # 把实测证据贴上去，让诊断可被复核，而不是一句结论。
     evidence = []
     if trace.status is not None:
@@ -244,21 +242,31 @@ def diagnose(trace):
             "confidence": "high",
             "next_steps": [],
             "evidence": evidence,
+            "state": trace.state,
         }
+    # unknown_result 是高于具体 category 的元语义：无论底层是超时还是断连，
+    # 结论都是「结果未知，勿盲目重试」。用 unknown_result 模板的建议覆盖具体分类建议。
+    if trace.state == "unknown_result":
+        ur_reason, ur_conf, ur_steps = netdiag.lookup("unknown_result")
+        reason = "%s；%s" % (reason, ur_reason)
+        conf = ur_conf
+        steps = list(ur_steps)
     return {
         "category": cat,
         "reason": reason,
         "confidence": conf,
         "next_steps": list(steps),
         "evidence": evidence,
+        "state": trace.state,
     }
 
 
-def run_diagnosis(url, **kw):
+def run_diagnosis(url, task_id=None, **kw):
     """独立入口：探测一次 + 出诊断报告。供 crawl.diagnose 能力调用。"""
-    tr = probe_url(url, **kw)
+    tr = probe_url(url, task_id=task_id, **kw)
     return {
         "url": url,
+        "task_id": task_id,
         "trace": tr.to_dict(),
         "diagnosis": diagnose(tr),
     }
