@@ -63,13 +63,22 @@ def _h_http_fetch(cap, args, dev):
 
 @_reg("crawl.diagnose")
 def _h_diagnose(cap, args, dev):
-    """网络诊断：探测一次 URL，产出结构化证据 + 故障诊断报告（V1.1 故障诊断器入口）。"""
-    from .. import netprobe
+    """网络诊断：探测一次 URL，产出结构化证据 + 故障诊断报告（V1.1 故障诊断器入口）。
+
+    升级（2026-11-03）：支持 task_id 关联；故障（非 success）自动沉淀为 incident 流水，
+    供后续「从故障转为能力」复用（计划书任务 D：保存失败结果，避免重复踩坑）。
+    """
+    from .. import netprobe, netdiag
     url = args.get("url")
     if not url:
         return R.error(cap, "url 必填", device=dev.name, via=dev.via)
-    rep = netprobe.run_diagnosis(url, timeout=args.get("timeout") or 30,
+    task_id = args.get("task_id")
+    rep = netprobe.run_diagnosis(url, task_id=task_id,
+                                timeout=args.get("timeout") or 30,
                                 follow_redirects=True)
+    # 仅在故障态记录 incident；成功探测不污染流水。
+    if rep["diagnosis"].get("state") != "success":
+        netdiag.record_incident(rep["trace"], rep["diagnosis"], task_id=task_id)
     return R.success(cap, dev.name, via=dev.via, data=rep)
 
 
