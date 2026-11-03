@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-11-03 05:40:32",
+  "generated_at": "2026-11-03 14:55:59",
   "gates_registered": 154,
   "eval_files": 91,
   "orphan_evals": [],
-  "doc_md": 18,
+  "doc_md": 13,
   "app_build": "49",
   "capabilities_declared": 471,
   "capabilities_owned": 462,
   "capabilities_live": null,
   "capabilities_gated": 194,
-  "devices": 50,
+  "devices": 47,
   "devices_live": null,
   "domains": {
     "rea": {
