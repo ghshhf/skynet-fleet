@@ -79,6 +79,7 @@ ENGINE_OF = {
     "crawl.export_dataset": "crawlee",
     "crawl.robots_sitemap": "httpx",
     "crawl.autoscale": "crawlee",
+    "crawl.diagnose": "httpx",
 }
 
 CRAWLER_CAPABILITIES = [
@@ -130,6 +131,10 @@ CRAWLER_CAPABILITIES = [
     Capability("crawl.robots_sitemap", "读取并解析 robots.txt / sitemap.xml，判断可抓取范围",
                params=(Param("url", "str", True, "站点根或 robots/sitemap URL")),
                side_effect=False, check=_mk("httpx"), note="[CRAWL] 依赖 httpx"),
+    Capability("crawl.diagnose", "网络诊断：探测一次 URL，产出结构化协议证据（耗时/重定向/状态码）与故障诊断（错误分类+下一步建议）",
+               params=(Param("url", "str", True, "目标 URL"),
+                       Param("timeout", "int", doc="秒，默认 30")),
+               side_effect=False, check=_mk("httpx"), note="[CRAWL] 依赖 httpx · 抓包方向第一版"),
     Capability("crawl.autoscale", "并发自适应（AutoscaledPool）：按系统负载自动调爬取并发",
                params=(Param("url", "str", True, "目标 URL")),
                side_effect=False, check=_mk("crawlee"), note="[CRAWL] 依赖 crawlee"),
