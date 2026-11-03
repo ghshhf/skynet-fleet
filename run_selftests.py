@@ -472,6 +472,10 @@ CASES = [
     ("eval_t77_netdiag", ["evals/t77_netdiag.py"], HERE, 120),
     # 出网自适应（11-03）：默认直连，只有网络层失败才回退代理；HTTP 错误不回退。
     ("eval_t78_net_adaptive", ["evals/t78_net_adaptive.py"], HERE, 120),
+    # 仓库自检（11-03）：HEAD 里的导入目标是否都在库里。补的是「门禁只在
+    # 工作区跑，所以本地有、仓库没有的模块永远是绿的」这个盲区——
+    # 当天就抓到 fleet/gemini.py 裸引用了从没入库的 fleet/vault.py。
+    ("eval_t79_repo_selfcheck", ["evals/t79_repo_selfcheck.py"], HERE, 120),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),
