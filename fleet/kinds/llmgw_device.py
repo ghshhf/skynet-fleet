@@ -343,10 +343,20 @@ MODEL_CLASSES = {
         "desc": "DeepSeek V4 Flash 常驻主力（快、便宜、够用；链最厚，专供日常高频）",
         "chain": [
             # 第一跳必须是**稳定**的那条，不是最快的那条。
-            # 教训（11-01 实测）：`opencode/deepseek-v4.1-flash-free` 3.76s 跑通一次，
-            # 几分钟后再打就 429「Free usage limit reached」—— OpenCode 的免费池是抢来的，
-            # 随时清零，不能当主力。buddy 走的是 CodeBuddy 自家账号池，稳定 1.38~2.09s。
-            ("ofm", "buddy/deepseek-v4.1-flash"),
+            # 更新：buddy 池的 DeepSeek 已下架（404 模型不存在），opencode free 池随时 429。
+            # ofm（18900）是聚合转发，下面 trae/codearts/loomy/raccoon 各池都有 DeepSeek
+            # 镜像——实测 9 个 200 可用（lobsterai 账号禁用 502、codearts 的 v4-flash/v4-pro
+            # 已停用 404）。按「V4.1 Flash 优先 → V4 Flash → Pro → V3」串成 ofm 段，
+            # 任一池抖就退下一池；这 9 跳全挂才轮到后面跨端点冗余。
+            ("ofm", "trae/deepseek-v4.1-flash"),
+            ("ofm", "codearts/deepseek-v4.1-flash"),
+            ("ofm", "loomy/DeepSeek-V4.1-Flash"),
+            ("ofm", "raccoon/sn-deepseek-v4-1-flash-1017"),
+            ("ofm", "trae/DeepSeek-V4-Flash"),
+            ("ofm", "trae/DeepSeek-V4-Pro"),
+            ("ofm", "trae/DeepSeek-V4-Pro-Official"),
+            ("ofm", "trae/deepseek-V3.1"),
+            ("ofm", "trae/deepseek-V3"),
             # 11-01 拿到 AMD key 后实测：V4.1（注意是 .1，不是 V4）1.43s 出正文、
             # 带 tools 只要 1.07s，比 buddy 的 2.26s 还快 —— 而且它是**真 DeepSeek 权重**，
             # 不像 buddy 那层是聚合池。放第二跳：平时打不到它，buddy 一抖就轮到它，
