@@ -1090,6 +1090,90 @@ def _v_shot(a):
         return dict(ok=True, path=path, url=s.page.url)
 
 
+@_verb("shot_el")
+def _v_shot_el(a):
+    """截单个元素存成图片文件，交给 captcha.* 去识别。
+
+    为什么截元素而不是整页：验证码图往往被缩放/裁切，整页截图后再算坐标
+    要来回换算，误差全叠在最后那几像素上。直接截元素，坐标就是元素内部坐标。
+    """
+    with Session(a.get("port") or 9222) as s:
+        sel = a.get("selector")
+        if not sel:
+            return dict(ok=False, err="selector 必填")
+        el = s.page.query_selector(sel)
+        if not el:
+            return dict(ok=False, err="找不到元素：%s" % sel)
+        box = el.bounding_box()
+        path = a.get("path") or os.path.join(
+            BROWSER_DIR, "el_%d_%d.png" % (int(time.time()), abs(hash(sel)) % 10000))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        el.screenshot(path=path)
+        return dict(ok=True, path=path, box=box, url=s.page.url)
+
+
+@_verb("drag")
+def _v_drag(a):
+    """按「人类轨迹」拖一个元素 —— 滑块验证码的最后一公里。
+
+    只算坐标不够：服务端校验的是**过程**（加速度曲线、纵向漂移、过冲回拉）。
+    直线匀速拖过去，坐标再准也判机器。轨迹由 fleet.captcha.human_path 生成，
+    这里只负责逐点发真实鼠标事件。
+
+    参数：
+      selector  拖动手柄（滑块按钮）的选择器，必需
+      distance  要拖多远（像素）。不传则用 dx 比例或 gap_x
+      gap_x/handle_x  也可以给两个绝对 x，自动算 distance
+      jitter    纵向抖动幅度（默认 2）
+      dry       只算不拖（看轨迹）
+    """
+    from . import captcha as C
+    with Session(a.get("port") or 9222) as s:
+        sel = a.get("selector")
+        if not sel:
+            return dict(ok=False, err="selector 必填")
+        el = s.page.query_selector(sel)
+        if not el:
+            return dict(ok=False, err="找不到拖动手柄：%s" % sel)
+        box = el.bounding_box()
+        if not box:
+            return dict(ok=False, err="手柄不可见（bounding_box 为空）")
+
+        if a.get("distance") is not None:
+            dist = float(a["distance"])
+        elif a.get("gap_x") is not None and a.get("handle_x") is not None:
+            dist = float(a["gap_x"]) - float(a["handle_x"])
+        else:
+            return dict(ok=False, err="要给 distance，或同时给 gap_x 与 handle_x")
+
+        sx = box["x"] + box["width"] / 2.0
+        sy = box["y"] + box["height"] / 2.0
+        path = C.human_path(dist, y_jitter=float(a.get("jitter", 2.0)),
+                            seed=a.get("seed"))
+        if a.get("dry"):
+            return dict(ok=True, dry=True, distance=dist, start=[sx, sy], path=path)
+
+        # 先落位再按：人手就是先移过去、停一下、再按下
+        s.page.mouse.move(sx, sy)
+        s.page.wait_for_timeout(int(a.get("settle_ms", 120)))
+        s.page.mouse.down()
+        s.page.wait_for_timeout(int(a.get("hold_ms", 90)))
+        for p in path:
+            s.page.mouse.move(sx + p["x"], sy + p["y"], steps=1)
+            s.page.wait_for_timeout(p["dt"])
+        s.page.wait_for_timeout(int(a.get("release_ms", 60)))
+        s.page.mouse.up()
+
+        out = dict(ok=True, distance=dist, points=len(path),
+                   start=[round(sx, 1), round(sy, 1)],
+                   elapsed_ms=sum(p["dt"] for p in path), url=s.page.url)
+        try:
+            out.update({k: v for k, v in wall_state(s.page).items() if k in ("blocked", "title")})
+        except Exception:
+            pass
+        return out
+
+
 def run_verb(verb, payload=None, timeout=180):
     """在**子进程**里跑一个动作，返回它的 JSON 结果。
 
