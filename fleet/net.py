@@ -208,10 +208,18 @@ def _build(proxy_url):
 
 
 
-def urlopen(url, data=None, headers=None, timeout=20, proxy=None, method=None):
+def urlopen(url, data=None, headers=None, timeout=20, proxy=None, method=None, fallback=True):
     """统一出口。url 可以是 str 或 Request。
 
     返回 response（要做 with 或 .close()）。
+
+    自适应（默认 proxy=None，对应「默认先直连、走到最后才代理」）：
+        先直连尝试；若**网络层**失败（连接被拒 / 重置 / 超时 / 解析失败），自动回退到
+        resolve_proxy() 选出的代理（自有 7891 → 系统代理）再试一次。
+        HTTP 层结果（4xx/5xx）**不回退**——那是目标返回的业务结论，不是网络问题。
+        fallback=False 关闭回退，严格按 proxy 走（排障用）。
+
+    显式 proxy（"self"/"auto"/具体 URL）走 opener()，不自动回退，遵守其语义。
     """
     hdrs = {"User-Agent": DEFAULT_UA}
     if headers:
@@ -223,7 +231,29 @@ def urlopen(url, data=None, headers=None, timeout=20, proxy=None, method=None):
                 req.add_header(k, v)
     else:
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    return opener(proxy).open(req, timeout=timeout)
+
+    if proxy in ("direct", False):
+        return _DIRECT.open(req, timeout=timeout)
+    if proxy not in (None, "", "adaptive"):
+        return opener(proxy).open(req, timeout=timeout)
+
+    # 默认自适应：先直连，网络层失败才回退代理
+    try:
+        return _DIRECT.open(req, timeout=timeout)
+    except urllib.error.HTTPError:
+        raise
+    except (urllib.error.URLError, ConnectionError, socket.timeout, OSError) as e1:
+        if not fallback:
+            raise
+        p_url, _why = resolve_proxy()
+        if not p_url:
+            raise
+        try:
+            return _build(p_url).open(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except Exception:
+            raise e1
 
 
 def get_json(url, headers=None, timeout=20, proxy=None):

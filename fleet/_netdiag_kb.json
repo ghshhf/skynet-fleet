@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "patterns": {
+    "dns": {
+      "reason": "DNS 解析失败：域名无法解析为主机地址",
+      "confidence": "high",
+      "next_steps": [
+        "核对域名拼写",
+        "本机查 DNS：nslookup <域名> / ipconfig /flushdns",
+        "若目标在代理后，确认是否需走特定通道解析"
+      ]
+    },
+    "connection": {
+      "reason": "连接被拒 / 网络不可达：TCP 三次握手未建立",
+      "confidence": "high",
+      "next_steps": [
+        "确认目标主机在线、端口开放",
+        "检查防火墙 / 代理 / 本机出口",
+        "若为内网地址确认是否在同一网络"
+      ]
+    },
+    "timeout_connect": {
+      "reason": "连接超时：握手在预算内未完成",
+      "confidence": "med",
+      "next_steps": [
+        "目标响应慢或链路拥塞",
+        "增大 timeout 或走代理重试",
+        "确认不是被限流 / 反爬拦截"
+      ]
+    },
+    "timeout_read": {
+      "reason": "读取超时：连接已建但响应迟迟不来",
+      "confidence": "med",
+      "next_steps": [
+        "服务端处理慢 / 挂起",
+        "检查是否触发反爬返回空响应",
+        "降低并发或改用分块读取"
+      ]
+    },
+    "tls": {
+      "reason": "TLS / 证书错误：加密握手失败",
+      "confidence": "high",
+      "next_steps": [
+        "确认系统根证书完整（本机曾删过 Windows Update 组件，证书库可能不全）",
+        "目标是否自签 / 过期",
+        "代理是否做了中间人拦截"
+      ]
+    },
+    "http_status": {
+      "reason": "HTTP 状态码错误（4xx/5xx）",
+      "confidence": "med",
+      "next_steps": [
+        "4xx = 客户端问题（鉴权 / 参数 / 频率 / 权限）",
+        "5xx = 服务端问题",
+        "务必读响应体定位具体原因，别只看状态码"
+      ]
+    },
+    "protocol": {
+      "reason": "协议错误：响应不符合 HTTP 规范",
+      "confidence": "med",
+      "next_steps": [
+        "目标可能不是 HTTP 服务",
+        "代理返回了非预期内容",
+        "检查端口 / 协议是否匹配"
+      ]
+    },
+    "proxy": {
+      "reason": "代理错误：出口代理拒绝或失败",
+      "confidence": "high",
+      "next_steps": [
+        "确认代理地址 / 凭据",
+        "换代理或直连对比",
+        "查代理侧日志"
+      ]
+    },
+    "http_error": {
+      "reason": "HTTP 层错误（非上述具体类别）",
+      "confidence": "med",
+      "next_steps": [
+        "保留原始异常文本",
+        "用更底层抓包拿证据"
+      ]
+    },
+    "unknown": {
+      "reason": "未能从异常归类失败原因（证据不足）",
+      "confidence": "low",
+      "next_steps": [
+        "保留原始异常文本",
+        "用更底层抓包拿证据",
+        "不要臆造原因"
+      ]
+    },
+    "unknown_result": {
+      "reason": "结果未知：请求已发出但响应未确认，无法确定服务端是否处理",
+      "confidence": "med",
+      "next_steps": [
+        "不要盲目重试（有副作用的操作先查状态）",
+        "用幂等查询接口确认服务端状态",
+        "若是无副作用读操作，可安全重试一次"
+      ]
+    }
+  }
+}

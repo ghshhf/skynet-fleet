@@ -464,6 +464,14 @@ CASES = [
     # / 三个真实写点接线到位 / 并发不留残留」六条。
     ("eval_t74_durable", ["evals/t74_durable.py"], HERE, 180),
     ("eval_t75_text_clock", ["evals/t75_text_clock.py"], HERE, 240),
+    # 网络观测（11-03，V1.1 计划书第六节）：抓取不再「只拿数据」，
+    # 每次请求都产出耗时/重定向链/状态码/错误分类，并能诊断卡在哪一层。
+    ("eval_t76_netprobe", ["evals/t76_netprobe.py"], HERE, 120),
+    # 诊断深化（11-03）：结果未知识别（没收到结果 ≠ 失败）、故障沉淀成知识库、
+    # 诊断带 task_id 可串请求链。
+    ("eval_t77_netdiag", ["evals/t77_netdiag.py"], HERE, 120),
+    # 出网自适应（11-03）：默认直连，只有网络层失败才回退代理；HTTP 错误不回退。
+    ("eval_t78_net_adaptive", ["evals/t78_net_adaptive.py"], HERE, 120),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),

@@ -31,7 +31,14 @@ import socket
 import subprocess
 import sys
 
-from . import text as _fleet_text
+try:                                    # 作为包导入：python -m fleet.netaccel
+    from . import text as _fleet_text
+except ImportError:                     # 直接跑脚本：python fleet/netaccel.py
+    # 这个文件被设计成「两种跑法都行」（docstring 里就写着 python netaccel.py），
+    # 而相对导入在无包上下文时必然 ImportError。t55 一直是按路径直接跑的，
+    # 只写相对导入等于把这个入口打死。
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from fleet import text as _fleet_text
 
 # GBK 防线（2026-11-01 铁律）：本文件输出含 ✓ ✗ 【】→ 等 GBK 外字符，
 # 中文 Windows 控制台默认 cp936，一个编码不到的字符就把整个命令炸死。
