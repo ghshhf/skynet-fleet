@@ -98,9 +98,9 @@ class DeviceResult:
                    ms=ms, via=via)
 
     @classmethod
-    def error(cls, cap, reason, device="", ms=0.0, via=""):
-        return cls(cap=cap, device=device, ok=False, code=ERROR, err=reason,
-                   ms=ms, via=via)
+    def error(cls, cap, reason, device="", data=None, ms=0.0, via=""):
+        return cls(cap=cap, device=device, ok=False, code=ERROR, data=data or {},
+                   err=reason, ms=ms, via=via)
 
     # ---------------- 与其他模块的 dict 习惯兼容 ----------------
 

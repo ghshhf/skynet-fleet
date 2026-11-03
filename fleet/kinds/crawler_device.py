@@ -37,19 +37,40 @@ def _reg(name):
 
 @_reg("crawl.http_fetch")
 def _h_http_fetch(cap, args, dev):
-    import httpx
+    """原始 HTTP 抓取：自带协议观测与故障诊断（V1.1 抓包方向第一版）。
+
+    不再把「DNS 失败 / TLS 错误 / 403 / 超时」全混成一个「请求失败」，
+    而是返回 metrics（耗时、重定向链、状态码）与 diagnosis（错误分类 + 下一步）。
+    """
+    from .. import netprobe
     url = args.get("url")
     if not url:
         return R.error(cap, "url 必填", device=dev.name, via=dev.via)
-    try:
-        r = httpx.get(url, headers=args.get("headers") or {},
-                      timeout=args.get("timeout") or 30, follow_redirects=True)
-    except Exception as e:
-        return R.error(cap, "请求失败：%s" % e, device=dev.name, via=dev.via)
-    return R.success(cap, dev.name, via=dev.via, data={
-        "url": str(r.url), "status": r.status_code,
-        "headers": dict(r.headers), "body": r.text[:200000],
-        "truncated": len(r.text) > 200000})
+    tr = netprobe.probe_url(url, headers=args.get("headers") or {},
+                            timeout=args.get("timeout") or 30,
+                            follow_redirects=True)
+    diag = netprobe.diagnose(tr)
+    if tr.state == "success":
+        return R.success(cap, dev.name, via=dev.via, data={
+            "url": tr.final_url, "status": tr.status,
+            "headers": tr.headers, "body": tr.body,
+            "truncated": tr.body_truncated,
+            "metrics": tr.to_metrics(), "diagnosis": diag})
+    return R.error(cap, "请求失败：%s" % (tr.error or "未知错误"),
+                   device=dev.name, via=dev.via,
+                   data={"metrics": tr.to_metrics(), "diagnosis": diag})
+
+
+@_reg("crawl.diagnose")
+def _h_diagnose(cap, args, dev):
+    """网络诊断：探测一次 URL，产出结构化证据 + 故障诊断报告（V1.1 故障诊断器入口）。"""
+    from .. import netprobe
+    url = args.get("url")
+    if not url:
+        return R.error(cap, "url 必填", device=dev.name, via=dev.via)
+    rep = netprobe.run_diagnosis(url, timeout=args.get("timeout") or 30,
+                                follow_redirects=True)
+    return R.success(cap, dev.name, via=dev.via, data=rep)
 
 
 @_reg("crawl.render")
