@@ -1,0 +1,29 @@
+name: probe
+
+# 只做一件事：从 GitHub 的机器上问一遍 X 的接口通不通。
+# 只在手动触发时跑 —— 原来还挂了 push 触发，结果每次推代码都空跑一轮并且连续 failure，
+# 既浪费队列又淹没真正的运行记录。探针本来就是排障用的，不该跟着代码走。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 出口连通性
+        run: python probe_x.py
+
+      - name: 落盘结果
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add probe_x.json
+          git diff --staged --quiet || git commit -m "probe: $(date -u +%FT%TZ)"
+          git push

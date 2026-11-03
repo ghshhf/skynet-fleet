@@ -173,3 +173,12 @@ addrbook.json.tmp
 # 网络诊断的 incident 流水（2026-11-03）：每次故障追加一条，属运行期数据。
 # 种子知识库 fleet/_netdiag_kb.json **要**入库（那是内容不是状态），只有流水忽略。
 fleet/_netdiag_incidents.jsonl
+
+# 运行资产：程序按相对路径找它们，但不入库（体积大 / 属数据不属代码）
+vendor/sing-box/
+github_runner/data/
+github_runner/nf/resources.json
+github_runner/nf/_harvested.json
+github_runner/nf/_visited.db*
+# 对端同步来的人格快照（源包在 personas/ 下，这个是带日期的整包拷贝）
+personas/_peer-*/
