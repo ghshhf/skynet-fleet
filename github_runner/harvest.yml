@@ -1,0 +1,50 @@
+name: harvest
+
+# 只爬 X 推文这一条腿，靠固定种子，爬完就停 —— 已被 netforce 完全覆盖。
+# 2026-11-02 按用户指示把算力集中到 netforce（「算力还不如让它爬点更多资源」），
+# 去掉 cron：netforce 现在是 24 小时接力跑、独占 data/，harvest 再按点启动只会
+# 跟它抢同一个目录、同一条分支。保留手动触发，需要单独抽查 X 数据时再用。
+on:
+  workflow_dispatch:
+    inputs:
+      max_seconds:
+        description: '本轮时间预算（秒）'
+        required: false
+        default: '20400'
+
+# 绝不允许两轮并行：并行会互相 push 冲突，也白白烧额度。
+concurrency:
+  group: harvest
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    # 平台硬上限 6 小时，留 5 分钟余量给收尾
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 抓取
+        env:
+          MAX_SECONDS: ${{ github.event.inputs.max_seconds || '20400' }}
+        run: python harvest.py
+
+      # 数据必须回传，否则下一轮等于从零开始 —— 断点续传全靠这一步。
+      # 用 rebase 而不是强推，避免和前一轮的提交打架。
+      - name: 提交数据
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A data/
+          git diff --staged --quiet || git commit -m "harvest: $(date -u +%FT%TZ)"
+          git pull --rebase --autostash
+          git push

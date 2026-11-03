@@ -1,0 +1,12 @@
+name: v6probe
+on:
+  workflow_dispatch:
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "=== global v6 ==="; ip -6 addr show scope global | grep inet6 || echo NONE
+          echo "=== v6 default route ==="; ip -6 route show default || echo NONE
+          echo "=== v6 egress ==="; curl -s -m 10 -6 https://api64.ipify.org || echo NO_V6_EGRESS
+          echo ""; echo "=== v4 ==="; curl -s -m 10 https://api.ipify.org

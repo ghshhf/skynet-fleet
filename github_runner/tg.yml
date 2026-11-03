@@ -1,0 +1,80 @@
+name: tg-register
+
+# 为什么放云端跑：
+#   本机出口是固定家宽/节点 IP，Telegram 的 auth.sendCode 限流按出口记账，
+#   本机已经把 FloodWait 累计到 16711s（4.6 小时）。Actions 每次都是全新 Azure IP，
+#   天然等于一个用不完的出口池；public 仓库不计分钟数，等于零成本 24 小时不中断。
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "本轮探测多少个号"
+        default: "60"
+        required: false
+      gap_min:
+        description: "号码之间最小间隔秒"
+        default: "2"
+        required: false
+      gap_max:
+        description: "号码之间最大间隔秒"
+        default: "5"
+        required: false
+      wait:
+        description: "等短信预算秒数"
+        default: "120"
+        required: false
+  schedule:
+    - cron: "41 */3 * * *"     # 每 3 小时一轮，UTC
+
+concurrency: tg-register          # 同一时刻只允许一轮，避免自己的号互相抢
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 220
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装依赖
+        run: pip install --quiet telethon
+
+      - name: 探测与注册
+        env:
+          TG_NOPROXY: "1"
+          TG_API_ID: "2040"
+          TG_API_HASH: "b18441a1ff607e10a989891a5462e627"
+          TG_OUT: "./accounts"
+        run: |
+          python tg_register.py \
+            --pool pool.json \
+            --limit "${{ inputs.limit || '60' }}" \
+            --gap-min "${{ inputs.gap_min || '2' }}" \
+            --gap-max "${{ inputs.gap_max || '5' }}" \
+            --wait "${{ inputs.wait || '120' }}" || true
+          echo "=== 结果 ==="
+          ls -la accounts/ 2>/dev/null || true
+
+      - name: 回写结果（断点续传）
+        if: always()
+        run: |
+          git config user.name  "tg-bot"
+          git config user.email "tg-bot@users.noreply.github.com"
+          mkdir -p accounts
+          git add -A accounts || true
+          if git diff --cached --quiet; then
+            echo "本轮无新增，跳过提交"
+          else
+            git commit -m "tg: probe $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git pull --rebase origin main || true
+            git push || true
+          fi
