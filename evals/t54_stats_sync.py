@@ -88,6 +88,15 @@ def main():
           "能力声明数 %d 明显低于 vendored_* 文件数（%d 个），计数口径可能退回只数 catalog.py"
           % (caps, vendored))
 
+    # ---- 退役能力名不许有残留（2026-11-03 加）----
+    # 一次归并在三处踩到同一件事：groups 的等价声明消失、远程白名单静默 404、
+    # 两张角色卡 tool_filter 让整个名册加载失败。共同点是**都不报「名字错了」**，
+    # 而是报别的现象。所以旧名登记成清单，扫到 0 为止。
+    gone = live.get("retired_refs") or []
+    check(not gone,
+          "有 %d 处还在用已退役的能力名：%s —— 改成新名（gen_stats.retired_refs 有对照）"
+          % (len(gone), "、".join("%s(%s)" % (g["file"], g["cap"]) for g in gone[:5])))
+
     # ---- 四层口径必须都在，且不许自相矛盾 ----
     own = live.get("capabilities_owned")
     gat = live.get("capabilities_gated")

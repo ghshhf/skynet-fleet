@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
-"""REA 能力设备：承载 rea.* 能力（来源 morluto/rea，方案 A 全量声明 + 诚实依赖检查）。
+"""REA 能力设备：承载 rea.* 能力（来源 morluto/rea）。
 
-每个 rea.* 能力已在 fleet/vendored_rea.py 里带 check= 探测对应底层引擎
-（Ghidra/JADX/rizin/adb/frida...），不在场就如实下线，不谎报可用。
-本设备的 invoke 按 ENGINE_OF 路由到引擎 handler；已接入 handler 的引擎真跑，
-未接入的如实返回 unavailable（待装好引擎后补齐 CLI 调用即可）。
+2026-11-03 归并：原先 140 个引擎原子动作各自成能力（Frida 一个会话拆七项），
+现在 catalog 只露 6 个领域能力（guidance / web / mobile / dynamic / native /
+appgraph），子动作由 action 参数指定。ENGINE_OF 仍是「原子名 → 引擎」的内部路由。
+
+两种调用都接：
+  - 新：invoke("rea.adb" 形式的域名, {"action": "pull_adb_package", "args": {...}})
+  - 旧：invoke("rea.pull_adb_package", {...})   ← 靠 DOMAIN_OF 自动归位
+不给 action 时返回该域的子动作清单（省一次猜）。
+已接 handler 的引擎真跑，未接的如实返回 unavailable。
 """
 import os
 
@@ -16,7 +21,7 @@ try:
 except Exception:
     _HAS_SQLITE = False
 
-from ..vendored_rea import ENGINE_OF
+from ..vendored_rea import DOMAIN_OF, DOMAINS, ENGINE_OF
 from .rizin_eng import _h_rizin
 from .rea_reverse_eng import _h_apktool, _h_binwalk, _h_tshark, _h_frida
 
@@ -28,30 +33,62 @@ class ReaDevice(BaseDevice):
     def __init__(self, name="rea:bench", **kw):
         super().__init__(name, via="local", **kw)
         self.meta.setdefault(
-            "note", "REA(morluto/rea) 逆向工程能力；各依赖底层引擎，未装如实下线")
+            "note", "REA(morluto/rea) 逆向工程能力；6 个领域，子动作走 action；"
+                    "各依赖底层引擎，未装如实下线")
 
     def probe(self):
         # 设备整体可用；单个能力靠各自的 check= 诚实判依赖
         return True, ""
 
     def caps(self):
-        return tuple(ENGINE_OF.keys())
+        # 只露领域能力（6 个），不再把 140 个原子动作当能力
+        return tuple(DOMAINS.keys())
 
     def invoke(self, cap, args=None):
-        args = args or {}
-        engine = ENGINE_OF.get(cap)
+        args = dict(args or {})
+
+        # 旧原子名 → 归位到域 + 预置 action（老门禁/老调用不用改）
+        if cap not in DOMAINS:
+            dom = DOMAIN_OF.get(cap)
+            if dom is None:
+                return R.unsupported(cap, "rea 设备没有这个能力",
+                                     device=self.name, via=self.via)
+            args.setdefault("action", cap[4:])
+            cap = dom
+
+        action = (args.get("action") or "").strip()
+        if not action:
+            # 不指定子动作 = 问「这个域有哪些动作」，不猜、不默认跑第一个
+            acts = list(DOMAINS[cap])
+            return R.success(cap, self.name, via=self.via, data={
+                "domain": cap, "actions": acts, "count": len(acts),
+                "hint": "用 action 指定子动作，子动作参数放 args"})
+
+        if action not in DOMAINS[cap]:
+            return R.unsupported(
+                cap, "%s 没有子动作 %s（该域有 %d 个，先不带 action 调一次拿清单）"
+                     % (cap, action, len(DOMAINS[cap])),
+                device=self.name, via=self.via)
+
+        sub = "rea." + action
+        engine = ENGINE_OF.get(sub)
         if engine is None:
-            return R.unsupported(cap, "rea 设备没有这个能力",
+            return R.unsupported(sub, "子动作没登记依赖引擎",
                                  device=self.name, via=self.via)
+
         h = _HANDLERS.get(engine)
         if h is None:
             return R.unavailable(
                 cap,
-                "REA 能力已声明；引擎 %s 的 handler 待接入"
-                "（装好引擎后接 CLI 即可实跑）" % engine,
+                "子动作 %s 依赖引擎 %s，该引擎的 handler 尚未接入"
+                "（装好引擎后接 CLI 即可实跑）" % (action, engine),
                 device=self.name, via=self.via)
+
+        # 子动作参数：顶层散键 + args 子字典（后者优先），action 本身不透传
+        payload = {k: v for k, v in args.items() if k not in ("action", "args")}
+        payload.update(args.get("args") or {})
         try:
-            return h(self, cap, args)
+            return h(self, sub, payload)
         except Exception as e:
             return R.error(cap, "REA 执行失败：%s" % str(e)[:200],
                            device=self.name, via=self.via)

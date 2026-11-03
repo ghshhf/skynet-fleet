@@ -858,21 +858,24 @@ class _Handler(BaseHTTPRequestHandler):
     # 想都别想（不在表里就是 404）。闸门仍在被控端本地：ask 档没批就是
     # denied，一次系统调用都不发生。
 
+    # 值 = (能力名, 固定参数)。2026-11-03 能力归并后，pc.mouse / pc.input 这类
+    # 域级能力靠 action 区分子动作，白名单必须把 action 一起钉死——否则远端传个
+    # action 就能把「点击」变成别的动作，白名单等于没写。固定参数**强制覆盖**。
     REMOTE_CAPS = {
         # 只读一档（approval=auto）：看不是改，不弹窗
-        "screenshot": "pcctl.screenshot",
-        "windows": "pcctl.windows",
-        "sysinfo": "pcctl.sysinfo",
-        "clipboard": "pcctl.clipboard.read",
-        "procs": "pcctl.proc.list",
+        "screenshot": ("pcctl.screenshot", {}),
+        "windows": ("pcctl.windows", {}),
+        "sysinfo": ("pcctl.sysinfo", {}),
+        "clipboard": ("pcctl.clipboard.read", {}),
+        "procs": ("pcctl.proc.list", {}),
         # 动手一档（approval=ask）：被控端审批弹窗不放行就 denied
-        "mouse": "pcctl.mouse.move",
-        "click": "pcctl.mouse.click",
-        "key": "pcctl.key",
-        "text": "pcctl.text",
-        "clipboard_set": "pcctl.clipboard.write",
-        "launch": "pcctl.app.launch",
-        "kill": "pcctl.proc.kill",
+        "mouse": ("pcctl.mouse", {"action": "move"}),
+        "click": ("pcctl.mouse", {"action": "click"}),
+        "key": ("pcctl.input", {"action": "key"}),
+        "text": ("pcctl.input", {"action": "text"}),
+        "clipboard_set": ("pcctl.clipboard.write", {}),
+        "launch": ("pcctl.app.launch", {}),
+        "kill": ("pcctl.proc.kill", {}),
     }
 
     def _session_authorized(self):
@@ -1039,15 +1042,18 @@ class _Handler(BaseHTTPRequestHandler):
         s, code, why = self._session_authorized()
         if s is None:
             return self._err(code, why)
-        cap = self.REMOTE_CAPS.get(name)
-        if not cap:
+        spec = self.REMOTE_CAPS.get(name)
+        if not spec:
             return self._err(404, f"受控端没有这个动作: {name}"
                                    "（可用：%s）" % "/".join(sorted(self.REMOTE_CAPS)))
+        cap, fixed = spec
         try:
             body = self._read_json()
         except ValueError as e:
             return self._err(400, str(e))
         args = body.get("args") if isinstance(body.get("args"), dict) else body
+        args = dict(args or {})
+        args.update(fixed)      # 白名单钉死的参数不许被远端覆盖
         r = self.fleet.call(cap, args=args, tag="remote:%s" % s["controller"])
         out = r if isinstance(r, dict) else {"ok": False, "err": "内部错误"}
         if name == "screenshot" and out.get("ok"):

@@ -81,7 +81,7 @@ CAP_DEPS = {
     "host.apps": [D("psutil", import_name="psutil", why="进程列表")],
     "host.screen": [D("mss", import_name="mss", why="屏幕截图"),
                     D("Pillow", import_name="PIL", pip_pkg="Pillow", why="截图盲文预览")],
-    "host.input.*": [D("pyautogui", import_name="pyautogui", why="模拟鼠标键盘")],
+    "host.input": [D("pyautogui", import_name="pyautogui", why="模拟鼠标键盘")],
 
     # 网络侦察
     "net.scan": [D("scapy", import_name="scapy", why="LAN 端口指纹扫描",

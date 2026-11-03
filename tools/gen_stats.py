@@ -100,10 +100,15 @@ def eval_file_count():
 
 
 def orphan_evals():
-    """evals/ 里有、但 CASES 没登记的脚本——「写了门禁没人跑」= 等于没写。"""
+    """evals/ 里有、但 CASES 没登记的脚本——「写了门禁没人跑」= 等于没写。
+
+    例外：`run_*.py` 是**批量运行器**，不是门禁（run_gates.py 一次跑完所有门禁），
+    它本来就不该出现在 CASES 里，否则就是「运行器跑运行器」。
+    """
     d = os.path.join(ROOT, "evals")
     try:
-        files = {f for f in os.listdir(d) if f.endswith(".py")}
+        files = {f for f in os.listdir(d)
+                 if f.endswith(".py") and not f.startswith("run_")}
     except OSError:
         return []
     registered = set()
@@ -113,6 +118,72 @@ def orphan_evals():
             if a.startswith("evals/"):
                 registered.add(os.path.basename(a))
     return sorted(files - registered)
+
+
+def retired_refs():
+    """全仓扫「已退役的能力名」还残留在哪。
+
+    为什么要有（2026-11-03 一次归并踩了三处）——
+    能力改名后旧名是**静默失效**的：registry 查不到就回「没有这项能力」，
+    但调用方不会自己知道该改。同一次归并踩到：
+      · groups.py 的等价声明消失 → 模型又开始抓错手
+      · gui/server.py 的远程白名单 → 那条路静默 404
+      · 两张角色卡的 tool_filter → 整个名册加载失败，八个角色集体「不在名册」
+    共同点是都不报「名字错了」，而是报别的现象。所以旧名必须登记成清单，扫。
+
+    只看会**被程序读**的文件（.py/.json/.yaml）。文档不扫——文档里提旧名
+    往往正是为了讲清历史，扫它只会逼人删掉有用的说明。
+    """
+    try:
+        from fleet.kinds.pc_control import ALIASES as _PC_ALIAS
+        from fleet.kinds.host import Host as _Host
+        from fleet.vendored_rea import ENGINE_OF as _REA
+    except Exception:
+        return []
+    try:
+        from fleet import catalog as _cat
+        alive = {c.name for c in _cat.CAPABILITIES}
+    except Exception:
+        alive = set()
+
+    retired = {k: "pcctl 归并" for k in _PC_ALIAS}
+    for a in getattr(_Host, "INPUT_ACTS", ()):
+        retired["host.input." + a] = "host.input 归并"
+    for cap in _REA:
+        retired.setdefault(cap, "rea 折叠")
+    retired = {k: v for k, v in retired.items() if k not in alive}
+
+    # 这些文件里出现旧名是故意的：兼容层 / 内部路由表 / 声明处
+    allow = {
+        "fleet/vendored_rea.py", "fleet/kinds/rea_device.py",
+        "fleet/kinds/pc_control.py", "fleet/kinds/host.py",
+        "fleet/catalog.py", "tools/gen_stats.py",
+        "fleet/kinds/rizin_eng.py", "fleet/kinds/rea_reverse_eng.py",
+    }
+    skip_dirs = {"vendor", "_vendor", "node_modules", ".git", "__pycache__",
+                 "site-packages", "_venv", "tmp", "archive"}
+    exts = (".py", ".json", ".yaml", ".yml")
+
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fn in filenames:
+            if not fn.endswith(exts):
+                continue
+            p = os.path.join(dirpath, fn)
+            rel = os.path.relpath(p, ROOT).replace("\\", "/")
+            if rel in allow:
+                continue
+            try:
+                src = open(p, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            for old in retired:
+                if old in src:
+                    hits.append({"file": rel, "cap": old,
+                                 "now": retired[old]})
+                    break
+    return sorted(hits, key=lambda x: x["file"])
 
 
 def _eval_text():
@@ -241,6 +312,7 @@ def collect(probe=False):
         "gates_registered": gate_count(),
         "eval_files": eval_file_count(),
         "orphan_evals": orphan_evals(),
+        "retired_refs": retired_refs(),
         "doc_md": doc_count(),
         "app_build": app_build(),
     }

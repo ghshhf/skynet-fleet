@@ -20,6 +20,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,22 @@ def _run():
         cmd += ["--only", only]
     env = dict(os.environ)
     env["FLEET_PY"] = sys.executable
+
+    # 🔴 卡库隔离（2026-11-03 加，第二轮修同一个坑）：
+    # 本门禁点遍界面，每张卡都带「切换到这张」按钮 → 真的写 active.json。
+    # 原来靠 main() 的 finally 还回去，但它是 900s 级的任务、批量跑按 180s 掐，
+    # **一被 kill finally 就来不及跑**，卡停在最后一张。实测停在「验收者」，
+    # 于是 t44 报「干完活忘了摘帽子」——一个门禁假红，怪到另一个门禁头上。
+    # 「记得还」是纪律，「根本不用还」才是设计：让它对着临时卡库跑。
+    try:
+        _tmp_cards = tempfile.mkdtemp(prefix="t32_cards_")
+        shutil.copytree(os.path.join(ROOT, "cards"), _tmp_cards,
+                        dirs_exist_ok=True)
+        env["FLEET_CARD_DIR"] = _tmp_cards
+        print("  卡库已隔离到临时目录（跑挂也不会改真卡）", flush=True)
+    except Exception as e:
+        print("  [!!] 卡库隔离失败，仍会改真卡：%s" % e, flush=True)
+
     print("  跑：" + " ".join(cmd[-4:]), flush=True)
 
     r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True,
