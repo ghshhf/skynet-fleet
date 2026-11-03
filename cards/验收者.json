@@ -30,7 +30,7 @@
           "ai.chat",
           "ai.complete",
           "host.apps",
-          "pcctl.text",
+          "pcctl.input",
           "pcctl.proc.list",
           "pcctl.screenshot",
           "screen.read",

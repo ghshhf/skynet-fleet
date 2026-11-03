@@ -296,7 +296,7 @@ def present_caps(caps):
     为什么这一步是必须的（11-01 盘点）：
 
         357 项能力里，同一件事有好几套实现且参数名还不一样：
-            pcctl.key(keys="ctrl+c")  vs  host.input.key(key="enter")
+            pcctl.input(keys=...)     vs  host.input(key=...)
             osint.dns(domain=...)     vs  web.dns(url=...)
             pc.state / pcctl.sysinfo / host.monitor   —— 三个都答「本机怎么样」
         模型面对这些不是「多了几个选择」，而是**多了几个能抓错的手**。

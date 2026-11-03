@@ -64,9 +64,9 @@ class Host(BaseDevice):
 
     def caps(self):
         # 只声明「我实现哪些能力名」；带参数/审批档的 Capability 定义见 catalog.CAPABILITIES
-        return ("host.monitor", "host.apps", "host.screen",
-                "host.input.click", "host.input.type", "host.input.key",
-                "host.input.scroll", "host.input.drag",
+        # 2026-11-03 归并：host.input.click/type/key/scroll/drag 五种原子动作
+        # 合成 host.input 一项，子动作用 action 区分（旧名在 INPUT_ALIASES 里兼容）。
+        return ("host.monitor", "host.apps", "host.screen", "host.input",
                 # 远程唤醒（WOL）：设备层从「能连已开机的」到「能叫醒睡着的」。
                 # 挂在 host 上是因为**发广播的是这台电脑**，被唤醒方是谁无所谓。
                 "device.wake")
@@ -169,6 +169,46 @@ class Host(BaseDevice):
         except Exception as e:
             return R.error(cap, f"执行失败：{e}")
 
+    #: host.input 的子动作。顺序即文档顺序，清单会原样回给调用方。
+    INPUT_ACTS = ("click", "type", "key", "scroll", "drag")
+
+    def _do_input(self, act, args):
+        """host.input 的子动作分发。
+
+        act 为空 ⇒ 回子动作清单，不猜、不默认跑第一个（默认点击是最糟的默认值）。
+        """
+        if not act:
+            return R.success("host.input", self.name, data={
+                "actions": list(self.INPUT_ACTS),
+                "hint": "用 action 指定子动作，参数同 catalog 里 host.input 的声明"})
+        if act not in self.INPUT_ACTS:
+            return R.unsupported(
+                "host.input",
+                "没有子动作 %s（有：%s）" % (act, " / ".join(self.INPUT_ACTS)))
+
+        if act == "click":
+            x = int(args.get("x", 0)); y = int(args.get("y", 0))
+            return self._act("host.input", f"点击 ({x},{y})",
+                             lambda g: g.click(x, y))
+        if act == "type":
+            t = str(args.get("text", ""))
+            return self._act("host.input", f"输入 {len(t)} 字",
+                             lambda g: g.write(t))
+        if act == "key":
+            k = str(args.get("key", ""))
+            return self._act("host.input", f"按键 {k}",
+                             lambda g: g.press(k))
+        if act == "scroll":
+            x = int(args.get("x", 0)); y = int(args.get("y", 0))
+            c = int(args.get("clicks", 0))
+            return self._act("host.input", f"滚动 ({x},{y}) {c}",
+                             lambda g: g.scroll(c, x=x, y=y))
+        # act == "drag"
+        x1 = int(args.get("x1", 0)); y1 = int(args.get("y1", 0))
+        x2 = int(args.get("x2", 0)); y2 = int(args.get("y2", 0))
+        return self._act("host.input", f"拖拽 ({x1},{y1})→({x2},{y2})",
+                         lambda g: g.drag(x2, y2, x1, y1, duration=0.3))
+
     # —— 分发 ——
     def invoke(self, name, args):
         try:
@@ -188,29 +228,12 @@ class Host(BaseDevice):
                 prev = _braille(path) or ""
                 return R.success("host.screen", self.name,
                                  data={"path": path, "preview": prev})
-            if name == "host.input.click":
-                x = int(args.get("x", 0)); y = int(args.get("y", 0))
-                return self._act("host.input.click", f"点击 ({x},{y})",
-                                 lambda g: g.click(x, y))
-            if name == "host.input.type":
-                t = str(args.get("text", ""))
-                return self._act("host.input.type", f"输入 {len(t)} 字",
-                                 lambda g: g.write(t))
-            if name == "host.input.key":
-                k = str(args.get("key", ""))
-                return self._act("host.input.key", f"按键 {k}",
-                                 lambda g: g.press(k))
-            if name == "host.input.scroll":
-                x = int(args.get("x", 0)); y = int(args.get("y", 0))
-                c = int(args.get("clicks", 0))
-                return self._act("host.input.scroll", f"滚动 ({x},{y}) {c}",
-                                 lambda g: g.scroll(c, x=x, y=y))
-            if name == "host.input.drag":
-                x1 = int(args.get("x1", 0)); y1 = int(args.get("y1", 0))
-                x2 = int(args.get("x2", 0)); y2 = int(args.get("y2", 0))
-                return self._act("host.input.drag",
-                                 f"拖拽 ({x1},{y1})→({x2},{y2})",
-                                 lambda g: g.drag(x2, y2, x1, y1, duration=0.3))
+            if name.startswith("host.input"):
+                # 兼容旧名：host.input.click → action=click（门禁/老调用不用改）
+                act = str(args.get("action") or "")
+                if not act and name != "host.input":
+                    act = name.rsplit(".", 1)[-1]
+                return self._do_input(act, args)
             if name == "device.wake":
                 mac = str(args.get("mac") or "").strip()
                 if not mac:

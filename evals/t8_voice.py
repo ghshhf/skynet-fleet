@@ -512,13 +512,19 @@ cases = [
     ("截个屏", "host.screen"),
     ("看一下电量", "state.read"),
     ("手机状态", "state.read"),
-    ("暂停", "host.input.key"),
-    ("搜索天气", "host.input.type"),
+    ("暂停", "host.input", "key"),
+    ("搜索天气", "host.input", "type"),
 ]
-for text, want in cases:
+for case in cases:
+    text, want = case[0], case[1]
+    want_act = case[2] if len(case) > 2 else None
     plan = V.voice_to_capability(text)
-    check(plan.get("ok") and plan.get("cap") == want,
-          "「%s」→ %s（实得 %s）" % (text, want, plan.get("cap")))
+    ok = plan.get("ok") and plan.get("cap") == want
+    if ok and want_act:
+        ok = (plan.get("args") or {}).get("action") == want_act
+    check(ok, "「%s」→ %s%s（实得 %s / %s）"
+          % (text, want, ("#" + want_act) if want_act else "",
+             plan.get("cap"), (plan.get("args") or {}).get("action")))
 
 # ⑦d 不明确 → 需要澄清，不许瞎猜
 for text in ("那个那个", "嗯", "帮我弄一下"):

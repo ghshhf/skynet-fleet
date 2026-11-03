@@ -45,8 +45,7 @@ from fleet.catalog import build         # noqa: E402
 from fleet.core import result as R      # noqa: E402
 
 HOST_READ = ("host.monitor", "host.apps", "host.screen")
-HOST_ACT = ("host.input.click", "host.input.type", "host.input.key",
-            "host.input.scroll", "host.input.drag")
+HOST_ACT = ("host.input",)
 HOST_ALL = HOST_READ + HOST_ACT
 
 FAIL = []
@@ -120,11 +119,11 @@ for name in HOST_READ:
 
 # ④ 动手能力 fail-closed：没闸门一律拒绝，且绝不真动作
 _gui_calls.clear()
-r = reg.call("host.input.click", args={"x": 10, "y": 20})
-check(r.code == R.DENIED, "host.input.click 无闸门→denied（fail-closed）")
+r = reg.call("host.input", args={"action": "click", "x": 10, "y": 20})
+check(r.code == R.DENIED, "host.input#click 无闸门→denied（fail-closed）")
 check(_gui_calls == [], "无闸门时绝不落到 pyautogui（不许真点）")
 
-r = reg.call("host.input.click", args={"x": 10, "y": 20},
+r = reg.call("host.input", args={"action": "click", "x": 10, "y": 20},
              gate=lambda c, d, a, l: (False, "主人说不"))
 check(r.code == R.DENIED and r.err == "主人说不", "闸门拒绝→denied 且带理由")
 check(_gui_calls == [], "闸门拒绝时同样不落地")
@@ -138,21 +137,21 @@ def gate_yes(cap, dev, args, level):
     return True, ""
 
 
-r = reg.call("host.input.click", args={"x": 10, "y": 20}, gate=gate_yes)
-check(r.ok, "host.input.click 放行→执行成功")
-check(r.side_effect, "host.input.click 标记为副作用")
+r = reg.call("host.input", args={"action": "click", "x": 10, "y": 20}, gate=gate_yes)
+check(r.ok, "host.input#click 放行→执行成功")
+check(r.side_effect, "host.input#click 标记为副作用")
 check(bool(_levels) and _levels[-1] == 2, "host.input.* 闸门 level=2（ask 档要人确认）")
 check(("click", (10, 20), {}) in _gui_calls, "click 落到 pyautogui.click(10,20)")
 
 # 五个动手能力各自路由对
 _gui_calls.clear()
-reg.call("host.input.type", args={"text": "hello"}, gate=gate_yes)
+reg.call("host.input", args={"action": "type", "text": "hello"}, gate=gate_yes)
 check(("write", ("hello",), {}) in _gui_calls, "input.type → pyautogui.write")
-reg.call("host.input.key", args={"key": "enter"}, gate=gate_yes)
+reg.call("host.input", args={"action": "key", "key": "enter"}, gate=gate_yes)
 check(("press", ("enter",), {}) in _gui_calls, "input.key → pyautogui.press")
-reg.call("host.input.scroll", args={"x": 5, "y": 6, "clicks": 3}, gate=gate_yes)
+reg.call("host.input", args={"action": "scroll", "x": 5, "y": 6, "clicks": 3}, gate=gate_yes)
 check(("scroll", (3,), {"x": 5, "y": 6}) in _gui_calls, "input.scroll → pyautogui.scroll")
-reg.call("host.input.drag", args={"x1": 1, "y1": 2, "x2": 3, "y2": 4}, gate=gate_yes)
+reg.call("host.input", args={"action": "drag", "x1": 1, "y1": 2, "x2": 3, "y2": 4}, gate=gate_yes)
 check(("drag", (3, 4, 1, 2), {"duration": 0.3}) in _gui_calls,
       "input.drag → pyautogui.drag")
 

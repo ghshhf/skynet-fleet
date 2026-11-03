@@ -387,10 +387,10 @@ INTENT_RULES = (
     # 电量 / 状态
     (("电量", "剩余电量", "还有多少电"), "state.read", "看手机状态（含电量）"),
     (("状态", "手机状态", "设备状态"), "state.read", "看手机状态"),
-    # 播放 / 暂停
-    (("播放", "暂停", "继续播放", "放音乐"), "host.input.key", "播放/暂停（媒体键）"),
+    # 播放 / 暂停（2026-11-03：host.input.* 归并成 host.input + action）
+    (("播放", "暂停", "继续播放", "放音乐"), "host.input", "播放/暂停（媒体键）", "key"),
     # 搜索
-    (("搜索", "搜一下", "查一下"), "host.input.type", "在当前焦点输入「{name}」"),
+    (("搜索", "搜一下", "查一下"), "host.input", "在当前焦点输入「{name}」", "type"),
 )
 
 #: 破坏性意图关键词：识别到这些一律拒绝执行（语音不许触发不可逆动作）
@@ -411,16 +411,19 @@ def _extract_name(text):
     return t.strip(" 　,，。.！!？?、")
 
 
-def _args_for(cap, name):
-    """按能力填参数。参数名必须与 catalog 里登记的一致。"""
+def _args_for(cap, name, action=None):
+    """按能力填参数。参数名必须与 catalog 里登记的一致。
+
+    action：域级能力（如 host.input）的子动作。三元素老规则没有它，按 key 处理。
+    """
     if cap == "app.launch":
         return {"target": name}
     if cap == "input.key":
         return {"key": "back"}
-    if cap == "host.input.key":
-        return {"key": "playpause"}
-    if cap == "host.input.type":
-        return {"text": name}
+    if cap == "host.input":
+        if action == "type":
+            return {"action": "type", "text": name}
+        return {"action": "key", "key": "playpause"}
     return {}
 
 
@@ -443,18 +446,21 @@ def voice_to_capability(text):
                     "hint": "这类事请在界面上点，嘴说不算"}
 
     # ② 白名单匹配
-    for words, cap, tmpl in INTENT_RULES:
+    for rule in INTENT_RULES:
+        words, cap, tmpl = rule[0], rule[1], rule[2]
+        action = rule[3] if len(rule) > 3 else None
         for w in words:
             if w not in raw:
                 continue
             name = _extract_name(raw)
-            args = {}
-            if "{name}" in tmpl:
-                if not name:
-                    return {"ok": False,
-                            "reason": "没听清是哪个%s" % w,
-                            "hint": "说清楚名字，比如「打开记事本」"}
-                args = _args_for(cap, name)
+            if "{name}" in tmpl and not name:
+                return {"ok": False,
+                        "reason": "没听清是哪个%s" % w,
+                        "hint": "说清楚名字，比如「打开记事本」"}
+            # 无论模板要不要 name 都得过一遍 _args_for：
+            # 「播放/暂停」这类没名字的意图照样要带 action/key，
+            # 原来只在 "{name}" in tmpl 时才填 ⇒ 这类意图永远缺必填参数。
+            args = _args_for(cap, name, action)
             return {"ok": True, "cap": cap, "args": args,
                     "say": tmpl.format(name=name) if name else tmpl}
     return {"ok": False,

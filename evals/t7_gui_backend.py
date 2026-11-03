@@ -515,9 +515,10 @@ try:
           "只读能力（ai.list）不受闸门影响")
 
     st, res, _ = http_json(f"{BASE}/api/call", token=TOKEN, method="POST",
-                            body={"cap": "host.input.click", "args": {"x": 1, "y": 1}})
+                            body={"cap": "host.input",
+                                  "args": {"action": "click", "x": 1, "y": 1}})
     check(bool(res) and res.get("code") == "denied",
-          "ask 档能力（host.input.click）无闸门 → denied，绝不真点鼠标")
+          "ask 档能力（host.input）无闸门 → denied，绝不真点鼠标")
 
     st, res, _ = http_json(f"{BASE}/api/call", token=TOKEN, method="POST",
                             body={"cap": "nope.nope", "args": {}})

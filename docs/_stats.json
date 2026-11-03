@@ -1,27 +1,18 @@
 {
-  "generated_at": "2026-11-03 05:40:32",
-  "gates_registered": 154,
-  "eval_files": 91,
+  "generated_at": "2026-11-03 20:23:18",
+  "gates_registered": 157,
+  "eval_files": 94,
   "orphan_evals": [],
+  "retired_refs": [],
   "doc_md": 18,
   "app_build": "49",
-  "capabilities_declared": 471,
-  "capabilities_owned": 462,
+  "capabilities_declared": 331,
+  "capabilities_owned": 322,
   "capabilities_live": null,
-  "capabilities_gated": 194,
+  "capabilities_gated": 188,
   "devices": 50,
   "devices_live": null,
   "domains": {
-    "rea": {
-      "declared": 140,
-      "owned": 140,
-      "gated": 0
-    },
-    "pcctl": {
-      "declared": 15,
-      "owned": 15,
-      "gated": 15
-    },
     "web": {
       "declared": 14,
       "owned": 14,
@@ -32,15 +23,15 @@
       "owned": 14,
       "gated": 14
     },
+    "crawl": {
+      "declared": 14,
+      "owned": 14,
+      "gated": 1
+    },
     "persona": {
       "declared": 13,
       "owned": 13,
       "gated": 13
-    },
-    "crawl": {
-      "declared": 13,
-      "owned": 13,
-      "gated": 0
     },
     "llmgw": {
       "declared": 13,
@@ -48,6 +39,11 @@
       "gated": 0
     },
     "tun": {
+      "declared": 12,
+      "owned": 12,
+      "gated": 12
+    },
+    "pcctl": {
       "declared": 12,
       "owned": 12,
       "gated": 12
@@ -76,11 +72,6 @@
       "declared": 8,
       "owned": 8,
       "gated": 0
-    },
-    "host": {
-      "declared": 8,
-      "owned": 8,
-      "gated": 8
     },
     "net": {
       "declared": 7,
@@ -121,6 +112,11 @@
       "declared": 6,
       "owned": 6,
       "gated": 3
+    },
+    "rea": {
+      "declared": 6,
+      "owned": 6,
+      "gated": 0
     },
     "protocol": {
       "declared": 6,
@@ -163,6 +159,11 @@
       "gated": 4
     },
     "image": {
+      "declared": 4,
+      "owned": 4,
+      "gated": 4
+    },
+    "host": {
       "declared": 4,
       "owned": 4,
       "gated": 4

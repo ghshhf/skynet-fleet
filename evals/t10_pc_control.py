@@ -47,9 +47,8 @@ from fleet.core import result as R             # noqa: E402
 
 READ_CAPS = ("pcctl.screenshot", "pcctl.windows", "pcctl.clipboard.read",
              "pcctl.proc.list", "pcctl.sysinfo")
-ACT_CAPS = ("pcctl.app.launch", "pcctl.window.activate", "pcctl.window.close",
-            "pcctl.mouse.move", "pcctl.mouse.click", "pcctl.key",
-            "pcctl.text", "pcctl.clipboard.write", "pcctl.proc.kill")
+ACT_CAPS = ("pcctl.app.launch", "pcctl.window", "pcctl.mouse",
+            "pcctl.input", "pcctl.clipboard.write", "pcctl.proc.kill")
 #: 第三档（2026-10-28）：**看，但看的东西会出本机**。
 #: 为什么不并进 READ_CAPS：它确实不改这台机器，但截图要送视觉模型 →
 #: 屏幕内容离开本地。并进只读档就等于把「外发」登记成了「只读」，
@@ -286,10 +285,13 @@ check(r.data.get("bytes", 0) > 0, "pcctl.screenshot 回文件大小")
 check(SHOT_FILES, "pcctl.screenshot 走 _subprocess_run 出口落盘")
 
 # ④ 动手能力 fail-closed：没闸门一律 denied，且**一次系统调用都不许有**
+ACTION_FOR = {"pcctl.window": "activate", "pcctl.mouse": "click", "pcctl.input": "key"}
 for name in ACT_CAPS:
     CALLS.clear()
     args = {"target": "notepad.exe", "hwnd": 1001, "x": 10, "y": 20,
             "keys": "ctrl+c", "text": "你好", "pid": 4321}
+    if name in ACTION_FOR:
+        args["action"] = ACTION_FOR[name]
     r = reg.call(name, args=args)
     check(r.code == R.DENIED, f"{name} 无闸门 → denied（fail-closed）")
     check(bool(r.err), f"{name} denied 必须带理由")
@@ -297,7 +299,7 @@ for name in ACT_CAPS:
 
 # ⑤ 闸门拒绝 → denied 且带理由，仍然不落地
 CALLS.clear()
-r = reg.call("pcctl.mouse.click", args={"x": 1, "y": 2},
+r = reg.call("pcctl.mouse", args={"action": "click", "x": 1, "y": 2},
              gate=lambda c, d, a, l: (False, "主人说不"))
 check(r.code == R.DENIED and r.err == "主人说不", "闸门拒绝 → denied 且带理由")
 check(not CALLS, "闸门拒绝时不落到系统调用")
@@ -308,6 +310,8 @@ for name in ACT_CAPS:
     CALLS.clear()
     args = {"target": "notepad.exe", "hwnd": 1001, "x": 10, "y": 20,
             "keys": "ctrl+c", "text": "你好", "pid": 4321}
+    if name in ACTION_FOR:
+        args["action"] = ACTION_FOR[name]
     r = reg.call(name, args=args, gate=gate_yes)
     check(r.ok, f"{name} 放行后执行成功（err={r.err}）")
     check(r.side_effect, f"{name} 标记为副作用")
@@ -320,51 +324,51 @@ check(r.data.get("risk") == "high", "结束进程标了 risk=high")
 check(r.data.get("reversible") is False, "结束进程标了不可逆")
 check("不可逆" in (r.data.get("reversible_note") or ""), "结束进程说清为什么不可逆")
 
-r = reg.call("pcctl.window.close", args={"hwnd": 1001, "force": True}, gate=gate_yes)
-check(r.ok, "pcctl.window.close(force) 成功")
+r = reg.call("pcctl.window", args={"action": "close", "hwnd": 1001, "force": True}, gate=gate_yes)
+check(r.ok, "pcctl.window close(force) 成功")
 check(r.data.get("risk") == "high", "强制关窗口标了 risk=high")
 check(r.data.get("reversible") is False, "强制关窗口标了不可逆")
 
-r = reg.call("pcctl.window.close", args={"hwnd": 1001}, gate=gate_yes)
+r = reg.call("pcctl.window", args={"action": "close", "hwnd": 1001}, gate=gate_yes)
 check(r.data.get("risk") == "medium", "普通关窗口是 medium 风险")
 check(r.data.get("reversible") is True, "普通关窗口标了可逆")
 
 # ⑧ 键盘注入必须说清「本次注入了什么」
-r = reg.call("pcctl.key", args={"keys": "ctrl+c"}, gate=gate_yes)
-check(r.ok, "pcctl.key 成功")
+r = reg.call("pcctl.input", args={"action": "key", "keys": "ctrl+c"}, gate=gate_yes)
+check(r.ok, "pcctl.input key 成功")
 acts = r.data.get("actions") or []
-check(len(acts) >= 2, f"pcctl.key 回逐条按键动作（{len(acts)} 条）")
+check(len(acts) >= 2, f"pcctl.input key 回逐条按键动作（{len(acts)} 条）")
 check(any("ctrl" in a for a in acts) and any(a.endswith("c") for a in acts),
-      "pcctl.key 说清了按了哪些键")
-check("本次注入了" in (r.data.get("summary") or ""), "pcctl.key 有一句人话总结")
+      "pcctl.input key 说清了按了哪些键")
+check("本次注入了" in (r.data.get("summary") or ""), "pcctl.input key 有一句人话总结")
 check(r.data.get("reversible") is False, "按键标了不可逆")
 
-r = reg.call("pcctl.text", args={"text": "你好"}, gate=gate_yes)
-check(r.ok, "pcctl.text 成功")
-check(r.data.get("chars") == 2, "pcctl.text 说清打了几字符")
-check("本次注入了" in (r.data.get("summary") or ""), "pcctl.text 有一句人话总结")
+r = reg.call("pcctl.input", args={"action": "text", "text": "你好"}, gate=gate_yes)
+check(r.ok, "pcctl.input text 成功")
+check(r.data.get("chars") == 2, "pcctl.input text 说清打了几字符")
+check("本次注入了" in (r.data.get("summary") or ""), "pcctl.input text 有一句人话总结")
 
-r = reg.call("pcctl.mouse.click", args={"x": 5, "y": 6}, gate=gate_yes)
-check(r.ok and r.data.get("actions"), "pcctl.mouse.click 说清点了什么")
+r = reg.call("pcctl.mouse", args={"action": "click", "x": 5, "y": 6}, gate=gate_yes)
+check(r.ok and r.data.get("actions"), "pcctl.mouse click 说清点了什么")
 check(r.data.get("reversible") is False, "点击标了不可逆")
 
 # ⑨ 失败必须带原因（每条失败路径）
 BAD = [
     ("pcctl.proc.kill", {}, "缺 pid"),
     ("pcctl.proc.kill", {"pid": "abc"}, "pid 不是整数"),
-    ("pcctl.window.activate", {}, "缺 hwnd"),
-    ("pcctl.window.close", {}, "缺 hwnd"),
-    ("pcctl.mouse.move", {"x": 1}, "缺 y"),
-    ("pcctl.mouse.click", {}, "缺坐标"),
-    ("pcctl.key", {}, "缺按键"),
-    ("pcctl.text", {}, "缺文本"),
+    ("pcctl.window", {"action": "activate"}, "缺 hwnd"),
+    ("pcctl.window", {"action": "close"}, "缺 hwnd"),
+    ("pcctl.mouse", {"action": "move", "x": 1}, "缺 y"),
+    ("pcctl.mouse", {"action": "click"}, "缺坐标"),
+    ("pcctl.input", {"action": "key"}, "缺按键"),
+    ("pcctl.input", {"action": "text"}, "缺文本"),
     ("pcctl.app.launch", {}, "缺 target"),
 ]
 for name, args, why in BAD:
     r = reg.call(name, args=args, gate=gate_yes)
     check(not r.ok and r.err, f"{name} {why} → 失败且带原因")
 
-r = reg.call("pcctl.key", args={"keys": "不存在的键"}, gate=gate_yes)
+r = reg.call("pcctl.input", args={"action": "key", "keys": "不存在的键"}, gate=gate_yes)
 check(not r.ok and "不认识的键名" in r.err, "键名不认识 → 失败且说清原因")
 
 # ⑩ 底层失败也必须带原因（PowerShell 报错 / taskkill 失败 / 剪贴板拿不到）

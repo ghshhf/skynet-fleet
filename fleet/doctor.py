@@ -296,7 +296,7 @@ def _selftest():
         def __init__(self, n):
             self.name = n
 
-    caps = [C("host.monitor"), C("host.input.click"), C("web.papers"),
+    caps = [C("host.monitor"), C("host.input"), C("web.papers"),
             C("adb.wifi.list"), C("pure.logic")]
     rep = scan(caps=caps, checker=lambda d: False)   # 全缺失
 
@@ -304,9 +304,9 @@ def _selftest():
     assert hm["status"] == "fail", "host.monitor 缺 psutil 应 fail"
     assert any(d["kind"] == "pip" for d in hm["missing"]), "应报缺 pip 包"
 
-    hi = next(r for r in rep["caps"] if r["name"] == "host.input.click")
+    hi = next(r for r in rep["caps"] if r["name"] == "host.input")
     assert hi["status"] == "fail" and hi["missing"][0]["name"] == "pyautogui", \
-        "前缀匹配 host.input.* 应命中 pyautogui"
+        "精确匹配 host.input 应命中 pyautogui"
 
     wp = next(r for r in rep["caps"] if r["name"] == "web.papers")
     assert wp["status"] == "fail" and wp["missing"][0]["kind"] == "repo", \

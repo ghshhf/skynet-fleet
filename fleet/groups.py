@@ -4,9 +4,9 @@
 
 357 项能力里，同一台机器上的同一件事有好几套实现，而且**参数名还不一样**：
 
-    pcctl.key(keys="ctrl+c")     vs  host.input.key(key="enter")      keys / key
-    pcctl.mouse.click(x,y)       vs  host.input.click(x,y)
-    pcctl.text(text)             vs  host.input.type(text)
+    pcctl.input(keys=...)        vs  host.input(key=...)              keys / key
+    pcctl.mouse(action=click)    vs  host.input(action=click)
+    pcctl.input(action=text)     vs  host.input(action=type)
     osint.dns(domain=...)        vs  web.dns(url=...)                 domain / url
     pc.state / pcctl.sysinfo / host.monitor                           三个都答「本机怎么样」
     host.screen / pcctl.screenshot / pcctl.look                       三个都答「截个屏」
@@ -50,11 +50,11 @@ ACTIONS = {
     "pc.screen": ("看本机屏幕（截图 + 文字预览）",
                   ["host.screen", "pcctl.screenshot", "pcctl.look"]),
     "pc.click": ("在本机屏幕坐标点击",
-                 ["pcctl.mouse.click", "host.input.click"]),
+                 ["pcctl.mouse", "host.input"]),
     "pc.type": ("在本机输入文字",
-                ["pcctl.text", "host.input.type"]),
+                ["pcctl.input", "host.input"]),
     "pc.key": ("在本机按键（单键或组合键）",
-               ["pcctl.key", "host.input.key"]),
+               ["pcctl.input", "host.input"]),
     "pc.launch": ("启动本机程序",
                   ["pcctl.app.launch"]),
     # ---- 手机 ----
@@ -89,11 +89,11 @@ for _a, (_l, _ms) in ACTIONS.items():
 # **为什么是「按实现声明」而不是「别名 ↔ 别名」**：
 # 一开始写成 {"keys": ["key"], "key": ["keys"]}（互为别名），结果第一趟把 key 搬成
 # keys、第二趟又搬回 key —— 互指会把结果转丢。正名不该由表决定，该由**目标实现**决定：
-# 你要发给 pcctl.key，它就一定叫 keys；发给 host.input.key，它就一定叫 key。
+# 你要发给 pcctl.input，它就一定叫 keys；发给 host.input，它就一定叫 key。
 # 这样每趟只有「别的实现叫过的名字 → 目标实现要的名字」一个方向，转不回去。
 
 ARG_ALIAS = {
-    "pc.key": {"键": {"pcctl.key": "keys", "host.input.key": "key", "*": "keys"},
+    "pc.key": {"键": {"pcctl.input": "keys", "host.input": "key", "*": "keys"},
                "等待": {"*": "wait"}},
     "net.dns": {"域名": {"osint.dns": "domain", "pentest.dns_resolve": "domain",
                         "web.dns": "url", "*": "domain"}},
@@ -104,6 +104,22 @@ ARG_ALIAS = {
                               "*": "host"}},
     "llm.chat": {"提示": {"llmgw.chat": "prompt", "ai.chat": "prompt",
                         "ai.complete": "prompt", "*": "prompt"}},
+}
+
+
+#: 组名 → {目标实现: 必须补的固定参数}（2026-11-03 加）。
+#
+# 能力从「一个名字 = 一个动作」变成「域 + action」之后，归组层只改参数名不够了：
+# 把 pc.click 转到 pcctl.mouse，参数全对，但没告诉它 action="click"，
+# 它不知道要点鼠标还是移动鼠标——参数齐了，动作是空的。
+# 所以「组 → 实现」要连带它的固定参数一起给。已有值不覆盖（调用方显式给了就听调用方的）。
+GROUP_CONST = {
+    "pc.click": {"pcctl.mouse": {"action": "click"},
+                 "host.input": {"action": "click"}},
+    "pc.type": {"pcctl.input": {"action": "text"},
+                "host.input": {"action": "type"}},
+    "pc.key": {"pcctl.input": {"action": "key"},
+               "host.input": {"action": "key"}},
 }
 
 
@@ -220,6 +236,10 @@ def norm_args(name: str, args: dict, target: str = "") -> dict:
             if c in out and out[c] not in (None, "", [], {}):
                 out[want] = out.pop(c)
                 break
+    # 域级能力要 action：转过去的参数全对、动作不能空着。
+    cst = (GROUP_CONST.get(a) or {}).get(target) or {}
+    for k, v in cst.items():
+        out.setdefault(k, v)
     return out
 
 
@@ -283,12 +303,17 @@ def _selftest():
         for m in ms:
             assert m in by, "动作 %s 声明了不存在的能力 %s" % (a, m)
 
-    # ② 一个能力只能属于一个动作（重复归属会让折叠结果随机）
+    # ② 同一「能力 + 固定参数」只能属于一个动作（重复归属会让折叠结果随机）。
+    #    2026-11-03 起能力是「域 + action」：host.input 既可能是 click 也可能是 type，
+    #    光看名字分不开，必须连 GROUP_CONST 里的 action 一起当键。
     seen = {}
     for a, (_l, ms) in ACTIONS.items():
         for m in ms:
-            assert m not in seen, "%s 同时属于 %s 和 %s" % (m, seen[m], a)
-            seen[m] = a
+            const = tuple(sorted((GROUP_CONST.get(a, {}).get(m) or {}).items()))
+            key = (m, const)
+            assert key not in seen, "%s(%s) 同时属于 %s 和 %s" % (
+                m, dict(const) or "无固定参", seen[key], a)
+            seen[key] = a
 
     # ③ 折叠后同一动作只剩一条，且总数下降
     col = collapse(caps)
@@ -308,10 +333,14 @@ def _selftest():
                                  % (a, ms[0], present[0]))
 
     # ⑤ 参数别名：keys/key 双向归一，且不碰无关参数
-    assert norm_args("pc.key", {"key": "enter"}, "pcctl.key").get("keys") == "enter"
-    assert norm_args("pc.key", {"keys": "ctrl+c"}, "host.input.key").get("key") == "ctrl+c"
-    a = norm_args("pc.key", {"key": "enter", "wait": 3}, "pcctl.key")
+    #    （2026-11-03：目标实现换成归并后的域名，同时要带上 action）
+    assert norm_args("pc.key", {"key": "enter"}, "pcctl.input").get("keys") == "enter"
+    assert norm_args("pc.key", {"keys": "ctrl+c"}, "host.input").get("key") == "ctrl+c"
+    a = norm_args("pc.key", {"key": "enter", "wait": 3}, "pcctl.input")
     assert a.get("keys") == "enter" and a.get("wait") == 3, "别名归一不许丢无关参数"
+    # 域级能力必须带上 action，否则参数齐了动作是空的
+    assert a.get("action") == "key", "转到域级实现时必须补 action"
+    assert norm_args("pc.click", {"x": 1, "y": 2}, "pcctl.mouse").get("action") == "click"
     # 正名已存在时不许被别名覆盖
     a = norm_args("net.dns", {"domain": "a.com", "url": "b.com"}, "osint.dns")
     assert a.get("domain") == "a.com", "正名参数不许被别名挤掉"
