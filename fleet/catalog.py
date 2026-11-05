@@ -984,6 +984,15 @@ CAPABILITIES = [
                check=_skynet_reason,
                note="只读：只发网络请求，不改本地任何东西。"
                     "内置意图校验与引擎健康度——搜到的垃圾结果会被过滤"),
+    # 🔴 曾漏登记（2026-11-06 契约校验抓出）：internet.py 里 _quote 实现了、
+    # caps() 也声明了，唯独这里没写 —— 结果设备会干、上层看不见、永远调不到。
+    # 这类「实现了但没登记」不会报错，只会表现为「这软件好像没这功能」。
+    Capability("web.quote", "行情精确查询（re_site 站点适配器，腾讯/东财只读）",
+               params=(Param("query", "str", True, "股票/基金名或代码"),
+                       Param("kind", "str", doc="限定品种，如 stock/fund；不给就自己判")),
+               note="只读公开接口。与 web.search 的分工：search 答「网上怎么说」，"
+                    "quote 答「现在是多少」——结构化事实，不是排名。"
+                    "适配器失败照常回信封，不炸不编（没查出来就说没查出来）"),
     Capability("web.fetch", "取一个 URL 的正文（skynet）",
                params=(Param("url", "str", True),
                        Param("timeout", "float", doc="单次超时秒，默认 15")),

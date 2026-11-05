@@ -101,6 +101,11 @@ CASES = [
     # ---- D0 契约层（结果信封 / 设备基类 / 注册表）----
     ("fleet_result", ["-m", "fleet.core.result"], HERE, 30),
     ("fleet_registry", ["-m", "fleet.core.registry"], HERE, 30),
+    # catalog × 设备契约（2026-11-06）：全仓 362 条能力 1.4 秒校一遍。
+    # 存在的意义是**替代**按 import 闭包白跑的那几十项（见 tools/check_catalog.py
+    # 顶部说明）：加一条能力定义，真正会坏的只有这四件事，一项就够。
+    # 它抓到的第一个真 bug 是 web.quote —— 设备实现了、声明了、唯独没登记。
+    ("catalog_contract", ["tools/check_catalog.py"], HERE, 30),
     # ---- 逆向拆解层（L7）：全部离线，不碰真网关不碰真机 ----
     # re_llm 起一次性本地假端点；reverse 用红外编码器造往返向量。
     # 门禁纪律：不许依赖外网/真机，所以这两个模块的 LLM 活体测试不进门禁。
@@ -529,6 +534,16 @@ def _dec(b):
 #:   显式点名   → 无论快慢都跑（`python run_selftests.py t32`）
 SLOW = {"eval_t32_deadlink"}
 
+#: 纯新增快车道必跑的**结构面**三项（见 `_select_by_changed` 里的说明）。
+#:
+#: 为什么只要这三项：追加代码不可能改变某个行为断言的结论，它能弄坏的只有
+#: 「catalog 起不来 / 能力契约对不上 / 注册表与结果信封这两块地基」。
+#: 2026-11-06 实测：这一组 1.4~6 秒，换掉的是 43 项 193 秒。
+#: 它抓到的第一个真 bug（web.quote 实现了没登记）此前 158 项门禁全绿也没抓到 ——
+#: **不是跑得少，是没跑对地方。**
+FASTLANE_CORE = ("catalog_contract", "fleet_registry", "fleet_result")
+
+
 
 def run_case(name, args, cwd, timeout):
     cmd = [PY] + args
@@ -654,6 +669,49 @@ def _git_changed(base=None):
     return {f for f in files if f.endswith((".py", ".json", ".yml", ".yaml"))}
 
 
+def _git_additive_only(base=None):
+    """返回「纯新增」的文件集合：diff 里一行都没删。
+
+    判据只看 `git diff --numstat` 的删除列。改一行必然表现为「1 加 1 删」，
+    所以删除列为 0 就是真正的追加，没动过任何已有行。
+
+    为什么这条判据值得存在：追加代码动不到已有代码路径，能坏的只剩
+    「导入崩了 / 契约不一致」这类**结构面**的问题，跟某个具体断言无关。
+    按 import 闭包把几十项拉起来跑，是把「被 import」当成了「受影响」。
+    2026-11-06 实测这笔账：catalog.py 追加 162 行 → 43 项 193 秒，
+    那 43 项里没有一项的断言跟新增内容有关。
+    """
+    try:
+        cmd = ["git", "diff", "--numstat"]
+        cmd.append(base if base else "HEAD")
+        out = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace").stdout
+    except OSError:
+        return None
+    keep = set()
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        add, dele, path = parts[0], parts[1], parts[2].strip()
+        # 二进制文件给的是 "-"，当成「不确定」处理，不进快车道
+        if add == "-" or dele == "-":
+            continue
+        if int(dele or 0) == 0 and int(add or 0) > 0:
+            keep.add(path.replace("\\", "/"))
+    # 未跟踪的新文件本身就是纯新增（还没进 diff）
+    try:
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=HERE,
+                            capture_output=True, text=True,
+                            encoding="utf-8", errors="replace").stdout
+        for line in st.splitlines():
+            if line.startswith("?? ") or line.startswith("A  "):
+                keep.add(line[3:].strip().replace("\\", "/"))
+    except OSError:
+        pass
+    return keep
+
+
 def _select_by_changed(base=None):
     """按改动文件反查该跑哪些项。返回 (要跑的项, 说明行)。
 
@@ -690,10 +748,34 @@ def _select_by_changed(base=None):
 
     # 门禁/映射自身变了：任何映射都不足以判断，直接全量。
     meta = {f for f in files
-            if os.path.basename(f) in ("run_selftests.py", "gate_map.py")}
+            if os.path.basename(f) in ("run_selftests.py", "gate_map.py",
+                                       "check_catalog.py")}
     if meta:
         print("改的是门禁基础设施（%s）—— 跑全量。" % ", ".join(sorted(meta)))
         return CASES, ""
+
+    # ---- 纯新增快车道 ----
+    # 全部改动文件都「一行没删」⇒ 动不到已有代码路径，能坏的只有结构面。
+    # 这时按 import 闭卡拉几十项是把「被 import」当成「受影响」，是过度防御
+    # （2026-11-06 主人原话：又不是造核弹）。只跑两类：
+    #   ① 入口就是被改文件的项（改谁测谁）
+    #   ② 结构面三项：catalog 契约 / 注册表基类 / 结果信封
+    # 不放心就加 --deep（走原闭包）或 --all（全量）。
+    if "--deep" not in sys.argv:
+        addonly = _git_additive_only(base)
+        if addonly is not None and files and set(files) <= addonly:
+            entries = {n: (v or {}).get("entry", "")
+                       for n, v in (data.get("cases") or {}).items()}
+            own = {n for n, e in entries.items() if e and e in files}
+            keep = own | set(FASTLANE_CORE)
+            cases = [c for c in CASES if c[0] in keep]
+            print("改动 %d 文件（全是纯新增，没删改任何已有行）-> %d 项快车道"
+                  % (len(files), len(cases)))
+            if own:
+                print("  改谁测谁：%s" % ", ".join(sorted(own)))
+            print("  结构面：%s" % ", ".join(sorted(set(FASTLANE_CORE) & set(keep))))
+            print("  要按 import 闭包跑加 --deep，要全量加 --all")
+            return cases, ""
 
     rev = data.get("reverse") or {}
     hit = {}
