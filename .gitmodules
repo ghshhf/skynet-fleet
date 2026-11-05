@@ -1,0 +1,3 @@
+[submodule "selfplay-lab"]
+	path = selfplay-lab
+	url = https://github.com/ghshhf/selfplay-lab.git
