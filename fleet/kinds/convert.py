@@ -413,7 +413,13 @@ class ConvertDevice(BaseDevice):
         else:
             out = os.path.splitext(src)[0] + "." + ext
         if os.path.normcase(out) == os.path.normcase(src):
-            return None, "输出路径与源文件相同（%s）：拒绝覆盖原件，请换 out 或换目标格式" % out
+            if raw:
+                # 用户自己把输出指到了源文件：这是明确要覆盖，必须拦住
+                return None, ("输出路径与源文件相同（%s）：拒绝覆盖原件，"
+                              "请换 out 或换目标格式" % out)
+            # 同容器重编码（「把这个 mp4 压小点」）：自动让到 rec_1.mp4，
+            # 既不覆盖原件，也不用逼调用方凭空想一个输出名
+            out = _unique(out)
         if not bool(args.get("overwrite") or False):
             out = _unique(out)
         parent = os.path.dirname(out)
@@ -836,7 +842,9 @@ class ConvertDevice(BaseDevice):
             return R.error(cap, "转 GIF 失败：%s" % _tail(e), device=self.name, via=self.via)
         return R.success(cap, self.name, via=self.via, data={
             "src": p, "out": out, "to": "gif", "fps": fps, "width": width,
-            "bytes": os.path.getsize(out), "engine": "ffmpeg palettegen/paletteuse",
+            "bytes": os.path.getsize(out), "src_bytes": os.path.getsize(p),
+            "ratio": round(os.path.getsize(out) / max(1, os.path.getsize(p)), 3),
+            "engine": "ffmpeg palettegen/paletteuse",
             "ms": int((time.time() - t0) * 1000),
         })
 
@@ -1124,6 +1132,11 @@ def _selftest():
         ck(r.ok, "视频：重编码 + scale=120（-2 保证偶数宽）")
         if r.ok:
             ck((r.data.get("video") or {}).get("height") == 120, "视频：产物高度真是 120")
+
+        # ---- 同容器重编码：自动改名，不覆盖原件 ----
+        r = dev.invoke("convert.video", {"path": src_mp4, "to": "mp4",
+                                        "crf": 35, "preset": "ultrafast"})
+        ck(r.ok and r.data["out"] != src_mp4, "视频：同容器重编码自动让到 _1，不覆盖原件")
 
         # ---- GIF ----
         r = dev.invoke("convert.gif", {"path": src_mp4, "fps": 5, "width": 160})
