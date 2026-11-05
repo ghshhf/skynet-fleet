@@ -131,6 +131,13 @@ CASES = [
     # Windows 会把连接随机分给其中一个（SO_REUSEADDR 的语义和 POSIX 完全不同），
     # 报的错互相打架。全离线：只绑 127.0.0.1 的临时端口，不碰真网关、不打外网。
     ("fleet_llmgw_srv", ["-m", "fleet.llmgw_server", "--selftest"], HERE, 30),
+    # ---- 2026-11-06 新增的四个 kinds：此前**一项都没进门禁** ----
+    # 上一轮那 43 项 193 秒里没有一项真的跑过它们（只是 import 了 catalog）。
+    # 四个加起来 5.7 秒，45 条断言：这笔账才是对的。
+    ("fleet_geo", ["-m", "fleet.kinds.geo", "--selftest"], HERE, 30),
+    ("fleet_drive", ["-m", "fleet.kinds.drive", "--selftest"], HERE, 60),
+    ("fleet_circle", ["-m", "fleet.kinds.circle", "--selftest"], HERE, 30),
+    ("fleet_wintool", ["-m", "fleet.kinds.wintool", "--selftest"], HERE, 60),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
