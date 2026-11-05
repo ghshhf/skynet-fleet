@@ -73,6 +73,10 @@ _FFMPEG = D("ffmpeg", kind="exe", exe="ffmpeg",
 _RENDER_ENGINE = D("渲染引擎 RuiC-motion-reel", kind="repo", env="RUIKIT_HOME",
                    fix="git clone RuiC-motion-reel 到本地，并把 RUIKIT_HOME 指向它",
                    why="render.* 动效渲染")
+#: 通用转换用：缺 ffmpeg 只是音视频转不了，图片照转，不该在 doctor 里报成硬失败
+_FFMPEG_SOFT = D("ffmpeg", kind="exe", exe="ffmpeg", hard=False,
+                 fix="装 ffmpeg 并加入 PATH（https://ffmpeg.org/download.html）",
+                 why="音视频格式转换（缺了图片仍可转）")
 
 # —— 逐能力 / 逐族声明（key 含 '*' 视为前缀匹配）——
 CAP_DEPS = {
@@ -108,6 +112,24 @@ CAP_DEPS = {
 
     # 渲染
     "render.*": [_RENDER_ENGINE, _FFMPEG],
+
+    # 通用格式转换（2026-11-06）：每类媒体各有一条腿，缺哪条就少哪一类。
+    # 注意 hard 全是 False —— 缺 ffmpeg 也还能转图片，缺 Pillow 也还能转视频，
+    # 除非两个都缺（那是 converter 设备自己的 probe 去答的）。
+    "convert.file": [_FFMPEG_SOFT, D("Pillow", import_name="PIL", pip_pkg="Pillow",
+                                     hard=False, why="图片转格式首选引擎")],
+    "convert.audio": [_FFMPEG],
+    "convert.video": [_FFMPEG],
+    "convert.gif": [_FFMPEG],
+    "convert.frames": [_FFMPEG],
+    "convert.batch": [_FFMPEG],
+    "convert.engines": [],
+    "convert.probe": [],
+
+    # 压缩包：zip/tar/gz 走标准库，永远可用；7z/rar 才需要外部程序
+    "archive.*": [D("7-Zip", kind="exe", exe="7z", hard=False,
+                    fix="scoop install 7zip（只有 7z/rar 需要，zip/tar/gz 用标准库）",
+                    why="7z / rar 格式的打包解包")],
 }
 
 # 项目级依赖（不挂具体能力，doctor 单独列出）

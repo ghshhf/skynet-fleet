@@ -68,6 +68,8 @@ from .kinds.domain_device import DomainDevice
 from .kinds.doc_device import DocDevice
 from .kinds.persona_device import PersonaDevice
 from .kinds.image_ops import ImageOps
+from .kinds.convert import ConvertDevice
+from .kinds.archive import ArchiveDevice
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1189,6 +1191,104 @@ CAPABILITIES = [
                        Param("out_dir", "str", doc="输出目录；默认 <源目录>/_<op>")),
                side_effect=True,
                note="永不覆盖源文件。单张失败不影响其余，failed 里带每张的错因"),
+    # ---- 通用格式转换（2026-11-06）：一个入口，引擎按媒体类型自动分派 ----
+    Capability("convert.engines", "本机有哪些转换引擎、各吃哪些格式、还缺什么",
+               note="只报实际探测到的，不报「理论上支持」"),
+    Capability("convert.probe", "一个文件到底是什么（按魔数判，不信扩展名）",
+               params=(Param("path", "str", True, "文件路径"),),
+               note="扩展名与内容不符时会明说。音视频额外给时长/分辨率/编码"),
+    Capability("convert.file", "任意文件 → 目标格式（自动选引擎）",
+               params=(Param("path", "str", True, "源文件"),
+                       Param("to", "str", doc="目标格式如 mp3/mp4/mkv/webp/md；"
+                                             "auto=按类型给默认值"),
+                       Param("out", "str", doc="输出路径；默认同目录换扩展名"),
+                       Param("overwrite", "bool", doc="允许覆盖已存在的输出，默认 false（自动加序号）"),
+                       Param("quality", "int", doc="图片质量 1-100，默认 90"),
+                       Param("crf", "int", doc="视频质量，越小越清晰，默认 23"),
+                       Param("scale", "str", doc="视频缩放 `720`（按高）或 `1280x720`"),
+                       Param("bitrate_kbps", "int", doc="音频码率"),
+                       Param("copy", "bool", doc="视频只换封装不重编码（秒级、无损）")),
+               side_effect=True,
+               note="视频转音频格式 = 自动抽音轨。源没有音轨会明说，不甩 ffmpeg 报错"),
+    Capability("convert.audio", "音频转码（码率/采样率/声道/响度归一）",
+               params=(Param("path", "str", True, "源文件（音频或视频）"),
+                       Param("to", "str", doc="mp3/wav/flac/ogg/m4a/aac/opus，默认 mp3"),
+                       Param("bitrate_kbps", "int", doc="默认 192k（128k 发闷，320k 对语音浪费）"),
+                       Param("rate", "int", doc="采样率 Hz"),
+                       Param("channels", "int", doc="声道数"),
+                       Param("normalize", "bool", doc="响度拉到 -16 LUFS（播客/视频平台通用）"),
+                       Param("start", "str", doc="起点，如 00:00:30"),
+                       Param("duration", "str", doc="截多长"),
+                       Param("out", "str", doc="输出路径")),
+               side_effect=True),
+    Capability("convert.video", "视频转码（容器/分辨率/质量/裁剪/去音轨）",
+               params=(Param("path", "str", True, "源文件"),
+                       Param("to", "str", doc="mp4/mkv/webm/avi/mov/flv/ts，默认 mp4"),
+                       Param("crf", "int", doc="质量，18 高清 / 23 默认 / 28 小体积"),
+                       Param("preset", "str", doc="x264 预设，默认 medium；求快用 veryfast"),
+                       Param("scale", "str", doc="`720` 按高缩放，或 `1280x720`"),
+                       Param("fps", "int", doc="改帧率"),
+                       Param("no_audio", "bool", doc="丢掉音轨"),
+                       Param("copy", "bool", doc="只换封装不重编码（装不下原编码时会失败，去掉它重编码）"),
+                       Param("start", "str", doc="起点"),
+                       Param("duration", "str", doc="截多长"),
+                       Param("out", "str", doc="输出路径")),
+               side_effect=True,
+               note="容器与编码器的搭配由本设备给默认值，不让 ffmpeg 自己猜"),
+    Capability("convert.gif", "视频 → GIF（调色板两遍，不出色带）",
+               params=(Param("path", "str", True, "源视频"),
+                       Param("fps", "int", doc="默认 10；GIF 越大越卡"),
+                       Param("width", "int", doc="宽度，默认 480"),
+                       Param("start", "str", doc="起点"),
+                       Param("duration", "str", doc="截多长"),
+                       Param("dither", "str", doc="抖动算法，默认 sierra2_4a"),
+                       Param("out", "str", doc="输出路径")),
+               side_effect=True,
+               note="必须 palettegen/paletteuse：固定调色板出来的 GIF 暗部全是色带"),
+    Capability("convert.frames", "视频均匀抽 N 帧成图（封面/故事板）",
+               params=(Param("path", "str", True, "源视频"),
+                       Param("count", "int", doc="抽几帧，默认 6，上限 60"),
+                       Param("fmt", "str", doc="jpg/png/webp，默认 jpg"),
+                       Param("height", "int", doc="高度，默认 720"),
+                       Param("start", "str", doc="从哪开始"),
+                       Param("out_dir", "str", doc="输出目录，默认 <视频名>_frames")),
+               side_effect=True,
+               note="用 fps=N/时长 均匀取，不用 select=mod(n,k)：手机视频大量是 VFR，总帧数不可靠"),
+    Capability("convert.batch", "目录批量转格式（默认只预演）",
+               params=(Param("dir", "str", True, "源目录"),
+                       Param("to", "str", True, "目标格式"),
+                       Param("pattern", "str", doc="文件名通配，默认 *"),
+                       Param("recursive", "bool", doc="递归子目录"),
+                       Param("limit", "int", doc="最多几个，默认 200"),
+                       Param("dry_run", "bool", doc="只列计划；不传则默认 true"),
+                       Param("out_dir", "str", doc="输出目录，默认 <源目录>/_<格式>")),
+               side_effect=True,
+               note="默认预演：批量 500 张参数错一次就是 500 个废文件"),
+    # ---- 压缩包（2026-11-06）：打包/解包/看内容。7-Zip + 标准库 ----
+    Capability("archive.info", "这个压缩包里有什么：几个文件、解压后多大、有没有坏条目",
+               params=(Param("path", "str", True, "压缩包路径"),),
+               note="unsafe_count>0 表示包含越界路径（zip-slip），解包会被拒"),
+    Capability("archive.list", "列压缩包里的条目（可通配过滤）",
+               params=(Param("path", "str", True, "压缩包路径"),
+                       Param("pattern", "str", doc="文件名通配，默认 *"),
+                       Param("limit", "int", doc="最多列几条，默认 100")),
+               note="matched 含目录条目，files 才是文件数（7z 会把目录也列出来）"),
+    Capability("archive.extract", "解压到指定目录（带两道防线）",
+               params=(Param("path", "str", True, "压缩包路径"),
+                       Param("out_dir", "str", doc="解到哪；默认 <包名>_extracted"),
+                       Param("dry_run", "bool", doc="只审条目和体积，不写文件"),
+                       Param("max_bytes", "int", doc="解压后体积上限，默认 4GB")),
+               side_effect=True,
+               note="拒绝绝对路径/盘符/../ 的条目（zip-slip），超体积上限也停（解压炸弹）"),
+    Capability("archive.pack", "把文件/目录打成 zip/7z/tar/gz",
+               params=(Param("src", "json", True, "文件或目录，可给列表"),
+                       Param("fmt", "str", doc="zip（默认）/ 7z / tar / gz"),
+                       Param("out", "str", doc="输出路径；默认源旁边同名"),
+                       Param("level", "int", doc="压缩级别 0-9，默认 5"),
+                       Param("gzip", "bool", doc="fmt=tar 时是否再套 gzip"),
+                       Param("overwrite", "bool", doc="允许覆盖，默认 false（自动加序号）")),
+               side_effect=True,
+               note="保留相对结构：打一个目录，解出来还是那个目录，不平铺"),
     # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
     Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
@@ -1703,6 +1803,13 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 分开注册：状态写入只发生在 var/，跟 cards/ 那层审批闸门不是一回事。
     reg.add(PersonaDevice())
     reg.add(ImageOps())
+    # 通用格式转换：一个入口吃任意文件，引擎按媒体类型分派（图片/Pillow、
+    # 音视频/ffmpeg、文档/MarkItDown、压缩包/7z）。image.* 那套是图片专用细活，
+    # 这台管「我有个文件，帮我转成 X」。
+    reg.add(ConvertDevice())
+    # 压缩包单独一台：解包是唯一「会把别人准备的文件写进你磁盘」的操作，
+    # 安全边界（路径穿越 / 解压炸弹）要能单独收紧，不跟格式转换混在一起。
+    reg.add(ArchiveDevice())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())

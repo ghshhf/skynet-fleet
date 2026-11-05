@@ -152,6 +152,12 @@ CASES = [
     # 图片流水线（2026-11-06 从 2 项扩到 9 项）：造 3 张不同比例的图当向量，
     # 断言尺寸/格式/字节关系，不断言「没抛异常」——「没抛但输出错」才是这类模块的病。
     ("fleet_image_ops", ["-m", "fleet.kinds.image_ops", "--selftest"], HERE, 60),
+    # 通用格式转换（2026-11-06）：素材由 ffmpeg 现场合成（1 秒测试片 + 正弦波），
+    # 不依赖仓库里任何样例文件；26 条断言覆盖嗅探/图片/音频/跨类抽音轨/视频/GIF/抽帧/批量。
+    ("fleet_convert", ["-m", "fleet.kinds.convert", "--selftest"], HERE, 180),
+    # 压缩包（2026-11-06）：19 条断言，含两个反向用例 —— 带 ../ 的恶意 zip 与带盘符的
+    # 条目都必须被拒且真的没写出文件。安全逻辑不写测试等于没写。
+    ("fleet_archive", ["-m", "fleet.kinds.archive", "--selftest"], HERE, 120),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
@@ -886,13 +892,17 @@ def _select_by_changed(base=None):
         print("要强制全量：python run_selftests.py --all")
         return [], ""
 
-    # 门禁/映射自身变了：任何映射都不足以判断，直接全量。
+    # 门禁/映射自身变了：映射不再可信，但**也不该在本地拉全量**。
+    # 2026-11-06 主人定：「不要在本地中搞那个什么门禁时间那么长，搞完推上去，从上面检测」。
+    # 所以这里只跑结构面（契约 + 注册表 + 结果信封）+ 按域自测，全量交给远程 CI。
     meta = {f for f in files
             if os.path.basename(f) in ("run_selftests.py", "gate_map.py",
                                        "check_catalog.py")}
     if meta:
-        print("改的是门禁基础设施（%s）—— 跑全量。" % ", ".join(sorted(meta)))
-        return CASES, ""
+        print("改的是门禁基础设施（%s）—— 本地只跑结构面，全量交给远程 CI。"
+              "要立刻全量就显式 --all。" % ", ".join(sorted(meta)))
+        keep = [c for c in CASES if c[0] in FASTLANE_CORE]
+        return keep, ""
 
     # ---- 纯新增快车道 ----
     # 全部改动文件都「一行没删」⇒ 动不到已有代码路径，能坏的只有结构面。
