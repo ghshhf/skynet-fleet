@@ -1,13 +1,5 @@
 //! 配置常量与域名分组（按表串发版）。
-//!
-//! 站点注册表（GROUPS / DIRECT_HOSTS / WHITELIST_HOSTS）已抽成运行时加载，见 `sites.rs`：
-//! 内置 GitHub 默认保证开箱即用，`sites.toml` 用于追加新站点（"加站点 = 加配置"）。
-//! 本文件只保留端口 / 超时 / 分片策略等常量，以及查询函数（数据源来自 `sites::global_sites()`）。
 
-// pub use: global_sites 需要在 config 模块外 (webui.rs) 经 config::global_sites() 访问
-pub use crate::sites::global_sites;
-// 多站点画像（site.rs）：供 route.rs / server / dial 统一调用。
-pub use crate::site::{global_site_table, is_site_direct, site_for_host, site_split_hello};
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// 默认端口（-port / -webui 可覆盖）。
@@ -36,26 +28,19 @@ pub fn set_webui_port(p: u16) {
 pub const HEAD_TIMEOUT_SECS: u64 = 30;
 /// 单候选拨号超时（TCP 与 TLS 握手共用）：黑洞型死 IP 不许拖住整轮串发。
 pub const CONNECT_TIMEOUT_SECS: u64 = 3;
-/// h2 SETTINGS 握手限时：TCP/TLS 已通但对端装死时快速垫底——裸等会永久持有
-/// per-host 拨号锁，把该域名所有缓存未命中的请求一起拖死。
+/// h2 SETTINGS 握手限时：对端装死会永久持有 per-host 拨号锁，拖死整个域名。
 pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
-/// 串发每请求总耗时预算（整圈最坏 3.6 分钟）；到期即停并按 host 冷却 30s。
-/// 与 ctx 分开：ctx = 整个请求的预算，这是圈内轮换预算。
+/// 串发每请求总耗时预算，到期即停并按 host 冷却 30s。
 pub const SERIAL_DIAL_BUDGET_SECS: u64 = 20;
 
+/// h2 连接空闲 50-65s 被边缘回收，30s 探测可稳定续命。
 pub const KEEPALIVE_PROBE_SECS: u64 = 30;
 pub const KEEPALIVE_WINDOW_SECS: u64 = 300;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 
-/// 隧道模式 TLS 握手首包分片：客户端→上游的第一段若为 TLS 握手记录(0x16 开头)，
-/// 拆成 2~3 段（切点/间隔每连接随机）发出。DPI 的 SNI 检测需要完整 ClientHello，
-/// 拆段后重组窗口拼不齐 → 真名 SNI 免于 RST（byedpi/GoodbyeDPI 同款思路，纯用户态）；
-/// 边缘的完整 TCP 栈不受影响。仅作用于 CONNECT 隧道首段——SSH/HTTP 流(非 0x16)不碰。
-/// 随机化而非固定形态的原因：教科书式"5B 记录头 + 固定间隔"是公开知识，
-/// 会被签名后针对性反制（2026-10-21 夜间窗口疑似即此）；随机让每条连接长得都不一样。
-/// 总闸：A/B 对照时改 false 重编译即全关。
+/// 隧道首包分片：0x16 开头的 ClientHello 拆 2~3 段随机构造发出；DPI 拼不齐 SNI 就不会 RST，非 TLS 流不碰。
 pub const HELLO_SPLIT_ENABLED: bool = true;
 /// 首刀上限：1..=FIRST_MAX 字节随机（覆盖 TLS 记录头 5B 一带）。
 pub const HELLO_SPLIT_FIRST_MAX: usize = 16;
@@ -65,167 +50,13 @@ pub const HELLO_SPLIT_DELAY_MAX_MS: u64 = 70;
 /// 真实流量拨号总并发闸（无它，开页面 30 并发会打爆自己）。
 pub const DIAL_GATE_SIZE: usize = 48;
 pub const LOG_BUFFER_SIZE: usize = 2000;
+/// 白名单腿分片参数：固定 3 段、间隔 100ms——真名 SNI 一旦被拼齐就明文暴露，宁可多等。
+pub const WHITELIST_SPLIT_SEGS: usize = 3;
+pub const WHITELIST_SPLIT_GAP_MS: u64 = 100;
 
-/// 域名匹配：`*.x` 匹配子域，否则全等。
-pub fn pattern_match(host: &str, pat: &str) -> bool {
-    match pat.strip_prefix("*.") {
-        Some(suffix) => host
-            .strip_suffix(suffix)
-            .is_some_and(|h| h.ends_with('.')),
-        None => host == pat,
-    }
-}
+/// 直连优先域：先试直连，失败按链序逐家；codeload 已并入小文件派发并享受 TTFB 校准。
+pub const DIRECT_FIRST_HOSTS: &[&str] = &["codeload.github.com"];
 
-/// 直连白名单：不归任何池、不经代理（vhost→边缘映射只有 GitHub 的 DNS 知道，交给系统解析）。
-/// 数据源见 `sites::global_sites().direct_hosts`（内置 GitHub 默认 + sites.toml 追加）。
-pub fn is_direct(host: &str) -> bool {
-    global_sites().direct_hosts.iter().any(|h| h == host)
-}
-
-/// 白名单腿 ClientHello 分片：段数与段间隔（毫秒）。
-/// 段间留够时间，DPI 的重组窗口拼不齐完整 SNI 就取不到域名。
-///
-/// 与上方 `HELLO_SPLIT_*`（透传腿）是**同一件事的两套参数，故意不同**：
-/// - 透传腿：2~3 段、间隔 20~70ms 随机。历史实测值，靠随机形态躲签名化反制。
-/// - 白名单腿：固定 3 段、间隔 100ms。更保守——这批域名走的是真名 SNI，
-///   一旦被拼齐就是明文暴露，宁可多等 200ms 也要把重组窗口赌死。
-///
-/// 改任一侧前先看另一侧的注释，别只调一处。数据源见 `sites::global_sites()`。
-pub fn whitelist_split_segs() -> usize {
-    global_sites().wl_split_segs
-}
-pub fn whitelist_split_gap_ms() -> u64 {
-    global_sites().wl_split_gap_ms
-}
-
-pub fn is_whitelist(host: &str) -> bool {
-    whitelist_seg(host).is_some()
-}
-
-/// 白名单域名该落哪段 IP（Fastly 末段 / Azure 前缀）；不在白名单返回 None。
-/// 数据源见 `sites::global_sites().whitelist`，route::FAMILY_WL_* 按 seg 自动认领。
-pub fn whitelist_seg(host: &str) -> Option<&'static str> {
-    global_sites()
-        .whitelist
-        .iter()
-        .find(|w| w.host == host)
-        .map(|w| w.seg.as_str())
-}
-
-/// 域名 → 池名（"" = 非池）。精确 pattern 优先于通配符；总路由见 route::master_route。
-///
-/// 多站点扩展：先匹配站点画像（site.rs），站点若有 seeds → 进该站点专用池；
-/// 若无 seeds 但有域名 → 走通用隧道（Tunnel，池名 ""）。GitHub 等已有池的站点
-/// 先按 sites.rs 的 groups 命中，再回落站点画像。
-pub fn pool_for(host: &str) -> &'static str {
-    // 直连必须先于一切。
-    if is_direct(host) || is_site_direct(host) {
-        return "";
-    }
-    // 白名单进 edge 池：池里靠白名单族按 seg 选 IP，握手由 dial_one 切成真名 + 分片。
-    if is_whitelist(host) {
-        return "edge";
-    }
-    // 站点画像：有 seeds 的站点进站点专用池（名=站点名）。无 seeds 的站点
-    // （如 github，路由仍由旧 sites.rs 的 groups 决定）不在此短路，落到下方
-    // groups 匹配——否则会把 *.githubusercontent.com 等本归 edge 的域误切成 Tunnel。
-    if let Some(site) = site_for_host(host) {
-        if !site.seeds.is_empty() {
-            return site.name.as_str();
-        }
-    }
-    let s = global_sites();
-    for g in &s.groups {
-        for pat in &g.patterns {
-            if pat == host {
-                return g.name.as_str();
-            }
-        }
-    }
-    for g in &s.groups {
-        for pat in &g.patterns {
-            if pattern_match(host, pat) {
-                return g.name.as_str();
-            }
-        }
-    }
-    ""
-}
-
-/// 全部受管域名的裸形（`*.x` 剥成 `x`），去重由调用方做一次（PAC 本身就是低频请求）。
-pub fn pooled_domains() -> impl Iterator<Item = &'static str> {
-    global_sites()
-        .groups
-        .iter()
-        .flat_map(|g| g.patterns.iter().map(|p| p.as_str()))
-        .chain(
-            global_site_table()
-                .profiles
-                .iter()
-                .flat_map(|p| p.domains.iter().map(|d| d.as_str())),
-        )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pattern_star_dot() {
-        assert!(pattern_match("api.github.com", "*.github.com"));
-        assert!(pattern_match("github.com", "github.com"));
-        assert!(!pattern_match("xgithub.com", "*.github.com"));
-        assert!(!pattern_match("github.com", "*.github.com"));
-        assert!(!pattern_match("evilgithub.com", "*.github.com"));
-    }
-
-    #[test]
-    fn pool_routing() {
-        assert_eq!(pool_for("github.com"), "core");
-        assert_eq!(pool_for("api.github.com"), "api");
-        assert_eq!(pool_for("api.github.com.cn"), ""); // 不误伤非 api.github.com 后缀
-        assert!(is_direct("objects-origin.githubusercontent.com"));
-        assert_eq!(pool_for("objects-origin.githubusercontent.com"), "");
-        assert!(is_direct("uploads.github.com"));
-        assert_eq!(pool_for("uploads.github.com"), "");
-        assert!(is_direct("viewscreen.githubusercontent.com"));
-        assert_eq!(pool_for("viewscreen.githubusercontent.com"), "");
-        assert!(is_direct("api.mcp.github.com")); // *.github.com 通配吞它，白名单精确短路
-        assert_eq!(pool_for("api.mcp.github.com"), "");
-        // 白名单：PAC 里故意不出现（要进代理才能分片），池名必须是 edge，且带段号。
-        for w in global_sites().whitelist.iter() {
-            assert!(is_whitelist(&w.host), "{} 应在白名单", w.host);
-            assert!(
-                !is_direct(&w.host),
-                "{} 不能进 DIRECT：那样流量被拦在代理外，拿不到分片",
-                w.host
-            );
-            assert_eq!(pool_for(&w.host), "edge", "{} 应判为 edge 池", w.host);
-            assert_eq!(
-                whitelist_seg(&w.host),
-                Some(w.seg.as_str()),
-                "{} 段号读不出",
-                w.host
-            );
-        }
-        // 段号必须覆盖四类：.154 / .153 / .133 / Azure 前缀
-        assert_eq!(whitelist_seg("docs.github.com"), Some("154"));
-        assert_eq!(whitelist_seg("pages.github.com"), Some("153"));
-        assert_eq!(whitelist_seg("support.github.com"), Some("133"));
-        assert_eq!(
-            whitelist_seg("copilot-proxy.githubusercontent.com"),
-            Some("4.249")
-        );
-        assert_eq!(pool_for("codeload.github.com"), "core");
-        assert_eq!(pool_for("raw.githubusercontent.com"), "edge");
-        assert_eq!(pool_for("avatars.githubusercontent.com"), "edge");
-        assert_eq!(pool_for("camo.githubusercontent.com"), "edge");
-        assert_eq!(pool_for("gist.githubusercontent.com"), "edge");
-        assert_eq!(pool_for("github.githubassets.com"), "edge");
-        assert_eq!(pool_for("foo.github.io"), "edge");
-        assert_eq!(pool_for("github.io"), "edge");
-        assert_eq!(pool_for("githubapp.com"), "edge");
-        assert_eq!(pool_for("api.githubapp.com"), "edge");
-        assert_eq!(pool_for("example.com"), "");
-    }
+pub fn is_direct_first(host: &str) -> bool {
+    DIRECT_FIRST_HOSTS.contains(&host)
 }

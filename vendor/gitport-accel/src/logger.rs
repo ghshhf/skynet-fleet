@@ -13,9 +13,8 @@ use time::OffsetDateTime;
 static LOCAL_OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
 
 fn now_str(fd: &[time::format_description::FormatItem<'static>]) -> String {
-    let offset = *LOCAL_OFFSET.get_or_init(|| {
-        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
-    });
+    let offset = *LOCAL_OFFSET
+        .get_or_init(|| time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
     OffsetDateTime::now_utc()
         .to_offset(offset)
         .format(fd)
@@ -88,7 +87,6 @@ impl Logger {
     }
 }
 
-
 /// 崩溃取证落点：未装（headless 以外的早期阶段）时静默丢弃。
 static CRASH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
@@ -136,29 +134,5 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ring_evicts_oldest_keeps_window() {
-        let lg = Logger::new(false);
-        for i in 0..(LOG_BUFFER_SIZE + 5) {
-            lg.log(&format!("line{i}"));
-        }
-        let (entries, latest) = lg.since(0);
-        assert_eq!(entries.len(), LOG_BUFFER_SIZE);
-        assert!(
-            entries[0].1.ends_with("line5"),
-            "最旧 5 条应被挤出: {}",
-            entries[0].1
-        );
-        assert!(entries
-            .last()
-            .unwrap()
-            .1
-            .ends_with(&format!("line{}", LOG_BUFFER_SIZE + 4)));
-        assert_eq!(latest, (LOG_BUFFER_SIZE + 5) as u64);
-        let (tail, _) = lg.since(entries[0].0);
-        assert_eq!(tail.len(), LOG_BUFFER_SIZE - 1);
-    }
-}
+#[path = "tests/logger.rs"]
+mod tests;

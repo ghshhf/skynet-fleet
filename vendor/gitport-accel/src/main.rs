@@ -3,14 +3,13 @@
 
 mod certgen;
 mod config;
-mod sites;
-mod site;
 mod desktop;
 mod fsx;
 mod logger;
 mod pool;
 mod server;
 mod settings;
+mod util;
 mod webui;
 mod winsec;
 
@@ -41,7 +40,9 @@ fn run() {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let _ = std::env::set_current_dir(&exe_dir);
-    logger::set_crash_path(&exe_dir);
+    let cache_dir = exe_dir.join(".cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    logger::set_crash_path(&cache_dir);
     settings::init_exe_dir(&exe_dir);
     settings::load();
 
@@ -58,7 +59,7 @@ fn run() {
 
     // 日志 stdout 回显仅 headless: GUI 构建的 stdout 重定向会把访问域名等浏览痕迹落盘
     let logs = Arc::new(logger::Logger::new(headless));
-    let log_fn: pool::LogFn = {
+    let log_fn: util::LogFn = {
         let l = logs.clone();
         Arc::new(move |msg: &str| l.log(msg))
     };
@@ -76,6 +77,7 @@ fn run() {
     );
 
     server::upstream::start_keepalive(&rt);
+    server::mitm::mirror::start_ect_ticker();
 
     let srv = Arc::new(server::ProxyServer {
         log: log_fn.clone(),
@@ -84,7 +86,19 @@ fn run() {
     if let Err(e) = server::start_proxy_with(&rt, srv, config::proxy_port()) {
         log_fn(&format!("代理启动失败: {e}"));
     } else {
-        settings::ensure_system_proxy(); // 分流开关接管系统代理(全关 = no-op)
+        // 分流开关接管系统代理(全关 = no-op)。只在没接管成功时留痕：接上是常态，不占日志。
+        if let Err(e) = settings::ensure_system_proxy() {
+            log_fn(&format!("[启动] 系统代理: 未接管 —— {e}"));
+        }
+    }
+    let me = settings::exe_name();
+    match settings::autostart_state() {
+        // 登记的是本 exe（或本来就没登记）是常态，不出声；指向别处才是真问题。
+        Ok(v) if !v.is_empty() && (me.is_empty() || !v.contains(me.as_str())) => {
+            log_fn(&format!("[启动] 开机自启: 指向别处 —— {v}"))
+        }
+        Ok(_) => {}
+        Err(e) => log_fn(&format!("[启动] 开机自启: 读不到 —— {e}")),
     }
 
     let app = Arc::new(webui::App {

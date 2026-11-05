@@ -1,10 +1,11 @@
-//! 路由唯一真相：master_route（System→Mirror→Pool→Tunnel）+ POOL_ROUTES 每池族表。
-//! 冷却/健康按 host 或 IP 记账不按池——池级冷却会让一个域的全灭毒倒同池其他族。
+//! 路由表：`routes.json` 的 `routes` 字典，键即域名；裸键含自身+子域，`*.` 仅子域，最长键胜。
+//! 这张表是唯一真相：host 用哪组 IP、真名还是伪装、全灭后走镜像还是 DNS。
 
 use super::SerialPlan;
-use crate::config;
-use crate::site;
-
+use crate::util::lock;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -14,18 +15,307 @@ pub enum Route {
     Tunnel,
 }
 
-/// 大文件下载域（整域镜像）：codeload=源码包；objects/release-assets=附件 302 落点。
+/// 一条路由的开关位；全部来自 routes.json，不从 host 形态推断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Flags {
+    /// 本机直连，不进代理。
+    pub direct: bool,
+    /// 真名 SNI + ClientHello 分片：伪装会被上游判非法的域用。
+    pub real: bool,
+    /// 内容域：走熔断与短响应预算。
+    pub content: bool,
+    /// 可被借道当 donor。
+    pub donor: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fallback {
+    #[default]
+    Dns,
+    MirrorDns,
+}
+
+/// routes.json 里一条路由的值部分；域名键在外层，解析时补进 `key`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteSpec {
+    /// 域名键：`github.com` = 自己 + 所有子域；`*.github.com` = 仅子域。
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub pac: Option<String>,
+    /// 目前只有 "direct"。
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub real: bool,
+    #[serde(default)]
+    pub content: bool,
+    #[serde(default)]
+    pub donor: bool,
+    /// "dns"（默认）或 "mirror"。
+    #[serde(default)]
+    pub fallback: Option<String>,
+    #[serde(default)]
+    pub plans: Vec<SerialPlan>,
+    /// 只在真名腿（隧道 / real 路由）额外可用的 IP。
+    #[serde(default, rename = "realPlans")]
+    pub real_plans: Vec<SerialPlan>,
+}
+
+pub struct RouteRow {
+    pub key: String,
+    pub pac: Option<String>,
+    pub flags: Flags,
+    pub fallback: Fallback,
+    pub plans: Vec<SerialPlan>,
+    pub real_plans: Vec<SerialPlan>,
+    /// 去掉 `*.` 的裸域名，全小写。
+    bare: String,
+    /// `*.` 前缀：只认子域，裸域不命中。
+    sub_only: bool,
+    /// 具体度 = bare 的字符数；多条同时命中时长的胜。
+    rank: usize,
+}
+
+impl RouteRow {
+    pub fn new(spec: RouteSpec) -> Result<Self, String> {
+        let key = spec.key.trim().trim_end_matches('.').to_string();
+        if key.is_empty() {
+            return Err("key 为空".to_string());
+        }
+        let lower = key.to_ascii_lowercase();
+        let (sub_only, bare) = match lower.strip_prefix("*.") {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, lower),
+        };
+        if bare.is_empty() {
+            return Err(format!("key {key:?} 缺域名"));
+        }
+        if bare.contains('*') {
+            return Err(format!("key {key:?} 只允许开头一个 `*.`"));
+        }
+        if !bare
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return Err(format!(
+                "key {key:?} 含非法字符（域名只允许字母数字 . - _）"
+            ));
+        }
+        if !bare.contains('.') || bare.starts_with('.') {
+            return Err(format!("key {key:?} 不像域名（至少一个点）"));
+        }
+        let fallback = match spec.fallback.as_deref().unwrap_or("dns") {
+            "dns" => Fallback::Dns,
+            "mirror" => Fallback::MirrorDns,
+            other => return Err(format!("key {key:?} fallback 未知({other})")),
+        };
+        let direct = match spec.action.as_deref().unwrap_or("") {
+            "" => false,
+            "direct" => true,
+            other => return Err(format!("key {key:?} action 未知({other})")),
+        };
+        Ok(Self {
+            rank: bare.len(),
+            key,
+            pac: spec.pac,
+            flags: Flags {
+                direct,
+                real: spec.real,
+                content: spec.content,
+                donor: spec.donor,
+            },
+            fallback,
+            plans: spec.plans,
+            real_plans: spec.real_plans,
+            bare,
+            sub_only,
+        })
+    }
+
+    /// 这个 host（已小写）命中本行吗？`foo.github.com` 命中 `github.com`；
+    /// `evilgithub.com` 不命中（要求点分隔）。
+    #[inline]
+    fn hits(&self, host_lower: &str) -> bool {
+        if host_lower.len() > self.bare.len() && host_lower.ends_with(&self.bare) {
+            // 边界必须是点：github.com 命中，xgithub.com 不命中
+            if host_lower.as_bytes()[host_lower.len() - self.bare.len() - 1] == b'.' {
+                return true;
+            }
+        }
+        !self.sub_only && host_lower == self.bare
+    }
+
+    /// 拨号候选：真名腿（隧道 / real 路由）额外带上 realPlans。
+    pub fn dial_plans(&self, real_wire: bool) -> Vec<SerialPlan> {
+        let mut out = self.plans.clone();
+        if real_wire {
+            out.extend(self.real_plans.iter().cloned());
+        }
+        out
+    }
+}
+
+/// 落盘用的快照（不含编译后的匹配态）。
+pub struct RowMeta {
+    pub key: String,
+    pub pac: Option<String>,
+    pub flags: Flags,
+    pub fallback: Fallback,
+    pub plans: Vec<SerialPlan>,
+    pub real_plans: Vec<SerialPlan>,
+}
+
+static TABLE: Mutex<Option<Arc<Vec<RouteRow>>>> = Mutex::new(None);
+
+/// host → 命中的下标；路由表装载后不再变化，缓存无需失效。
+static MEMO: Mutex<Option<HashMap<String, Option<usize>>>> = Mutex::new(None);
+
+/// 装载路由表（启动一次；测试可反复调用）。
+pub fn install(rows: Vec<RouteRow>) {
+    *lock(&TABLE) = Some(Arc::new(rows));
+    *lock(&MEMO) = Some(HashMap::new());
+}
+
+/// 命中的路由行；持有表的 Arc，脱离锁也能安全读。
+pub struct Hit {
+    table: Arc<Vec<RouteRow>>,
+    idx: usize,
+}
+
+impl std::ops::Deref for Hit {
+    type Target = RouteRow;
+    fn deref(&self) -> &RouteRow {
+        &self.table[self.idx]
+    }
+}
+
+pub fn route_for(host: &str) -> Option<Hit> {
+    let table = lock(&TABLE).as_ref()?.clone();
+    let mut memo = lock(&MEMO);
+    let memo = memo.as_mut()?;
+    let idx = match memo.get(host) {
+        Some(v) => *v,
+        None => {
+            // 域名不区分大小写；每个 host 只算一次，结果进 memo。
+            let lower = host.to_ascii_lowercase();
+            let mut best: Option<usize> = None;
+            for (i, r) in table.iter().enumerate() {
+                if r.hits(&lower) && best.is_none_or(|b| r.rank > table[b].rank) {
+                    best = Some(i);
+                }
+            }
+            if memo.len() < 4096 {
+                memo.insert(host.to_string(), best);
+            }
+            best
+        }
+    }?;
+    Some(Hit { table, idx })
+}
+
+/// 受管（会进代理）的域名？direct 行不算。
+pub fn is_managed(host: &str) -> bool {
+    route_for(host).is_some_and(|r| !r.flags.direct)
+}
+
+pub fn is_content(host: &str) -> bool {
+    route_for(host).is_some_and(|r| r.flags.content)
+}
+
+pub fn is_donor(host: &str) -> bool {
+    route_for(host).is_some_and(|r| r.flags.donor)
+}
+
+pub fn is_real(host: &str) -> bool {
+    route_for(host).is_some_and(|r| r.flags.real)
+}
+
+pub fn fallback_for(host: &str) -> Fallback {
+    route_for(host).map_or(Fallback::Dns, |r| r.fallback)
+}
+
+/// 游标键：每条非直连路由两把（主键 / `~2` 副键），双通道各记各的。
+pub fn cursor_keys() -> Vec<String> {
+    let g = lock(&TABLE);
+    let Some(t) = g.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(t.len() * 2);
+    for r in t.iter() {
+        if r.flags.direct {
+            continue;
+        }
+        out.push(r.key.clone());
+        out.push(format!("{}~2", r.key));
+    }
+    out
+}
+
+/// PAC 用：(走代理的裸域名, 直连的具体 host)。
+pub fn pac_lists() -> (Vec<String>, Vec<String>) {
+    let g = lock(&TABLE);
+    let Some(t) = g.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut proxy = Vec::new();
+    let mut direct = Vec::new();
+    for r in t.iter() {
+        let Some(pac) = r.pac.as_ref() else { continue };
+        if r.flags.direct {
+            if !direct.contains(pac) {
+                direct.push(pac.clone());
+            }
+        } else if !proxy.contains(pac) {
+            proxy.push(pac.clone());
+        }
+    }
+    (proxy, direct)
+}
+
+pub fn snapshot() -> Vec<RowMeta> {
+    let g = lock(&TABLE);
+    let Some(t) = g.as_ref() else {
+        return Vec::new();
+    };
+    t.iter()
+        .map(|r| RowMeta {
+            key: r.key.clone(),
+            pac: r.pac.clone(),
+            flags: r.flags,
+            fallback: r.fallback,
+            plans: r.plans.clone(),
+            real_plans: r.real_plans.clone(),
+        })
+        .collect()
+}
+
+pub fn route_count() -> usize {
+    lock(&TABLE).as_ref().map_or(0, |t| t.len())
+}
+
+pub fn plan_count() -> usize {
+    let g = lock(&TABLE);
+    g.as_ref()
+        .map(|t| t.iter().map(|r| r.plans.len() + r.real_plans.len()).sum())
+        .unwrap_or(0)
+}
+
+// ---- 镜像链归属（与拨号路由正交，仍按 host 形状判定）----
+
+/// 大文件下载域（分片竞速）：objects/release-assets=附件 302 落点。
 pub fn is_big_file_host(host: &str) -> bool {
     matches!(
         host,
-        "codeload.github.com"
-            | "objects.githubusercontent.com"
-            | "release-assets.githubusercontent.com"
+        "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
     )
 }
 
-/// 走镜像的大文件路径类别：`/releases/download`（含 `latest/download`）与 `/archive`。
-/// git 智能协议路径不在此列；一个解析器同时供路由与镜像链归属用。
+/// 整域镜像域：大文件域 + codeload。
+pub fn is_whole_domain_mirror(host: &str) -> bool {
+    is_big_file_host(host) || host == "codeload.github.com"
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AssetKind {
     Release,
@@ -49,10 +339,9 @@ fn is_release_asset_path(host: &str, path: &str) -> bool {
     release_asset_kind(host, path).is_some()
 }
 
-/// 镜像链归属：请求 host → 实际内容 host 的专属链（与请求 host 解耦）。
-/// release 附件必须用 release-assets 链——github.com 链头部实测慢且中断。
+/// 镜像链归属：请求 host → 实际内容 host 的专属链。
 pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
-    if is_big_file_host(host) {
+    if is_whole_domain_mirror(host) {
         return host;
     }
     match release_asset_kind(host, path) {
@@ -62,517 +351,22 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     }
 }
 
-/// 总路由：host → 处置。method/path 只影响 Mirror 分流（附件路径仅 GET/HEAD）。
+/// 总路由：命中直连行 → System；未命中 → Tunnel；其余按镜像路径分流。
 pub fn master_route(host: &str, method: &str, path: &str) -> Route {
-    // 白名单必须先于一切：objects-origin 落 edge 通配符会 Fastly 500。
-    if config::is_direct(host) || config::is_site_direct(host) {
+    let Some(row) = route_for(host) else {
+        return Route::Tunnel;
+    };
+    if row.flags.direct {
         return Route::System;
     }
     if matches!(method, "GET" | "HEAD")
-        && (is_big_file_host(host) || is_release_asset_path(host, path))
+        && (is_whole_domain_mirror(host) || is_release_asset_path(host, path))
     {
         return Route::Mirror;
-    }
-    // 池名由 `config::pool_for` 单一给出：枚举只表达"走池"，不再夹带第二份副本。
-    if config::pool_for(host).is_empty() {
-        return Route::Tunnel;
     }
     Route::Pool
 }
 
-
-/// 族全灭后的兜底策略；执行流在 mitm 的 get_direct 失败分支，单测钉住两端一致。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fallback {
-    MirrorDns,
-    Dns,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FamilyRoute {
-    pub name: &'static str,
-    pub host_of: fn(&str) -> bool,
-    pub serves: fn(&str, &SerialPlan) -> bool,
-    pub fallback: Fallback,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PoolRoute<'a> {
-    pub pool: &'a str,
-    pub families: &'static [FamilyRoute],
-}
-
-pub fn host_is_content(host: &str) -> bool {
-    host.ends_with("githubusercontent.com")
-}
-
-fn host_is_assets(host: &str) -> bool {
-    host.ends_with("githubassets.com")
-}
-fn host_is_io(host: &str) -> bool {
-    host == "github.io" || host.ends_with(".github.io")
-}
-fn host_is_auth(host: &str) -> bool {
-    host == "githubapp.com" || host.ends_with(".githubapp.com")
-}
-
-
-/// Fastly 段（185.199.108-111）IP 的末段；非 Fastly 返回 None。
-pub fn fastly_last_octet(ip: &str) -> Option<&str> {
-    let mut o = ip.split('.');
-    match (o.next(), o.next(), o.next(), o.next()) {
-        (Some("185"), Some("199"), Some("108" | "109" | "110" | "111"), Some(last)) => {
-            Some(last)
-        }
-        _ => None,
-    }
-}
-
-/// 非 Fastly 段（族资格只看 IP 段；sni 是透传形态，不参与族判定）。
-/// 排除 Azure 的 4.249：那是白名单专用的 Copilot 代理段，混进 githubapp 的兜底族
-/// 会让 auth 族拿它当候选，连过去必失败（不同服务）。
-fn serves_non_fastly(_host: &str, p: &SerialPlan) -> bool {
-    fastly_last_octet(&p.ip).is_none() && !p.ip.starts_with("4.249.")
-}
-
-const FAMILY_ALL: FamilyRoute = FamilyRoute {
-    name: "all",
-    host_of: |_| true,
-    serves: serves_non_fastly,
-    fallback: Fallback::Dns,
-};
-
-/// content：.133 伪装（2026-10-19 切换：默认证书 SAN 覆盖 *.githubusercontent.com 且实测出内容，
-/// 真名反遭 RST）；伪装若失效，应急回退 = plans.json 该条 sni 改回 "sni"（重启生效）；兜底走镜像链。
-const FAMILY_CONTENT: FamilyRoute = FamilyRoute {
-    name: "content",
-    host_of: host_is_content,
-    serves: |_host, p| fastly_last_octet(&p.ip) == Some("133"),
-    fallback: Fallback::MirrorDns,
-};
-
-/// content 透传(真名)腿：额外放行 .154/.215。这三组都能出内容(2026-10-25 全表试探实测)，
-/// 但只有 .133 的默认证书 SAN 覆盖 *.githubusercontent.com——MITM 假名腿验得过，.154/.215
-/// 只剩 *.githubassets.com 验不过，混进假名池只会白拨+池序抖动；真名腿浏览器按 SNI 拿对
-/// 证书，好窗口白捡 8 个候选，坏窗口(SNI 点名)反正全灭，无损。
-const FAMILY_CONTENT_PASSTHROUGH: FamilyRoute = FamilyRoute {
-    name: "content",
-    host_of: host_is_content,
-    serves: |_host, p| {
-        matches!(
-            fastly_last_octet(&p.ip),
-            Some("133") | Some("154") | Some("215")
-        )
-    },
-    fallback: Fallback::MirrorDns,
-};
-
-/// assets：.154/.215 伪装（抗 SNI 阻断）。
-const FAMILY_ASSETS: FamilyRoute = FamilyRoute {
-    name: "assets",
-    host_of: host_is_assets,
-    serves: |_host, p| matches!(fastly_last_octet(&p.ip), Some("154") | Some("215")),
-    fallback: Fallback::Dns,
-};
-
-/// io：.153 伪装。
-const FAMILY_IO: FamilyRoute = FamilyRoute {
-    name: "io",
-    host_of: host_is_io,
-    serves: |_host, p| fastly_last_octet(&p.ip) == Some("153"),
-    fallback: Fallback::Dns,
-};
-
-/// auth：githubapp.com 系，非 Fastly 段伪装；兼 edge 未列族 host 的兜底族。
-const FAMILY_AUTH: FamilyRoute = FamilyRoute {
-    name: "auth",
-    host_of: host_is_auth,
-    serves: serves_non_fastly,
-    fallback: Fallback::Dns,
-};
-
-/// 白名单族：域名该落哪段 IP 由 config::whitelist_seg 定，这里只按段认 IP。
-/// 必须排在各老族之前——copilot-proxy 的后缀是 githubusercontent.com，
-/// 排在后面会被 content 族先认走，而 content 只认 .133，它的 Azure 段对不上。
-/// 分四个族而不是一个：cursor_key 是 `{pool}/{family}`，混成一个会让 docs 的池序
-/// 被 support 的失败带偏。
-fn wl_seg(host: &str) -> Option<&'static str> {
-    config::whitelist_seg(host)
-}
-
-const FAMILY_WL_154: FamilyRoute = FamilyRoute {
-    name: "wl154",
-    host_of: |h| matches!(wl_seg(h), Some("154")),
-    serves: |_h, p| fastly_last_octet(&p.ip) == Some("154"),
-    fallback: Fallback::Dns,
-};
-
-const FAMILY_WL_153: FamilyRoute = FamilyRoute {
-    name: "wl153",
-    host_of: |h| matches!(wl_seg(h), Some("153")),
-    serves: |_h, p| fastly_last_octet(&p.ip) == Some("153"),
-    fallback: Fallback::Dns,
-};
-
-const FAMILY_WL_133: FamilyRoute = FamilyRoute {
-    name: "wl133",
-    host_of: |h| matches!(wl_seg(h), Some("133")),
-    serves: |_h, p| fastly_last_octet(&p.ip) == Some("133"),
-    fallback: Fallback::Dns,
-};
-
-/// Azure 段：不是 Fastly 四段之一，按前缀认（4.249.x）。
-const FAMILY_WL_AZURE: FamilyRoute = FamilyRoute {
-    name: "wl_azure",
-    host_of: |h| matches!(wl_seg(h), Some("4.249")),
-    serves: |_h, p| p.ip.starts_with("4.249."),
-    fallback: Fallback::Dns,
-};
-
-pub const POOL_ROUTES: &[PoolRoute<'static>] = &[
-    PoolRoute {
-        pool: "core",
-        families: &[FAMILY_ALL],
-    },
-    PoolRoute {
-        pool: "api",
-        families: &[FAMILY_ALL],
-    },
-    PoolRoute {
-        pool: "edge",
-        // 白名单族在最前：先按 config 里的 seg 认领，认到了就不进老族。
-        families: &[
-            FAMILY_WL_154,
-            FAMILY_WL_153,
-            FAMILY_WL_133,
-            FAMILY_WL_AZURE,
-            FAMILY_CONTENT,
-            FAMILY_ASSETS,
-            FAMILY_IO,
-            FAMILY_AUTH,
-        ],
-    },
-];
-
-/// 站点专用池的族表：站点自带 seeds，全部 IP 命中即可（FAMILY_ALL），
-/// SNI 伪装由 dial 一侧按站点画像透传。族名 = `{site_pool}/all`，游标与老池隔离。
-const SITE_FAMILY_ALL: FamilyRoute = FamilyRoute {
-    name: "all",
-    host_of: |_| true,
-    serves: |_h, _p| true,
-    fallback: Fallback::Dns,
-};
-
-pub fn pool_route(pool: &str) -> Option<&'static PoolRoute<'static>> {
-    POOL_ROUTES.iter().find(|pr| pr.pool == pool)
-}
-
-/// 站点专用池的动态路由：site 池名 = 站点名，family 唯一 `all`（SITE_FAMILY_ALL，静态引用，
-/// 不捕获任何变量，避免悬垂/闭包 coerce 失败）。host_of 恒 `|_| true`——
-/// 站点池只由该站点的 host 触发，serial_family 拿到 pool+host 已配对，无需再筛。
-/// 供 serial_family / circle_keys 通过 pool_route_for 间接消费。
-pub fn site_pool_route(pool: &str) -> Option<PoolRoute<'_>> {
-    if site::host_belongs_to_site(pool) {
-        Some(PoolRoute {
-            pool,
-            families: &[SITE_FAMILY_ALL],
-        })
-    } else {
-        None
-    }
-}
-
-/// pool_route_for：优先返回站点专用池（动态构建），再回落静态 POOL_ROUTES。
-pub fn pool_route_for(pool: &str) -> Option<PoolRoute<'_>> {
-    site_pool_route(pool).or_else(|| pool_route(pool).cloned())
-}
-
-/// 串发族筛选：池内按 host 选族，未列族 host 归末族兜底（edge 即 auth）。
-/// passthrough = 真名腿（CONNECT 隧道 / 明文转发），content 族放宽到 .154/.215。
-/// 返回拥有的 FamilyRoute（站点池动态构建，无静态引用）。
-pub fn serial_family(pool: &str, host: &str, passthrough: bool) -> Option<FamilyRoute> {
-    let pr = pool_route_for(pool)?;
-    let fam = pr
-        .families
-        .iter()
-        .find(|f| (f.host_of)(host))
-        .or_else(|| {
-            if pr.families.len() > 1 {
-                pr.families.last()
-            } else {
-                None
-            }
-        })?;
-    let mut fam = *fam;
-    if passthrough && fam.name == "content" {
-        fam = FAMILY_CONTENT_PASSTHROUGH;
-    }
-    Some(fam)
-}
-
-/// host 的兜底策略（族全灭后怎么走）；族语义与 serial_family 单点一致。仅 MITM 消费。
-pub fn fallback_for(pool: &str, host: &str) -> Fallback {
-    serial_family(pool, host, false).map_or(Fallback::Dns, |f| f.fallback)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mk(ip: &str, sni: &str) -> SerialPlan {
-        SerialPlan {
-            ip: ip.into(),
-            sni: sni.into(),
-        }
-    }
-
-    /// 白名单四族：按 seg 认域名、按段认 IP。段号填错或族序排错都会在这里红。
-    #[test]
-    fn whitelist_families_route_by_seg() {
-        for (host, fam, ip) in [
-            ("docs.github.com", "wl154", "185.199.108.154"),
-            ("pages.github.com", "wl153", "185.199.108.153"),
-            ("support.github.com", "wl133", "185.199.108.133"),
-        ] {
-            let f = serial_family("edge", host, false)
-                .unwrap_or_else(|| panic!("{host} 没有命中任何族"));
-            assert_eq!(f.name, fam, "{host} 落错族");
-            assert!((f.serves)(host, &mk(ip, "baidu.com")), "{host} 应认 {ip}");
-        }
-
-        // Azure 段不是 Fastly 四段之一，必须按前缀认
-        let cp = "copilot-proxy.githubusercontent.com";
-        let f = serial_family("edge", cp, false).unwrap();
-        assert_eq!(f.name, "wl_azure", "copilot-proxy 被别的族抢走了");
-        assert!((f.serves)(cp, &mk("4.249.131.160", "baidu.com")));
-
-        // 反例一：githubapp 系的兜底族不能把 Azure 段当候选（连过去是别的服务）
-        let auth = serial_family("edge", "api.githubapp.com", false).unwrap();
-        assert_eq!(auth.name, "auth");
-        assert!(!(auth.serves)(
-            "api.githubapp.com",
-            &mk("4.249.131.160", "baidu.com")
-        ));
-
-        // 反例二：老族行为不变，content 仍只认 .133
-        let content = serial_family("edge", "avatars.githubusercontent.com", false).unwrap();
-        assert_eq!(content.name, "content");
-        assert!((content.serves)(
-            "avatars.githubusercontent.com",
-            &mk("185.199.110.133", "baidu.com")
-        ));
-        assert!(!(content.serves)(
-            "avatars.githubusercontent.com",
-            &mk("185.199.110.154", "baidu.com")
-        ));
-    }
-
-
-    #[test]
-    fn master_route_all_hosts() {
-        use Route::*;
-        assert_eq!(
-            master_route("objects-origin.githubusercontent.com", "PUT", "/x"),
-            System
-        );
-        assert_eq!(master_route("uploads.github.com", "GET", "/"), System);
-        assert_eq!(
-            master_route("viewscreen.githubusercontent.com", "GET", "/"),
-            System
-        );
-        assert_eq!(
-            master_route("api.mcp.github.com", "GET", "/x"),
-            System,
-            "core 池证书不覆盖 api.mcp，必须白名单短路"
-        );
-        assert_eq!(
-            master_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
-            Mirror
-        );
-        assert_eq!(
-            master_route("objects.githubusercontent.com", "HEAD", "/x"),
-            Mirror
-        );
-        assert_eq!(
-            master_route(
-                "github.com",
-                "GET",
-                "/git-lfs/git-lfs/releases/download/v3.5.1/x.zip"
-            ),
-            Mirror
-        );
-        assert_eq!(master_route("github.com", "GET", "/o/r/archive/x.zip"), Mirror);
-        assert_eq!(
-            master_route("github.com", "POST", "/o/r/releases/download/x"),
-            Pool
-        );
-        assert_eq!(
-            master_route("github.com", "GET", "/o/r/releases"),
-            Pool
-        );
-        assert_eq!(
-            master_route("github.com", "GET", "/"),
-            Pool
-        );
-        assert_eq!(
-            master_route("gist.github.com", "GET", "/"),
-            Pool
-        );
-        assert_eq!(
-            master_route("api.github.com", "GET", "/"),
-            Pool
-        );
-        assert_eq!(master_route("example.com", "GET", "/"), Tunnel);
-        assert_eq!(master_route("githubstatus.com", "GET", "/"), Tunnel);
-    }
-
-    #[test]
-    fn master_route_edge_families() {
-        use Route::*;
-        for (host, fam) in [
-            ("raw.githubusercontent.com", "content"),
-            ("avatars.githubusercontent.com", "content"),
-            ("camo.githubusercontent.com", "content"),
-            ("user-images.githubusercontent.com", "content"),
-            ("media.githubusercontent.com", "content"),
-            ("private-user-images.githubusercontent.com", "content"),
-            ("github.githubassets.com", "assets"),
-            ("assets.githubassets.com", "assets"),
-            ("github.io", "io"),
-            ("octocat.github.io", "io"),
-            ("githubapp.com", "auth"),
-            ("api.githubapp.com", "auth"),
-        ] {
-            assert_eq!(
-                master_route(host, "GET", "/x"),
-                Pool,
-                "{host} 应归 edge 池"
-            );
-            assert_eq!(
-                serial_family("edge", host, false).map(|f| f.name),
-                Some(fam),
-                "{host} 的族应为 {fam}"
-            );
-        }
-    }
-
-
-    #[test]
-    fn family_entry_serves() {
-        assert!(host_is_content("avatars.githubusercontent.com"));
-        assert_eq!(fastly_last_octet("185.199.110.133"), Some("133"));
-        assert_eq!(fastly_last_octet("185.199.110.154"), Some("154"));
-        assert!(fastly_last_octet("140.82.112.3").is_none());
-        assert!((FAMILY_CONTENT.serves)("x", &mk("185.199.110.133", "baidu.com")));
-        assert!(!(FAMILY_CONTENT.serves)("x", &mk("185.199.110.154", "baidu.com")));
-        assert!((FAMILY_ASSETS.serves)("x", &mk("185.199.110.215", "baidu.com")));
-        assert!((FAMILY_ASSETS.serves)("x", &mk("185.199.110.154", "baidu.com")));
-        assert!(!(FAMILY_ASSETS.serves)(
-            "x",
-            &mk("185.199.110.133", "baidu.com")
-        ));
-        assert!((FAMILY_IO.serves)("x", &mk("185.199.110.153", "baidu.com")));
-        assert!(!(FAMILY_IO.serves)("x", &mk("185.199.110.154", "baidu.com")));
-        assert!((FAMILY_AUTH.serves)("x", &mk("140.82.112.29", "baidu.com")));
-        assert!(!(FAMILY_AUTH.serves)(
-            "x",
-            &mk("185.199.110.133", "baidu.com")
-        ));
-        assert!((FAMILY_ALL.serves)("x", &mk("140.82.112.3", "baidu.com")));
-    }
-
-    fn fam(pool: &str, host: &str) -> &'static str {
-        serial_family(pool, host, false).map_or("", |f| f.name)
-    }
-
-    #[test]
-    fn family_for_and_fallback() {
-        assert_eq!(fam("core", "github.com"), "all");
-        assert_eq!(fam("api", "api.github.com"), "all");
-        assert_eq!(fam("edge", "raw.githubusercontent.com"), "content");
-        assert_eq!(fam("edge", "github.githubassets.com"), "assets");
-        assert_eq!(fam("edge", "octocat.github.io"), "io");
-        assert_eq!(fam("edge", "githubapp.com"), "auth");
-        assert_eq!(fam("edge", "future.edge.host"), "auth");
-        assert_eq!(fam("codeload", "codeload.github.com"), "");
-        assert_eq!(
-            fallback_for("edge", "raw.githubusercontent.com"),
-            Fallback::MirrorDns
-        );
-        assert_eq!(
-            fallback_for("edge", "camo.githubusercontent.com"),
-            Fallback::MirrorDns
-        );
-        assert_eq!(fallback_for("edge", "github.githubassets.com"), Fallback::Dns);
-        assert_eq!(fallback_for("edge", "octocat.github.io"), Fallback::Dns);
-        assert_eq!(fallback_for("edge", "githubapp.com"), Fallback::Dns);
-        assert_eq!(fallback_for("core", "github.com"), Fallback::Dns);
-        assert_eq!(fallback_for("api", "api.github.com"), Fallback::Dns);
-    }
-
-    #[test]
-    fn serial_family_edge_fallback() {
-        let f = serial_family("edge", "future.edge.host", false).unwrap();
-        assert_eq!(f.name, "auth");
-        assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
-        assert!(!(f.serves)("x", &mk("185.199.110.133", "real")));
-    }
-
-    #[test]
-    fn content_serves_splits_by_leg() {
-        let mitm = serial_family("edge", "raw.githubusercontent.com", false).unwrap();
-        let pt = serial_family("edge", "raw.githubusercontent.com", true).unwrap();
-        assert_eq!(mitm.name, "content");
-        assert_eq!(pt.name, "content", "游标键不随模式分裂");
-        // MITM 假名腿：只有 .133（默认证书 SAN 覆盖内容族）
-        assert!((mitm.serves)("x", &mk("185.199.110.133", "baidu.com")));
-        // 透传真名腿：.133/.154/.215 全放行，.153(io 组)不放行
-        for last in ["133", "154", "215"] {
-            let ip = format!("185.199.110.{last}");
-            assert!((pt.serves)("x", &mk(&ip, "baidu.com")), "透传应放行 {ip}");
-        }
-        for last in ["154", "215"] {
-            let ip = format!("185.199.110.{last}");
-            assert!(!(mitm.serves)("x", &mk(&ip, "baidu.com")), "MITM 仍拒绝 {ip}");
-        }
-        assert!(!(pt.serves)("x", &mk("185.199.110.153", "baidu.com")));
-        // 非 content 族不受模式影响
-        let assets = serial_family("edge", "github.githubassets.com", true).unwrap();
-        assert_eq!(assets.name, "assets");
-        assert!((assets.serves)("x", &mk("185.199.110.154", "baidu.com")));
-    }
-
-    #[test]
-    fn mirror_chain_host_dedicated() {
-        assert_eq!(
-            mirror_chain_host("github.com", "/o/r/releases/download/v1/f.exe"),
-            "release-assets.githubusercontent.com"
-        );
-        assert_eq!(
-            mirror_chain_host("github.com", "/o/r/releases/latest/download/f.exe"),
-            "release-assets.githubusercontent.com"
-        );
-        assert_eq!(
-            mirror_chain_host("github.com", "/o/r/archive/refs/tags/v1.tar.gz"),
-            "codeload.github.com"
-        );
-        assert_eq!(
-            mirror_chain_host(
-                "release-assets.githubusercontent.com",
-                "/x?sig=abc"
-            ),
-            "release-assets.githubusercontent.com"
-        );
-        assert_eq!(
-            mirror_chain_host("codeload.github.com", "/o/r/tar.gz/x"),
-            "codeload.github.com"
-        );
-        assert_eq!(mirror_chain_host("raw.githubusercontent.com", "/o/r/f"), "raw.githubusercontent.com");
-        assert_eq!(mirror_chain_host("github.com", "/o/r"), "github.com");
-        assert_eq!(mirror_chain_host("github.com", "/o/r/releases"), "github.com");
-        assert_eq!(
-            master_route("github.com", "GET", "/o/r/releases/latest/download/f.exe"),
-            Route::Mirror
-        );
-    }
-}
+#[path = "../tests/pool/route.rs"]
+mod tests;

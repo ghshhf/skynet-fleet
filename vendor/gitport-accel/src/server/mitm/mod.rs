@@ -1,9 +1,10 @@
-//! MITM：池内域名本地终结 TLS，按 route::master_route 分流（直连串发 / 内容域回落镜像链 / 大文件域直连同台 ECT 派发 / 流式直通）。
-//! 拦截页(403 restricted/400 Whoa)本地识别 gh_defuse。
-use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
+//! MITM：池内域名本地终结 TLS，按 route::master_route 分流；拦截页本地识别 gh_defuse。
+use super::protocol::{self, BoxBody, Incoming, REQUEST_BUDGET};
+use super::upstream;
 use crate::certgen::Authority;
 use crate::config;
-use crate::pool::{self, LogFn};
+use crate::pool;
+use crate::util::LogFn;
 use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
@@ -12,15 +13,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod defuse;
-mod mirror;
+mod merge;
 mod page_cache;
+mod quiet;
 mod redirect_memo;
+
+pub(crate) mod mirror;
 
 pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, CALIB_RUNNING};
 
 use defuse::gh_defuse;
 use mirror::chain_fetch;
-
 
 const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 内容域 .133 直连腿响应头预算
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
@@ -28,7 +31,7 @@ pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
     }
-    !config::pool_for(host).is_empty()
+    crate::pool::route::is_managed(host)
 }
 pub async fn handle_connect_mitm(
     srv: &crate::server::ProxyServer,
@@ -46,10 +49,10 @@ pub async fn handle_connect_mitm(
     let Some(authority) = &srv.authority else {
         return;
     };
-    let cfg = crate::certgen::tls_config_of(authority);
+    let acceptor = crate::certgen::tls_acceptor_of(authority);
     let accept = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio_rustls::TlsAcceptor::from(cfg).accept(client),
+        tokio_boring::accept(&acceptor, client),
     )
     .await;
     let Ok(Ok(tls)) = accept else {
@@ -57,20 +60,21 @@ pub async fn handle_connect_mitm(
         return;
     };
     let alpn = tls
-        .get_ref()
-        .1
-        .alpn_protocol()
+        .ssl()
+        .selected_alpn_protocol()
         .map(|p| p.to_vec())
         .unwrap_or_default();
-// ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
+    // ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
     let alpn_name = match alpn.as_slice() {
         b"h2" => "h2",
         b"http/1.1" => "http/1.1",
         _ => "none",
     };
-    (srv.log)(&format!(
-        "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
-    ));
+    if quiet::first_time("tunnel", host) {
+        (srv.log)(&format!(
+            "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
+        ));
+    }
     let log = srv.log.clone();
     let svc = hyper::service::service_fn(move |req| {
         let log = log.clone();
@@ -86,8 +90,7 @@ pub async fn handle_connect_mitm(
             .await
     };
     if let Err(e) = result {
-        // 浏览器掐断本地连接(RST/提前关闭/写体中止)是高频日常行为(切页/取消/回收连接),
-        // 不当错误刷屏; 协议类等真错误仍保留。GitHub 侧故障有各自的行([串发]/[镜像]/[上游])。
+        // 浏览器掐断本地连接是高频日常，不刷屏；协议类真错误仍保留。
         let benign = e.to_string().contains("connection error")
             || e.is_incomplete_message()
             || e.is_closed()
@@ -106,7 +109,7 @@ async fn mitm_http(
     log: LogFn,
     mut req: hyper::Request<Incoming>,
 ) -> axum::response::Response<BoxBody> {
-// h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
+    // h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
     let host = {
         let from_uri = crate::server::host_only(req.uri().host().unwrap_or("")).to_lowercase();
         if from_uri.is_empty() {
@@ -119,24 +122,18 @@ async fn mitm_http(
             from_uri
         }
     };
-    // GitHub 前端遥测（Datadog RUM / error beacon）只占带宽、不影响页面功能。
-    // 实测 api.github.com 436 个请求里 325 个是它（p50 690ms），把搜索/GraphQL 挤在后面。
-    // 必须先把请求体读掉再回 204：body 不消费会让 hyper 重置连接，反而逼浏览器重开。
+    // GitHub 前端遥测只占带宽不影响功能（实测 436 个请求里 325 个是它），读掉请求体再回 204。
     if is_telemetry(&host, &path_of(req.uri())) {
         let _ = http_body_util::BodyExt::collect(req.into_body()).await;
         return no_content();
     }
 
     let info = UpstreamInfo::default();
-    // 页面缓存命中即秒回；细节全在 page_cache 模块。
-    // 勿加 SWR/后台 ETag 验证：_gh_sess 轮换，旧 cookie 重用被 GitHub 判定
-    // 账号泄露（与 /login 排除同源的安全边界）。要看最新按 F5 直达上游。
+    // 页面缓存命中即秒回；勿加 SWR/ETag 验证，旧 cookie 重用会被判账号泄露。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
         return write_upstream(cached, "cache", &info);
     }
-    // 头像入口 302 记忆：github.com/<user>.png 是「302 + no-cache」入口，浏览器
-    // 每次渲染页面都要重问一遍跳转（一个来回 260-310ms × 十几个并行）。跳转目标
-    // 按用户稳定，记住后本地直答——浏览器行为不变，只是来回归零。fast path 无日志。
+    // 头像入口 302 记忆：跳转目标按用户稳定，记住后本地直答，省掉每次渲染的来回。
     if req.method() == Method::GET {
         if let Some(loc) =
             redirect_memo::cached_location(&host, req.uri().path(), req.uri().query())
@@ -146,7 +143,7 @@ async fn mitm_http(
                 .status(StatusCode::FOUND)
                 .header("location", loc)
                 .header("cache-control", "no-cache")
-                .body(upstream::full_body(Bytes::new()))
+                .body(protocol::full_body(Bytes::new()))
                 .unwrap();
             return write_upstream(resp, "302memo", &info);
         }
@@ -186,16 +183,15 @@ async fn mitm_http(
     }
     if let Some(reason) = streaming_reason {
         let body = match overflow_prefix {
-            Some(prefix) => upstream::prepend_body(
-                vec![Bytes::from(prefix)],
-                incoming_to_body(req.into_body()),
-            ),
+            Some(prefix) => {
+                upstream::prepend_body(vec![Bytes::from(prefix)], incoming_to_body(req.into_body()))
+            }
             None => incoming_to_body(req.into_body()),
         };
         return stream_passthrough(&log, &out, &host, &info, body, reason).await;
     }
     let out_body = match &replay {
-        Some(b) => out.map(|_| upstream::full_body(b.clone())),
+        Some(b) => out.map(|_| protocol::full_body(b.clone())),
         None => out,
     };
     if is_simple
@@ -206,10 +202,13 @@ async fn mitm_http(
     {
         let chain_host = pool::route::mirror_chain_host(&host, &path);
         let new_bytes =
-            mirror::range_bytes_of(req.headers().get("range").and_then(|v| v.to_str().ok()));
-        // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；链空时候选=仅直连。
-        // 直连失败记 45s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
-        match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await {
+            mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
+        // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；全部候选耗尽才 502。
+        match mirror_or_direct(
+            &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
+        )
+        .await
+        {
             Ok(resp) => return resp,
             // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
             Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
@@ -220,19 +219,20 @@ async fn mitm_http(
             "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
         );
     }
-    let name = config::pool_for(&host);
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
         Ok(r) => r,
         Err(e) => {
-            match pool::route::fallback_for(name, &host) {
+            match pool::route::fallback_for(&host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     let chain_host = pool::route::mirror_chain_host(&host, &path);
-                    let new_bytes = mirror::range_bytes_of(
+                    let new_bytes = mirror::range_bytes(
                         req.headers().get("range").and_then(|v| v.to_str().ok()),
                     );
-                    // 直连刚在全灭分支失败过: load 会带 45s 降权, chain_fetch 内
-                    // ECT 自动跳过直连优先镜像——语义即"兜底最后一次机会"。
-                    match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await
+                    // 直连刚失败过会带 45s 降权，ECT 自动跳过它——语义就是兜底的最后一次机会。
+                    match mirror_or_direct(
+                        &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
+                    )
+                    .await
                     {
                         Ok(resp) => return resp,
                         Err(_) => (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭")),
@@ -253,7 +253,11 @@ async fn mitm_http(
                     }
                 }
             }
-            return mitm_unavailable(&req, &host, "直连与镜像链均不可用, 疑似封锁窗口期, 代理正在按表自动重试。");
+            return mitm_unavailable(
+                &req,
+                &host,
+                "直连与镜像链均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
+            );
         }
     };
     if is_simple
@@ -267,12 +271,15 @@ async fn mitm_http(
                     "[MITM] {host}{} 拦截页化解失败: {e}",
                     path_of(req.uri())
                 ));
-                return mitm_unavailable(&req, &host, "全部边缘均返回风控拦截页, 代理正在按表自动重试。");
+                return mitm_unavailable(
+                    &req,
+                    &host,
+                    "全部边缘均返回风控拦截页, 代理正在按表自动重试。",
+                );
             }
         }
     }
-    // 写操作成功后的缓存失效：改完设置/发完评论跳回来必须看到新页面
-    // （内存热点同步清 + 磁盘半场投递管家线程，见 page_cache 模块）
+    // 写操作成功后缓存失效：内存热点同步清，磁盘半场交给管家线程。
     if host == "github.com"
         && matches!(
             req.method(),
@@ -286,11 +293,7 @@ async fn mitm_http(
     let resp = page_cache::cache_put(&log, &req, &host, resp).await;
     write_upstream(resp, "direct", &info)
 }
-fn stream_decision(
-    method: &Method,
-    path: &str,
-    declared_len: Option<u64>,
-) -> Option<&'static str> {
+fn stream_decision(method: &Method, path: &str, declared_len: Option<u64>) -> Option<&'static str> {
     if *method == Method::GET || *method == Method::HEAD {
         return None;
     }
@@ -316,11 +319,12 @@ fn incoming_to_body(body: Incoming) -> BoxBody {
 fn plain_502() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::BAD_GATEWAY)
-        .body(upstream::full_body(Bytes::from_static(b"upstream unavailable")))
+        .body(protocol::full_body(Bytes::from_static(
+            b"upstream unavailable",
+        )))
         .unwrap()
 }
-/// 流式直通：体不进缓冲边收边泵（h2 背压分片），单次尝试不重发。
-/// 响应头一到立即交付；泵失败绝不覆盖已交付的响应。
+/// 流式直通：体不进缓冲边收边泵，响应头一到立即交付，泵失败不覆盖已交付的响应。
 async fn stream_passthrough(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -329,7 +333,6 @@ async fn stream_passthrough(
     body: BoxBody,
     reason: &str,
 ) -> axum::response::Response<BoxBody> {
-    let name = config::pool_for(host);
     let path = path_of(out.uri());
     let t0 = Instant::now();
     let mut body = Some(body);
@@ -343,7 +346,7 @@ async fn stream_passthrough(
                 }
             }
         }
-        match upstream::dial_upstream(name, host, log).await {
+        match upstream::dial_upstream(host, log).await {
             Ok((up, _fresh)) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
@@ -367,10 +370,8 @@ async fn stream_passthrough(
     match timed {
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
-            if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true, false, up.slot);
-                upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
-            }
+            pool::cursor_note(host, &up.ip, true, up.slot);
+            upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
@@ -406,7 +407,7 @@ fn is_telemetry(host: &str, path: &str) -> bool {
 fn no_content() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .unwrap()
 }
 
@@ -432,15 +433,12 @@ fn request_budget(is_content: bool) -> Duration {
     }
 }
 
-/// GitHub 搜索(blackbird)反爬对同会话跨 IP 敏感:会话在双通道间漂移会被
-/// 降级成"无结果"骨架页(2026-10-27 实证)。搜索系请求固定走主通道。
+/// 搜索请求固定走主通道：GitHub 反爬对同会话跨 IP 敏感，漂移会被降级成无结果骨架。
 fn is_search_path(path: &str) -> bool {
     path.starts_with("/search")
 }
 
-/// 在给定连接上发一次请求、等响应头，返回 (响应, 耗时ms)。
-/// 三处调用点（复用快路径 / 串发新拨 / 系统 DNS 直连）共用这一份：
-/// 请求必须每次重建（BoxBody 不可克隆），预算与记账口径也只该有一处。
+/// 在给定连接上发一次请求、等响应头；三处调用点共用，请求每次重建（BoxBody 不可克隆）。
 async fn send_once(
     up: &upstream::H2Upstream,
     out: &hyper::Request<BoxBody>,
@@ -454,11 +452,97 @@ async fn send_once(
     }
 }
 
-/// 直连腿组装(主路径与兜底路径共用一份)：charge 在 future 首行——镜像胜出
-/// 丢弃本 future 时零残留, Err/取消靠 guard Drop 归还(字节+流数)。
+/// 借道被服务端拒绝（421）后的冷却：这不是某条连接坏了，而是跨 `:authority` 不被收，
+/// 换一条也一样，所以停的是整条借道路径。
+static BORROW_BREAKER: pool::Breaker = pool::Breaker::new(30);
+
+/// 一次请求最多换几条 donor 重试（assets 通常一条 host 两条连接）。
+const MAX_BORROW_TRIES: usize = 2;
+
+/// 借来的响应体带着"借出中"计数：流走完或中途被丢弃都要归还，
+/// 否则那条 donor 会一直显示在忙，下一轮再也挑不中它。
+struct BorrowGuard(Option<(String, u64)>);
+
+impl Drop for BorrowGuard {
+    fn drop(&mut self) {
+        if let Some((host, id)) = self.0.take() {
+            upstream::borrow_done(&host, id);
+        }
+    }
+}
+
+fn borrow_guard_body(host: String, id: u64, body: BoxBody) -> BoxBody {
+    let stream = http_body_util::BodyExt::into_data_stream(body);
+    let guarded = futures_util::stream::unfold(
+        (stream, BorrowGuard(Some((host, id)))),
+        |(mut s, g)| async move {
+            let item = futures_util::StreamExt::next(&mut s).await?;
+            Some((item.map(hyper::body::Frame::data), (s, g)))
+        },
+    );
+    BoxBody::new(http_body_util::StreamBody::new(guarded))
+}
+
+/// 内容域全灭时的最后一条路：借 assets 的伪装连接发同一请求，全程零握手。
+/// h2 用 `out` 的 URI 生成 `:authority`，Fastly 按它路由，不暴露真名；一条 donor 失败换下一条（最多 `MAX_BORROW_TRIES`）。
+pub(super) async fn try_borrow(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    host: &str,
+    info: &UpstreamInfo,
+    body: &Option<Bytes>,
+) -> Option<Result<hyper::Response<BoxBody>, String>> {
+    if BORROW_BREAKER.open(host) {
+        return None;
+    }
+    let mut last = String::new();
+    for _ in 0..MAX_BORROW_TRIES {
+        let Some((donor_host, donor)) = upstream::borrow_donor(host) else {
+            break; // 没有现成通道，或都在冷却：交回原回退路径
+        };
+        match send_once(&donor, out, body, request_budget(true)).await {
+            Ok((resp, _)) if resp.status() == StatusCode::MISDIRECTED_REQUEST => {
+                // 连接本身没坏，只是服务端不收跨 :authority：归还配额，整条路先歇一会。
+                upstream::borrow_done(&donor_host, donor.id);
+                BORROW_BREAKER.set(host);
+                return Some(Err("借道被 421 拒绝(服务端不收跨 :authority)".to_string()));
+            }
+            Ok((resp, ms)) => {
+                // 借用请求的耗时也记在这条连接上：下次挑 donor 时快的那条更受青睐。
+                upstream::note_latency(&donor_host, donor.id, ms);
+                // 只记实际出口，不回写内容域候选游标：把 .154 记进 content 键，
+                // 下一轮就会拿它配伪装 SNI 去拨 avatars，证书必挂。
+                *info.lock().unwrap() = donor.ip.clone();
+                if quiet::first_time("borrow", host) {
+                    (log)(&format!(
+                        "[借道] {host} 借 {donor_host}({}) 的现成通道, {ms}ms",
+                        donor.ip
+                    ));
+                }
+                let (parts, body) = resp.into_parts();
+                let body = borrow_guard_body(donor_host, donor.id, body);
+                return Some(Ok(hyper::Response::from_parts(parts, body)));
+            }
+            Err(e) => {
+                // 这条坏了就冷藏它，换同 host 的另一条继续——两条通道的意义就在这。
+                upstream::borrow_poison(&donor_host, donor.id);
+                last = format!("{donor_host}({}) {e}", donor.ip);
+            }
+        }
+    }
+    if last.is_empty() {
+        None
+    } else {
+        Some(Err(format!("借道失败: {last}")))
+    }
+}
+
+/// 直连腿组装（两条路径共用）：charge 在 future 首行，镜像胜出丢弃 future 时零残留。
+#[allow(clippy::too_many_arguments)] // 直连腿组装的字面清单, 强行并参只会丢语义
 fn direct_leg<'a>(
     chain_host: &str,
     new_bytes: u64,
+    big: bool,
     log: &LogFn,
     out: &'a hyper::Request<BoxBody>,
     host: &str,
@@ -471,7 +555,7 @@ fn direct_leg<'a>(
     let body2 = body.clone();
     let info2 = info.clone();
     let fetch = Box::pin(async move {
-        let mut guard = mirror::LoadGuard::charge(load, new_bytes);
+        let mut guard = mirror::LoadGuard::charge(load, new_bytes, big);
         match get_direct(&log2, out, &host2, &info2, true, &body2).await {
             Ok(resp) => {
                 // 头已到：码表重跑，IP 表串发拨号/等待不进速度样本。
@@ -491,8 +575,7 @@ fn direct_leg<'a>(
     mirror::DirectLeg { fetch }
 }
 
-/// 主路径/兜底路径共用的镜像链派发：组装直连腿 + chain_fetch + 按实际胜出者
-/// 写诊断头。Err = 候选全灭(原因透传，交 502 日志)。
+/// 两条路径共用的镜像链派发：组装直连腿 + chain_fetch + 按胜出者写诊断头。
 async fn mirror_or_direct(
     log: &LogFn,
     out_body: &hyper::Request<BoxBody>,
@@ -502,8 +585,17 @@ async fn mirror_or_direct(
     info: &UpstreamInfo,
     replay: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let fetch = direct_leg(chain_host, new_bytes, log, out_body, host, info, replay);
-    let resp = chain_fetch(log, out_body, host, fetch).await?;
+    let fetch = direct_leg(
+        chain_host,
+        new_bytes,
+        pool::route::is_big_file_host(chain_host),
+        log,
+        out_body,
+        host,
+        info,
+        replay,
+    );
+    let resp = chain_fetch(log, out_body, host, fetch, info, replay).await?;
     let route = resp
         .extensions()
         .get::<&'static str>()
@@ -520,25 +612,22 @@ async fn try_cached(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
-    // name/path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
-    let name = config::pool_for(host);
+    // path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
+    let is_content = pool::route::is_content(host);
     let up = upstream::cached_h2_in(host, want_slot)?;
     match send_once(&up, out, body, request_budget(is_content)).await {
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
-            if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true, false, up.slot);
-            }
+            pool::cursor_note(host, &up.ip, true, up.slot);
             upstream::note_latency(host, up.id, ms);
             if is_content {
                 pool::CONTENT_BREAKER.clear(host);
             }
             // 复用路径同样要学 302：头像请求几乎总走这里，只挂拨号分支会漏。
             redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
-            (log)(&format!("[上游] {host}{path} 复用连接#{}, {ms}ms", up.id));
+            quiet::note_reuse(log, host, ms);
             Some(Ok(resp))
         }
         Err(why) => {
@@ -560,27 +649,31 @@ pub(super) async fn get_direct(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let name = config::pool_for(host);
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    // copilot-proxy 的后缀是 githubusercontent.com，会误命中内容域熔断；
-    // 它走 edge 的白名单族（Azure 段），不该被内容域的熔断拦住。
-    let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
-    if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
+    // copilot-proxy 后缀是 githubusercontent.com，会误命中内容域熔断，但它走 edge 白名单族。
+    let is_content = pool::route::is_content(host);
+    if is_content && pool::CONTENT_BREAKER.open(host) {
+        // 熔断期间不干等：内容域候选全灭时借 assets 的现成通道，借不到才回镜像链。
+        if let Some(r) = try_borrow(log, out, host, info, body).await {
+            return r;
+        }
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
         return r;
     }
-// per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
+    // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
-    if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
+    if is_content && pool::CONTENT_BREAKER.open(host) {
+        // 等锁期间别人可能刚把熔断补上：同样先试借道，借不到才回镜像链。
+        if let Some(r) = try_borrow(log, out, host, info, body).await {
+            return r;
+        }
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    // 必须重查：等锁期间别人可能刚建好连接，直接用就不会一起排队拨号。
-    // （曾经为省掉"两条都失效时多烧一个预算"砍掉过这里，结果一条连接收 GOAWAY 时
-    //  18 个在途请求各自拨号，单飞锁前排成 10 秒以上的队。）
+    // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
     if upstream::cached_h2_in(host, want_slot).is_some() {
         guard.take();
         if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
@@ -590,12 +683,10 @@ pub(super) async fn get_direct(
     }
     let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 拿到拨号锁后再看一眼池子:等锁期间冷启动竞速的第二个任务可能已经
-        // 建成入库——排队者直接复用它,这就是"晚成者把排队的塞进自己这里"。
-        // fresh = 连接尚不在池中,发送成功后由这里入库;复用/竞速入库的不再重存。
+        // 每轮再查一次池子：竞速任务可能已建成，排队者直接复用。
         let (up, fresh) = match upstream::cached_h2_in(host, want_slot) {
             Some(up) => (up, false),
-            None => match upstream::dial_upstream(name, host, log).await {
+            None => match upstream::dial_upstream(host, log).await {
                 Ok((up, fresh)) => (up, fresh),
                 Err(e) => {
                     (log)(&format!(
@@ -606,7 +697,12 @@ pub(super) async fn get_direct(
                         return Err(format!("POST 等非简单方法不重发({e})"));
                     }
                     if is_content {
+                        // 候选确实全灭：先把熔断记上，后续请求直接抄借道这条近路，
+                        // 不再挨个等拨号超时。
                         pool::CONTENT_BREAKER.set(host);
+                        if let Some(r) = try_borrow(log, out, host, info, body).await {
+                            return r;
+                        }
                         return Err(format!("内容域直连全灭({e})"));
                     }
                     continue;
@@ -619,9 +715,7 @@ pub(super) async fn get_direct(
                 let up_slot = up.slot;
                 let up_ip = up.ip.clone();
                 *info.lock().unwrap() = up_ip.clone();
-                if !name.is_empty() {
-                    pool::cursor_note(name, host, &up_ip, true, false, up_slot); // 数据到手 = 真成功, 置顶
-                }
+                pool::cursor_note(host, &up_ip, true, up_slot); // 数据到手 = 真成功, 置顶
                 if fresh {
                     upstream::store_h2(host, up);
                     upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
@@ -637,10 +731,9 @@ pub(super) async fn get_direct(
             }
             Err(e) => e,
         };
-        // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
-        // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
-        if !name.is_empty() && is_simple && !is_content {
-            pool::cursor_note(name, host, &up.ip, false, false, up.slot);
+        // 数据层失败才垫底 IP，且只认幂等、无镜像兜底的失败；POST/内容域失败不代表 IP 死。
+        if is_simple && !is_content {
+            pool::cursor_note(host, &up.ip, false, up.slot);
         }
         upstream::drop_h2_id(host, up.id);
         (log)(&format!(
@@ -651,7 +744,11 @@ pub(super) async fn get_direct(
             return Err(format!("POST 等非简单方法不重发({e})"));
         }
         if is_content {
+            // 同上：先熔断再借道，让下一条请求少走一轮必败的拨号。
             pool::CONTENT_BREAKER.set(host);
+            if let Some(r) = try_borrow(log, out, host, info, body).await {
+                return r;
+            }
             return Err(format!("内容域直连全灭({e})"));
         }
         continue; // GET/HEAD: 换下一个候选重发完整请求
@@ -721,7 +818,7 @@ code{{font-family:Consolas,monospace;color:#3fb950}}a{{color:#3fb950;text-decora
         .status(StatusCode::BAD_GATEWAY)
         .header("content-type", "text/html; charset=utf-8")
         .header("retry-after", "8")
-        .body(upstream::full_body(Bytes::from(html)))
+        .body(protocol::full_body(Bytes::from(html)))
         .unwrap()
 }
 /// 串发+镜像全灭后按系统解析真名 SNI 直拨（池表漂移自愈）；仅 GET/HEAD，成功入缓存。
@@ -743,19 +840,20 @@ async fn dns_direct_fetch(
         "[DNS直连] {host} 系统解析 {} 个候选, 真名 SNI 逐个尝试",
         addrs.len()
     ));
-    // 与 get_direct 的口径一致：白名单域名不算内容域（copilot-proxy 后缀会误命中）。
-    // 预算跟候选地址无关，循环外算一次。
-    let budget_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
+    // 与 get_direct 口径一致：白名单域名不算内容域；预算与候选地址无关，循环外算一次。
+    let budget_content = pool::route::is_content(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn = match pool::dial::dial_one(host, &ip, host, true).await {
-            Ok(c) => c,
-            Err(e) => {
-                (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
-                continue;
-            }
-        };
-        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await {
+        let conn =
+            match pool::dial::dial_one(host, &ip, host, pool::route::is_real(host), true).await {
+                Ok(c) => c,
+                Err(e) => {
+                    (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
+                    continue;
+                }
+            };
+        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await
+        {
             Ok(u) => u,
             Err(e) => {
                 (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
@@ -789,118 +887,5 @@ async fn dns_direct_fetch(
 }
 
 #[cfg(test)]
-mod tests {
-    /// 审计 #1 回归: 镜像胜出时直连 future 未钧即弃——charge 在 future 内,
-    /// 零残留, 账面不得出现幽灵在途字节/流数。
-    #[test]
-    fn direct_leg_unpolled_leaves_zero_debt() {
-        let key = mirror::direct_load_key("debt.test");
-        let load = mirror::mirror_load_for(&key);
-        load.in_flight_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
-        load.in_flight_streams.store(0, std::sync::atomic::Ordering::Relaxed);
-        let out = hyper::Request::builder()
-            .uri("https://debt.test/f")
-            .body(upstream::empty_body())
-            .unwrap();
-        let log: LogFn = Arc::new(|_: &str| {});
-        let info = UpstreamInfo::default();
-        let leg = direct_leg("debt.test", 8 * 1024 * 1024, &log, &out, "debt.test", &info, &None);
-        drop(leg);
-        assert_eq!(
-            load.in_flight_bytes.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "未钧即弃不得留下幽灵在途字节"
-        );
-        assert_eq!(
-            load.in_flight_streams.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "流数同样不得泄漏"
-        );
-    }
-    use super::*;
-
-
-    #[test]
-    fn release_asset_path_gate() {
-        use pool::route::{master_route, Route};
-        let mirror = |host: &str, path: &str| {
-            matches!(master_route(host, "GET", path), Route::Mirror)
-        };
-        let not_mirror = |host: &str, path: &str| {
-            !matches!(master_route(host, "GET", path), Route::Mirror)
-        };
-        assert!(mirror(
-            "github.com",
-            "/torvalds/linux/archive/refs/tags/v6.6.tar.gz"
-        ));
-        assert!(mirror(
-            "github.com",
-            "/cli/cli/releases/download/v2.0.0/gh_2.0.0_windows_amd64.zip"
-        ));
-        assert!(mirror(
-            "github.com",
-            "/docmirror/dev-sidecar/releases/latest/download/DevSidecar.exe"
-        ));
-        assert!(not_mirror("github.com", "/torvalds/linux/releases"));
-        assert!(not_mirror("github.com", "/torvalds/linux/releases/tag/v6.6"));
-        assert!(not_mirror(
-            "github.com",
-            "/torvalds/linux/info/refs?service=git-upload-pack"
-        ));
-        assert!(not_mirror("github.com", "/torvalds/linux/git-upload-pack"));
-        assert!(not_mirror(
-            "api.github.com",
-            "/repos/x/y/releases/assets/1"
-        ));
-        assert!(mirror("codeload.github.com", "/x/y/legacy.tar.gz"));
-    }
-
-
-    #[test]
-    fn telemetry_paths_intercepted_only() {
-        assert!(is_telemetry("api.github.com", "/_private/browser/rum?ddforward=x"));
-        assert!(is_telemetry("api.github.com", "/_private/browser/errors"));
-        assert!(is_telemetry("collector.github.com", "/"));
-        assert!(is_telemetry("alive.github.com", "/"));
-        assert!(!is_telemetry("api.github.com", "/graphql"));
-        assert!(!is_telemetry("api.github.com", "/search/suggestions"));
-        assert!(!is_telemetry("github.com", "/_private/browser/rum"));
-    }
-
-
-    #[test]
-    fn stream_decision_contract() {
-        use upstream::MAX_REPLAY_BODY;
-        assert_eq!(
-            stream_decision(
-                &Method::POST,
-                "/fastgh/fgit.git/git-receive-pack",
-                Some(100)
-            ),
-            Some("git 智能协议")
-        );
-        assert_eq!(
-            stream_decision(&Method::POST, "/fastgh/fgit.git/git-upload-pack", None),
-            Some("git 智能协议")
-        );
-        assert_eq!(
-            stream_decision(
-                &Method::GET,
-                "/fastgh/fgit.git/info/refs?service=git-receive-pack",
-                None
-            ),
-            None
-        );
-        assert_eq!(
-            stream_decision(&Method::PUT, "/some/upload", Some(MAX_REPLAY_BODY as u64 + 1)),
-            Some("声明超限")
-        );
-        assert_eq!(
-            stream_decision(&Method::POST, "/api/x", Some(MAX_REPLAY_BODY as u64)),
-            None
-        );
-        assert_eq!(stream_decision(&Method::POST, "/api/x", None), None);
-        assert_eq!(stream_decision(&Method::GET, "/x", Some(u64::MAX)), None);
-        assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
-    }
-}
+#[path = "../../tests/server/mitm/mod.rs"]
+mod tests;

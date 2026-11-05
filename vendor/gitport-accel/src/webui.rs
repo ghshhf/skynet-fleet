@@ -1,6 +1,6 @@
 //! 管理界面：axum + 内嵌前端，REST API 驱动；本地管理面防护见 localGuard。
 use crate::certgen::Authority;
-use crate::config::{self, pooled_domains};
+use crate::config;
 use crate::logger::Logger;
 use crate::{pool, settings};
 use axum::extract::{Path, Query, State};
@@ -29,7 +29,6 @@ pub struct App {
     pub version: &'static str,
 }
 
-
 fn local_host(h: &str) -> bool {
     matches!(
         crate::server::host_only(&h.to_lowercase()),
@@ -52,11 +51,7 @@ fn local_origin(o: &str) -> bool {
     false
 }
 
-/// 写操作来源校验。
-/// - 浏览器一定带 Origin（跨站 POST 也带），校验它是不是本工作台。
-/// - 没有 Origin/Referer 的是本机脚本。**不再直接放行**，要求显式带
-///   `X-GitPort-Request: 1`：浏览器跨站带不了自定义头（会被 CORS 预检拦下），
-///   而本机程序要加这行才算表明意图。curl 用法变为加 `-H "X-GitPort-Request: 1"`。
+/// 写操作来源校验：浏览器必须同源，无 Origin/Referer 的本机脚本须显式带 `X-GitPort-Request: 1`。
 fn same_site_write(headers: &HeaderMap) -> bool {
     if let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         return local_origin(o);
@@ -88,7 +83,6 @@ async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) 
     next.run(req).await
 }
 
-
 pub async fn serve(app: Arc<App>) -> Result<(), String> {
     let router = axum::Router::new()
         .route("/", axum::routing::get(index))
@@ -108,7 +102,10 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             "/api/settings/closeToTray",
             axum::routing::post(api_close_to_tray),
         )
-        .route("/api/settings/workerMirrors", axum::routing::post(api_worker_mirrors))
+        .route(
+            "/api/settings/workerMirrors",
+            axum::routing::post(api_worker_mirrors),
+        )
         .route(
             "/api/settings/githubPAC",
             axum::routing::post(api_github_pac),
@@ -124,7 +121,6 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| format!("管理界面端口 {port} 绑定失败: {e}"))?;
-    app.logs.log(&format!("管理界面: http://127.0.0.1:{port}"));
     axum::serve(listener, router)
         .await
         .map_err(|e| format!("webui 服务退出: {e}"))
@@ -181,11 +177,13 @@ async fn app_js() -> Response {
         .into_response()
 }
 
-
 /// 教程截图响应（jpeg，编译期内嵌零磁盘依赖）
 async fn img_jpeg(bytes: &'static [u8]) -> Response {
     (
-        [("cache-control", "no-cache"), ("content-type", "image/jpeg")],
+        [
+            ("cache-control", "no-cache"),
+            ("content-type", "image/jpeg"),
+        ],
         bytes,
     )
         .into_response()
@@ -203,24 +201,21 @@ async fn guide_img(Path(file): Path<String>) -> Response {
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
-/// 分流 PAC：白名单 DIRECT 短路必须在通配符匹配之前（否则被 *.githubusercontent.com 吞掉）。
+/// 分流 PAC：host 名单全部来自路由表（`pac` 字段），不再另存一份。
 fn pac_script() -> String {
-    let mut domains: Vec<&str> = Vec::new();
-    if settings::github_pac() {
-        for d in pooled_domains() {
-            if !domains.contains(&d) {
-                domains.push(d);
-            }
-        }
-    }
+    let (proxy_hosts, direct_hosts) = crate::pool::route::pac_lists();
+    let domains = if settings::github_pac() {
+        proxy_hosts
+    } else {
+        Vec::new()
+    };
     let proxy = format!("PROXY 127.0.0.1:{}", config::proxy_port());
     let list = domains
         .iter()
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let direct_list = config::global_sites()
-        .direct_hosts
+    let direct_list = direct_hosts
         .iter()
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
@@ -274,8 +269,8 @@ struct StatusResp {
 }
 
 async fn api_status(State(st): State<Arc<App>>) -> Response {
-    let domain_count = config::global_sites().groups.iter().map(|g| g.patterns.len()).sum();
-    let pool_total: usize = pool::plans_snapshot().values().map(|v| v.len()).sum();
+    let domain_count = pool::route::route_count();
+    let pool_total: usize = pool::route::plan_count();
     write_json(&StatusResp {
         version: st.version.to_string(),
         running: crate::server::running(),
@@ -283,14 +278,12 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
         mitm: settings::mitm(),
         domain_count,
         pool_total,
-        split_attempt: pool::dial::SPLIT_ATTEMPT
-            .load(std::sync::atomic::Ordering::Relaxed),
+        split_attempt: pool::dial::SPLIT_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
         split_done: pool::dial::SPLIT_DONE.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
-/// 校准任务结束标志：Drop 里复位，panic 展开时同样会走到
-/// （否则一次意外 panic 就让校准按钮永久回"已在后台进行中"，只能重启）。
+/// 校准任务结束标志：Drop 里复位，panic 展开也会走到，否则按钮永久卡在“进行中”。
 struct CalibDone;
 
 impl Drop for CalibDone {
@@ -301,7 +294,7 @@ impl Drop for CalibDone {
 
 async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
     let logs = st.logs.clone();
-    let log: pool::LogFn = Arc::new(move |m: &str| logs.log(m));
+    let log: crate::util::LogFn = Arc::new(move |m: &str| logs.log(m));
     if crate::server::mitm::CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return (
             [
@@ -329,7 +322,7 @@ async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
              关闭窗口进托盘不影响任务。"
             .to_string(),
     )
-    .into_response()
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -363,64 +356,23 @@ struct WorkerMirrorsBody {
     mirrors: Vec<crate::settings::WorkerMirror>,
 }
 
-/// 整表保存自定义镜像注册表：新增/启停/删除都由前端提交完整清单，
-/// 后端按新旧差集对齐镜像链（删除的条目自动从链中消失——彻底删除），
-/// 并回传规范化后的注册表（前端据此重绘，避免本地态与服务端漂移）。
+/// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），并回传规范化后的注册表。
 async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> Response {
     match settings::set_worker_mirrors(body.mirrors) {
-        Ok(_) => write_json(
-            &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
-        ),
+        Ok((_, removed)) => {
+            // 链对齐是 pool 的事：settings 只负责存，存完由这里推一次。
+            pool::sync_custom_mirrors(&removed);
+            write_json(
+                &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
+            )
+        }
         Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_host_and_origin_gate() {
-        assert!(local_host("127.0.0.1:7811"));
-        assert!(local_host("LOCALHOST:7811"));
-        assert!(!local_host("evil.com"));
-        assert!(!local_host("127.0.0.2:7811"));
-        let port = config::webui_port();
-        assert!(local_origin(&format!("http://127.0.0.1:{port}")));
-        assert!(local_origin(&format!("http://localhost:{port}/")));
-        assert!(!local_origin(&format!("http://127.0.0.1:{port}@evil.com")));
-        assert!(!local_origin("http://evil.com"));
-        assert!(!local_origin(""));
-    }
-
-    #[test]
-    fn same_site_write_rules() {
-        let mut h = HeaderMap::new();
-        assert!(
-            !same_site_write(&h),
-            "无 Origin/Referer 且没带 X-GitPort-Request：不再默认放行"
-        );
-        h.insert("x-gitport-request", HeaderValue::from_static("1"));
-        assert!(same_site_write(&h), "带意图头的本机脚本应放行");
-        h.remove("x-gitport-request");
-        let base = format!("http://127.0.0.1:{}", config::webui_port());
-        h.insert(
-            "origin",
-            HeaderValue::from_str(&base).unwrap(),
-        );
-        assert!(same_site_write(&h));
-        h.insert("origin", HeaderValue::from_static("http://evil.com"));
-        assert!(!same_site_write(&h));
-        h.remove("origin");
-        h.insert(
-            "referer",
-            HeaderValue::from_str(&format!("{base}/x")).unwrap(),
-        );
-        assert!(same_site_write(&h));
-        h.insert("referer", HeaderValue::from_static("http://evil.com/x"));
-        assert!(!same_site_write(&h));
-    }
-}
+#[path = "tests/webui.rs"]
+mod tests;
 
 async fn api_mitm(State(st): State<Arc<App>>, axum::Json(body): axum::Json<OnBody>) -> Response {
     if body.on {
@@ -502,7 +454,10 @@ async fn api_github_pac(
         return write_json(&serde_json::json!({"ok": false, "error": e}));
     }
     if crate::server::running() {
-        settings::ensure_system_proxy();
+        match settings::ensure_system_proxy() {
+            Ok(note) => st.logs.log(&format!("系统代理: {note}")),
+            Err(e) => st.logs.log(&format!("系统代理应用失败: {e}")),
+        }
     } else {
         settings::remove_system_proxy();
     }
