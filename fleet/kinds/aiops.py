@@ -80,10 +80,34 @@ ZEN_PORT = int(os.environ.get("FLEET_AI_ZEN_PORT", "8787"))
 AGENTROUTER_BASE = "https://agentrouter.org/v1"
 
 # 记忆树里记着的 key（10-31 实测有效，余额按美元计）。允许环境变量覆盖。
-AR_KEY = os.environ.get(
-    "AGENTROUTER_API_KEY",
-    "***REMOVED-LEAKED-KEY***",
-)
+def _ar_key():
+    """AgentRouter 的 key 只从本地取，**绝不写进代码**。
+
+    🔴 2026-11-06 教训：我第一版把默认值硬编码在这个常量里，仓一推就泄了。
+    这个仓是 public —— 密钥进代码 = 当众贴出来，没有任何补救空间。
+    现在三条来源，按顺序：环境变量 → ~/.fleet/agentrouter.key → vault。
+    """
+    k = os.environ.get("AGENTROUTER_API_KEY")
+    if k:
+        return k.strip()
+    p = os.path.expanduser("~/.fleet/agentrouter.key")
+    try:
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except OSError:
+        pass
+    try:
+        from .. import vault
+        v = vault.get("agentrouter") if hasattr(vault, "get") else None
+        return v or None
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+AR_KEY = _ar_key()
 # 这站的客户端指纹校验：UA 不对直接 401 unauthorized_client_error，不是 key 错
 AR_UA_CLI = "claude-cli/2.1.150 (external, cli)"
 

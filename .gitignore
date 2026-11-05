@@ -185,3 +185,18 @@ personas/_peer-*/
 
 # 运行时状态目录：挂载表、persona 状态、临时截图等，都不入库
 var/
+
+# ---- 凭证与密钥（2026-11-06 事故后加）----
+# 🔴 本仓是 public。密钥、token、私钥一律不许进版本库。
+# 2026-11-06 我把一个 sk- 开头的 API key 硬编码进 fleet/kinds/aiops.py 并推了上去，
+# 那一次是当众泄露。这条规则就是为了让这种事不可能再发生。
+*.key
+*.pem
+*.p12
+.env
+.env.*
+!.env.example
+local.env
+secrets/
+*_secret*
+*credentials*
