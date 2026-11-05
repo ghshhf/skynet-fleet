@@ -635,10 +635,11 @@ def _selftest():
     # 2026-10-23 更正：这条断言原写成「必然报未配置」，只在没装 ffmpeg 的机器上成立；
     # 本机装了 ffmpeg 就走 pc_video_backend 的占位路线（真出片），于是门禁在
     # 有 ffmpeg 的机器上恒红——那是**环境差异**，不是代码坏了。按环境分支断言。
-    import shutil as _sh
-    _video_backend = bool(os.environ.get("FLEET_VIDEO_CLI")
-                          or os.environ.get("FLEET_FFMPEG")
-                          or _sh.which("ffmpeg"))
+    # 2026-11-05：判定必须与 video_gen_runner._ffmpeg() 同源——imageio-ffmpeg
+    # 也算「有 ffmpeg」，只看 PATH 会漏，CI 上就因此判成未配置而误红。
+    _video_backend = bool(os.environ.get("FLEET_LOCAL_DREAM")
+                          or os.environ.get("FLEET_VIDEO_CLI")
+                          or video_gen_runner._ffmpeg())
     se2 = _FakeSock()
     _do_video_gen(se2, {"id": "ve", "prompt": "云"})
     me2 = _read_msgs(se2)[0]
