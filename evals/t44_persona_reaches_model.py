@@ -58,8 +58,15 @@ if cid:
     except Exception as e:
         check(False, "build_system(%r) 抛了 %s: %s" % (cid, type(e).__name__, e))
     check(bool(sys_p.strip()), "build_system 非空（实得 %d 字）" % len(sys_p))
-    # 卡名可能带昵称（"大肥鱼（昵称：她）"），用 id 做子串判定最稳
-    check(cid in sys_p, "system 里出现了卡 id %r（说明取的是这张卡，不是别的）" % cid)
+    # 卡 id 不一定写进 system：whale_girl 这类卡的显示名是「鲸鱼娘」。
+    # 判「取到的是这张卡」时 id 或卡名命中其一即可，别把显示名当失败。
+    try:
+        disp = (C._data(cid) or {}).get("name") or ""
+    except Exception:
+        disp = ""
+    check(cid in sys_p or (disp and disp in sys_p),
+          "system 里出现了卡 id/卡名 %r（说明取的是这张卡，不是别的）"
+          % (cid if cid in sys_p else disp))
 
 print("\n== ④ agent_server 侧取到的必须是同一份 ==")
 # 用 __new__ 绕过 __init__：_persona_system 只 import 卡库、不碰实例状态，

@@ -1,0 +1,11 @@
+# 只在 CI / 门禁里装的可选依赖（不进发行包，避免给打包产物增重）。
+# 这些依赖对应已经登记的能力/门禁：装了才算真验过，不装则相关门禁会红。
+
+# t76/t77 联网探测门禁直接 import httpx
+httpx>=0.27
+
+# t23 / video_gen_runner：没有系统 ffmpeg 时走 imageio-ffmpeg 自带二进制
+imageio-ffmpeg>=0.5
+
+# t72 文档转换（doc.convert / doc.read）：MarkItDown 是运行时可选能力
+markitdown[pdf,docx,pptx,xlsx]>=0.1

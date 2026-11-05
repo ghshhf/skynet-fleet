@@ -18,8 +18,15 @@ import os
 import subprocess
 from pathlib import Path
 
-PENTEST_BIN = Path("G:/DevTools/pentest/bin")
-NUCLEI_TEMPLATES = Path("G:/DevTools/pentest/nuclei-templates")
+from . import locate as _L
+
+PENTEST_HOME = _L.dir_("pentest", hints=("DevTools/pentest",)) or os.path.join(
+    os.path.expanduser("~"), "_tools", "pentest"
+)
+PENTEST_BIN = Path(os.environ.get("FLEET_PENTEST_BIN") or os.path.join(PENTEST_HOME, "bin"))
+NUCLEI_TEMPLATES = Path(
+    os.environ.get("FLEET_NUCLEI_TEMPLATES") or os.path.join(PENTEST_HOME, "nuclei-templates")
+)
 
 # 工具名 -> 能力名（用于 check 报告）
 TOOLS = {

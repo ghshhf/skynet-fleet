@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-03 20:39:05",
+  "generated_at": "2026-11-05 22:24:02",
   "gates_registered": 158,
   "eval_files": 95,
   "orphan_evals": [],
@@ -10,7 +10,7 @@
   "capabilities_owned": 322,
   "capabilities_live": null,
   "capabilities_gated": 188,
-  "devices": 50,
+  "devices": 47,
   "devices_live": null,
   "domains": {
     "web": {

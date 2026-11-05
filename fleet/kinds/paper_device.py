@@ -26,7 +26,10 @@ import re
 from ..core import BaseDevice, DeviceResult as R
 
 #: 论文库根：环境变量优先，其次 G:\_papers（落盘器默认），再退用户目录。
-DEFAULT_ROOTS = (r"G:\_papers", os.path.join(os.path.expanduser("~"), "_papers"))
+DEFAULT_ROOTS = tuple(x for x in (
+    os.environ.get("PAPERS_HOME"),
+    os.path.join(os.path.expanduser("~"), "_papers"),
+) if x)
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+|[\u4e00-\u9fff]+")
 

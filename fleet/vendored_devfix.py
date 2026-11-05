@@ -13,7 +13,9 @@ import os
 
 from .core import Capability, Param
 
-AUTOFIX_HOME = "D:/DevTools/devfix/autofix_skills"
+AUTOFIX_HOME = os.environ.get("FLEET_AUTOFIX_HOME") or os.path.expanduser(
+    "~/.fleet/autofix_skills"
+)
 
 
 def _check_repo(reg, dev):

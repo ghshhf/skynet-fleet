@@ -296,4 +296,10 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Windows 上解释器 finalize 时，还活着的 daemon 服务线程会触发
+    # 0xC0000409（栈溢出/fail-fast），这是 CPython 退出期的问题，不是协议失败。
+    # 门禁已经跑完并打印结论，直接跳过 finalize。
+    os._exit(rc)

@@ -15,11 +15,11 @@ from .core import Capability, Param
 # 既让 check 诚实可用，也让 handler 能直接调起引擎（不依赖会话 PATH 状态）。
 _py_scripts = os.path.join(os.path.dirname(_sys.executable), "Scripts")  # pip 装 frida/binwalk 等 CLI
 for _d in (r"C:\Program Files\Rizin\bin", r"C:\Program Files\rizin\bin",
-           r"D:\DevTools\reverse\bin",        # apktool.cmd
-           r"D:\DevTools\reverse\jadx\bin",   # jadx.exe
+           os.environ.get("FLEET_REVERSE_BIN") or "",
+           os.environ.get("FLEET_JADX_BIN") or "",
            r"C:\Program Files\Wireshark",     # tshark.exe
            _py_scripts):                      # pip 装的 frida / binwalk / mitmproxy 等 CLI
-    if os.path.isdir(_d) and _d not in os.environ.get("PATH", "").split(";"):
+    if _d and os.path.isdir(_d) and _d not in os.environ.get("PATH", "").split(";"):
         os.environ["PATH"] = _d + ";" + os.environ.get("PATH", "")
 
 _ENGINE_CMDS = {

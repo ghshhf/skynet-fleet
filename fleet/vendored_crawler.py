@@ -39,10 +39,8 @@ def _chromium_present():
     bp = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
     if bp:
         cands.append(bp)
+    cands.append(os.environ.get("FLEET_CRAWLER_BROWSERS") or "")
     cands.append(os.path.expanduser("~/.cache/ms-playwright"))
-    # 本机约定落 D 盘：Windows 原生 python 只认 D:/ 风格，不认 /d/ Unix 风格
-    cands.append("D:/DevTools/crawler/playwright-browsers")
-    cands.append("/d/DevTools/crawler/playwright-browsers")
     for c in cands:
         if glob.glob(os.path.join(c, "chromium-*")):
             return True

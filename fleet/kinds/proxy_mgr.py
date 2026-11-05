@@ -24,7 +24,7 @@ import urllib.request
 from .. import proxymgr as PM
 from ..core import BaseDevice, DeviceResult as R
 
-_RULESET_REF = r"E:/xmanbian/karing-ruleset"
+_RULESET_REF = PM._KARING_RULESET_DIR
 
 
 class ProxyMgr(BaseDevice):

@@ -543,6 +543,20 @@ def _git(args, cwd):
     return out.stdout.decode("utf-8", "replace")
 
 
+def _rel_in_repo(path):
+    """path 相对仓库根的路径，交给 git 时不用 os.path.relpath。
+
+    Windows 上 `git rev-parse --show-toplevel` 可能返回 8.3 短名（RUNNER~1），
+    而 path 是长名；两者 relpath 会算出 `../../../../RUNNER~1/...` 这种仓库外
+    路径，`git log -- <path>` 直接报错。让 git 自己用 --show-prefix 算，口径一致。
+    """
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    prefix = _git(["rev-parse", "--show-prefix"], d).strip().replace("\\", "/")
+    if os.path.isdir(path):
+        return prefix.rstrip("/")
+    return prefix + os.path.basename(path)
+
+
 def commit_evolved(name, message=""):
     """把一张自写技能的落盘提交进 git（scoped add，不碰别的改动）。
 
@@ -554,8 +568,8 @@ def commit_evolved(name, message=""):
     repo = _repo_root()
     if repo is None:
         return None
-    rel_dir = os.path.relpath(os.path.join(Evolved_DIR, name), repo).replace("\\", "/")
-    rel_ledger = os.path.relpath(LEDGER, repo).replace("\\", "/")
+    rel_dir = _rel_in_repo(os.path.join(Evolved_DIR, name))
+    rel_ledger = _rel_in_repo(LEDGER)
     _git(["add", "--", rel_dir, rel_ledger], repo)
     # 没有暂存内容就不提交（比如什么都没变）——空 commit 只是噪音
     staged = _git(["diff", "--cached", "--name-only"], repo).strip()
@@ -613,7 +627,7 @@ def rollback(name, to_sha=None, db=None, reg=None):
     if repo is None:
         raise SkillError(
             "当前不在 git 仓库里——没有已提交的快照可回滚（版本=git，P3 定的机制）")
-    rel = os.path.relpath(skmd, repo).replace("\\", "/")
+    rel = _rel_in_repo(skmd)
 
     shas = [s for s in _git(["log", "--format=%H", "--", rel], repo).split() if s]
     if not shas:

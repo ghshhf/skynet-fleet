@@ -19,7 +19,7 @@ DPAPI 的作用范围就是「本机 + 本 Windows 账户」。所以同一账�
 用法
 ----
     from fleet import browsercookie
-    ck = browsercookie.read(r"C:\\Users\\...\\app\\session", host="x.com")
+    ck = browsercookie.read(os.path.expanduser("~/AppData/Local/app/session"), host="x.com")
     # -> {"auth_token": "...", "ct0": "..."}  或者带属性的完整列表
 
     browsercookie.to_header(ck)   # -> "auth_token=...; ct0=..."

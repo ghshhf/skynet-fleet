@@ -42,7 +42,9 @@ _KARING_RULESET_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "karing-ruleset")
 )
 if not os.path.isdir(_KARING_RULESET_DIR):
-    _KARING_RULESET_DIR = r"E:/xmanbian/karing-ruleset"
+    _KARING_RULESET_DIR = os.environ.get("FLEET_KARING_RULESET") or os.path.expanduser(
+        "~/.fleet/karing-ruleset"
+    )
 
 
 class ProxyNode:

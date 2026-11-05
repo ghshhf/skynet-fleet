@@ -147,10 +147,13 @@ class SkyNetRelay:
             self.port = self._srv.getsockname()[1]
         self._srv.listen(64)
         # 监听套超时：让 accept 循环能定期醒一次记心跳（没连接时也算活着）。
-        self._srv.settimeout(30.0)
+        # 0.5s 而不是 30s：stop() 要能在 1s 内真正退出并释放端口，
+        # 否则「停了 relay」之后端口还被旧线程占着，新连接会排队干等。
+        self._srv.settimeout(0.5)
         self.port = self._srv.getsockname()[1]
         self._stop.clear()
-        self._thread = threading.Thread(target=self._accept_loop, args=(N,), daemon=True)
+        self._thread = threading.Thread(
+            target=self._accept_loop, args=(N, self._srv), daemon=True)
         self._thread.start()
         save_relay_state(self.host, self.port, self.token)
         return self.port
@@ -162,13 +165,20 @@ class SkyNetRelay:
 
     def stop(self):
         self._stop.set()
+        srv, self._srv = self._srv, None
         try:
-            if self._srv:
-                self._srv.close()
+            if srv:
+                srv.close()
         except Exception:
             pass
+        # 等 accept 线程退出：它最多 0.5s 就会醒，join 成功才算端口真释放。
+        t = getattr(self, "_thread", None)
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2.0)
+        self._thread = None
 
-    def _accept_loop(self, N):
+    def _accept_loop(self, N, srv=None):
+        srv = srv or self._srv
         try:
             from .beat import register
         except (ImportError, ValueError):

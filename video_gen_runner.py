@@ -387,8 +387,8 @@ def pc_video_backend(prompt, duration=3, fps=24, size="512x512", seed=-1, model=
             raise RuntimeError(f"视频 CLI 失败（rc={proc.returncode}）：{(proc.stderr or proc.stdout or '').strip()[:300]}")
         return out_path
 
-    ff = _sh.which("ffmpeg") or os.environ.get("FLEET_FFMPEG") or ""
-    if not ff or not _os.path.isfile(ff):
+    ff = _ffmpeg()
+    if not ff:
         raise RuntimeError("视频后端未配置：设 FLEET_VIDEO_CLI 或安装 ffmpeg（FLEET_FFMPEG）")
     cmd = [ff, "-y", "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}:d={duration}",
            "-vf", f"drawtext=text='{prompt[:40]}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2",
@@ -415,7 +415,7 @@ def _default_backend(prompt, duration, fps, size, seed, model, **kw):
         return path
     if os.environ.get("FLEET_VIDEO_BACKEND"):
         raise RuntimeError("video.gen 远端桥接待实现：FLEET_VIDEO_BACKEND 已设但桥代码未落地")
-    if os.environ.get("FLEET_VIDEO_CLI") or os.environ.get("FLEET_FFMPEG") or __import__("shutil").which("ffmpeg"):
+    if os.environ.get("FLEET_VIDEO_CLI") or _ffmpeg():
         return pc_video_backend(prompt, duration, fps, size, seed, model)
     raise RuntimeError(
         "video.gen 后端未配置：设 FLEET_LOCAL_DREAM=<手机IP> 走手机 NPU 帧链"
@@ -649,7 +649,14 @@ def _selftest():
         section("未配置时如实报错")
         for k in keys:
             os.environ.pop(k, None)
-        r = run("a cat", backend=None)
+        # imageio-ffmpeg 装了的话 _ffmpeg() 一定能兜底出一个二进制，
+        # 那测的就不是「未配置」而是「装了 ffmpeg」。这里按成空模拟干净机器。
+        _real_ff = globals().get("_ffmpeg")
+        globals()["_ffmpeg"] = lambda: ""
+        try:
+            r = run("a cat", backend=None)
+        finally:
+            globals()["_ffmpeg"] = _real_ff
         check(r["ok"] is False and ("未配置" in r["err"] or "pillow" in r["err"]),
               "没配后端 -> ok:false 且说未配置：%s" % r["err"][:70])
         check(r["path"] == "", "失败时 path 为空，不交假路径")

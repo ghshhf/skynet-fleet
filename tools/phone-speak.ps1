@@ -22,8 +22,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$py   = "D:\DevTools\Python312\pythonw.exe"
-$adb  = "D:\DevTools\Android\platform-tools\adb.exe"
+$py   = if ($env:FLEET_PYTHONW) { $env:FLEET_PYTHONW } else { (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source }
+$adb  = if ($env:ADB) { $env:ADB } else { (Get-Command adb.exe -ErrorAction SilentlyContinue).Source }
 
 function Get-Listener([int]$p) {
     Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue

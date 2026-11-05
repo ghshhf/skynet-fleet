@@ -16,6 +16,49 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# t8 是离线门禁：自己造一个最小 netforce（skynet.net.fetch_text），
+# 不依赖外部 netforce 仓库；这样 relay 的取页/鉴权/端口回退逻辑都能真跑。
+def _install_fake_netforce():
+    import tempfile
+
+    base = tempfile.mkdtemp(prefix="fleet-t8-netforce-")
+    sk = os.path.join(base, "skynet")
+    os.makedirs(sk, exist_ok=True)
+    with open(os.path.join(base, "resource_finder.py"), "w", encoding="utf-8") as f:
+        f.write('"""t8 fake netforce marker"""\n')
+    with open(os.path.join(sk, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write("")
+    with open(os.path.join(sk, "net.py"), "w", encoding="utf-8") as f:
+        f.write(
+            "import urllib.request\n"
+            "from dataclasses import dataclass\n\n"
+            "@dataclass\n"
+            "class FetchResult:\n"
+            "    ok: bool = True\n"
+            "    status: int = 0\n"
+            "    data: bytes = b''\n"
+            "    text: str = ''\n"
+            "    error: str = ''\n"
+            "    url: str = ''\n\n"
+            "def fetch_text(url, timeout=15, **kw):\n"
+            "    try:\n"
+            "        req = urllib.request.Request(url, headers={'User-Agent': 'fleet-t8/1'})\n"
+            "        with urllib.request.urlopen(req, timeout=timeout) as r:\n"
+            "            body = r.read()\n"
+            "            return FetchResult(ok=True, status=getattr(r, 'status', 200),\n"
+            "                               data=body,\n"
+            "                               text=body.decode('utf-8', 'replace'), url=url)\n"
+            "    except Exception as e:\n"
+            "        return FetchResult(ok=False, error='%s: %s' % (type(e).__name__, e),\n"
+            "                           url=url)\n"
+        )
+    os.environ["NETFORCE_HOME"] = base
+    for k in [k for k in sys.modules if k == "skynet" or k.startswith("skynet.")]:
+        del sys.modules[k]
+
+
+_install_fake_netforce()
+
 from fleet.kinds.fleet_node import FleetNode
 from fleet.skynet_relay import get_relay, SkyNetRelay
 

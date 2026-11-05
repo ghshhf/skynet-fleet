@@ -1375,8 +1375,10 @@ BROWSER_EXE_CANDIDATES = [
     r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
     r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
     r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
-    r'C:\Users\21393\AppData\Local\ms-playwright\chromium-1228\chrome-win\chrome.exe',
-    r'G:\_pw_chrome\chrome-win64\chrome.exe',
+    os.environ.get("FLEET_CHROME") or "",
+    os.environ.get("FLEET_PW_CHROME") or "",
+    os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright",
+                 "chromium-1228", "chrome-win", "chrome.exe"),
 ]
 
 _BW = {'pw': None, 'browser': None, 'ctx': None, 'tried': False}
@@ -1936,7 +1938,9 @@ from datetime import datetime as _DT, timedelta as _TD
 from pathlib import Path
 
 HERE = Path(__file__).parent
-CORPUS_DIR = Path(os.environ.get("NETFORCE_DATA", "G:/_train_corpus_raw"))
+CORPUS_DIR = Path(os.environ.get("NETFORCE_DATA") or os.path.join(
+    os.path.expanduser("~"), "_train_corpus_raw"
+))
 CORPUS_STATE = CORPUS_DIR / "crawler_state.json"
 CORPUS_LOG = CORPUS_DIR / "crawler.corpus_log"
 

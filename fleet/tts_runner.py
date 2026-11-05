@@ -153,7 +153,7 @@ def _tts_dir():
         os.path.join(ROOT, "_contrib", "tts"),
         os.path.join(os.path.dirname(ROOT), "_contrib", "tts"),
         os.path.expanduser("~/.fleet/tts"),
-        "D:/code/_contrib/tts",
+        os.environ.get("FLEET_TTS_HOME") or "",
     ]
     for c in cands:
         if os.path.isdir(c):

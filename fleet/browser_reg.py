@@ -100,7 +100,14 @@ def _candidates():
     if local:
         roots.append(os.path.join(local, "ms-playwright"))
     # 本机双账户（21393 / 123），playwright 各自装各自的，都算可用
-    roots.extend(glob.glob(r"C:\Users\*\AppData\Local\ms-playwright"))
+    roots.extend(
+        glob.glob(
+            os.path.join(
+                os.path.dirname(os.path.expanduser("~")),
+                "*", "AppData", "Local", "ms-playwright",
+            )
+        )
+    )
     seen = set()
     for root in roots:
         if not root or not os.path.isdir(root):

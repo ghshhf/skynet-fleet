@@ -34,6 +34,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller textual rich prompt_toolkit
           python -m pip install -r requirements.txt
+          python -m pip install -r requirements-ci.txt
 
       - name: 冒烟（先证明界面自己能起来，再谈打包）
         # CI 的控制台是 cp1252，中文 print 会当场 UnicodeEncodeError：

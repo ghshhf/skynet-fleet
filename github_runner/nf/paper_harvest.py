@@ -34,7 +34,7 @@ import urllib.request
 import urllib.parse
 import concurrent.futures as cf
 
-OUT = os.environ.get("PAPER_OUT", r"G:\_papers")
+OUT = os.environ.get("PAPER_OUT") or os.path.expanduser("~/_papers")
 PDF_DIR = os.path.join(OUT, "pdf")
 META = os.path.join(OUT, "papers.jsonl")
 STATE = os.path.join(OUT, "state.json")

@@ -46,7 +46,9 @@ import sys
 from ctypes import wintypes
 
 # 默认库目录：与 netforce 的 _accounts 对齐（那边是主人认得的落点）
-VAULT_DIR = os.environ.get("FLEET_VAULT_DIR", r"E:\xmanbian\netforce\_accounts")
+VAULT_DIR = os.environ.get("FLEET_VAULT_DIR") or os.path.join(
+    os.path.expanduser("~"), ".fleet", "vault"
+)
 SUFFIX = ".vault"
 
 # 熵：给同一份数据加一层站内盐。改这个值 = 旧密文全部作废，慎动。

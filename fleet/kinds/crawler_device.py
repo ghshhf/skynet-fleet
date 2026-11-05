@@ -19,7 +19,14 @@ from ..vendored_crawler import ENGINE_OF
 # 后果是「谁 import 本模块，谁的进程里 playwright 就集体找不到浏览器」，一 launch 就
 # 报「Looks like Playwright was just installed」。t18 的门禁活线检查就是这么红的
 # （2026-11-02 定位）。环境变量是进程级全局副作用，不能这么随手写。
-_PW_HOME = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "D:/DevTools/crawler/playwright-browsers"
+if os.name == "nt":
+    _PW_DEFAULT = os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+        "AppData", "Local", "ms-playwright",
+    )
+else:
+    _PW_DEFAULT = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+_PW_HOME = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or _PW_DEFAULT
 if os.path.isdir(_PW_HOME):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
 else:

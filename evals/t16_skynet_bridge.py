@@ -229,19 +229,24 @@ def _make_fake_skynet(base):
     for fn, body in FAKE_SKYNET.items():
         with open(os.path.join(sk, fn), "w", encoding="utf-8") as f:
             f.write(body)
+    # netrunner.discover_home() 要求 NETFORCE_HOME 下同时有 resource_finder.py
+    # 和 skynet/__init__.py 两个标记；缺一个就会被判「没装」。
+    with open(os.path.join(base, "resource_finder.py"), "w", encoding="utf-8") as f:
+        f.write('"""t16 fake netforce marker"""\n')
     return base
 
 
 def main():
-    import fleet.catalog as C
-    from fleet import netforce_skynet as NS
-
     tmp = tempfile.mkdtemp(prefix="fleet-t16-")
     home = _make_fake_skynet(os.path.join(tmp, "netforce"))
 
     old_home = os.environ.get("NETFORCE_HOME")
     old_path = list(sys.path)
     os.environ["NETFORCE_HOME"] = home
+    # netforce_skynet 一 import 就会顺手 import netrunner，而 netrunner 在 import
+    # 时就把 NETFORCE_HOME 算成模块常量；所以先指好假包，再 import 这一串。
+    from fleet import netforce_skynet as NS
+    import fleet.catalog as C
     # 清掉可能已 import 的真 skynet，保证门禁用的是假包
     for k in [k for k in sys.modules if k == "skynet" or k.startswith("skynet.")]:
         del sys.modules[k]
