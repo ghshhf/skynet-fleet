@@ -503,7 +503,7 @@ class ConvertDevice(BaseDevice):
 
     def _probe(self, args):
         p, err = self._src(args, "convert.probe")
-        if err:
+        if err is not None:
             return err
         info = sniff(p)
         kind = info["kind"]
@@ -533,7 +533,7 @@ class ConvertDevice(BaseDevice):
 
     def _file(self, args):
         p, err = self._src(args, "convert.file")
-        if err:
+        if err is not None:
             return err
         info = sniff(p)
         kind = info["kind"]
@@ -596,7 +596,7 @@ class ConvertDevice(BaseDevice):
                            % (want, _suggest(want, IMAGE_FMT), " / ".join(IMAGE_FMT)),
                            device=self.name, via=self.via)
         out, err = self._out(p, args, want)
-        if err:
+        if err is not None:
             return R.error("convert.file", err, device=self.name, via=self.via)
         quality = int(args.get("quality") or 90)
         try:
@@ -635,7 +635,7 @@ class ConvertDevice(BaseDevice):
             return R.error(cap, "既没有 Pillow 也没有 ffmpeg，转不了图",
                            device=self.name, via=self.via)
         out, err = self._out(p, args, want)
-        if err:
+        if err is not None:
             return R.error(cap, err, device=self.name, via=self.via)
         cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                "-i", p, "-frames:v", "1"]
@@ -655,7 +655,7 @@ class ConvertDevice(BaseDevice):
 
     def _audio(self, args, cap="convert.audio"):
         p, err = self._src(args, cap)
-        if err:
+        if err is not None:
             return err
         ff = _tool("ffmpeg")
         if not ff:
@@ -667,7 +667,7 @@ class ConvertDevice(BaseDevice):
                            % (want, _suggest(want, AUDIO_FMT), " / ".join(AUDIO_FMT)),
                            device=self.name, via=self.via)
         out, err = self._out(p, args, want)
-        if err:
+        if err is not None:
             return R.error(cap, err, device=self.name, via=self.via)
 
         # 无声视频转音频：ffmpeg 只会回一句 "Output file does not contain any stream"，
@@ -722,7 +722,7 @@ class ConvertDevice(BaseDevice):
 
     def _video(self, args, cap="convert.video"):
         p, err = self._src(args, cap)
-        if err:
+        if err is not None:
             return err
         ff = _tool("ffmpeg")
         if not ff:
@@ -734,7 +734,7 @@ class ConvertDevice(BaseDevice):
                            % (want, _suggest(want, VIDEO_FMT), " / ".join(VIDEO_FMT)),
                            device=self.name, via=self.via)
         out, err = self._out(p, args, want)
-        if err:
+        if err is not None:
             return R.error(cap, err, device=self.name, via=self.via)
 
         cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", p]
@@ -812,13 +812,13 @@ class ConvertDevice(BaseDevice):
         再用 paletteuse 套上去 —— ffmpeg 能在一个 filtergraph 里做完。
         """
         p, err = self._src(args, cap)
-        if err:
+        if err is not None:
             return err
         ff = _tool("ffmpeg")
         if not ff:
             return R.error(cap, "没装 ffmpeg", device=self.name, via=self.via)
         out, err = self._out(p, args, "gif")
-        if err:
+        if err is not None:
             return R.error(cap, err, device=self.name, via=self.via)
         fps = int(args.get("fps") or 10)
         width = int(args.get("width") or 480)
@@ -858,7 +858,7 @@ class ConvertDevice(BaseDevice):
         不可靠（手机上拍的视频大量是 VFR）。
         """
         p, err = self._src(args, cap)
-        if err:
+        if err is not None:
             return err
         ff, fp = _tool("ffmpeg"), _tool("ffprobe")
         if not ff:
@@ -926,7 +926,7 @@ class ConvertDevice(BaseDevice):
                            "没装 markitdown：pip install 'markitdown[pdf,docx,pptx,xlsx]'",
                            device=self.name, via=self.via)
         out, err = self._out(p, args, want)
-        if err:
+        if err is not None:
             return R.error("convert.file", err, device=self.name, via=self.via)
         try:
             res = MarkItDown().convert(p)
@@ -960,7 +960,7 @@ class ConvertDevice(BaseDevice):
         if merged.get("dir") and not merged.get("path"):
             merged["path"] = merged["dir"]
         root, err = self._src(merged, "convert.batch", allow_dir=True)
-        if err:
+        if err is not None:
             return err
         if not os.path.isdir(root):
             return R.error("convert.batch", "不是目录: %s" % root,
@@ -1150,6 +1150,11 @@ def _selftest():
         # ---- 错误信息有没有用 ----
         bad = dev.invoke("convert.video", {"path": src_mp4, "to": "mp5"})
         ck((not bad.ok) and "mp4" in (bad.err or ""), "报错：写错目标格式会提示正确的那个")
+        # 回归：DeviceResult 的 __bool__ 返回 ok，`if err:` 对失败结果恒为假，
+        # 代码会带着 p=None 继续跑。这类反向条件只有错误路径才暴露，必须钉住。
+        bad = dev.invoke("convert.file", {"path": os.path.join(td, "nope.png"), "to": "jpg"})
+        ck((not bad.ok) and "文件不存在" in (bad.err or ""),
+           "报错：文件不存在时明说，不带着 None 往下跑")
 
         # ---- 批量（默认预演，不落盘） ----
         if has_pil:

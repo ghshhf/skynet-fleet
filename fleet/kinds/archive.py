@@ -183,7 +183,7 @@ class ArchiveDevice(BaseDevice):
 
     def _info(self, args):
         p, err = self._src(args, "archive.info")
-        if err:
+        if err is not None:
             return err
         fmt = _fmt_of(p, args.get("fmt"))
         if not fmt:
@@ -210,7 +210,7 @@ class ArchiveDevice(BaseDevice):
 
     def _list(self, args):
         p, err = self._src(args, "archive.list")
-        if err:
+        if err is not None:
             return err
         fmt = _fmt_of(p, args.get("fmt"))
         if not fmt:
@@ -236,7 +236,7 @@ class ArchiveDevice(BaseDevice):
 
     def _extract(self, args):
         p, err = self._src(args, "archive.extract")
-        if err:
+        if err is not None:
             return err
         fmt = _fmt_of(p, args.get("fmt"))
         if not fmt:
@@ -366,15 +366,17 @@ class ArchiveDevice(BaseDevice):
             return R.error("archive.pack", "只支持 zip/7z/tar/gz，收到 %s" % fmt,
                            device=self.name, via=self.via)
         raw_out = (args.get("out") or "").strip().strip('"')
+        # 单个文件打包时去掉它本身的扩展名：`v.mp4` → `v.zip`，不是 `v.mp4.zip`
+        base = os.path.basename(srcs[0].rstrip("\\/")) or "pack"
+        if os.path.isfile(srcs[0]):
+            base = os.path.splitext(base)[0] or base
         if raw_out:
             out = os.path.abspath(os.path.expanduser(raw_out))
             if os.path.isdir(out):
-                base = os.path.basename(srcs[0].rstrip("\\/")) or "pack"
                 out = os.path.join(out, base + "." + ("tar.gz" if fmt == "gz" else fmt))
             elif not os.path.splitext(out)[1]:
                 out += "." + ("tar.gz" if fmt == "gz" else fmt)
         else:
-            base = os.path.basename(srcs[0].rstrip("\\/")) or "pack"
             out = os.path.join(os.path.dirname(srcs[0]), base + "." + ("tar.gz" if fmt == "gz" else fmt))
         if os.path.exists(out) and not bool(args.get("overwrite") or False):
             stem, ext = os.path.splitext(out)
@@ -490,6 +492,12 @@ def _selftest():
         with open(os.path.join(td, "src", "sub", "b.txt"), "w", encoding="utf-8") as f:
             f.write("world " * 200)
         ck(True, "素材：造出 2 个文件的目录")
+
+        # 回归：DeviceResult 的 __bool__ 返回 ok，`if err:` 对失败结果恒为假，
+        # 于是代码带着 p=None 继续跑，报出来的是 AttributeError 而不是「文件不存在」。
+        r = dev.invoke("archive.info", {"path": os.path.join(td, "nope.zip")})
+        ck((not r.ok) and "文件不存在" in (r.err or ""),
+           "报错：文件不存在时明说，不带着 None 往下跑")
 
         # ---- 打包 zip ----
         r = dev.invoke("archive.pack", {"src": os.path.join(td, "src"),
