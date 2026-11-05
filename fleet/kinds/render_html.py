@@ -100,12 +100,24 @@ def ffmpeg_path():
     p = os.environ.get("FLEET_FFMPEG", "").strip()
     if p and os.path.isfile(p):
         return p
-    return L.exe("ffmpeg", env="FLEET_FFMPEG",
-                 hints=("tools/ffmpeg/bin", "dev/ffmpeg/bin",
-                        "_tools/ffmpeg/bin", "ffmpeg/bin",
-                        "tools/ffmpeg", "_tools/ffmpeg"),
-                 # 版本号目录猜不到，用 under 在该前缀下递归（见 render.py 同处注释）
-                 under=("tools/ffmpeg", "dev/ffmpeg", "_tools/ffmpeg", "ffmpeg"))
+    p = L.exe("ffmpeg", env="FLEET_FFMPEG",
+              hints=("tools/ffmpeg/bin", "dev/ffmpeg/bin",
+                     "_tools/ffmpeg/bin", "ffmpeg/bin",
+                     "tools/ffmpeg", "_tools/ffmpeg"),
+              # 版本号目录猜不到，用 under 在该前缀下递归（见 render.py 同处注释）
+              under=("tools/ffmpeg", "dev/ffmpeg", "_tools/ffmpeg", "ffmpeg"))
+    if p:
+        return p
+    # CI/干净机器上没有系统 ffmpeg：requirements-ci 里的 imageio-ffmpeg
+    # 自带一个二进制，直接用它，不必再要求装进 PATH。
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return ""
 
 
 def check_env():
