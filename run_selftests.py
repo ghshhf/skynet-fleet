@@ -7,11 +7,18 @@
 红了在 Job Summary 里直接写清哪一项、红在哪几行，不用去翻日志。
 
   python run_selftests.py                   # 【日常】按改动跑，通常几秒
+  python run_selftests.py --domains         # 369 条能力按域摊开，标出哪些域门禁空着
+  python run_selftests.py --domain image    # 【按分类跑】只跑 image 域的门禁
+  python run_selftests.py --domain drive,geo
   python run_selftests.py --changed HEAD~1  # 连同与某基线的差异一起算
   python run_selftests.py video storyboard  # 按名字子串挑
-  python run_selftests.py --all             # 全量（163 项，24 分钟起步，少用）
+  python run_selftests.py --all             # 全量（164 项，24 分钟起步，少用）
   python run_selftests.py --shard 1/4       # 全量的第 1/4 片（CI 矩阵并行用）
   python run_selftests.py --slowest         # 看历史耗时排行，谁在拖后腿
+
+**分类 = 域 = 模块**。能力名一律 `域.动作`，域到模块的映射从代码推（设备 `caps()`
+说自己认哪些名字，`type(dev).__module__` 说实现在哪个文件），所以改一个域
+就 `--domain 那个域`，不用记哪个文件对应哪条测试。
 
 `--changed` 的映射由 `tools/gate_map.py --build` 从代码里推出（入口文件 + import
 闭包）。碰上「纯新增」的文件（diff 里一行都没删）不进闭包，只跑结构面 ——
@@ -142,6 +149,9 @@ CASES = [
     ("fleet_drive", ["-m", "fleet.kinds.drive", "--selftest"], HERE, 60),
     ("fleet_circle", ["-m", "fleet.kinds.circle", "--selftest"], HERE, 30),
     ("fleet_wintool", ["-m", "fleet.kinds.wintool", "--selftest"], HERE, 60),
+    # 图片流水线（2026-11-06 从 2 项扩到 9 项）：造 3 张不同比例的图当向量，
+    # 断言尺寸/格式/字节关系，不断言「没抛异常」——「没抛但输出错」才是这类模块的病。
+    ("fleet_image_ops", ["-m", "fleet.kinds.image_ops", "--selftest"], HERE, 60),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
@@ -723,6 +733,125 @@ def _git_additive_only(base=None):
     return keep
 
 
+def _domain_index():
+    """能力域 -> 实现它的设备模块。
+
+    「几百个功能通过分类，跟模块一样」（2026-11-06 主人）—— 362 条能力本来就按
+    `drive.*` / `image.*` / `pcctl.*` 这种域分好了，那门禁也该按域挑，
+    而不是让人记住「改哪个文件对应哪几条测试」。
+
+    映射不手贴：设备 `caps()` 说自己认哪些名字，`type(dev).__module__`
+    说实现在哪个文件 —— 两边一拼就是域到模块的真映射。
+    """
+    sys.path.insert(0, HERE)
+    try:
+        import fleet.catalog as CAT
+        reg = CAT.build()
+    except Exception:
+        return {}
+    idx = {}
+    for d in reg.devices():
+        try:
+            caps = list(d.caps() or ())
+        except Exception:
+            continue
+        mod = sys.modules.get(type(d).__module__)
+        path = getattr(mod, "__file__", None)
+        if not path:
+            continue
+        rel = os.path.relpath(os.path.abspath(path), HERE).replace("\\", "/")
+        for c in caps:
+            if isinstance(c, str) and "." in c:
+                idx.setdefault(c.split(".")[0], set()).add(rel)
+    return idx
+
+
+def _domain_cases(domains, data, verbose=True):
+    """按域挑门禁项。返回 (项, 没覆盖到的域)。
+
+    归属判据用**入口文件**，不用 import 闭包：一个模块就是这一域的门禁，
+    这正是「跟模块一样」。用闭包的话每个域都会显示 59 项 —— 因为 catalog.py
+    被所有人 import，那又变回「被 import 当成受影响」的老毛病了。
+    """
+    idx = _domain_index()
+    if not idx:
+        print("推不出能力域映射（fleet.catalog 起不来）—— 退回全量")
+        return CASES, []
+    entries = {n: (v or {}).get("entry", "")
+               for n, v in (data.get("cases") or {}).items()}
+    rev = data.get("reverse") or {}
+    pick = set()
+    holes = []
+    for dom in domains:
+        mods = idx.get(dom) or set()
+        if not mods:
+            holes.append((dom, "没有设备声明这个域"))
+            continue
+        in_dom = {n for n, e in entries.items() if e and e in mods}
+        if not in_dom:
+            # 没有专属入口的域，退一步用「直接依赖」（dist<=1），仍不算传递依赖
+            for f in mods:
+                for name, d in (rev.get(f) or []):
+                    if d <= 1:
+                        in_dom.add(name)
+        if not in_dom:
+            holes.append((dom, "域内模块没有任何门禁项覆盖"))
+        pick |= in_dom
+    cases = [c for c in CASES if c[0] in pick]
+    if verbose:
+        print("域：%s -> %d 项" % ("、".join(domains), len(cases)))
+        for dom, why in holes:
+            print("  ⚠ %s：%s" % (dom, why))
+    return cases, holes
+
+
+def _show_domains():
+    """`--domains`：把 369 条能力按域摊开，顺手标出哪些域门禁是空的。"""
+    idx = _domain_index()
+    if not idx:
+        print("推不出能力域映射（fleet.catalog 起不来）")
+        return 1
+    path = os.path.join(HERE, "tools", ".gate_map.json")
+    data = {}
+    if os.path.isfile(path):
+        import json as _j
+        data = _j.load(open(path, encoding="utf-8"))
+    entries = {n: (v or {}).get("entry", "")
+               for n, v in (data.get("cases") or {}).items()}
+    rev = data.get("reverse") or {}
+    sys.path.insert(0, HERE)
+    import fleet.catalog as CAT
+    reg = CAT.build()
+    count, per = {}, {}
+    for c in reg.capabilities():
+        dom = c.name.split(".")[0]
+        count[dom] = count.get(dom, 0) + 1
+        per.setdefault(dom, set()).add(c.name)
+    rows = []
+    for dom in sorted(count):
+        mods = idx.get(dom) or set()
+        gates = {n for n, e in entries.items() if e and e in mods}
+        if not gates:
+            for f in mods:
+                for name, d in (rev.get(f) or []):
+                    if d <= 1:
+                        gates.add(name)
+        rows.append((dom, count[dom], gates))
+    rows.sort(key=lambda r: (-r[1], r[0]))
+    print("能干的事 %d 条，分在 %d 个域里。\n" % (len(reg.capabilities()), len(rows)))
+    print("%-10s %5s  %s" % ("域", "能力", "盖住它的门禁项"))
+    for dom, n, gates in rows:
+        if gates:
+            g = "、".join(sorted(gates)[:4]) + ("…" if len(gates) > 4 else "")
+        else:
+            g = "⚠ 空着"
+        print("%-10s %5d  %s" % (dom, n, g))
+    empty = [r[0] for r in rows if not r[2]]
+    print("\n门禁空着的域：%d/%d 个%s"
+          % (len(empty), len(rows), "（%s）" % "、".join(empty[:12]) if empty else ""))
+    return 0
+
+
 def _select_by_changed(base=None):
     """按改动文件反查该跑哪些项。返回 (要跑的项, 说明行)。
 
@@ -907,6 +1036,25 @@ def main():
     include_slow = bool(flags & {"--slow", "--all"})
     if "--slowest" in flags:
         return show_slowest()
+    if "--domains" in flags:
+        return _show_domains()
+
+    # --domain image[,drive]：按能力域跑。域 -> 模块 -> 门禁项，全从代码推。
+    doms = []
+    for i, a in enumerate(raw):
+        if a == "--domain":
+            nxt = raw[i + 1] if i + 1 < len(raw) else ""
+            doms = [x.strip() for x in nxt.replace("，", ",").split(",") if x.strip()]
+    if doms:
+        _p = os.path.join(HERE, "tools", ".gate_map.json")
+        _d = {}
+        if os.path.isfile(_p):
+            import json as _j
+            _d = _j.load(open(_p, encoding="utf-8"))
+        cases, _holes = _domain_cases(doms, _d)
+        if not cases:
+            print("这些域没有覆盖到任何门禁项（见上面的 ⚠）")
+            return 0
 
     # 🔴 默认（不带任何参数）= 按改动跑，而且纯新增只跑结构面。
     #
@@ -919,7 +1067,7 @@ def main():
         cases, _ = _select_by_changed(None)
         if cases is not None and not cases:
             return 0
-    else:
+    elif not doms:
         cases = None
 
     # --changed [基线]：只跑被改动文件影响到的项。这是日常该用的入口 ——
