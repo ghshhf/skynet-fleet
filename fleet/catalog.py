@@ -78,6 +78,7 @@ from .kinds.wordops import WordOps
 from .kinds.pptops import PptOps
 from .live import LiveOps
 from .kinds.aiops import AgentOps
+from .kinds.chartops import ChartOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1947,6 +1948,58 @@ CAPABILITIES = [
                params=(Param("job", "str", True, "任务 id"),),
                side_effect=True, destructive=True,
                note="Windows 走 taskkill /F /T；已结束的报 already 而不是报错"),
+    # ---- 图表层：数据画成图（2026-11-06）----
+    # 表内原生图归 sheet 域（openpyxl.chart，读者改数能跟着刷新）；
+    # 这里出的是报告用的 PNG —— 贴进文档、发给别人看。
+    Capability("chart.bar", "柱状图（第 1 列分类，第 2 列起每列一个系列）",
+               params=(Param("data", "json", True, "二维数组（首行表头）或 csv/tsv 路径"),
+                       Param("out", "str", True, ".png 路径，重名自动让号"),
+                       Param("title", "str"), Param("xlabel", "str"),
+                       Param("ylabel", "str"),
+                       Param("width", "int", doc="像素宽，默认 1280"),
+                       Param("height", "int", doc="像素高，默认 720"),
+                       Param("dpi", "int", doc="默认 100"),
+                       Param("rotate", "int", doc="x 轴标签旋转角度")),
+               side_effect=True,
+               note="多个系列自动并排；返回 path/width/height/points/series/font_used"),
+    Capability("chart.line", "折线图（第 1 列为 x 轴标签，第 2 列起每列一个系列）",
+               params=(Param("data", "json", True, "二维数组或 csv/tsv 路径"),
+                       Param("out", "str", True, ".png 路径"),
+                       Param("title", "str"), Param("xlabel", "str"),
+                       Param("ylabel", "str"),
+                       Param("width", "int"), Param("height", "int"),
+                       Param("marker", "str", doc="数据点样式，默认 o，传 none 去掉"),
+                       Param("rotate", "int")),
+               side_effect=True,
+               note="缺值断线而不是连成假的趋势（NaN 不会被画成 0）"),
+    Capability("chart.pie", "饼图（第 1 列名称，第 2 列数值；只接受非负）",
+               params=(Param("data", "json", True, "二维数组或 csv 路径"),
+                       Param("out", "str", True, ".png 路径"),
+                       Param("title", "str"),
+                       Param("format", "str", doc="百分比格式，默认 %1.1f%%"),
+                       Param("startangle", "int", doc="起始角，默认 90"),
+                       Param("show_values", "bool", doc="是否同时显示绝对值")),
+               side_effect=True,
+               note="负数或合计为 0 直接报错——占比图对这两种情况没有意义，不画假饼"),
+    Capability("chart.scatter", "散点图（第 1 列 x，第 2 列 y，可选第 3 列当颜色）",
+               params=(Param("data", "json", True, "二维数组或 csv 路径"),
+                       Param("out", "str", True, ".png 路径"),
+                       Param("title", "str"), Param("xlabel", "str"),
+                       Param("ylabel", "str"),
+                       Param("color_col", "int", doc="用第几列当颜色深浅"),
+                       Param("size", "int", doc="点大小，默认 36"),
+                       Param("alpha", "float", doc="透明度，默认 0.75")),
+               side_effect=True,
+               note="非数字行会被跳过而不是当 0；有效点少于 2 个直接报错"),
+    Capability("chart.hist", "直方图（数值列分布，可选多列叠加）",
+               params=(Param("data", "json", True, "二维数组或 csv 路径"),
+                       Param("out", "str", True, ".png 路径"),
+                       Param("title", "str"), Param("xlabel", "str"),
+                       Param("ylabel", "str", doc="默认「频数」"),
+                       Param("bins", "int", doc="分箱数，默认 20"),
+                       Param("columns", "json", doc="指定列下标数组，默认自动挑数字列")),
+               side_effect=True,
+               note="每列至少 2 个数字才参与；一列都不够就报错，不画空图"),
     # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
     Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
@@ -2493,6 +2546,9 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # AI 代理层：本机 codex CLI 本身就是个有写权限、能调工具的智能体，
     # 这层只是把它接进总线，省掉每次手敲命令与摸通道。
     reg.add(AgentOps())
+    # 图表层：sheet 能算数，但人看报表先看形状——一张图画完的事，
+    # 用表说半天。表内原生图归 sheet，报告图归这里。
+    reg.add(ChartOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())

@@ -166,6 +166,7 @@ CASES = [
     ("fleet_pptops", ["-m", "fleet.kinds.pptops", "--selftest"], HERE, 180),
     ("fleet_live", ["-m", "fleet.live", "--selftest"], HERE, 180),
     ("fleet_agentops", ["-m", "fleet.kinds.aiops", "--selftest"], HERE, 600),
+    ("fleet_chartops", ["-m", "fleet.kinds.chartops", "--selftest"], HERE, 240),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
