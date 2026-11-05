@@ -5,7 +5,8 @@
   python run_selftests.py --changed         # 【日常用这个】只跑被改动文件波及的项
   python run_selftests.py --changed HEAD~1  # 连同与某基线的差异一起算
   python run_selftests.py video storyboard  # 按名字子串挑（老用法，仍在）
-  python run_selftests.py --all             # 全量（117 项，十几分钟，发布前跑）
+  python run_selftests.py --all             # 全量（157 项，发布前跑）
+  python run_selftests.py --shard 1/4       # 全量的第 1/4 片（CI 矩阵并行用）
   python run_selftests.py --slowest         # 看历史耗时排行，谁在拖后腿
 
 `--changed` 的映射由 `tools/gate_map.py --build` 从代码里推出（入口文件 + import
@@ -799,6 +800,26 @@ def main():
             if skipped:
                 print("（跳过 %d 条慢门禁：%s —— 要跑加 --slow）"
                       % (len(skipped), ", ".join(skipped)), flush=True)
+
+    # --shard i/n：按位置切片，把串行全量摊到 n 个 runner 上跑。
+    # 按位置而不是按耗时均衡：结果可复现，不需要维护一张权重表。
+    shard = None
+    for i, a in enumerate(raw):
+        if a == "--shard":
+            nxt = raw[i + 1] if i + 1 < len(raw) else ""
+            try:
+                i_, n_ = (int(x) for x in nxt.split("/"))
+            except ValueError:
+                print("--shard 用法：--shard 1/4（从 1 开始，分母为正整数）")
+                return 2
+            if n_ < 1 or not 1 <= i_ <= n_:
+                print("--shard 越界：%s（要求 1 <= 分子 <= 分母）" % nxt)
+                return 2
+            shard = (i_, n_)
+    if shard:
+        cases = cases[shard[0] - 1::shard[1]]
+        print("（分片 %d/%d：本片 %d 项）" % (shard[0], shard[1], len(cases)), flush=True)
+
     print(f"=== 天网工程离线自测：{len(cases)} 项 ===", flush=True)
     results = []
     spent = {}

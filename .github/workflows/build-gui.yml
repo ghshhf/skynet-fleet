@@ -27,6 +27,13 @@ jobs:
   # 拆开后：门禁红照实报红（不 continue-on-error，不掩盖），产物照样出。
   selftests:
     runs-on: windows-latest
+    # 全量门禁按位置切 4 片，4 个 runner 并行跑：
+    # 串行一次要 5~6 分钟，切成 4 片后墙钟时间约等于最慢的一片。
+    # 分片是「同样的用例、同样的断言」，只是分摊到不同机器，不是少跑。
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
@@ -60,7 +67,7 @@ jobs:
         # 不写具体条数：手填必然过期（历史上出现过 52/58/67/74 四个版本并存）。
         env:
           FLEET_PY: python
-        run: python run_selftests.py
+        run: python run_selftests.py --shard ${{ matrix.shard }}/${{ strategy.job-total }}
 
   build-windows:
     runs-on: windows-latest
