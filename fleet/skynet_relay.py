@@ -189,7 +189,7 @@ class SkyNetRelay:
         bt.beat()
         while not self._stop.is_set():
             try:
-                conn, peer = self._srv.accept()
+                conn, peer = srv.accept()
             except socket.timeout:
                 # 监听套设有超时（见 start）：没连接也应定期记一次心跳，
                 # 否则「静悄悄没流量」会被判成「线程死了」——两件事不能混。
