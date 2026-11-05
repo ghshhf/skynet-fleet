@@ -72,6 +72,7 @@ from .kinds.convert import ConvertDevice
 from .kinds.archive import ArchiveDevice
 from .kinds.fileops import FileOps
 from .kinds.textops import TextOps
+from .kinds.pdfops import PdfOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1443,6 +1444,100 @@ CAPABILITIES = [
                        Param("limit", "int", doc="to=json 时最多几条，默认 100")),
                note="Excel 中文版默认 GBK + 分号，所以两样都得探测；"
                     "导出给 Excel 时必须 utf-8-sig（不带 BOM 就是乱码）"),
+    # ---- PDF 层：改 PDF 才是麻烦事，抽文本那一步 doc.convert 已经够了 ----
+    Capability("pdf.info", "这个 PDF 是什么：页数/尺寸/加密/有没有文字层/书签",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("password", "str", doc="加密的才需要")),
+               note="looks_scanned=true 表示抽不出文字，是扫描件不是文件坏了"),
+    Capability("pdf.merge", "把多个 PDF 合成一个",
+               params=(Param("paths", "json", True, "至少两个 PDF 路径"),
+                       Param("out", "str", doc="输出路径；默认第一个源旁边加 _merged"),
+                       Param("password", "str", doc="源的密码（都相同时）")),
+               side_effect=True,
+               note="只搬页面，源文件的书签/表单会丢"),
+    Capability("pdf.split", "拆分 PDF（每页一个 / 按份数均分 / 按页号）",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("mode", "str", doc="each（默认，每页一个）/ chunks / pages"),
+                       Param("every", "int", doc="mode=each 时每几页一份，默认 1"),
+                       Param("chunks", "int", doc="mode=chunks 时拆成几份"),
+                       Param("out_dir", "str", doc="输出目录；默认 <名字>_split"),
+                       Param("name", "str", doc="产物文件名前缀"),
+                       Param("password", "str", doc="源密码")),
+               side_effect=True,
+               note="文件名带页码且补零（p001/p002），排序才不会乱"),
+    Capability("pdf.extract", "把指定页抽出来组成新 PDF",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("pages", "str", True, "如 1-3,5,7- ；最后一页写 last"),
+                       Param("out", "str", doc="输出路径"),
+                       Param("password", "str", doc="源密码")),
+               side_effect=True,
+               note="页号 1 起；按给定顺序排列，可以倒着抽"),
+    Capability("pdf.text", "按页抽文字",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("pages", "str", doc="页范围，默认全部"),
+                       Param("limit", "int", doc="最多读几页，默认 50"),
+                       Param("max_chars", "int", doc="最多返回多少字符"),
+                       Param("per_page", "bool", doc="要不要按页分开返回"),
+                       Param("password", "str", doc="源密码")),
+               note="抽不到会说「像扫描件」而不是返回空串让人以为文件坏了"),
+    Capability("pdf.tables", "抽 PDF 里的表格（靠线条识别）",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("pages", "str", doc="页范围，默认全部"),
+                       Param("limit", "int", doc="最多读几页，默认 20")),
+               note="纯文字排版的表它看不出（没线条）；那种用 text.regex 自己切更靠谱"),
+    Capability("pdf.rotate", "旋转页面（整本或指定页）",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("degrees", "int", doc="90 / 180 / 270"),
+                       Param("pages", "str", doc="只转哪几页，默认全部"),
+                       Param("out", "str", doc="输出路径"),
+                       Param("password", "str", doc="源密码")),
+               side_effect=True,
+               note="只收 90 的倍数：PDF 页面只有四个方向，45 度不是旋转是重绘"),
+    Capability("pdf.watermark", "加文字水印",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("text", "str", True, "水印文字"),
+                       Param("opacity", "float", doc="不透明度，默认 0.18"),
+                       Param("angle", "int", doc="角度，默认 35"),
+                       Param("tile", "bool", doc="平铺（适合「机密」这类）"),
+                       Param("color", "str", doc="颜色，默认 #808080"),
+                       Param("pages", "str", doc="只盖哪几页，默认全部"),
+                       Param("out", "str", doc="输出路径"),
+                       Param("password", "str", doc="源密码")),
+               side_effect=True,
+               note="叠在原内容上面，不是替换；中文字体自动找系统里能用的"),
+    Capability("pdf.encrypt", "给 PDF 加密码 / 去掉密码",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("password", "str", True, "用户密码（打开时要输的）"),
+                       Param("action", "str", doc="encrypt（默认）/ decrypt"),
+                       Param("owner_password", "str", doc="所有者密码，默认同用户密码"),
+                       Param("algorithm", "str", doc="AES-128（默认）/ AES-256-R5 / RC4-128"),
+                       Param("out", "str", doc="输出路径"),
+                       Param("already_encrypted", "bool", doc="源本来就有密码")),
+               side_effect=True,
+               destructive=True,
+               note="写完立刻用密码重读验证：密码能开、不带密码打不开才算成功；"
+                    "密码丢了就打不开，没有后门"),
+    Capability("pdf.compress", "压小 PDF（去重复对象 + 压内容流）",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("out", "str", doc="输出路径"),
+                       Param("password", "str", doc="源密码")),
+               side_effect=True,
+               note="只能压结构不能重采样图片：扫描件压不动，会如实说压了多少"),
+    Capability("pdf.meta", "读/写 PDF 元数据（标题、作者、主题…）",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("set", "json", doc="要写的键值，如 {'Title':'年报'}；不给就是只读"),
+                       Param("out", "str", doc="输出路径"),
+                       Param("password", "str", doc="源密码")),
+               side_effect=True,
+               note="不给 set 是只读；给了就写出新文件（不覆盖源）"),
+    Capability("pdf.outline", "读 PDF 的书签/目录",
+               params=(Param("path", "str", True, "PDF 路径"),
+                       Param("password", "str", doc="源密码")),
+               note="很多导出工具默认不写书签，没有会说明原因"),
+    Capability("pdf.engines", "本机有什么 PDF 引擎、能做什么、缺什么",
+               params=(),
+               note="「PDF 转图片」需要渲染器（pdftoppm/gs/mutool），"
+                    "缺了会如实报，不用 pypdf 硬凑白图"),
     # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
     Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
@@ -1972,6 +2067,10 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 中文 Windows 上「记事本存的 txt 是 GBK、Excel 导的 csv 是 GBK+分号」
     # 是每天都在发生的事，此前一条能力都没有，只能开个编码转换器小软件。
     reg.add(TextOps())
+    # PDF 层：合并/拆分/提页/抽文字表格/旋转/水印/加密/压缩。
+    # `doc.convert` 只会「把 PDF 抽成文本」，而 PDF 真正麻烦的是**改它**：
+    # 三个报告合成一个、从 80 页里抽第 12-20 页、给合同加水印、给扫描件加密码。
+    reg.add(PdfOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())

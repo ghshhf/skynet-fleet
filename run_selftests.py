@@ -160,6 +160,7 @@ CASES = [
     ("fleet_archive", ["-m", "fleet.kinds.archive", "--selftest"], HERE, 120),
     ("fleet_fileops", ["-m", "fleet.kinds.fileops", "--selftest"], HERE, 120),
     ("fleet_textops", ["-m", "fleet.kinds.textops", "--selftest"], HERE, 120),
+    ("fleet_pdfops", ["-m", "fleet.kinds.pdfops", "--selftest"], HERE, 180),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
@@ -896,14 +897,26 @@ def _select_by_changed(base=None):
 
     # 门禁/映射自身变了：映射不再可信，但**也不该在本地拉全量**。
     # 2026-11-06 主人定：「不要在本地中搞那个什么门禁时间那么长，搞完推上去，从上面检测」。
-    # 所以这里只跑结构面（契约 + 注册表 + 结果信封）+ 按域自测，全量交给远程 CI。
+    # 所以这里只跑结构面（契约 + 注册表 + 结果信封），全量交给远程 CI。
+    #
+    # 🔴 但结构面之外还要加上「改动文件自己对应的项」：改了 run_selftests.py
+    # 常常就是在**加门禁项**，而「加了一条门禁却没跑过它」等于没验证。
+    # 这个漏洞 2026-11-06 实打实地踩了一次：加完 fleet_pdfops 跑 --changed，
+    # 只跑了 3 项结构面，新模块一条断言都没执行。
     meta = {f for f in files
             if os.path.basename(f) in ("run_selftests.py", "gate_map.py",
                                        "check_catalog.py")}
     if meta:
-        print("改的是门禁基础设施（%s）—— 本地只跑结构面，全量交给远程 CI。"
-              "要立刻全量就显式 --all。" % ", ".join(sorted(meta)))
-        keep = [c for c in CASES if c[0] in FASTLANE_CORE]
+        entries = {n: (v or {}).get("entry", "")
+                   for n, v in (data.get("cases") or {}).items()}
+        own = {n for n, e in entries.items() if e and e in set(files)}
+        keep_names = own | set(FASTLANE_CORE)
+        keep = [c for c in CASES if c[0] in keep_names]
+        print("改的是门禁基础设施（%s）—— 跑结构面 %d 项"
+              "%s，全量交给远程 CI。要立刻全量就显式 --all。"
+              % (", ".join(sorted(meta)), len(FASTLANE_CORE),
+                 (" + 改动文件自己的 %d 项（%s）"
+                  % (len(own), "、".join(sorted(own)))) if own else ""))
         return keep, ""
 
     # ---- 纯新增快车道 ----
