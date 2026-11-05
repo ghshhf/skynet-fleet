@@ -70,6 +70,7 @@ from .kinds.persona_device import PersonaDevice
 from .kinds.image_ops import ImageOps
 from .kinds.convert import ConvertDevice
 from .kinds.archive import ArchiveDevice
+from .kinds.fileops import FileOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1289,6 +1290,80 @@ CAPABILITIES = [
                        Param("overwrite", "bool", doc="允许覆盖，默认 false（自动加序号）")),
                side_effect=True,
                note="保留相对结构：打一个目录，解出来还是那个目录，不平铺"),
+    # ---- 本地文件层：找文件、看盘、清重复、批量改名 ----
+    Capability("file.search", "按名字/正则/内容/大小/时间搜文件",
+               params=(Param("root", "str", True, "从哪个目录开始"),
+                       Param("pattern", "str", doc="文件名通配，如 *.jpg，默认 *"),
+                       Param("regex", "str", doc="文件名正则（与 pattern 可叠加）"),
+                       Param("contains", "str", doc="文件内容包含这段文字（只搜 ≤8MB 的）"),
+                       Param("min_size", "str", doc="如 10K / 1.5M，按字节比较"),
+                       Param("max_size", "str", doc="如 100M"),
+                       Param("since", "str", doc="改动时间晚于，如 7d / 2026-01-01"),
+                       Param("until", "str", doc="改动时间早于"),
+                       Param("max_depth", "int", doc="最多往下几层"),
+                       Param("limit", "int", doc="最多返回几条，默认 200"),
+                       Param("include_dirs", "bool", doc="目录也返回，默认只返回文件"),
+                       Param("sort", "str", doc="name（默认）/ size / mtime"),
+                       Param("budget", "float", doc="时间预算秒，默认 15；到点收工"),
+                       Param("ignore", "json", doc="额外跳过的目录名列表"),
+                       Param("follow_links", "bool", doc="跟符号链接/junction，默认不跟")),
+               note="complete=false 表示没搜完（超时或超条数）——别把「没搜完」当成「不存在」"),
+    Capability("file.tree", "目录树 + 每个子树的体积",
+               params=(Param("root", "str", True, "根目录"),
+                       Param("depth", "int", doc="展开几层，默认 2（最多 8）"),
+                       Param("top", "int", doc="最多返回几个节点，默认 15"),
+                       Param("budget", "float", doc="时间预算秒，默认 15"),
+                       Param("ignore", "json", doc="额外跳过的目录名列表")),
+               note="每层带 total_bytes（含子树），用来回答「哪个目录在吃盘」"),
+    Capability("file.dupes", "找重复文件（三级剪枝：大小 → 前 8KB → 全量哈希）",
+               params=(Param("root", "str", True, "从哪个目录开始"),
+                       Param("min_size", "str", doc="小于这个的不管，默认 1K"),
+                       Param("include_empty", "bool", doc="0 字节文件也算，默认不算"),
+                       Param("limit", "int", doc="最多返回几组，默认 100"),
+                       Param("budget", "float", doc="时间预算秒，默认 60"),
+                       Param("ignore", "json", doc="额外跳过的目录名列表")),
+               note="硬链接不算重复（删一个不省空间）；只报不删，删除由调用方决定"),
+    Capability("file.big", "占空间最多的文件（或子目录）",
+               params=(Param("root", "str", True, "从哪个目录开始"),
+                       Param("mode", "str", doc="file（默认，按文件）/ dir（按子目录）"),
+                       Param("top", "int", doc="看前几个，默认 30"),
+                       Param("min_size", "str", doc="小于这个的不管，默认 10M"),
+                       Param("budget", "float", doc="时间预算秒，默认 15"),
+                       Param("ignore", "json", doc="额外跳过的目录名列表")),
+               note="mode=dir 只统计根下第一层子目录，用来快速定位「谁在吃盘」"),
+    Capability("file.recent", "最近改动过的文件",
+               params=(Param("root", "str", True, "从哪个目录开始"),
+                       Param("within", "str", doc="多久以内，默认 7d（也收 24h / 2026-01-01）"),
+                       Param("limit", "int", doc="最多几条，默认 50"),
+                       Param("min_size", "str", doc="小于这个的不管"),
+                       Param("budget", "float", doc="时间预算秒，默认 15"),
+                       Param("ignore", "json", doc="额外跳过的目录名列表")),
+               note="按 mtime 倒序；「我昨天改的那个文件在哪」用它"),
+    Capability("file.rename", "批量改名（正则 / 序号 / 前后缀），默认预演",
+               params=(Param("root", "str", True, "在哪个目录里改（只本层，不递归）"),
+                       Param("mode", "str", doc="regex（默认）/ seq / affix"),
+                       Param("pattern", "str", doc="先按通配筛出候选，默认 *"),
+                       Param("find", "str", doc="mode=regex：要匹配的正则"),
+                       Param("replace", "str", doc="mode=regex：换成什么，可用 \\1 反向引用"),
+                       Param("template", "str",
+                             doc="mode=seq：如 照片_{n:03d}，可用 {name} {n} {ext} {kind}"),
+                       Param("start", "int", doc="mode=seq：起始号，默认 1"),
+                       Param("step", "int", doc="mode=seq：步长，默认 1"),
+                       Param("prefix", "str", doc="mode=affix：加在前面的"),
+                       Param("suffix", "str", doc="mode=affix：加在扩展名之前的"),
+                       Param("dry_run", "bool", doc="**默认 true**，只列计划不动手"),
+                       Param("ignore_case", "bool", doc="默认 true")),
+               side_effect=True,
+               note="目标已存在/同批次重名一律跳过不覆盖；两段式改名，链式 a→b,b→c 不丢文件"),
+    Capability("file.stats", "目录按类型统计：多少张图、多少个视频、各占多少",
+               params=(Param("root", "str", True, "统计哪个目录"),
+                       Param("verify", "bool", doc="逐个读魔数，拆穿改过扩展名的文件"),
+                       Param("budget", "float", doc="时间预算秒，默认 15"),
+                       Param("ignore", "json", doc="额外跳过的目录名列表")),
+               note="verify=true 会慢（每个文件都要开一次），只在怀疑扩展名造假时开"),
+    Capability("file.info", "单个文件/目录的详情：大小、时间、真实类型、硬链接数",
+               params=(Param("path", "str", True, "文件或目录路径"),),
+               note="real_type 读魔数得来；与扩展名矛盾时用 mismatch 标出来"),
     # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
     Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
@@ -1810,6 +1885,10 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 压缩包单独一台：解包是唯一「会把别人准备的文件写进你磁盘」的操作，
     # 安全边界（路径穿越 / 解压炸弹）要能单独收紧，不跟格式转换混在一起。
     reg.add(ArchiveDevice())
+    # 本地文件层：搜 / 树 / 重复 / 大文件 / 最近改动 / 批量改名 / 类型统计。
+    # `file.pull` / `file.push` 是编队节点之间传文件，跟这台不是一回事——
+    # 本地这层此前一直空着，os.walk 散在十几个模块里各写一遍。
+    reg.add(FileOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())
