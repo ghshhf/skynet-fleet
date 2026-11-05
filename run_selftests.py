@@ -1,18 +1,22 @@
 """天网工程 · 一键离线自测。
 
-把仓库里所有「不需要真机、不需要网络」的自测串起来跑，作为每轮改动的门禁。
+把仓库里所有「不需要真机、不需要网络」的自测串起来跑。
 
-  python run_selftests.py --changed         # 【日常用这个】只跑被改动文件波及的项
+**日常入口就是不带参数：`python run_selftests.py`** —— 按改动跑，纯新增只跑结构面
+（契约 / 注册表 / 结果信封）+ 改谁测谁。全量交给远程 CI：push 到 main 自动 4 片并行，
+红了在 Job Summary 里直接写清哪一项、红在哪几行，不用去翻日志。
+
+  python run_selftests.py                   # 【日常】按改动跑，通常几秒
   python run_selftests.py --changed HEAD~1  # 连同与某基线的差异一起算
-  python run_selftests.py video storyboard  # 按名字子串挑（老用法，仍在）
-  python run_selftests.py --all             # 全量（157 项，发布前跑）
+  python run_selftests.py video storyboard  # 按名字子串挑
+  python run_selftests.py --all             # 全量（163 项，24 分钟起步，少用）
   python run_selftests.py --shard 1/4       # 全量的第 1/4 片（CI 矩阵并行用）
   python run_selftests.py --slowest         # 看历史耗时排行，谁在拖后腿
 
 `--changed` 的映射由 `tools/gate_map.py --build` 从代码里推出（入口文件 + import
-闭包），改了哪几个文件就只跑覆盖它们的项 —— 改 `fleet/motion.py` 只需 10 项几十秒，
-不必重跑手机配对和桌面壳。碰上公共模块（`capabilities.py` / `common.py` 这类被
-几十项依赖的）会明说「影响面是全仓级的」，那时才值得补一次 `--all`。
+闭包）。碰上「纯新增」的文件（diff 里一行都没删）不进闭包，只跑结构面 ——
+追加代码动不到已有代码路径，把整圈拉起来是白跑。2026-11-06 实测那笔账：
+43 项 193 秒，对新写的四个模块覆盖率为 0。
 
 任一失败即退出码 1。用便携 python 亦可：/d/tools/python/python.exe run_selftests.py
 """
@@ -858,6 +862,44 @@ def show_slowest(n=15):
     return 0
 
 
+def _write_ci_summary(results, spent, shard=None):
+    """在 GitHub Actions 的 Job Summary 上写一份「哪项红了、红在哪」。
+
+    2026-11-06 主人定：本地不再跑长门禁，改完推上去让远程检测 ——
+    「他能红了基本上也是能提示哪里有问题，还能给你日志呢」。
+    既然如此，远程这份输出就必须自己把话说完：不能只丢一句 exit 1 让人去翻
+    几万行日志里找 `[FAIL]`。所以失败项连同它自己的输出尾巴一起进摘要。
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    passed = sum(1 for r in results if r[1])
+    lines = []
+    head = "门禁分片 %d/%d" % shard if shard else "门禁（本地/全量）"
+    lines.append("## %s：%d/%d 通过" % (head, passed, len(results)))
+    bad = [r for r in results if not r[1]]
+    if not bad:
+        lines.append("")
+        lines.append("全绿，耗时 %.0f 秒。" % sum(spent.values()))
+    else:
+        lines.append("")
+        lines.append("### ❌ 失败 %d 项" % len(bad))
+        for name, _ok, rc, tail in bad:
+            lines.append("")
+            lines.append("<details><summary><code>%s</code>（rc=%s，%.1fs）</summary>"
+                         % (name, rc, spent.get(name, 0.0)))
+            lines.append("")
+            lines.append("```")
+            lines.append((tail or "（无输出）")[-1500:])
+            lines.append("```")
+            lines.append("</details>")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
 def main():
     raw = sys.argv[1:]
     flags = {a.lower() for a in raw if a.startswith("--")}
@@ -866,10 +908,23 @@ def main():
     if "--slowest" in flags:
         return show_slowest()
 
+    # 🔴 默认（不带任何参数）= 按改动跑，而且纯新增只跑结构面。
+    #
+    # 2026-11-06 主人定调：「不要在本地中搞那个什么门禁时间那么长，搞完推上去，
+    # 从上面检测」。所以本地默认**不再**是全量 —— 全量 24 分 45 秒这件事
+    # 交给远程 CI（push 到 main 自动 4 片并行，红了给日志给摘要）。
+    #
+    # 想全量就明说 --all；CI 自己用 --shard，不受这里影响。
+    if not raw:
+        cases, _ = _select_by_changed(None)
+        if cases is not None and not cases:
+            return 0
+    else:
+        cases = None
+
     # --changed [基线]：只跑被改动文件影响到的项。这是日常该用的入口 ——
     # 117 项全量十几分钟，改一行 fleet/motion.py 没必要重跑手机配对。
-    cases = None
-    if "--changed" in flags:
+    if cases is None and "--changed" in flags:
         base = None
         for i, a in enumerate(raw):
             if a == "--changed":
@@ -926,17 +981,18 @@ def main():
                 print("[stderr]", "\n".join(err.strip().splitlines()[-4:]))
             print(f"[{'PASS' if ok else 'FAIL'}] {name} "
                   f"(rc={rc}, {spent[name]:.1f}s)", flush=True)
-            results.append((name, ok))
+            results.append((name, ok, rc, tail))
     finally:
         _restore_states(snap)
         _record_times(spent)
 
-    passed = sum(1 for _, ok in results if ok)
+    passed = sum(1 for r in results if r[1])
     total_s = sum(spent.values())
     print(f"\n=== 结果：{passed}/{len(results)} 通过，耗时 {total_s:.0f}s ===")
+    _write_ci_summary(results, spent, shard)
     if passed != len(results):
         slow = sorted(spent.items(), key=lambda kv: -kv[1])[:3]
-        print("失败项:", ", ".join(n for n, ok in results if not ok))
+        print("失败项:", ", ".join(r[0] for r in results if not r[1]))
         print("这次最慢三项:", ", ".join("%s %.0fs" % kv for kv in slow))
         return 1
     return 0

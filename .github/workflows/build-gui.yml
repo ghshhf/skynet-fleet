@@ -63,11 +63,28 @@ jobs:
           npx playwright install chromium
         working-directory: tools/uicheck
 
+      - name: 慢门禁开关
+        # 本地已经不跑长门禁了（2026-11-06 定），那 t32 就只能在这里跑。
+        # 但它一条约 15 分钟（Playwright 逐个点界面），不能每次 push 都陪跑：
+        # 打 tag 或手动触发时才带上，日常 push 只跑快档。
+        id: slow
+        shell: bash
+        run: |
+          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" \
+             || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "flag=--slow" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 自测（全量门禁，数字见 docs/_stats.json）
         # 不写具体条数：手填必然过期（历史上出现过 52/58/67/74 四个版本并存）。
+        # 失败项连同输出尾巴会写进 Job Summary（见 run_selftests._write_ci_summary），
+        # 所以「红在哪」不用翻日志。
+        timeout-minutes: 60
         env:
           FLEET_PY: python
-        run: python run_selftests.py --shard ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: python run_selftests.py --shard ${{ matrix.shard }}/${{ strategy.job-total }} ${{ steps.slow.outputs.flag }}
 
   build-windows:
     runs-on: windows-latest
