@@ -76,6 +76,8 @@ from .kinds.pdfops import PdfOps
 from .kinds.sheetops import SheetOps
 from .kinds.wordops import WordOps
 from .kinds.pptops import PptOps
+from .live import LiveOps
+from .kinds.aiops import AgentOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1843,6 +1845,108 @@ CAPABILITIES = [
                side_effect=True,
                note="不做「复制页」：deepcopy 的页会复用原 slideN.xml 的 part 名，"
                     "保存后 zip 有重名条目，PowerPoint 会提示修复——如实不做"),
+    # ---- 活状态层：人和 AI 读写同一棵运行态树（2026-11-06 主人提的想法）----
+    # 不是 RPC、不是 MCP、不是 CLI——是把程序当前状态摊开成一块可寻址的活内存，
+    # 谁改谁广播，双方读到的都是同一份。真正的难点不是共享，是「谁赢了」：
+    # 所以每次写入带版本号、写者身份、时间戳，改动进有界事件环。
+    Capability("live.get", "读一格运行态（带版本号与写者身份）",
+               params=(Param("path", "str", True, "路径，如 /jobs/3/progress"),
+                       Param("default", "json", doc="不存在时的默认值")),
+               note="返回 value / version / writer / ts / exists。"
+                    "版本号是做乐观并发的依据"),
+    Capability("live.set", "写一格运行态；带 expect 就是乐观并发，版本不符直接拒",
+               params=(Param("path", "str", True, "路径"),
+                       Param("value", "json", True, "值（必须能 JSON 序列化）"),
+                       Param("writer", "str", doc="谁写的：ai / human / 模块名"),
+                       Param("expect", "int", doc="期望的版本号，不符就报冲突")),
+               side_effect=True,
+               note="🔴 默认不覆盖别人的改动：版本不符抛冲突并告知现在是几，"
+                    "绝不当没看见。这是共享状态里最容易被忽略、也最贵的错误"),
+    Capability("live.del", "删一格（连带清掉这一支的版本记录）",
+               params=(Param("path", "str", True, "路径"),
+                       Param("writer", "str", doc="谁删的")),
+               side_effect=True,
+               note="删不存在的返回 deleted=false 而不是报错——幂等，重复调用安全"),
+    Capability("live.list", "列某个前缀下所有叶子（带版本、写者、类型）",
+               params=(Param("prefix", "str", doc="前缀，默认整棵树"),),
+               note="大树上会很长；只看结构用 live.snapshot，别用这个"),
+    Capability("live.events", "读事件环：谁在什么时刻改了哪一格",
+               params=(Param("since", "int", doc="从这个 seq 之后开始"),
+                       Param("prefix", "str", doc="只看这个前缀"),
+                       Param("limit", "int", doc="最多几条，默认 200")),
+               note="配合 live.watch 返回的 seq 做增量拉取；这是跨进程的「推送」形态"),
+    Capability("live.snapshot", "整树概览（默认不带内容，full=true 才带）",
+               params=(Param("full", "bool", doc="要不要整棵树")),
+               note="默认剥掉 root：树一大就很沉，塞进上下文没意义"),
+    Capability("live.tx", "批量写多格（先全部校验再全部落盘）",
+               params=(Param("items", "json", True, "数组，每项 {path, value, expect?}"),
+                       Param("writer", "str", doc="谁写的")),
+               side_effect=True,
+               note="⚠️ 不是事务：校验失败时一格都不写（这点是原子的），"
+                    "但不做回滚——要回滚得整树快照，代价太大，如实不做"),
+    Capability("live.watch", "登记一个关注点，拿当前 seq 当锚点",
+               params=(Param("prefix", "str", doc="关注的前缀")),
+               side_effect=True,
+               note="能力调用是同步的，推不了。真正的实时回调走 Python 的 "
+                    "live.watch(prefix, cb)；跨进程用返回的 seq 配 live.events"),
+    Capability("live.dump", "把快照原子写盘（先写 .tmp 再替换，读的人看不到半截）",
+               params=(Param("out", "str", True, "快照文件路径"),),
+               side_effect=True),
+    Capability("live.load", "从快照文件灌回活树（启动恢复 / 跨进程对齐）",
+               params=(Param("path", "str", True, "快照文件路径"),
+                       Param("writer", "str", doc="记成谁灌的，默认 load")),
+               side_effect=True),
+    # ---- AI 代理层：把本机 codex CLI 接成能力（2026-11-06）----
+    # 主人原话：「本质的话你就把它当一个智能体去调就行了」「真实的智能体是有写入权限，
+    # 是能调用工具，因为它本身是有命令行」⇒ 这层不做权限收敛，只做调用与记录。
+    Capability("agent.status", "通道体检：codex CLI / 本地网关端口 / 代理 / 在跑任务数",
+               note="出问题先跑这个，别靠猜。网关没起会直接给启动命令"),
+    Capability("agent.models", "列本地网关可用的模型清单",
+               note="key 从 ~/.codex/auth.json 取（ofm- 开头，不是 sk-）"),
+    Capability("agent.whoami", "当前用的是哪条通道、哪个模型",
+               note="读 ~/.codex/config.toml 的 model_provider 与 model"),
+    Capability("agent.ask", "问一句（只读沙箱，纯问答不动磁盘）",
+               params=(Param("q", "str", True, "问题"),
+                       Param("model", "str", doc="指定模型，默认用配置里的"),
+                       Param("cwd", "str", doc="工作目录（它可能要看代码）"),
+                       Param("timeout", "float", doc="秒，默认 300")),
+               side_effect=True,
+               note="回答已剥掉 codex 的版本头噪音；同时回报 tokens 与耗时"),
+    Capability("agent.exec", "派活：让智能体在当前目录里读代码、改文件、跑命令",
+               params=(Param("prompt", "str", True, "任务描述"),
+                       Param("cwd", "str", doc="工作目录"),
+                       Param("model", "str", doc="指定模型"),
+                       Param("readonly", "bool", doc="true 才收窄成只读，默认全权限"),
+                       Param("timeout", "float", doc="秒，默认 900")),
+               side_effect=True,
+               note="🔴 默认全权限：命令行本身就是权限边界，这层不再套一层预演确认。"
+                    "实测 49 秒能把 hello.py 真写出来"),
+    Capability("agent.gpt", "直调 AgentRouter（比免费车道强，按美元计费，走代理）",
+               params=(Param("prompt", "str", True, "问题"),
+                       Param("model", "str", doc="gpt-6.1-sol（默认）/ gpt-6-astra / gpt-5.6-sol"),
+                       Param("max_tokens", "int", doc="默认 10 万；给少了会被推理吃光变成空回复"),
+                       Param("timeout", "float", doc="秒，默认 300")),
+               side_effect=True,
+               note="这站有三道暗门：必须伪装 UA、只走 /v1/responses、"
+                    "中文长句易被内容审核拦（英文技术提问正常）"),
+    Capability("agent.spawn", "后台派长活，进度实时写进 live 树",
+               params=(Param("prompt", "str", True, "任务描述"),
+                       Param("cwd", "str", doc="工作目录"),
+                       Param("model", "str", doc="指定模型"),
+                       Param("readonly", "bool", doc="true 才只读")),
+               side_effect=True,
+               note="状态路径 /ai/jobs/<id>/：status / pid / elapsed / tail / exit_code。"
+                    "人和 AI 读同一份，谁都不等谁返回"),
+    Capability("agent.jobs", "列所有后台任务及其实时状态",
+               note="running / done / failed，带耗时与任务描述"),
+    Capability("agent.log", "读某个后台任务的输出尾部",
+               params=(Param("job", "str", True, "任务 id"),
+                       Param("bytes", "int", doc="读多少字节，默认 4000")),
+               note="只读尾部，不读全文件——长任务日志可能几十兆"),
+    Capability("agent.kill", "杀掉后台任务（连子孙进程一起，不留孤儿）",
+               params=(Param("job", "str", True, "任务 id"),),
+               side_effect=True, destructive=True,
+               note="Windows 走 taskkill /F /T；已结束的报 already 而不是报错"),
     # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
     Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
@@ -2383,6 +2487,12 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 真正每天要用的是「写」：一个模板 + 一份数据 → 一百份成品。
     reg.add(WordOps())
     reg.add(PptOps())
+    # 活状态层：以上所有设备都是「调用—返回」，只有这层是「共享一块活内存」。
+    # 人和 AI 读写同一棵树，改完对方下一次读立刻看见。
+    reg.add(LiveOps())
+    # AI 代理层：本机 codex CLI 本身就是个有写权限、能调工具的智能体，
+    # 这层只是把它接进总线，省掉每次手敲命令与摸通道。
+    reg.add(AgentOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())
