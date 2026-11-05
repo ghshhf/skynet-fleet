@@ -26,6 +26,7 @@ macOS/Linux **明确不支持**：本实现只用 Win32（user32）与 PowerShel
 不许静默返回空。
 """
 import ctypes
+import json
 import os
 import platform
 import shutil
@@ -60,6 +61,8 @@ CAPS = (
     "pcctl.window",
     "pcctl.mouse",
     "pcctl.input",
+    "pcctl.gesture",
+    "pcctl.screen",
     "pcctl.clipboard.write",
     "pcctl.proc.kill",
 )
@@ -98,6 +101,7 @@ _MOUSEEVENTF_RIGHTDOWN = 0x0008
 _MOUSEEVENTF_RIGHTUP = 0x0010
 _MOUSEEVENTF_MIDDLEDOWN = 0x0020
 _MOUSEEVENTF_MIDDLEUP = 0x0040
+_MOUSEEVENTF_WHEEL = 0x0800
 
 
 # ================================================================ 最低层出口
@@ -202,26 +206,103 @@ def _mouse_move(x, y):
         return False, "移动鼠标失败：%s" % e
 
 
-def _mouse_click(x, y, button="left", clicks=1):
-    """在 (x, y) 点一下。返回 (ok, reason, actions)。"""
+def _btn_codes(button):
+    b = str(button or "left").lower()
+    if b == "right":
+        return _MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP
+    if b == "middle":
+        return _MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP
+    return _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP
+
+
+def _mouse_click(x, y, button="left", clicks=1, gap_ms=60):
+    """在 (x, y) 点一下（或连点）。返回 (ok, reason, actions)。
+
+    `gap_ms` 不是装饰：双击两次 down/up 之间没间隔，很多程序（资源管理器、
+    浏览器）根本不认成双击，只会当成两次单击——表现是「点了但没打开」。
+    """
     acts = []
     try:
         user32 = _ctypes_load("user32")
         user32.SetCursorPos(int(x), int(y))
         acts.append("move(%d,%d)" % (int(x), int(y)))
-        if button == "right":
-            down, up = _MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP
-        elif button == "middle":
-            down, up = _MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP
-        else:
-            down, up = _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP
-        for _ in range(max(1, int(clicks))):
+        down, up = _btn_codes(button)
+        n = max(1, int(clicks))
+        for i in range(n):
             user32.mouse_event(down, 0, 0, 0, 0)
             user32.mouse_event(up, 0, 0, 0, 0)
             acts.append("%s click" % button)
+            if i < n - 1 and gap_ms:
+                time.sleep(max(1, int(gap_ms)) / 1000.0)
         return True, "", acts
     except Exception as e:
         return False, "点击失败：%s" % e, acts
+
+
+def _mouse_button(x, y, button="left", down=True):
+    """只按下或只抬起。长按、拖拽、框选都要靠这一对拼出来。"""
+    try:
+        user32 = _ctypes_load("user32")
+        if x is not None and y is not None:
+            user32.SetCursorPos(int(x), int(y))
+        dn, up = _btn_codes(button)
+        user32.mouse_event(dn if down else up, 0, 0, 0, 0)
+        return True, "", ["%s %s" % (button, "down" if down else "up")]
+    except Exception as e:
+        return False, "鼠标按键失败：%s" % e, []
+
+
+def _mouse_drag(x1, y1, x2, y2, button="left", steps=12, duration_ms=300):
+    """从 (x1,y1) 拖到 (x2,y2)。
+
+    为什么不是「按下 → 瞬间移动 → 松开」：很多程序靠**移动过程中的中间点**
+    判断这是拖拽还是点击（尤其是画布、拖拽排序、滑块）。一步跳到终点，
+    程序看到的是「按下时在 A，松开时在 B，中间没动过」——直接忽略。
+    所以这里按步插值，每步之间留时间。
+    """
+    acts = []
+    try:
+        user32 = _ctypes_load("user32")
+        user32.SetCursorPos(int(x1), int(y1))
+        acts.append("move(%d,%d)" % (int(x1), int(y1)))
+        dn, up = _btn_codes(button)
+        user32.mouse_event(dn, 0, 0, 0, 0)
+        acts.append("%s down" % button)
+        n = max(2, int(steps))
+        sleep_s = max(0, int(duration_ms)) / 1000.0 / n
+        for i in range(1, n + 1):
+            cx = int(round(x1 + (x2 - x1) * i / n))
+            cy = int(round(y1 + (y2 - y1) * i / n))
+            user32.SetCursorPos(cx, cy)
+            if sleep_s:
+                time.sleep(sleep_s)
+        acts.append("move->(%d,%d) x%d" % (int(x2), int(y2), n))
+        user32.mouse_event(up, 0, 0, 0, 0)
+        acts.append("%s up" % button)
+        return True, "", acts
+    except Exception as e:
+        # 拖到一半出错必须把键抬起来，否则整个系统会卡在「按住」状态
+        try:
+            _mouse_button(x2, y2, button, down=False)
+        except Exception:
+            pass
+        return False, "拖拽失败：%s" % e, acts
+
+
+def _mouse_scroll(x, y, delta):
+    """滚轮。delta 正数向上、负数向下，一格 = 120。
+
+    传「几格」比传「原始 delta」好懂：调用方写 -3 就是往下滚三格。
+    """
+    try:
+        user32 = _ctypes_load("user32")
+        if x is not None and y is not None:
+            user32.SetCursorPos(int(x), int(y))
+        amount = int(delta) * 120
+        user32.mouse_event(_MOUSEEVENTF_WHEEL, 0, 0, amount & 0xFFFFFFFF, 0)
+        return True, "", ["scroll %+d 格 @(%s,%s)" % (int(delta), x, y)]
+    except Exception as e:
+        return False, "滚轮失败：%s" % e, []
 
 
 def _key_combo(spec):
@@ -345,6 +426,52 @@ def _clipboard_set(text):
     if rc != 0:
         return False, "写剪贴板失败：%s" % (err or "").strip()[:200]
     return True, ""
+
+
+def _screen_info():
+    """屏幕几何：分辨率、DPI 缩放、多显示器边界、光标位置。返回 (info, reason)。
+
+    为什么要有它：手机通过看图来操控这台电脑，看到的是**缩放过的截图**。
+    用户点的是「图上第 300 像素」，屏幕真实坐标可能是 600（缩了 50%）。
+    没有这个换算，屏幕越大点得越偏——这是远程操控最容易踩、又最难自查的坑。
+    """
+    if not _is_windows():
+        return None, "只支持 Windows（当前 %s）" % (os.name or "未知")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+        "$dpi=96;"
+        "try{Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;"
+        "public class DpiX{[DllImport(\"user32.dll\")]public static extern int GetDpiForSystem();}' "
+        "-ErrorAction Stop; $dpi=[DpiX]::GetDpiForSystem()}catch{};"
+        "$ss=@();foreach($x in [System.Windows.Forms.Screen]::AllScreens){"
+        "$ss+=@{device=$x.DeviceName;primary=$x.Primary;x=$x.Bounds.X;y=$x.Bounds.Y;"
+        "w=$x.Bounds.Width;h=$x.Bounds.Height}};"
+        "$v=[System.Windows.Forms.SystemInformation]::VirtualScreen;"
+        "$c=[System.Windows.Forms.Cursor]::Position;"
+        "@{dpi=$dpi;scale=[math]::Round($dpi/96.0,3);screens=$ss;"
+        "virtual=@{x=$v.X;y=$v.Y;w=$v.Width;h=$v.Height};"
+        "cursor=@{x=$c.X;y=$c.Y}} | ConvertTo-Json -Depth 6 -Compress"
+    )
+    rc, out, err = _ps(script, timeout=25)
+    if rc != 0 or not out:
+        return None, (err or "读不到屏幕信息")[:200]
+    try:
+        data = json.loads(out)
+    except Exception as e:
+        return None, "屏幕信息不是 JSON：%s" % e
+    screens = data.get("screens") or []
+    if isinstance(screens, dict):
+        screens = [screens]
+    dpi = data.get("dpi") or 96
+    data["screens"] = [{
+        "device": s.get("device"), "primary": bool(s.get("primary")),
+        "x": s.get("x"), "y": s.get("y"), "w": s.get("w"), "h": s.get("h"),
+    } for s in screens]
+    data["scale"] = round(float(dpi) / 96.0, 3)
+    data["dpi"] = dpi
+    data["primary"] = next((s for s in data["screens"] if s["primary"]),
+                           (data["screens"] or [None])[0])
+    return data, ""
 
 
 def _list_windows():
@@ -608,13 +735,32 @@ class PcControl(BaseDevice):
         ok, reason = _screen_capture(path)
         if not ok:
             return R.error("pcctl.screenshot", reason, device=self.name, via=self.via)
+        scr, _ = _screen_info()
         return R.success("pcctl.screenshot", self.name, via=self.via, data={
             "path": path,
             "bytes": (os.path.getsize(path) if os.path.isfile(path) else 0),
+            "screen": scr,
             "risk": RISK_LOW,
             "reversible": True,
-            "note": "截图是「看」不是「改」。" + INJECT_DEFENSE,
+            "note": "截图是「看」不是「改」。" + INJECT_DEFENSE
+                    + " 截图可能是缩过的：按 screen.scale 把看到的坐标换算回屏幕坐标再点。",
         })
+
+    def _do_screen(self, args):
+        """屏幕几何：分辨率、DPI 缩放、多显示器边界、光标位置。
+
+        为什么必须能查：手机看电脑屏幕时，传输的图是缩放过的（省流量），
+        手机用户点的是**缩放图上的位置**。不做换算直接拿那个像素去点，
+        屏幕越大偏得越离谱——1920 宽的屏缩到 960 显示，点右边会点到中间。
+        """
+        info, reason = _screen_info()
+        if info is None:
+            return R.error("pcctl.screen", reason, device=self.name, via=self.via)
+        info["risk"] = RISK_LOW
+        info["reversible"] = True
+        info["note"] = ("点之前先按 scale 换算：屏幕坐标 = 图上坐标 / scale。"
+                        "多显示器时还得分清目标在哪个屏。")
+        return R.success("pcctl.screen", self.name, via=self.via, data=info)
 
     def _do_look(self, args):
         """看这一屏：截图 → 缩略 → 视觉模型 → 结构化观察。
@@ -735,8 +881,59 @@ class PcControl(BaseDevice):
     def _do_mouse(self, args):
         action = str(args.get("action") or "").strip().lower()
         x, y = args.get("x"), args.get("y")
+        button = str(args.get("button") or "left")
+
+        # 滚轮不需要坐标（缺省就滚在当前光标处），先处理掉
+        if action == "scroll":
+            delta = args.get("delta")
+            if delta is None:
+                delta = args.get("clicks")
+            ok, reason, acts = _mouse_scroll(x, y, int(delta or -3))
+            if not ok:
+                return R.error("pcctl.mouse", reason, device=self.name, via=self.via)
+            return R.success("pcctl.mouse", self.name, via=self.via, side_effect=True,
+                             data={"action": "scroll", "delta": int(delta or -3),
+                                   "actions": acts, "risk": RISK_LOW, "reversible": True})
+
+        # 拖拽：起点 from=[x1,y1]，终点 to=[x2,y2]；也接受 x1/y1/x2/y2
+        if action == "drag":
+            frm = args.get("from") or [x, y]
+            to = args.get("to") or [args.get("x2"), args.get("y2")]
+            try:
+                x1, y1 = int(frm[0]), int(frm[1])
+                x2, y2 = int(to[0]), int(to[1])
+            except Exception:
+                return R.error("pcctl.mouse",
+                               "drag 需要 from=[x1,y1] 与 to=[x2,y2]",
+                               device=self.name, via=self.via)
+            ok, reason, acts = _mouse_drag(
+                x1, y1, x2, y2, button=button,
+                steps=int(args.get("steps") or 12),
+                duration_ms=int(args.get("duration_ms") or 300))
+            if not ok:
+                return R.error("pcctl.mouse", reason, device=self.name, via=self.via)
+            return R.success("pcctl.mouse", self.name, via=self.via, side_effect=True,
+                             data={"action": "drag", "from": [x1, y1], "to": [x2, y2],
+                                   "button": button, "actions": acts,
+                                   "risk": RISK_MEDIUM, "reversible": False,
+                                   "reversible_note": "不可逆：拖过去的东西已经移位了"})
+
+        # 单独按下 / 抬起：给长按与自定义拖拽用
+        if action in ("down", "up"):
+            ok, reason, acts = _mouse_button(x, y, button=button, down=(action == "down"))
+            if not ok:
+                return R.error("pcctl.mouse", reason, device=self.name, via=self.via)
+            return R.success("pcctl.mouse", self.name, via=self.via, side_effect=True,
+                             data={"action": action, "x": x, "y": y, "button": button,
+                                   "actions": acts, "risk": RISK_MEDIUM,
+                                   "reversible": action == "down",
+                                   "reversible_note": ("按住了还没松，记得再发一次 up，"
+                                                       "否则系统一直处于按住状态"
+                                                       if action == "down" else "")})
+
         if x is None or y is None:
             return R.error("pcctl.mouse", "没给坐标（x 与 y）", device=self.name, via=self.via)
+
         if action == "move":
             ok, reason = _mouse_move(x, y)
             if not ok:
@@ -745,10 +942,13 @@ class PcControl(BaseDevice):
                              data={"action": "move", "x": x, "y": y,
                                    "risk": RISK_MEDIUM, "reversible": True,
                                    "reversible_note": "再移到别处即可（可逆）"})
-        if action == "click":
-            button = str(args.get("button") or "left")
-            clicks = int(args.get("clicks") or 1)
-            ok, reason, acts = _mouse_click(x, y, button=button, clicks=clicks)
+
+        if action in ("click", "double_click", "doubleclick", "dblclick", ""):
+            # double_click 是 click 的语义化写法——clicks=2，且中间留间隔
+            clicks = 2 if action in ("double_click", "doubleclick", "dblclick") \
+                else int(args.get("clicks") or 1)
+            ok, reason, acts = _mouse_click(x, y, button=button, clicks=clicks,
+                                            gap_ms=int(args.get("gap_ms") or 60))
             if not ok:
                 return R.error("pcctl.mouse", reason, device=self.name, via=self.via)
             return R.success("pcctl.mouse", self.name, via=self.via, side_effect=True,
@@ -756,8 +956,102 @@ class PcControl(BaseDevice):
                                    "clicks": clicks, "actions": acts,
                                    "risk": RISK_MEDIUM, "reversible": False,
                                    "reversible_note": "不可逆：点下去的事没法撤销"})
-        return R.error("pcctl.mouse", "未知 action=%r（可用 move/click）" % action,
+
+        return R.error("pcctl.mouse",
+                       "未知 action=%r（可用 move/click/double_click/drag/scroll/down/up）" % action,
                        device=self.name, via=self.via)
+
+    def _do_gesture(self, args):
+        """一串动作一次做完：点开菜单 → 拖到目标 → 键入 → 回车。
+
+        为什么需要它：单步调用要来回好几轮，中间任何一步的时序都靠调用方猜
+        （比如「点完等菜单弹出来再点下一项」）。这里把等待写进序列，一次下发。
+
+        失败即停：中间某步没成功，后面的步骤在错误状态上继续做只会更糟。
+        """
+        steps = args.get("steps") or args.get("actions")
+        if isinstance(steps, str):
+            try:
+                steps = json.loads(steps)
+            except Exception as e:
+                return R.error("pcctl.gesture", "steps 不是合法 JSON：%s" % e,
+                               device=self.name, via=self.via)
+        if not isinstance(steps, list) or not steps:
+            return R.error("pcctl.gesture",
+                           "需要 steps（动作数组），例如 "
+                           '[{"do":"click","x":10,"y":20},{"do":"wait","ms":300}]',
+                           device=self.name, via=self.via)
+        if len(steps) > 50:
+            return R.error("pcctl.gesture", "一次最多 50 步（现在 %d）" % len(steps),
+                           device=self.name, via=self.via)
+
+        stop_on_error = args.get("stop_on_error", True)
+        receipts, failed = [], 0
+        for idx, st in enumerate(steps):
+            if not isinstance(st, dict):
+                receipts.append({"i": idx, "ok": False, "err": "这一步不是对象"})
+                failed += 1
+                if stop_on_error:
+                    break
+                continue
+            op = str(st.get("do") or st.get("action") or "").lower()
+            try:
+                if op == "wait":
+                    ms = int(st.get("ms") or st.get("duration_ms") or 300)
+                    time.sleep(max(0, min(ms, 10000)) / 1000.0)
+                    receipts.append({"i": idx, "do": "wait", "ok": True, "ms": ms})
+                    continue
+                if op in ("click", "double_click", "doubleclick"):
+                    clicks = 2 if op != "click" else int(st.get("clicks") or 1)
+                    ok, reason, acts = _mouse_click(
+                        st.get("x"), st.get("y"), button=st.get("button") or "left",
+                        clicks=clicks, gap_ms=int(st.get("gap_ms") or 60))
+                elif op == "move":
+                    ok, reason = _mouse_move(st.get("x"), st.get("y"))
+                    acts = ["move"]
+                elif op == "drag":
+                    frm, to = st.get("from") or [], st.get("to") or []
+                    ok, reason, acts = _mouse_drag(
+                        int(frm[0]), int(frm[1]), int(to[0]), int(to[1]),
+                        button=st.get("button") or "left",
+                        steps=int(st.get("steps") or 12),
+                        duration_ms=int(st.get("duration_ms") or 300))
+                elif op == "scroll":
+                    ok, reason, acts = _mouse_scroll(
+                        st.get("x"), st.get("y"),
+                        int(st.get("delta") if st.get("delta") is not None else -3))
+                elif op in ("down", "up"):
+                    ok, reason, acts = _mouse_button(
+                        st.get("x"), st.get("y"), st.get("button") or "left",
+                        down=(op == "down"))
+                elif op == "key":
+                    ok, reason, acts = _key_combo(str(st.get("keys") or st.get("key") or ""))
+                elif op == "text":
+                    ok, reason, acts = _type_text(str(st.get("text") or ""))
+                else:
+                    ok, reason, acts = False, "未知动作 %r" % op, []
+            except Exception as e:
+                ok, reason, acts = False, "%s: %s" % (type(e).__name__, e), []
+
+            receipts.append({"i": idx, "do": op, "ok": ok,
+                             "actions": acts[:6], "err": reason or ""})
+            if not ok:
+                failed += 1
+                if stop_on_error:
+                    break
+            # 步间默认留 120ms：太快的话程序还没响应完就轮到下一步
+            gap = int(st.get("gap_ms", args.get("gap_ms", 120)))
+            if gap and idx < len(steps) - 1:
+                time.sleep(max(0, min(gap, 5000)) / 1000.0)
+
+        done = len(receipts)
+        return R.success("pcctl.gesture", self.name, via=self.via, side_effect=True,
+                         data={"steps": len(steps), "executed": done,
+                               "ok_steps": done - failed, "failed": failed,
+                               "stopped_early": stop_on_error and failed > 0 and done < len(steps),
+                               "receipts": receipts,
+                               "risk": RISK_MEDIUM, "reversible": False,
+                               "reversible_note": "整串动作做完就没法整体撤销（每一步要单独回滚）"})
 
     def _do_input(self, args):
         action = str(args.get("action") or "").strip().lower()

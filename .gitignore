@@ -182,3 +182,6 @@ github_runner/nf/_harvested.json
 github_runner/nf/_visited.db*
 # 对端同步来的人格快照（源包在 personas/ 下，这个是带日期的整包拷贝）
 personas/_peer-*/
+
+# 运行时状态目录：挂载表、persona 状态、临时截图等，都不入库
+var/

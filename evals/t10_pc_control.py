@@ -46,9 +46,10 @@ from fleet.catalog import build                # noqa: E402
 from fleet.core import result as R             # noqa: E402
 
 READ_CAPS = ("pcctl.screenshot", "pcctl.windows", "pcctl.clipboard.read",
-             "pcctl.proc.list", "pcctl.sysinfo")
+             "pcctl.proc.list", "pcctl.sysinfo", "pcctl.screen")
 ACT_CAPS = ("pcctl.app.launch", "pcctl.window", "pcctl.mouse",
-            "pcctl.input", "pcctl.clipboard.write", "pcctl.proc.kill")
+            "pcctl.input", "pcctl.clipboard.write", "pcctl.proc.kill",
+            "pcctl.gesture")
 #: 第三档（2026-10-28）：**看，但看的东西会出本机**。
 #: 为什么不并进 READ_CAPS：它确实不改这台机器，但截图要送视觉模型 →
 #: 屏幕内容离开本地。并进只读档就等于把「外发」登记成了「只读」，
@@ -309,7 +310,9 @@ for name in ACT_CAPS:
     GATE_LEVELS.clear()
     CALLS.clear()
     args = {"target": "notepad.exe", "hwnd": 1001, "x": 10, "y": 20,
-            "keys": "ctrl+c", "text": "你好", "pid": 4321}
+            "keys": "ctrl+c", "text": "你好", "pid": 4321,
+            # gesture 要的是动作序列；给一步纯等待，既能验证放行后真跑，又不碰任何东西
+            "steps": [{"do": "wait", "ms": 5}]}
     if name in ACTION_FOR:
         args["action"] = ACTION_FOR[name]
     r = reg.call(name, args=args, gate=gate_yes)
