@@ -114,6 +114,42 @@ AR_UA_CLI = "claude-cli/2.1.150 (external, cli)"
 _JOB_LOCK = threading.Lock()
 _JOBS = {}          # jid -> {"proc": Popen, "file": str, "started": float, "args": dict}
 
+# 🔴 任务表不能只放内存：主人要「我也能看状态」，而我一开另一个终端就什么都看不到。
+# 所以每次状态变化都落一份盘；`agent.jobs` 读的是「盘上 + 内存」的并集。
+# 落盘用 .tmp + os.replace，读的人永远不会拿到半截 JSON。
+JOB_FILE = os.path.expanduser("~/.fleet/agent_jobs.json")
+_FILE_LOCK = threading.Lock()
+
+
+def _job_load():
+    try:
+        with open(JOB_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _job_save(jid, rec):
+    """把一条任务状态写盘。失败不影响任务本身——记录丢了也不能让活停掉。"""
+    with _FILE_LOCK:
+        data = _job_load()
+        cur = data.get(jid) or {}
+        cur.update(rec)
+        data[jid] = cur
+        # 只留最近 200 条，免得文件无限长
+        if len(data) > 200:
+            for k in sorted(data, key=lambda x: data[x].get("started") or 0)[:-200]:
+                data.pop(k, None)
+        tmp = JOB_FILE + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(JOB_FILE), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, JOB_FILE)
+        except OSError:
+            pass
+
 
 def _env_with_proxy():
     e = dict(os.environ)
@@ -476,6 +512,11 @@ class AgentOps(BaseDevice):
             "prompt": str(p)[:500],
             "readonly": readonly, "started": time.time(), "elapsed": 0.0,
         })
+        _job_save(jid, {"status": "running", "pid": proc.pid,
+                        "model": a.get("model") or os.environ.get("FLEET_AR_MODEL", "gpt-6.1-sol"),
+                        "cwd": a.get("cwd") or os.getcwd(),
+                        "prompt": str(p)[:500], "readonly": readonly,
+                        "log": outp, "started": time.time(), "elapsed": 0.0})
         t = threading.Thread(target=self._watch, args=(jid,), daemon=True)
         t.start()
         return {"job": jid, "pid": proc.pid,
@@ -510,6 +551,7 @@ class AgentOps(BaseDevice):
                 last_beat = now
                 self._live_tx(jid, {"elapsed": elapsed,
                                     "tail": _tail_file(outp, 2000)})
+                _job_save(jid, {"status": "running", "elapsed": elapsed})
             if rc is not None:
                 break
             time.sleep(0.4)
@@ -529,66 +571,110 @@ class AgentOps(BaseDevice):
             "tail": raw[-2000:],
             "ended": time.time(),
         })
+        _job_save(jid, {"status": "done" if rc == 0 else "failed",
+                        "exit_code": rc,
+                        "elapsed": round(time.time() - job["started"], 1),
+                        "tokens": _parse_tokens(full_tail) or _parse_tokens(raw),
+                        "reply": _parse_reply(full_tail)[-1500:],
+                        "tail": raw[-2000:], "ended": time.time()})
 
     def _jobs(self, a):
-        rows = []
+        """列任务：内存里的活任务 + 盘上的历史，按 jid 去重。
+
+        🔴 盘上那份不是缓存，是「人开另一个终端也能看」的唯一依据。
+        只读内存的话，换个进程就一片空白，等于没做共享。
+        """
+        disk = _job_load()
         with _JOB_LOCK:
-            items = list(_JOBS.items())
-        for jid, job in items:
-            proc = job["proc"]
-            rc = proc.poll()
+            items = dict(_JOBS)
+
+        rows = []
+        for jid, rec in disk.items():
+            if jid in items:
+                continue                      # 内存里的更新，下面统一出
+            st = rec.get("status") or "unknown"
+            el = rec.get("elapsed")
+            if st == "running" and rec.get("started"):
+                el = round(time.time() - rec["started"], 1)
+            rows.append({"job": jid, "state": st, "pid": rec.get("pid"),
+                         "elapsed": el, "prompt": (rec.get("prompt") or "")[:80],
+                         "model": rec.get("model"), "log": rec.get("log")})
+
+        for jid, job in items.items():
+            rc = job["proc"].poll()
             rows.append({
                 "job": jid,
                 "state": "running" if rc is None else ("done" if rc == 0 else "failed"),
-                "pid": proc.pid,
+                "pid": job["proc"].pid,
                 "elapsed": round(time.time() - job["started"], 1),
                 "prompt": job["args"].get("prompt", "")[:80],
+                "model": job["args"].get("model"),
                 "log": job["file"],
             })
-        rows.sort(key=lambda r: r["elapsed"])
+
+        rows.sort(key=lambda r: r.get("elapsed") or 0)
         return {"count": len(rows),
                 "running": sum(1 for r in rows if r["state"] == "running"),
                 "jobs": rows}
 
     def _log(self, a):
         jid = a.get("job")
+        nbytes = int(a.get("bytes", 4000))
         with _JOB_LOCK:
             job = _JOBS.get(jid) if jid else None
-        if not job:
-            return R.error("agent.log", "没有这个任务：%r（先 ai.jobs 看有哪些）" % jid,
+        if job:
+            rc = job["proc"].poll()
+            return {"job": jid,
+                    "state": "running" if rc is None else ("done" if rc == 0 else "failed"),
+                    "exit_code": rc,
+                    "elapsed": round(time.time() - job["started"], 1),
+                    "tail": _tail_file(job["file"], nbytes),
+                    "log": job["file"]}
+        rec = _job_load().get(jid) if jid else None
+        if not rec:
+            return R.error("agent.log", "没有这个任务：%r（先 agent.jobs 看有哪些）" % jid,
                            device=self.name)
-        rc = job["proc"].poll()
-        return {"job": jid,
-                "state": "running" if rc is None else ("done" if rc == 0 else "failed"),
-                "exit_code": rc,
-                "elapsed": round(time.time() - job["started"], 1),
-                "tail": _tail_file(job["file"], int(a.get("bytes", 4000))),
-                "log": job["file"]}
+        return {"job": jid, "state": rec.get("status"),
+                "exit_code": rec.get("exit_code"), "elapsed": rec.get("elapsed"),
+                "tail": _tail_file(rec.get("log") or "", nbytes),
+                "log": rec.get("log")}
 
     def _kill(self, a):
         jid = a.get("job")
         with _JOB_LOCK:
             job = _JOBS.get(jid) if jid else None
-        if not job:
-            return R.error("agent.kill", "没有这个任务：%r" % jid, device=self.name)
-        proc = job["proc"]
-        if proc.poll() is not None:
-            return {"job": jid, "already": True, "exit_code": proc.returncode}
+        if job:
+            proc = job["proc"]
+            if proc.poll() is not None:
+                return {"job": jid, "already": True, "exit_code": proc.returncode}
+            pid = proc.pid
+        else:
+            rec = _job_load().get(jid) if jid else None
+            if not rec:
+                return R.error("agent.kill", "没有这个任务：%r" % jid, device=self.name)
+            if rec.get("status") != "running" or not rec.get("pid"):
+                return {"job": jid, "already": True, "exit_code": rec.get("exit_code")}
+            pid = rec["pid"]
+
         try:
             if os.name == "nt":
                 # /T 连子孙进程一起杀，否则 codex 拉起的子进程会变孤儿
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                timeout=15)
+            elif job:
+                job["proc"].terminate()
             else:
-                proc.terminate()
+                os.kill(pid, 15)
         except Exception:                                # noqa: BLE001
-            try:
-                proc.kill()
-            except Exception:                            # noqa: BLE001
-                pass
+            if job:
+                try:
+                    job["proc"].kill()
+                except Exception:                        # noqa: BLE001
+                    pass
         self._live_tx(jid, {"status": "killed", "ended": time.time()})
-        return {"job": jid, "killed": True, "pid": proc.pid}
+        _job_save(jid, {"status": "killed", "ended": time.time()})
+        return {"job": jid, "killed": True, "pid": pid}
 
 
 # ---------------------------------------------------------------- 自测
