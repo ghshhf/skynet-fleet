@@ -71,6 +71,7 @@ from .kinds.image_ops import ImageOps
 from .kinds.convert import ConvertDevice
 from .kinds.archive import ArchiveDevice
 from .kinds.fileops import FileOps
+from .kinds.textops import TextOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -1364,6 +1365,84 @@ CAPABILITIES = [
     Capability("file.info", "单个文件/目录的详情：大小、时间、真实类型、硬链接数",
                params=(Param("path", "str", True, "文件或目录路径"),),
                note="real_type 读魔数得来；与扩展名矛盾时用 mismatch 标出来"),
+    # ---- 文本层：编码是中文 Windows 上每天都在踩的坑 ----
+    Capability("text.encoding", "这文件到底是什么编码（给证据不给结论）",
+               params=(Param("path", "str", True, "文件路径"),),
+               note="confidence<0.9 时别硬信；中文内容优先试 gb18030（GBK 超集）"),
+    Capability("text.convert", "转文件编码（GBK ↔ UTF-8 ↔ UTF-16，可加/去 BOM）",
+               params=(Param("path", "str", True, "源文件"),
+                       Param("to", "str", True, "目标编码：utf-8 / utf-8-sig / gbk / "
+                                                "gb18030 / big5 / shift_jis / utf-16"),
+                       Param("from", "str", doc="源编码；不给就自动探测"),
+                       Param("out", "str", doc="输出路径；默认源旁边加编码后缀"),
+                       Param("inplace", "bool", doc="原地转：覆盖源文件，需二次确认"),
+                       Param("bom", "bool", doc="要不要 BOM；默认按目标编码决定"),
+                       Param("newline", "str", doc="lf / crlf，不给就保持原样"),
+                       Param("_confirmed", "bool", doc="inplace 的二次确认标记")),
+               side_effect=True,
+               note="默认另存不覆盖源；inplace=true 第一次只给预演，加 _confirmed=true 才真写"),
+    Capability("text.read", "按编码读文本（自动探测，可只取一段）",
+               params=(Param("path", "str", True, "文件路径"),
+                       Param("encoding", "str", doc="强制指定，不给就探测"),
+                       Param("offset", "int", doc="从第几行开始（0 起）"),
+                       Param("limit", "int", doc="取几行"),
+                       Param("max_chars", "int", doc="最多返回多少字符")),
+               note="大日志不用整个塞进上下文：用 offset/limit 取那一段"),
+    Capability("text.regex", "正则提取 / 替换 / 计数",
+               params=(Param("pattern", "str", True, "正则"),
+                       Param("action", "str", doc="find（默认）/ replace / count"),
+                       Param("path", "str", doc="从文件读；不给就用 text"),
+                       Param("text", "str", doc="直接给一段文本"),
+                       Param("replace", "str", doc="replace 动作的替换串，可用 \\1"),
+                       Param("out", "str", doc="replace 的输出；默认加 .replaced"),
+                       Param("encoding", "str", doc="读文件用的编码，不给就探测"),
+                       Param("to", "str", doc="写出用的编码，默认跟源一致"),
+                       Param("dry_run", "bool", doc="replace 默认 true（只预演）"),
+                       Param("ignore_case", "bool", doc="默认 true"),
+                       Param("multiline", "bool", doc="^$ 按行匹配"),
+                       Param("dotall", "bool", doc=". 匹配换行"),
+                       Param("limit", "int", doc="find 最多返回几条，默认 100")),
+               side_effect=True,
+               note="find 会带行列位置；replace 默认预演不写文件"),
+    Capability("text.diff", "两个文件/两段文本的行级差异",
+               params=(Param("a", "str", doc="第一个文件"),
+                       Param("b", "str", doc="第二个文件"),
+                       Param("a_text", "str", doc="直接给第一段文本"),
+                       Param("b_text", "str", doc="直接给第二段文本"),
+                       Param("encoding", "str", doc="读文件编码，不给就探测"),
+                       Param("ignore_ws", "bool", doc="忽略空白差异"),
+                       Param("ignore_case", "bool", doc="忽略大小写"),
+                       Param("context", "int", doc="unified 上下文行数，默认 3")),
+               note="给 ratio（相似度 0~1）和 hunks（按块列改动），不只是贴一段 diff"),
+    Capability("text.lines", "行操作：去重 / 排序 / 过滤 / 裁剪 / 加前后缀 / 编号",
+               params=(Param("text", "str", doc="直接给文本"),
+                       Param("path", "str", doc="从文件读"),
+                       Param("ops", "json", doc="操作链，如 [{'op':'dedupe'},{'op':'sort'}]；"
+                                                "可用 strip/dedupe/sort/grep/drop_empty/"
+                                                "prefix/suffix/number/cut/unique_all"),
+                       Param("out", "str", doc="写到文件（不给就只返回文本）"),
+                       Param("to", "str", doc="写出编码，默认跟源一致"),
+                       Param("encoding", "str", doc="读文件编码，不给就探测"),
+                       Param("limit", "int", doc="最多返回几行")),
+               note="ops 按顺序串联；只返回文本不落盘，除非给 out"),
+    Capability("text.stats", "字数统计：中文按字、英文按词，带词频",
+               params=(Param("path", "str", doc="文件路径"),
+                       Param("text", "str", doc="或直接给文本"),
+                       Param("encoding", "str", doc="读文件编码，不给就探测"),
+                       Param("top", "int", doc="词频看前几名，默认 15")),
+               note="中英混排时 chars 和 english_words 要分开看；"
+                    "top_cjk 是二元组近似，不是分词"),
+    Capability("text.csv", "读 CSV（自动探测编码与分隔符），转 JSON/TSV",
+               params=(Param("path", "str", True, "CSV 路径"),
+                       Param("to", "str", doc="json（默认）/ jsonl / tsv / csv"),
+                       Param("delimiter", "str", doc="分隔符；不给就探测 , ; \\t |"),
+                       Param("header", "bool", doc="第一行是表头，默认 true"),
+                       Param("encoding", "str", doc="编码，不给就探测"),
+                       Param("out", "str", doc="to=tsv/csv 时写到哪"),
+                       Param("to_encoding", "str", doc="写出编码；给 Excel 看用 utf-8-sig"),
+                       Param("limit", "int", doc="to=json 时最多几条，默认 100")),
+               note="Excel 中文版默认 GBK + 分号，所以两样都得探测；"
+                    "导出给 Excel 时必须 utf-8-sig（不带 BOM 就是乱码）"),
     # ---- 视频生成：手机 NPU 稀疏关键帧 + 几何运镜（2026-10-30 晚重做）----
     Capability("video.gen", "生成一段视频（手机 NPU：稀疏关键帧 + 几何运镜）",
                params=(Param("prompt", "str", True, "画面描述"),
@@ -1889,6 +1968,10 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # `file.pull` / `file.push` 是编队节点之间传文件，跟这台不是一回事——
     # 本地这层此前一直空着，os.walk 散在十几个模块里各写一遍。
     reg.add(FileOps())
+    # 文本层：编码探测 / 转码 / 正则 / diff / 行操作 / 统计 / CSV。
+    # 中文 Windows 上「记事本存的 txt 是 GBK、Excel 导的 csv 是 GBK+分号」
+    # 是每天都在发生的事，此前一条能力都没有，只能开个编码转换器小软件。
+    reg.add(TextOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())

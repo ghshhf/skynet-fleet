@@ -159,6 +159,7 @@ CASES = [
     # 条目都必须被拒且真的没写出文件。安全逻辑不写测试等于没写。
     ("fleet_archive", ["-m", "fleet.kinds.archive", "--selftest"], HERE, 120),
     ("fleet_fileops", ["-m", "fleet.kinds.fileops", "--selftest"], HERE, 120),
+    ("fleet_textops", ["-m", "fleet.kinds.textops", "--selftest"], HERE, 120),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
