@@ -14,14 +14,18 @@
 后端清单与探测见 `ai_backends.py`（四元组：id / protocol / base_url / model）。
 """
 import hashlib
+import json
+import math
 import os
 import threading
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from .. import ai_backends as AB
 from ..core import BaseDevice, DeviceResult as R
+from .mediaops import _unique
 
 # 🔴 默认 max_tokens 为什么是 2048（2026-10-21 实测抓到的坑）：
 #   minimax-m3.1-flash 这类**推理模型**会先花一大截 token 思考，再吐正文。
@@ -30,6 +34,72 @@ from ..core import BaseDevice, DeviceResult as R
 #   同样参数 1024/2048 → finish_reason=stop，正文正常。
 #   原默认 512 正好落在「够不着正文」的区间里 ⇒ 默认给 2048。
 DEFAULT_MAX_TOKENS = 2048
+DEFAULT_NEG = "blurry, low quality, watermark, deformed, extra limbs, text"
+SEED_MAX = 2 ** 31 - 1
+
+
+def _num(value, label, low, high, default=None, integer=False):
+    """严格参数校验：非法输入在进入昂贵的生成之前变成明确错误。"""
+    if value is None or value == "":
+        if default is None:
+            raise ValueError("缺 %s" % label)
+        value = default
+    if isinstance(value, bool):
+        raise ValueError("%s 不接受 bool" % label)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s 必须是数字，收到 %r" % (label, value)) from None
+    if not math.isfinite(number) or not low <= number <= high:
+        raise ValueError("%s 必须在 %g ~ %g 之间，收到 %r" % (label, low, high, value))
+    if integer:
+        if number != int(number):
+            raise ValueError("%s 必须是整数，收到 %r" % (label, value))
+        return int(number)
+    return number
+
+
+def _size(value):
+    """宽高必须是 8 的倍数：扩散模型潜在空间按 8 像素下采样。"""
+    parts = str(value or "512x512").strip().lower().split("x")
+    if len(parts) != 2:
+        raise ValueError("size 要写成 宽x高，如 512x512")
+    try:
+        width, height = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError("size 的宽高必须是整数：%r" % value) from None
+    for label, side in (("宽", width), ("高", height)):
+        if not 64 <= side <= 2048:
+            raise ValueError("%s 必须在 64~2048，收到 %d" % (label, side))
+        if side % 8:
+            raise ValueError("%s 必须是 8 的倍数，收到 %d" % (label, side))
+    return "%dx%d" % (width, height)
+
+
+def _sidecar(file_path, payload):
+    """把这次生成的完整参数写成台账：没有它就无法复现，也无法排查旧版本。"""
+    target = _unique(Path(file_path).with_suffix(".json"))
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+    return str(target)
+
+
+def _verify_image(path):
+    """真打开一次：魔术字节只能认格式，不能证明文件没坏、尺寸对不对。
+
+    Pillow 不在位时如实返回 None（「没验」），不假装验过、也不把好图挡掉。
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as handle:
+            handle.verify()
+        with Image.open(path) as handle:
+            return handle.width, handle.height, (handle.format or "").lower()
+    except Exception as exc:
+        raise ValueError("图片打不开或已损坏：%s" % exc) from exc
 
 
 def _img_fmt(data):
@@ -85,37 +155,49 @@ class AI(BaseDevice):
     # ---------------- 出图（经手机 SdBridge）----------------
 
     def _image_gen(self, args):
-        """生成一张图：参数规整后交给 image_gen_runner（后端可注入、未配置明确报错）。
+        """生成一张图：先挡非法参数，再交给 image_gen_runner（后端可注入）。
 
-        」，失败带原因（runner 不静默交空）。出图是写文件副作用 ⇒ side_effect=True。
+        runner 未配置或失败一律 unavailable 并带原因，不静默交空。
+        出图是写文件副作用 ⇒ side_effect=True；参数随台账落盘，便于复现。
         """
-        try:
-            import image_gen_runner as IG
-        except Exception as e:
-            return R.error("image.gen", f"出图 runner 加载失败: {e}",
-                           device=self.name, via=self.via)
-        prompt = (args.get("prompt") or "").strip()
+        prompt = str(args.get("prompt") or "").strip()
         if not prompt:
             return R.error("image.gen", "prompt 不能为空",
                            device=self.name, via=self.via)
         try:
-            seed = int(args["seed"]) if args.get("seed") is not None else -1
-        except (TypeError, ValueError):
-            seed = -1
-        res = IG.run(
-            prompt,
-            neg=(args.get("neg") or ""),
-            size=(args.get("size") or "512x512"),
-            steps=int(args.get("steps") or 20),
-            seed=seed,
-            cfg=float(args.get("cfg") or 7.0),
-            model=args.get("model") or None,
-        )
-        if not res.get("ok"):
-            return R.unavailable("image.gen", res.get("err") or "出图失败",
+            size = _size(args.get("size"))
+            steps = _num(args.get("steps"), "steps", 1, 100, 20, integer=True)
+            cfg = _num(args.get("cfg"), "cfg", 0, 20, 7.0)
+            seed_raw = _num(args.get("seed"), "seed", -1, SEED_MAX, -1, integer=True)
+        except ValueError as exc:
+            return R.error("image.gen", str(exc), device=self.name, via=self.via)
+        seed = (int(time.time() * 1000) % SEED_MAX) if seed_raw < 0 else seed_raw
+        neg = str(args.get("neg") or DEFAULT_NEG)
+        model = str(args.get("model") or "").strip()
+        try:
+            import image_gen_runner as IG
+        except Exception as e:
+            return R.unavailable("image.gen", "出图后端未配置：%s" % e,
                                  device=self.name, via=self.via)
+        res = IG.run(prompt, neg=neg, size=size, steps=steps, seed=seed,
+                     cfg=cfg, model=model or None)
+        if not isinstance(res, dict) or not res.get("ok"):
+            return R.unavailable("image.gen",
+                                 (res or {}).get("err") or "出图失败",
+                                 device=self.name, via=self.via)
+        path = res.get("path") or ""
+        payload = {"cap": "image.gen", "prompt": prompt, "negative": neg,
+                   "size": size, "steps": steps, "cfg": cfg, "seed": seed,
+                   "model": model, "backend": "android_bridge",
+                   "generated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        manifest = ""
+        if path and os.path.isfile(path):
+            payload["file"] = path
+            manifest = _sidecar(path, payload)
         return R.success("image.gen", self.name, side_effect=True, via=self.via,
-                         data={"path": res.get("path"), "backend": "android_bridge"})
+                         data={"path": path, "backend": "android_bridge",
+                               "seed": seed, "size": size, "steps": steps,
+                               "cfg": cfg, "model": model, "manifest": manifest})
 
     # ---------------- 只读 ----------------
 
@@ -256,17 +338,26 @@ class AI(BaseDevice):
         为什么要它：内容生成这块只有一条腿（手机），手机一断就整块瘫——
         多一条免 key 的公网腿，才能「谁在谁上」。
 
-        选路不写死端口：天网自有 7891 → 系统代理 → 直连，逐个试（与 paper_harvest 同源）。
+        出图不是只读：写文件 ⇒ side_effect=True。参数先校验、seed 进 URL、
+        完整参数写同 stem 的 .json 台账，输出另取编号绝不覆盖旧图。
+        选路不写死端口：天网自有 7891 → 系统代理 → 直连，逐个试。
         """
-        prompt = (args.get("prompt") or "").strip()
+        prompt = str(args.get("prompt") or "").strip()
         if not prompt:
             return R.error("image.free", "缺 prompt", device=self.name, via=self.via)
-        w = max(64, min(int(args.get("width") or 1024), 2048))
-        h = max(64, min(int(args.get("height") or 1024), 2048))
-        model = (args.get("model") or "flux").strip()
-        out = (args.get("out") or "").strip()
-        url = ("https://image.pollinations.ai/prompt/%s?width=%d&height=%d&nologo=true&model=%s"
-               % (urllib.parse.quote(prompt), w, h, urllib.parse.quote(model)))
+        try:
+            w = _num(args.get("width"), "width", 64, 2048, 1024, integer=True)
+            h = _num(args.get("height"), "height", 64, 2048, 1024, integer=True)
+            seed_raw = _num(args.get("seed"), "seed", -1, SEED_MAX, -1, integer=True)
+        except ValueError as exc:
+            return R.error("image.free", str(exc), device=self.name, via=self.via)
+        seed = (int(time.time() * 1000) % SEED_MAX) if seed_raw < 0 else seed_raw
+        model = str(args.get("model") or "flux").strip() or "flux"
+        given = str(args.get("out") or "").strip()
+        url = ("https://image.pollinations.ai/prompt/%s?width=%d&height=%d"
+               "&nologo=true&model=%s&seed=%d"
+               % (urllib.parse.quote(prompt), w, h,
+                  urllib.parse.quote(model), seed))
 
         data = None
         last = None
@@ -285,28 +376,54 @@ class AI(BaseDevice):
             except Exception as e:
                 last = e
         if not data:
-            return R.error("image.free", "出图失败（三条路都不通）: %s" % last,
-                           device=self.name, via=self.via)
+            return R.unavailable("image.free", "出图失败（三条路都不通）: %s" % last,
+                                 device=self.name, via=self.via)
 
         fmt = _img_fmt(data)
         if not fmt:
             return R.error("image.free", "回来的不是图片（%d 字节，头 %r）"
                            % (len(data), data[:8]), device=self.name, via=self.via)
-        if not out:
-            tag = hashlib.md5(url.encode()).hexdigest()[:8]
-            out = os.path.join(os.getcwd(), "tmp", "img_%s.%s" % (tag, fmt))
+        if given:
+            target = Path(given).expanduser().absolute()
+            root, ext = os.path.splitext(str(target))
+            if ext.lower().lstrip(".") != fmt:  # 要 .png 回来 jpg：以真实格式为准
+                target = Path(root + "." + fmt)
         else:
-            root, ext = os.path.splitext(out)
-            if ext.lower().lstrip(".") != fmt:      # 要的 .png、回来的是 jpg：以真实格式为准
-                out = root + "." + fmt
-        out = os.path.abspath(out)
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        with open(out + ".tmp", "wb") as f:
-            f.write(data)
-        os.replace(out + ".tmp", out)
-        return R.success("image.free", self.name, via=self.via, data={
+            tag = hashlib.sha256(url.encode()).hexdigest()[:10]
+            target = Path(os.getcwd()) / "tmp" / ("img_%s.%s" % (tag, fmt))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target = _unique(target)
+        tmp = target.with_name(target.name + ".tmp")
+        try:
+            tmp.write_bytes(data)
+            os.replace(str(tmp), str(target))
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+        try:
+            checked = _verify_image(target)
+        except ValueError as exc:
+            target.unlink(missing_ok=True)
+            return R.error("image.free", str(exc), device=self.name, via=self.via)
+        real_w, real_h, real_fmt = checked or (None, None, None)
+        checked_ok = checked is not None
+        payload = {"cap": "image.free", "prompt": prompt, "width": w, "height": h,
+                   "model": model, "seed": seed, "format": fmt, "bytes": len(data),
+                   "real_width": real_w, "real_height": real_h,
+                   "real_format": real_fmt, "verified": checked_ok,
+                   "source": "pollinations（免 key）", "file": str(target),
+                   "url_digest": hashlib.sha256(url.encode()).hexdigest()[:16],
+                   "generated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        manifest = _sidecar(str(target), payload)
+        return R.success("image.free", self.name, side_effect=True, via=self.via, data={
             "prompt": prompt, "model": model, "width": w, "height": h,
-            "file": out, "bytes": len(data), "format": fmt,
+            "file": str(target), "path": str(target), "bytes": len(data),
+            "format": fmt, "seed": seed, "manifest": manifest,
+            "real_width": real_w, "real_height": real_h, "verified": checked_ok,
             "source": "pollinations（免 key）",
         })
 
@@ -331,3 +448,186 @@ class AI(BaseDevice):
             return AB.healthy_backends()
         want = {s.strip() for s in spec.split(",") if s.strip()}
         return [b for b in AB.backends() if b["id"] in want]
+
+
+# ---------------------------------------------------------------- 出图自测
+
+def _selftest():
+    """全离线：网络与出图后端都打桩，只验参数契约、台账与不覆盖。"""
+    import shutil
+    import sys
+    import tempfile
+    import types
+
+    total = 0
+    fails = []
+    folder = tempfile.mkdtemp(prefix="ai-image-test-")
+    # 打桩图必须是真能打开的图片：加了真校验后，假的魔术字节会被正确地挡掉。
+    has_pil = True
+    try:
+        import io
+        from PIL import Image as _PIL
+        _buf = io.BytesIO()
+        _PIL.new("RGB", (8, 8), (201, 33, 33)).save(_buf, format="JPEG")
+        jpeg = _buf.getvalue()
+    except ImportError:
+        has_pil = False
+        jpeg = b"\xff\xd8" + b"fakejpeg" * 20
+    seen_urls = []
+    orig_opener = urllib.request.build_opener
+    orig_module = sys.modules.get("image_gen_runner")
+
+    def check(cond, label):
+        nonlocal total
+        total += 1
+        if not cond:
+            fails.append(label)
+            print("失败：%s" % label)
+
+    class _Resp:
+        def __init__(self, data):
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            if isinstance(self.data, Exception):
+                raise self.data
+            return self.data
+
+    class _Opener:
+        def __init__(self, data):
+            self.data = data
+
+        def open(self, req, timeout=None):
+            seen_urls.append(req.full_url)
+            return _Resp(self.data)
+
+    def fake_opener(*_a, **_kw):
+        return _Opener(state["payload"])
+
+    state = {"payload": jpeg}
+
+    try:
+        dev = AI()
+        check("image.gen" in dev.caps() and "image.free" in dev.caps(), "两项出图能力在位")
+        check(_size("512x512") == "512x512" and _size("512X512") == "512x512", "尺寸：标准写法")
+        for value in ("512", "0x512", "500x512", "512x2049", "abc"):
+            try:
+                _size(value)
+                check(False, "尺寸：拒绝 %r" % value)
+            except ValueError:
+                check(True, "尺寸：拒绝 %r" % value)
+        check(_img_fmt(jpeg) == "jpg" and _img_fmt(b"\x89PNG\r\n\x1a\n") == "png",
+              "格式按魔术字节认，不信扩展名")
+        check(_img_fmt(b"not an image") is None, "格式：非图片返回 None")
+
+        # image.gen：参数先挡、后端打桩避免碰真手机
+        fake_module = types.ModuleType("image_gen_runner")
+        captured = {}
+
+        def fake_run(prompt, neg="", size="512x512", steps=20, seed=-1,
+                     cfg=7.0, model=None, **kw):
+            captured.update({"prompt": prompt, "neg": neg, "size": size,
+                             "steps": steps, "seed": seed, "cfg": cfg})
+            return {"ok": False, "err": "打桩：没接手机"}
+
+        fake_module.run = fake_run
+        sys.modules["image_gen_runner"] = fake_module
+        r = dev.invoke("image.gen", {"prompt": ""})
+        check(not r.ok, "gen：空 prompt 被拒")
+        for label, patch in (("非法尺寸", {"size": "500x512"}),
+                             ("步数越界", {"steps": 0}),
+                             ("CFG 越界", {"cfg": 99}),
+                             ("种子越界", {"seed": -5})):
+            args = {"prompt": "一只猫"}
+            args.update(patch)
+            r = dev.invoke("image.gen", args)
+            check(not r.ok and r.code == "error", "gen：%s 明确报错" % label)
+        r = dev.invoke("image.gen", {"prompt": "一只猫", "seed": 7, "steps": 12})
+        check(not r.ok and r.code == "unavailable", "gen：后端未配置诚实降级")
+        check(captured.get("seed") == 7 and captured.get("size") == "512x512"
+              and captured.get("steps") == 12, "gen：参数被规整后传给后端")
+        check("blurry" in captured.get("neg", ""), "gen：带默认负向提示词")
+
+        # image.free：打桩网络，真落文件 + 台账
+        urllib.request.build_opener = fake_opener
+        root = Path(folder)
+        out = root / "cat.png"           # 故意给 .png，回来是 jpg，应自动改后缀
+        r = dev.invoke("image.free", {"prompt": "一只猫", "seed": 123,
+                                      "width": 512, "height": 512, "out": str(out)})
+        check(r.ok and r.code == "ok", "free：成功：%s" % r.err)
+        file1 = None
+        first_bytes = b""
+        if r.ok:
+            d = r.data
+            check(r.side_effect is True, "free：结果信封标副作用")
+            check(d["format"] == "jpg" and d["path"].endswith(".jpg"),
+                  "free：以魔术字节为准改后缀")
+            check(d["path"] == d["file"], "free：path 与 file 指向同一文件")
+            check(d["seed"] == 123, "free：seed 回显")
+            check(any("seed=123" in u for u in seen_urls), "free：seed 进了请求 URL")
+            check(d["verified"] is has_pil, "free：是否真验过如实回显")
+            if has_pil:
+                check(d["real_width"] == 8 and d["real_height"] == 8,
+                      "free：真打开读出实际尺寸")
+            file1 = Path(d["path"])
+            sidecar = Path(d["manifest"])
+            check(file1.is_file() and file1.read_bytes() == jpeg, "free：文件真落盘")
+            check(sidecar.is_file() and json.loads(sidecar.read_text(encoding="utf-8"))["seed"] == 123,
+                  "free：台账落盘且记下完整参数")
+            first_bytes = file1.read_bytes()
+        r2 = dev.invoke("image.free", {"prompt": "一只猫", "seed": 123,
+                                       "width": 512, "height": 512, "out": str(out)})
+        check(file1 is not None and r2.ok and r2.data["path"] != str(file1),
+              "free：同名再跑另取编号")
+        check(file1 is not None and first_bytes == file1.read_bytes(),
+              "free：旧图没被覆盖")
+
+        r = dev.invoke("image.free", {"prompt": ""})
+        check(not r.ok, "free：空 prompt 被拒")
+        for label, patch in (("宽度非数字", {"width": "abc"}),
+                             ("宽度越界", {"width": 9999}),
+                             ("高度为零", {"height": 0}),
+                             ("种子越界", {"seed": -9})):
+            args = {"prompt": "一只猫"}
+            args.update(patch)
+            rr = dev.invoke("image.free", args)
+            check(not rr.ok and rr.code == "error", "free：%s 明确报错" % label)
+        state["payload"] = b"this is not an image"
+        r = dev.invoke("image.free", {"prompt": "一只猫", "out": str(root / "bad.jpg")})
+        check(not r.ok and r.code == "error", "free：回来的不是图片被拒")
+        if has_pil:
+            state["payload"] = b"\xff\xd8" + b"fakejpeg" * 20
+            r = dev.invoke("image.free", {"prompt": "一只猫",
+                                          "out": str(root / "broken.jpg")})
+            check(not r.ok and r.code == "error" and not (root / "broken.jpg").exists(),
+                  "free：伪 JPEG 被真校验挡掉且不留下坏文件")
+        state["payload"] = OSError("三条路都不通")
+        r = dev.invoke("image.free", {"prompt": "一只猫"})
+        check(not r.ok and r.code == "unavailable", "free：三条路全断报 unavailable")
+    finally:
+        urllib.request.build_opener = orig_opener
+        if orig_module is None:
+            sys.modules.pop("image_gen_runner", None)
+        else:
+            sys.modules["image_gen_runner"] = orig_module
+        shutil.rmtree(folder, ignore_errors=True)
+
+    got = total - len(fails)
+    print("\nai image selftest: %d/%d%s"
+          % (got, total, "" if not fails else "（失败 %d）" % len(fails)))
+    for item in fails:
+        print("   失败:", item)
+    return 0 if not fails else 1
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--selftest" in _sys.argv:
+        _sys.exit(_selftest())
+    print("用法: python -m fleet.kinds.ai --selftest")

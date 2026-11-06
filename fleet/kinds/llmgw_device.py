@@ -3760,6 +3760,7 @@ _HANDLERS = {
 
 
 class LlmGwDevice(BaseDevice):
+    kind = "llmgw"
     name = "llmgw"
     via = "local"
 

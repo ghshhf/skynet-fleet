@@ -9,3 +9,6 @@ imageio-ffmpeg>=0.5
 
 # t72 文档转换（doc.convert / doc.read）：MarkItDown 是运行时可选能力
 markitdown[pdf,docx,pptx,xlsx]>=0.1
+
+# flow.* 调度层依赖 doit（dict_to_task / TaskLoader2 / DoitMain），fleet_flowops 门禁实测导入
+doit>=0.37

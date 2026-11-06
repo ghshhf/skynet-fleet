@@ -47,6 +47,7 @@ def _norm_error_text(text):
 
 
 class DevFixDevice(BaseDevice):
+    kind = "devfix"
     name = "devfix"
     via = "本机"
 

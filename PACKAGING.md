@@ -4,7 +4,7 @@
 在本机 `pip install -r requirements.txt` 后直接 `python fleet_gui.py` / `python -m fleet` 就能跑，
 不需要任何构建链（没有 Electron / Tauri / 前端 bundler）。
 
-但图形版（Windows GUI）和终端版（TUI）也提供 **PyInstaller 冻扁成单文件 exe** 的路径，
+但图形版（Windows GUI）也提供 **PyInstaller 冻扁成单文件 exe** 的路径，
 方便分发给不想装 Python 的人。冻扁产物**不入库**（`build/ dist/ *.spec *.exe` 已在 `.gitignore`），
 只在 CI（`windows-latest`）上构建并作为 artifact / release 资产发布。
 
@@ -14,10 +14,9 @@
 
 | 形态 | 入口脚本 | CI 工作流 | 产物 |
 |------|----------|-----------|------|
-| 终端版 TUI | `fleet_tui.py` | `.github/workflows/build-tui.yml` | `fleet-tui.exe` |
 | 图形版 GUI | `fleet_gui.py` | `.github/workflows/build-gui.yml` | `fleet-gui.exe` |
 
-两个工作流都在 `push` 到 `main` / 打 `v*` tag / 手动触发时跑。
+工作流在 `push` 到 `main` / 打 `v*` tag / 手动触发时跑。
 
 ---
 

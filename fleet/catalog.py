@@ -79,6 +79,8 @@ from .kinds.chartops import ChartOps
 from .kinds.codeops import CodeOps
 from .capindex import CapIndexOps
 from .kinds.mediaops import MediaOps
+from .kinds.audioops import AudioOps
+from .kinds.videogen import VideoGen
 from .kinds.flowops import FlowOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
@@ -1226,24 +1228,27 @@ CAPABILITIES = [
     # ---- 出图（kind=ai，经手机 SdBridge；本节点没接 android_bridge 时如实说未配置）----
     Capability("image.gen", "生成一张图（手机 SdBridge 出图）",
                params=(Param("prompt", "str", True, "画面描述"),
-                       Param("neg", "str", doc="不想要的元素"),
-                       Param("size", "str", doc="如 512x512，默认 512x512"),
-                       Param("steps", "int", doc="步数，默认 20"),
-                       Param("seed", "int", doc="随机种子，-1=随机，默认 -1"),
-                       Param("cfg", "float", doc="CFG，默认 7.0"),
+                       Param("neg", "str", doc="负向提示词，默认一组画质/畸形排除词"),
+                       Param("size", "str", doc="如 512x512，宽高须为 8 的倍数"),
+                       Param("steps", "int", doc="1~100，默认 20"),
+                       Param("seed", "int", doc="固定种子可复现，-1=随机，默认 -1"),
+                       Param("cfg", "float", doc="0~20，默认 7.0"),
                        Param("model", "str", doc="模型名，留给桥接层")),
                side_effect=True,
-               note="出图落手机 Pictures/fleet/；本节点没接 android_bridge 时如实说「后端未配置」"),
+               note="出图落手机 Pictures/fleet/；参数随 .json 台账落盘便于复现；"
+                    "本节点没接 android_bridge 时如实报 unavailable"),
     # 内容生成的第二条腿（2026-11-03）：手机不在场时用免 key 公网端点兜底。
     # 之前只有「手机 SdBridge」一条腿，手机一断整块瘫——谁在谁上。
     Capability("image.free", "免 key 出图（Pollinations，零配置不要 token）",
                params=(Param("prompt", "str", True, "画面描述"),
-                       Param("width", "int", doc="默认 1024"),
-                       Param("height", "int", doc="默认 1024"),
+                       Param("width", "int", doc="64~2048，默认 1024"),
+                       Param("height", "int", doc="64~2048，默认 1024"),
                        Param("model", "str", doc="默认 flux"),
+                       Param("seed", "int", doc="固定种子可复现，-1=随机，默认 -1"),
                        Param("out", "str", doc="落盘路径；不给则落 cwd/tmp/")),
                side_effect=True,
-               note="选路走天网 7891 → 系统代理 → 直连；按魔术字节认格式（实测常回 JPEG）"),
+               note="选路走天网 7891 → 系统代理 → 直连；按魔术字节认格式（实测常回 JPEG）；"
+                    "seed 进请求、完整参数写同 stem 的 .json 台账；输出另取编号不覆盖旧图"),
     Capability("image.info", "看一张 PNG 的尺寸/通道/字节（纯本地只读）",
                params=(Param("path", "str", True),)),
     Capability("image.resize", "等比缩一张图（ffmpeg scale，PNG 可无 ffmpeg）",
@@ -2149,17 +2154,25 @@ CAPABILITIES = [
                        Param("seed", "int", doc="随机种子，-1=随机，默认 -1"),
                        Param("model", "str", doc="模型名，留给后端"),
                        Param("denoise", "float", doc="关键帧 img2img 强度，默认 0.28"),
-                       Param("steps", "int", doc="首帧步数，默认 12（后续自动 65%）")),
+                       Param("steps", "int", doc="首帧步数，默认 12（后续自动 65%）"),
+                       Param("cfg", "float", doc="提示词跟随强度 0~20，默认 7"),
+                       Param("neg", "str", doc="负向提示词，默认一组画质/畸形排除词"),
+                       Param("out", "str", doc="mp4 落盘路径，默认 tmp/video_<hash>.mp4"),
+                       Param("plan_only", "bool", doc="只算关键帧/播放帧计划，不生成")),
                side_effect=True,
                note="运动由相机轨迹精确决定、播放帧靠 warp 合成不调模型；"
-                    "旧的逐帧 img2img 链已废弃（帧间无几何联系，观感抽搐）"),
+                    "旧逐帧 img2img 链已废弃（帧间无几何联系，观感抽搐）。"
+                    "宽高须为 8 的倍数；每次出片写同 stem 的 .json 台账（seed/参数/帧时刻），"
+                    "输出另取编号不覆盖；后端未配置报 unavailable 并附计划"),
     Capability("video.story", "漫剧成片（画布 + 分镜 + 字幕 + 配音）",
                params=(Param("board", "json", True, "分镜数据（见 fleet/storyboard.py）"),
                        Param("model", "str", doc="出图模型，默认跟 board.model"),
-                       Param("dry_run", "bool", doc="只算账不出片")),
+                       Param("dry_run", "bool", doc="只校验分镜并算账，不出片"),
+                       Param("out_dir", "str", doc="成片工作目录，不给则临时目录")),
                side_effect=True,
                note="台词决定镜头时长：先合成配音拿真实秒数，再反过来出画面；"
-                    "等价于市面上的「节点式无限画布」，这里压成一次调用"),
+                    "等价于市面上的「节点式无限画布」，这里压成一次调用。"
+                    "dry_run 真调 validate/estimate 且无副作用；真出片失败如实降级"),
     # ---- 本机操控（kind=host：这台机器既是控制面也是被控端，学 Cherry computerUse）----
     Capability("host.monitor", "本机资源监控（CPU/内存/磁盘/网速 + 进程表）",
                note="可视化主屏的数据源；纯读，不碰系统"),
@@ -2553,6 +2566,62 @@ CAPABILITIES = [
     Capability("proxy.download_wintun", "下载 wintun.dll 到 vendor/sing-box（TUN system/mixed 栈需要）",
                side_effect=True,
                note="有副作用：下载 wintun 驱动（gvisor 栈不需要）"),
+    # ---- 音频细节层：五项读与五项写分开命名，读的免闸门 ----
+    Capability("audio.info", "读一个音频文件的真实规格：编码/采样率/声道/时长/码率/标签",
+               params=(Param("src", "str", True, "本地音频文件路径")),
+               note="只读：数值来自 ffprobe，不按后缀猜；没有音频流会明确报错"),
+    Capability("audio.level", "量一个音频文件有多响：峰值/RMS/削波样本数/是否静音",
+               params=(Param("src", "str", True, "本地音频文件路径")),
+               note="只读：基于解码后 8 kHz 单声道 PCM，是用于比较的相对值，不是母带测量"),
+    Capability("audio.silence", "列出静音段（起止与时长），阈值与最短时长可调",
+               params=(Param("src", "str", True, "本地音频文件路径"),
+                       Param("noise_db", "int", doc="静音阈值 dB，-90~0，默认 -35"),
+                       Param("min_s", "json", doc="最短静音秒数，默认 0.2")),
+               note="只读：末尾静音没有结束标记时按文件时长补齐；能量阈值不等于听感"),
+    Capability("audio.wave", "给波形数据：按桶返回峰值与 RMS 序列，供画图",
+               params=(Param("src", "str", True, "本地音频文件路径"),
+                       Param("buckets", "int", doc="桶数 10~2000，默认 100")),
+               note="只读：幅度归一到 0~1，桶数决定分辨率不改变文件"),
+    Capability("audio.tags", "读容器里的元数据标签",
+               params=(Param("src", "str", True, "本地音频文件路径")),
+               note="只读：没有标签就回空字典，不编造"),
+    Capability("audio.convert", "转码到目标容器/采样率/声道/码率，另存不覆盖",
+               params=(Param("src", "str", True, "本地音频文件路径"),
+                       Param("out", "str", doc="输出路径，默认 <原名>_conv.wav"),
+                       Param("rate", "int", doc="采样率，默认保持源文件"),
+                       Param("channels", "int", doc="1 或 2，默认保持源文件"),
+                       Param("bitrate_k", "int", doc="有损格式码率 kbps，默认 192")),
+               side_effect=True,
+               note="动手：输出一律另存，编码失败清掉残件；flac/wav 等无损格式忽略码率"),
+    Capability("audio.normalize", "响度归一化到目标 LUFS，并给出前后电平",
+               params=(Param("src", "str", True, "本地音频文件路径"),
+                       Param("out", "str", doc="输出路径，默认 <原名>_norm.wav"),
+                       Param("target_lufs", "json", doc="目标响度，默认 -16"),
+                       Param("true_peak", "json", doc="真峰值上限 dBTP，默认 -1.5"),
+                       Param("lra", "json", doc="响度范围，默认 11")),
+               side_effect=True,
+               note="动手：ffmpeg loudnorm 单遍；另存不覆盖，返回前后 RMS 便于核对"),
+    Capability("audio.segment", "按静音边界或固定时长把一个文件切成多段",
+               params=(Param("src", "str", True, "本地音频文件路径"),
+                       Param("mode", "str", doc="silence（默认）或 fixed"),
+                       Param("noise_db", "int", doc="静音阈值 dB，默认 -35"),
+                       Param("min_s", "json", doc="最短静音秒数，默认 0.2"),
+                       Param("chunk_s", "json", doc="fixed 模式下每段秒数，默认 1"),
+                       Param("out_dir", "str", doc="输出目录，默认 <原名>_parts")),
+               side_effect=True,
+               note="动手：每段独立落盘，最多 200 段；按静音切会丢掉静音段，不补空白"),
+    Capability("audio.mix", "把 2~8 条音轨混成一个文件，各轨音量可调",
+               params=(Param("inputs", "json", True, "至少两个本地音频文件路径"),
+                       Param("gains", "json", doc="各轨音量 0~4，默认全 1"),
+                       Param("out", "str", doc="输出路径，默认 <首轨>_mix.wav")),
+               side_effect=True,
+               note="动手：时长取最长轨；另存不覆盖，输入不足两条直接报错"),
+    Capability("audio.retag", "写入元数据标签并读回校验，另存不覆盖",
+               params=(Param("src", "str", True, "本地音频文件路径"),
+                       Param("tags", "json", True, "{键: 值} 字典"),
+                       Param("out", "str", doc="输出路径，默认 <原名>_tagged<同后缀>")),
+               side_effect=True,
+               note="动手：流拷贝，输出容器必须与源一致；写后会用 ffprobe 读回"),
 ]
 
 CAPABILITIES.extend(REA_CAPABILITIES)
@@ -2689,10 +2758,16 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(CodeOps())
     # 媒体处理：ffmpeg 是本机外部命令，缺了 probe() 就如实报不可用。
     reg.add(MediaOps())
+    # 音频细节：把已有文件读透（规格/电平/静音/波形/标签）与改对（转码/归一化/
+    # 切分/混音/标签）分开登记，读操作不进闸门。
+    reg.add(AudioOps())
     # 能力索引：只读目录表，不接触外部世界。
     reg.add(CapIndexOps())
     # 流程编排：调度交给 doit，设备本身只管定义与结果落盘。
     reg.add(FlowOps())
+    # 视频生成：把 motion/storyboard 两套已写好的算法接成可调能力；
+    # 出图后端没配置就如实降级，不返回空壳文件。
+    reg.add(VideoGen())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())

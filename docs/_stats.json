@@ -1,22 +1,22 @@
 {
-  "generated_at": "2026-11-06 22:08:39",
-  "gates_registered": 181,
-  "eval_files": 95,
+  "generated_at": "2026-11-07 03:40:57",
+  "gates_registered": 182,
+  "eval_files": 94,
   "orphan_evals": [],
   "retired_refs": [],
-  "doc_md": 18,
+  "doc_md": 5,
   "app_build": "49",
-  "capabilities_declared": 491,
-  "capabilities_owned": 482,
+  "capabilities_declared": 501,
+  "capabilities_owned": 494,
   "capabilities_live": null,
-  "capabilities_gated": 191,
-  "devices": 69,
+  "capabilities_gated": 232,
+  "devices": 71,
   "devices_live": null,
   "domains": {
     "web": {
       "declared": 15,
       "owned": 15,
-      "gated": 9
+      "gated": 6
     },
     "adb": {
       "declared": 14,
@@ -46,7 +46,7 @@
     "pdf": {
       "declared": 13,
       "owned": 13,
-      "gated": 0
+      "gated": 13
     },
     "llmgw": {
       "declared": 13,
@@ -58,6 +58,11 @@
       "owned": 12,
       "gated": 12
     },
+    "audio": {
+      "declared": 12,
+      "owned": 12,
+      "gated": 2
+    },
     "image": {
       "declared": 11,
       "owned": 11,
@@ -66,7 +71,7 @@
     "sheet": {
       "declared": 11,
       "owned": 11,
-      "gated": 0
+      "gated": 11
     },
     "fp": {
       "declared": 11,
@@ -86,12 +91,12 @@
     "word": {
       "declared": 10,
       "owned": 10,
-      "gated": 0
+      "gated": 10
     },
     "ppt": {
       "declared": 10,
       "owned": 10,
-      "gated": 0
+      "gated": 10
     },
     "live": {
       "declared": 10,
@@ -175,7 +180,7 @@
     },
     "video": {
       "declared": 6,
-      "owned": 4,
+      "owned": 6,
       "gated": 1
     },
     "card": {
@@ -376,11 +381,6 @@
     "skynet": {
       "declared": 2,
       "owned": 0,
-      "gated": 2
-    },
-    "audio": {
-      "declared": 2,
-      "owned": 2,
       "gated": 2
     },
     "tree": {

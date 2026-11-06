@@ -316,7 +316,7 @@ def card_summary(data):
 def world_book_entries(data):
     """取角色卡里挂的世界书条目：[{keys, content, enabled, constant, ...}]。
 
-    字段语义按 SillyTavern V2/V3 规范（见 docs/角色卡生态调研_2026-10-21.md）：
+    字段语义按 SillyTavern V2/V3 规范：
       keys            主触发词，任一命中即激活
       secondary_keys  次级词；selective=true 时需「主+次各命中一个」才激活
       selective       开启 AND 语义

@@ -169,6 +169,17 @@ CASES = [
     ("fleet_chartops", ["-m", "fleet.kinds.chartops", "--selftest"], HERE, 240),
     ("fleet_codeops", ["-m", "fleet.kinds.codeops", "--selftest"], HERE, 120),
     ("fleet_mediaops", ["-m", "fleet.kinds.mediaops", "--selftest"], HERE, 300),
+    # 音频细节层（2026-11-06）：素材由标准库 wave 现场合成，真跑 ffmpeg；
+    # 75 条断言覆盖规格/电平/静音/波形/标签 + 转码/归一化/切分/混音/改标签，
+    # 并验「源文件字节不变」「同名输出另取编号」「失败不留残件」。
+    ("fleet_audioops", ["-m", "fleet.kinds.audioops", "--selftest"], HERE, 300),
+    # 视频生成（2026-11-06）：把 motion/storyboard 两套算法接成可调能力。
+    # 打桩出图后端离线真跑「关键帧 → warp 播放帧 → mp4」，ffprobe 验帧，
+    # 并验参数边界、seed 台账、同名不覆盖、后端缺失时 unavailable 且附计划。
+    ("fleet_videogen", ["-m", "fleet.kinds.videogen", "--selftest"], HERE, 300),
+    # 生图（2026-11-06）：网络与出图后端全打桩，34 条断言覆盖参数边界、
+    # 结果信封副作用标记、seed 台账、按魔术字节认格式、同名不覆盖、后端缺失降级。
+    ("fleet_ai_image", ["-m", "fleet.kinds.ai", "--selftest"], HERE, 120),
     ("fleet_capindex", ["-m", "fleet.capindex", "--selftest"], HERE, 120),
     ("fleet_netproxy", ["-m", "fleet.netproxy", "--selftest"], HERE, 60),
     ("fleet_flowops", ["-m", "fleet.kinds.flowops", "--selftest"], HERE, 180),
@@ -201,13 +212,14 @@ CASES = [
     # ---- evals：一次真事故一个脚本 ----
     ("eval_d0_bridge_offline", ["evals/d0_bridge_offline.py"], HERE, 90),
     ("eval_t0_input", ["evals/t0_input_not_clobbered.py"], HERE, 90),
-    # ---- T1：全屏界面 + 两个显影面共用一套 dispatch ----
-    ("fleet_tui_smoke", ["-m", "fleet.tui", "--smoke"], HERE, 240),
-    ("eval_t1_two_faces", ["evals/t1_cli_and_tui_share_dispatch.py"], HERE, 240),
-    # 这条超时就是失败：它卡住说明界面在长任务期间被拖死了
-    ("eval_t2_ui_alive", ["evals/t2_ui_alive_under_job_stream.py"], HERE, 120),
-    # ---- T3/T4/T5：论文直播开关 / 免费 AI 后端 / 本机操控设备 ----
-    ("eval_t3_live_switch", ["evals/t3_live_switch_papers.py"], HERE, 240),
+    # ---- T1：终端只留一个面（命令行），dispatch 的两条渲染路径仍要一起验 ----
+    # 全屏那套已于 2026-11-07 删除（与命令行本来就是同一套命令）；这条同时盯着
+    # 「入口不许回来」和「console.print / emit 两条路不许一边响一边哑」。
+    ("eval_t1_single_surface", ["evals/t1_single_terminal_surface.py"], HERE, 120),
+    # ---- T80：文档四层（PDF / 表格 / Word / PPT）----
+    # 四个域此前有设备认领但门禁为 0。这里只做契约面 + 起子进程跑模块自带自测，
+    # 实测 20 秒上下；整轮超过 120 秒由脚本自己判红（门禁变慢当缺陷修）。
+    ("eval_t80_office_ops", ["evals/t80_office_ops.py"], HERE, 180),
     ("eval_t4_ai_free", ["evals/t4_ai_free_backends.py"], HERE, 240),
     ("eval_t5_host_control", ["evals/t5_host_control.py"], HERE, 120),
     # ---- T6：WiFi ADB 设备（kind=adb_wifi）----
@@ -1069,7 +1081,13 @@ def _write_ci_summary(results, spent, shard=None):
 def main():
     raw = sys.argv[1:]
     flags = {a.lower() for a in raw if a.startswith("--")}
-    only = [a.lower() for a in raw if not a.startswith("--")]
+    # --shard / --domain / --changed 后面跟的是**值**，不是门禁名过滤词。
+    # 不排除它们，--shard 1/4 会把 "1/4" 当成名字去筛 CASES，结果四片各跑 0 项，
+    # CI 还一片绿。分片本身在下面按位置切片，不该在这里先被过滤掉。
+    _value_flags = {"--shard", "--domain", "--changed"}
+    _value_pos = {i + 1 for i, a in enumerate(raw) if a in _value_flags}
+    only = [a.lower() for i, a in enumerate(raw)
+            if i not in _value_pos and not a.startswith("--")]
     include_slow = bool(flags & {"--slow", "--all"})
     if "--slowest" in flags:
         return show_slowest()

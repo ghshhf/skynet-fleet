@@ -1,6 +1,6 @@
 @echo off
-REM 设备编队 - 命令行版（不进全屏，一行一行敲）
-REM 全屏版是 fleet-tui.bat；这个是想留在命令行里时用的
+REM 设备编队 - 命令行（唯一入口，一行一行敲）
+REM 全屏版已删（2026-11-07：两套命令本来就一样，只留命令行）
 REM 挑解释器顺序：FLEET_PY 覆盖，本机 portable，py -3，python
 REM 每个候选都要真跑通 import sys 才要：Windows 商店那个存根是空壳，
 REM 不实测的话它会假装自己是 python（静默 exit=49），然后什么都干不了。

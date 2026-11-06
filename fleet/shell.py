@@ -446,11 +446,7 @@ def main(argv=None):
     ap.add_argument("--no-watch", action="store_true", help="关掉设备上下线事件流")
     ap.add_argument("--interval", type=float, default=15.0, help="事件流探测间隔秒")
     ap.add_argument("-c", "--command", default="", help="不进入交互，只跑一条命令")
-    ap.add_argument("--tui", action="store_true", help="启动全屏 TUI（原 fleet-tui，已合并进 CLI 入口）")
     a = ap.parse_args(argv)
-    if a.tui:
-        from . import tui as _tui
-        return _tui.main(["--interval", str(a.interval)])
     sh = FleetShell(interval=a.interval, watch=not a.no_watch)
     if a.command:
         sh.dispatch(a.command)
