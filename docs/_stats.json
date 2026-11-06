@@ -1,24 +1,29 @@
 {
-  "generated_at": "2026-11-05 22:24:02",
-  "gates_registered": 158,
+  "generated_at": "2026-11-06 22:08:39",
+  "gates_registered": 181,
   "eval_files": 95,
   "orphan_evals": [],
   "retired_refs": [],
   "doc_md": 18,
   "app_build": "49",
-  "capabilities_declared": 331,
-  "capabilities_owned": 322,
+  "capabilities_declared": 491,
+  "capabilities_owned": 482,
   "capabilities_live": null,
-  "capabilities_gated": 188,
-  "devices": 47,
+  "capabilities_gated": 191,
+  "devices": 69,
   "devices_live": null,
   "domains": {
     "web": {
-      "declared": 14,
-      "owned": 14,
+      "declared": 15,
+      "owned": 15,
       "gated": 9
     },
     "adb": {
+      "declared": 14,
+      "owned": 14,
+      "gated": 14
+    },
+    "pcctl": {
       "declared": 14,
       "owned": 14,
       "gated": 14
@@ -28,10 +33,20 @@
       "owned": 14,
       "gated": 1
     },
+    "drive": {
+      "declared": 13,
+      "owned": 13,
+      "gated": 0
+    },
     "persona": {
       "declared": 13,
       "owned": 13,
       "gated": 13
+    },
+    "pdf": {
+      "declared": 13,
+      "owned": 13,
+      "gated": 0
     },
     "llmgw": {
       "declared": 13,
@@ -43,10 +58,15 @@
       "owned": 12,
       "gated": 12
     },
-    "pcctl": {
-      "declared": 12,
-      "owned": 12,
-      "gated": 12
+    "image": {
+      "declared": 11,
+      "owned": 11,
+      "gated": 4
+    },
+    "sheet": {
+      "declared": 11,
+      "owned": 11,
+      "gated": 0
     },
     "fp": {
       "declared": 11,
@@ -58,6 +78,31 @@
       "owned": 10,
       "gated": 10
     },
+    "file": {
+      "declared": 10,
+      "owned": 8,
+      "gated": 2
+    },
+    "word": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 0
+    },
+    "ppt": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 0
+    },
+    "live": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 1
+    },
+    "agent": {
+      "declared": 10,
+      "owned": 10,
+      "gated": 0
+    },
     "proxy": {
       "declared": 10,
       "owned": 10,
@@ -68,7 +113,22 @@
       "owned": 10,
       "gated": 0
     },
+    "code": {
+      "declared": 9,
+      "owned": 9,
+      "gated": 2
+    },
     "osint": {
+      "declared": 8,
+      "owned": 8,
+      "gated": 0
+    },
+    "convert": {
+      "declared": 8,
+      "owned": 8,
+      "gated": 0
+    },
+    "text": {
       "declared": 8,
       "owned": 8,
       "gated": 0
@@ -77,6 +137,11 @@
       "declared": 7,
       "owned": 7,
       "gated": 2
+    },
+    "flow": {
+      "declared": 7,
+      "owned": 7,
+      "gated": 0
     },
     "re": {
       "declared": 7,
@@ -91,6 +156,11 @@
     "pentest": {
       "declared": 7,
       "owned": 7,
+      "gated": 0
+    },
+    "media": {
+      "declared": 6,
+      "owned": 6,
       "gated": 0
     },
     "nat": {
@@ -133,10 +203,35 @@
       "owned": 5,
       "gated": 2
     },
+    "circle": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 0
+    },
+    "geo": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 0
+    },
+    "wt": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 0
+    },
+    "cap": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 0
+    },
     "lan": {
       "declared": 5,
       "owned": 5,
       "gated": 5
+    },
+    "chart": {
+      "declared": 5,
+      "owned": 5,
+      "gated": 0
     },
     "slider": {
       "declared": 5,
@@ -158,10 +253,10 @@
       "owned": 4,
       "gated": 4
     },
-    "image": {
+    "archive": {
       "declared": 4,
       "owned": 4,
-      "gated": 4
+      "gated": 0
     },
     "host": {
       "declared": 4,
@@ -273,19 +368,9 @@
       "owned": 2,
       "gated": 0
     },
-    "code": {
-      "declared": 2,
-      "owned": 2,
-      "gated": 2
-    },
     "ssh": {
       "declared": 2,
       "owned": 2,
-      "gated": 2
-    },
-    "file": {
-      "declared": 2,
-      "owned": 0,
       "gated": 2
     },
     "skynet": {

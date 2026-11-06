@@ -44,6 +44,7 @@ RFC 5780 明确要求：过滤测试的前置条件是「尚未向备用地址�
     python -m fleet.nat --servers a,b    # 指定 STUN 服务器
     python -m fleet.nat --selftest       # 离线自测（不依赖任何外部服务器）
 """
+from . import endpoints
 import json
 import os
 import random
@@ -84,7 +85,7 @@ DEFAULT_SERVERS = (
 
 #: 配置端口映射用的默认本地 UDP 端口。固定端口比随机端口好在：
 #: NAT 的映射老化是「按内部端点」记的，端口换个不停等于每次都从零开始。
-DEFAULT_PUNCH_PORT = 0
+DEFAULT_PUNCH_PORT = endpoints.port_num("PUNCH", 0)
 
 #: NAT 绑定存活时间。RFC 4787 要求至少 2 分钟；实测家用路由多在 30~120 秒，
 #: 运营商 CGNAT 常短到 30 秒。保活按最坏情况取。
@@ -347,7 +348,7 @@ def probe_filtering(server, timeout=2.0, sock=None):
             return {"ok": False, "err": "基础 Binding 都没通，无法判定过滤"}
         # t2/t3 **不重试**：CHANGE-REQUEST 是「服务器要么执行要么不执行」，
         # 不回就是不看，重发一遍只是白等一个 timeout。原来用 retries=2 +
-        # timeout=2.0，两个测试白烧 8 秒，整次体检被拖到 40 秒。
+        # timeout=2.0，两个测试各耗 8 秒，体检总耗时被拖到 40 秒。
         t2 = stun_once(s, server, change_ip=True, change_port=True,
                        timeout=min(timeout, 1.2), retries=1)
         t3 = stun_once(s, server, change_port=True,

@@ -32,6 +32,7 @@ import json
 import os
 import sys
 import threading
+from . import endpoints
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -59,7 +60,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from .catalog import build
 from .kinds import llmgw_device as L
 
-_DEFAULT_PORT = 8790
+_DEFAULT_PORT = endpoints.port_num("LLMGW", 8790)
 _DEV_LOCK = threading.Lock()
 _DEV = None
 

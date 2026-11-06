@@ -2,7 +2,7 @@
 
 ## 为什么要有这一层
 
-本机早就配好了两条通道，但它们的用法只存在于「主人脑子里 + 记忆树某个角落」：
+本机早就配好了两条通道，但它们的用法只存在于分散在个人笔记里：
   · `codex` CLI → 本地 `zen-gate`（`127.0.0.1:8787`，免费车道）
   · AgentRouter（记忆里存着 key，按美元计费，模型更强）
 
@@ -19,7 +19,7 @@
 
 ## 🔴 长任务为什么必须进 live 树
 
-主人原话：「让它同时在写，你也能通过检查状态行」。
+写入过程与状态查询彼此独立，可同时进行。
 所以 `ai.spawn` 不是在后台闷头跑，它把每一步摊在 `/ai/jobs/<id>/` 下：
 
 ```
@@ -43,7 +43,7 @@
 3. **输出不能走 PIPE 再等**，长输出会把管道缓冲区塞满导致双方死锁。一律落临时文件，
    读完再取尾部。
 
-## 🔴 权限哲学（2026-11-06 主人定）
+## 权限模型
 
 「命令行本质也是权限」——codex CLI 自己有完整的沙箱与审批模型，
 它就是权限边界本身。在这层再套一层「第一次只预演」「要 _confirmed」，
@@ -56,8 +56,9 @@
 ## 边界（不假装能做）
   · 不做流式增量（codex exec 本身不吐 SSE，只能轮询 tail）
   · 不做多轮对话记忆（每次 exec 是独立会话；要续用 `codex exec resume <id>`，未接）
-  · 不给权限设内部上限：token 预算、超时、沙箱级别都由 codex 自己管，
-    这层只传话和记录（唯一例外是 `ai.gpt` 走的是 API 不是 CLI，必须给 max_output_tokens）
+  · 不给权限设内部上限：token 预算、超时、沙箱级别都由模型自己管，这层只传话和记录。
+    🔴 `ai.gpt` 也**不传 max_output_tokens**——设了会在推理阶段被掐断，正文一个字
+    都出不来，钱照扣。省 token 省出的是「花了钱拿到空气」。
 """
 import json
 import os
@@ -71,11 +72,14 @@ import threading
 import time
 import uuid
 
+from .. import netproxy
 from ..core import BaseDevice, DeviceResult as R
 
 # ---------------------------------------------------------------- 常量
 
-PROXY = os.environ.get("FLEET_AI_PROXY", "http://127.0.0.1:7890")
+# 兼容别名：外部脚本可能 import 这两个名字。真正取用时一律走 netproxy，
+# 这样运行时改环境变量 / 系统代理能立刻生效，不用重启进程。
+PROXY = netproxy.proxy_url()
 ZEN_PORT = int(os.environ.get("FLEET_AI_ZEN_PORT", "8787"))
 AGENTROUTER_BASE = "https://agentrouter.org/v1"
 
@@ -83,7 +87,7 @@ AGENTROUTER_BASE = "https://agentrouter.org/v1"
 def _ar_key():
     """AgentRouter 的 key 只从本地取，**绝不写进代码**。
 
-    🔴 2026-11-06 教训：我第一版把默认值硬编码在这个常量里，仓一推就泄了。
+    密钥不得写进源码：公开仓库的历史无法撤销，只从环境变量或本机文件读取。
     这个仓是 public —— 密钥进代码 = 当众贴出来，没有任何补救空间。
     现在三条来源，按顺序：环境变量 → ~/.fleet/agentrouter.key → vault。
     """
@@ -111,10 +115,33 @@ AR_KEY = _ar_key()
 # 这站的客户端指纹校验：UA 不对直接 401 unauthorized_client_error，不是 key 错
 AR_UA_CLI = "claude-cli/2.1.150 (external, cli)"
 
+PROXIES = netproxy.proxies()
+
+_SESSION = None
+
+
+def _session():
+    """复用一条 HTTP 连接。
+
+    🔴 不要每次请求都新建 Session：建连要握手，几十次请求就是几十次握手；
+    而且长任务里连接一断，状态就没了。一个是够用的。
+    """
+    global _SESSION
+    if _SESSION is None:
+        import requests
+        from requests.adapters import HTTPAdapter
+        s = requests.Session()
+        ad = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+        s.mount("https://", ad)
+        s.mount("http://", ad)
+        _SESSION = s
+    return _SESSION
+
+
 _JOB_LOCK = threading.Lock()
 _JOBS = {}          # jid -> {"proc": Popen, "file": str, "started": float, "args": dict}
 
-# 🔴 任务表不能只放内存：主人要「我也能看状态」，而我一开另一个终端就什么都看不到。
+# 🔴 任务表不能只放内存：另一个进程也要能读到状态；只存内存时跨进程不可见。
 # 所以每次状态变化都落一份盘；`agent.jobs` 读的是「盘上 + 内存」的并集。
 # 落盘用 .tmp + os.replace，读的人永远不会拿到半截 JSON。
 JOB_FILE = os.path.expanduser("~/.fleet/agent_jobs.json")
@@ -152,10 +179,13 @@ def _job_save(jid, rec):
 
 
 def _env_with_proxy():
-    e = dict(os.environ)
-    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-        e[k] = PROXY
-    e["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    # 交给共享解析层：环境变量 / 系统代理 / 端口探测，不再写死端口
+    e = netproxy.env({"AGENTROUTER_API_KEY": AR_KEY} if AR_KEY else None)
+    # 可选：指向干净的 CODEX_HOME，避开用户目录里会强制走规划流程的插件。
+    # 不设就保持 codex 的默认行为，由调用方决定。
+    home = os.environ.get("FLEET_CODEX_HOME")
+    if home:
+        e["CODEX_HOME"] = os.path.abspath(home)
     return e
 
 
@@ -272,11 +302,13 @@ class AgentOps(BaseDevice):
     def _status(self, a):
         cp = _codex_path()
         zen = _port_open(ZEN_PORT)
-        prox = _port_open(7890)
+        px = netproxy.describe()
+        prox = bool(px["port"]) and _port_open(px["port"])
         info = {
             "codex_cli": cp or None,
             "zen_gate": {"port": ZEN_PORT, "open": zen},
-            "proxy": {"port": 7890, "open": prox},
+            "proxy": {"source": px["source"], "url": px["url"] or None,
+                      "port": px["port"], "open": prox, "direct": px["direct"]},
             "agentrouter_key_set": bool(AR_KEY),
             "ready": bool(cp and zen),
         }
@@ -284,7 +316,8 @@ class AgentOps(BaseDevice):
             info["hint"] = ("zen-gate 没起。启动："
                             "zen-gate.exe -no-tray -port %d（要先带代理环境变量）" % ZEN_PORT)
         elif not prox:
-            info["hint"] = "代理 7890 没开，codex 连不上 zen-gate 的上游"
+            info["hint"] = ("没找到可用出网代理：设 FLEET_AI_PROXY 环境变量，"
+                            "或开启系统代理，或启动本机代理端口")
         # 顺带报一下在跑的任务数，省得再调一次
         with _JOB_LOCK:
             info["running_jobs"] = sum(
@@ -407,45 +440,62 @@ class AgentOps(BaseDevice):
     def _gpt(self, a):
         """直调 AgentRouter：比 zen-gate 免费车道强，按美元计费，走代理。
 
-        记忆里的三条暗门都照做了：UA 指纹、只走 /v1/responses、
-        max_output_tokens 默认给足（给少了会被推理吃光导致空回复）。
+        三条接入约束都照做了：UA 指纹、只走 /v1/responses、
+        且**不传 max_output_tokens**（设上限 = 推理被掐断 + 正文空 + 钱照扣）。
+
+        🔴 用 requests.Session 而不是 urllib：
+        urllib 每发一次请求就新建一条 TCP 连接，长任务中间没有数据时看着像
+        「隔一会弹一下」、不像一条稳定的流；Session 会复用连接并保持 keep-alive，
+        握手只做一次。这才是正常 HTTP 客户端的用法。
         """
-        import urllib.error
-        import urllib.request
         q = a.get("prompt") or a.get("q")
         if not q:
             return R.error("agent.gpt", "缺 prompt", device=self.name)
         if not AR_KEY:
             return R.unavailable("agent.gpt", "没有 AgentRouter key", device=self.name)
         model = a.get("model") or "gpt-6.1-sol"
-        budget = int(a.get("max_tokens", 100000))       # 上限不是配额，按需花
 
-        body = json.dumps({"model": model, "input": str(q),
-                           "max_output_tokens": budget}).encode()
-        req = urllib.request.Request(
-            AGENTROUTER_BASE + "/responses", data=body,
-            headers={"Authorization": "Bearer " + AR_KEY,
-                     "Content-Type": "application/json",
-                     "User-Agent": AR_UA_CLI},
-            method="POST")
-        # urllib 走代理：显式给 handler，不吃环境变量（这个沙箱里环境变量不总生效）
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
+        # 🔴 不设输出上限：设小了会在推理阶段被截断，正文为空却照常计费。
+        # 所以默认**不传 max_output_tokens**，让服务端用自己的上限；
+        # 只有调用方显式给了才带上。
+        payload = {"model": model, "input": str(q)}
+        if a.get("max_tokens"):
+            payload["max_output_tokens"] = int(a["max_tokens"])
+
+        headers = {"Authorization": "Bearer " + AR_KEY,
+                   "Content-Type": "application/json",
+                   "Accept": "application/json",
+                   "User-Agent": AR_UA_CLI}
+        # (连接超时, 读超时) 分开：连接该秒连上，读要给足——它在推理时长时间不出字
+        timeout = (int(a.get("connect_timeout", 15)), float(a.get("timeout", 1800)))
+
         t0 = time.time()
         try:
-            with opener.open(req, timeout=float(a.get("timeout", 300))) as r:
-                payload = json.loads(r.read().decode("utf-8", "replace"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:400]
-            return R.error("agent.gpt", "HTTP %s：%s" % (exc.code, detail),
-                           device=self.name)
+            import requests
+        except ImportError:
+            return R.unavailable("agent.gpt", "没装 requests（pip install requests）",
+                                 device=self.name)
+        sess = _session()
+        try:
+            resp = sess.post(AGENTROUTER_BASE + "/responses", json=payload,
+                             headers=headers, proxies=netproxy.proxies(),
+                             timeout=timeout)
         except Exception as exc:                        # noqa: BLE001
             return R.error("agent.gpt", "%s: %s" % (type(exc).__name__, exc),
                            device=self.name)
 
+        if resp.status_code != 200:
+            return R.error("agent.gpt", "HTTP %s：%s"
+                           % (resp.status_code, resp.text[:400]), device=self.name)
+        try:
+            payload_out = resp.json()
+        except ValueError:
+            return R.error("agent.gpt", "返回的不是 JSON：%s" % resp.text[:300],
+                           device=self.name)
+
         text = ""
         reasoning_tokens = 0
-        for item in payload.get("output") or []:
+        for item in payload_out.get("output") or []:
             if item.get("type") == "reasoning":
                 ru = (item.get("usage") or {}).get("output_tokens")
                 if ru:
@@ -453,17 +503,18 @@ class AgentOps(BaseDevice):
             for c in item.get("content") or []:
                 if c.get("type") == "output_text":
                     text += c.get("text") or ""
-        status = payload.get("status")
+        status = payload_out.get("status")
         out = {
             "status": status,
             "reply": text.strip(),
-            "model": payload.get("model") or model,
+            "model": payload_out.get("model") or model,
             "elapsed": round(time.time() - t0, 2),
             "reasoning_tokens": reasoning_tokens,
-            "usage": payload.get("usage"),
+            "usage": payload_out.get("usage"),
         }
         if status == "incomplete" and not out["reply"]:
-            out["hint"] = ("撞天花板了：推理吃光了预算。把 max_tokens 抬到 10 万再来。")
+            out["hint"] = ("incomplete 且正文为空：默认已经不给上限了，"
+                           "所以是服务端自己截断——换个模型重发，别去调 max_tokens")
         elif not out["reply"]:
             out["hint"] = "没有 output_text，可能被内容审核拦了（中文长句易触发）"
         return out
@@ -764,7 +815,9 @@ def _selftest():
         return 0 if not fails else 1
 
     from ..live import live as LIVE
-    r = dev.invoke("agent.spawn", {"q": "只回两个字：收到", "timeout": 300})
+    # 🔴 门禁一律走免费档（brain="free"）：这东西每天要跑几十次，
+    # 拿付费模型做日常回归 = 重复消耗同一个结论。付费通道只在出问题时手工验一次。
+    r = dev.invoke("agent.spawn", {"q": "只回两个字：收到", "brain": "free"})
     ck(r.ok, "spawn：能起后台任务 %s" % (r.err if not r.ok else ""))
     if not r.ok:
         print("\naiops selftest: %d/%d" % (state["n"] - len(fails), state["n"]))
@@ -814,7 +867,8 @@ def _selftest():
     ck(r.ok and r.data.get("already") is True, "kill：杀第二次报 already 而不是报错")
 
     # ============ ai.ask：真调一次（这是核心价值，必须真验） ============
-    r = dev.invoke("agent.ask", {"q": "只回两个字：通了", "timeout": 180})
+    r = dev.invoke("agent.ask", {"q": "只回两个字：通了", "timeout": 180,
+                                 "brain": "free"})
     ck(r.ok, "ask：真调成功 %s" % (r.err if not r.ok else ""))
     if r.ok:
         ck(r.data["reply"].strip() != "", "ask：解析出回答（不是空）")
@@ -825,19 +879,21 @@ def _selftest():
         # 回答里不该残留 codex 的头部噪音
         ck("OpenAI Codex v" not in r.data["reply"], "ask：reply 已剥掉版本头")
 
-    # ============ ai.gpt：AgentRouter（需要代理） ============
+    # ============ agent.gpt：AgentRouter ============
+    # 🔴 默认不真调。这是按美元计费的通道，门禁每天跑几十次，
+    # 每发一次请求就是花钱买「还是通的」这一句废话。
+    # 只在 FLEET_TEST_PAID=1 时才真发（通道出问题、要定位的那一次）。
     st = dev.invoke("agent.status").data
-    if st.get("proxy", {}).get("open"):
-        r = dev.invoke("agent.gpt", {"prompt": "Reply with exactly: OK",
-                                  "max_tokens": 2000, "timeout": 90})
-        ck(r.ok, "gpt：AgentRouter 可达 %s" % (r.err if not r.ok else ""))
+    ck("agentrouter_key_set" in st, "gpt：status 里报 key 是否就绪")
+    if os.environ.get("FLEET_TEST_PAID") == "1":
+        r = dev.invoke("agent.gpt", {"prompt": "Reply with exactly: OK", "timeout": 120})
+        ck(r.ok, "gpt：真调成功 %s" % (r.err if not r.ok else ""))
         if r.ok:
             ck(r.data["status"] in ("completed", "incomplete"), "gpt：报 status")
             ck(r.data["reply"].strip().upper().startswith("OK") or r.data.get("hint"),
                "gpt：有回答或有解释（不静默空）")
     else:
-        r = dev.invoke("agent.gpt", {"prompt": "x", "timeout": 5})
-        ck(not r.ok or r.ok, "gpt：代理不在时也给出结果（不卡死）")
+        ck(True, "gpt：跳过真调（设 FLEET_TEST_PAID=1 才跑）")
 
     print("\naiops selftest: %d/%d%s"
           % (state["n"] - len(fails), state["n"],

@@ -1,11 +1,8 @@
-"""能力清单：全仓唯一一处「有哪些能力」。
+"""能力清单：全仓唯一的能力定义源。
 
-这份清单是唯一真相——终端补全、MCP 工具列表、她/模型能看见的东西，全部从这里
-长出来。以前加一项能力要改三处（commander 的 elif、手写 help、accounts 的分权表），
-漏一处就是「能力存在但没人知道」；现在只改这里。
-
-命名一律 domain.verb（screen.read / input.tap / pc.state）。domain 是能力族，
-verb 是动作；这样补全能按族分组，权限树也能按族授权。
+终端补全、MCP 工具列表与模型可见的能力说明均由此生成；新增能力只需改这里。
+命名一律 domain.verb（screen.read / input.tap / pc.state）：domain 为能力族，
+verb 为动作，便于按族分组补全与授权。
 """
 import os
 
@@ -79,6 +76,10 @@ from .kinds.pptops import PptOps
 from .live import LiveOps
 from .kinds.aiops import AgentOps
 from .kinds.chartops import ChartOps
+from .kinds.codeops import CodeOps
+from .capindex import CapIndexOps
+from .kinds.mediaops import MediaOps
+from .kinds.flowops import FlowOps
 from .kinds.remote_phone import RelayNode, sync_remote_devices
 from .kinds.pc_control import PcControl
 from .kinds.render import Render
@@ -543,6 +544,127 @@ CAPABILITIES = [
                params=(Param("code", "str", True, "要校验的代码"),
                        Param("lang", "str", doc="语言，默认 python")),
                note="只做语法/编译级校验，不做语义证明"),
+    # ---- 静态代码分析层（只读 .py，ast.parse 不执行；扫描用 BFS，避免扎进深目录）----
+    Capability("code.info", "目录或单文件盘点：文件数、行数、函数/类数量、语法错计数",
+               params=(Param("path", "str", True, "目录或单个 .py 路径"),
+                       Param("limit", "int", doc="最多扫多少个 .py，默认 20000")),
+               note="语法错的文件照数但跳过解析，parse_errors 如实报，不假装全过"),
+    Capability("code.ast", "单个 .py 的 AST 摘要：顶层定义、参数、圈复杂度、import 列表",
+               params=(Param("path", "str", True, "单个 .py 路径")),
+               note="只收单文件；要看整个目录用 code.info。语法错会带行号报错"),
+    Capability("code.imports", "目录内模块依赖图：边、扇入、环（三色 DFS）",
+               params=(Param("path", "str", True, "包/项目根目录"),
+                       Param("limit", "int", doc="最多扫多少个 .py，默认 20000")),
+               note="标准库不进图，否则全是噪音；cycles 返回参与环的模块名"),
+    Capability("code.dead", "找定义了但静态引用为零的顶层函数/类（候选清单）",
+               params=(Param("path", "str", True, "项目根目录"),
+                       Param("limit", "int", doc="最多扫多少个 .py，默认 20000")),
+               note="候选不是判决：动态派发、getattr、插件注册、被别的仓引用都看不见，"
+                    "返回里带 why_candidate_not_verdict 说明，别拿它直接删代码"),
+    Capability("code.complex", "按圈复杂度给函数排榜，超过阈值的点出来",
+               params=(Param("path", "str", True, "项目根目录"),
+                       Param("threshold", "int", doc="告警阈值，默认 10"),
+                       Param("top", "int", doc="返回前几条，默认 20")),
+               note="parse_skipped 如实报被跳过的坏文件数"),
+    Capability("code.calls", "查某个函数被谁调用；不给 name 时给符号引用排行榜",
+               params=(Param("path", "str", True, "项目根目录"),
+                       Param("name", "str", doc="要查的符号名；留空则返回排行榜"),
+                       Param("top", "int", doc="排行榜条数，默认 30")),
+               note="查不到时 found=false，不算错误"),
+    Capability("code.todos", "扫 TODO / FIXME / XXX / HACK 注释，按种类计数并给出行号",
+               params=(Param("path", "str", True, "项目根目录"),
+                       Param("kinds", "list", doc="只保留这些种类，如 [\"FIXME\"]"),
+                       Param("limit", "int", doc="最多扫多少个 .py，默认 20000")),
+               note="最多回 300 条，truncated 会如实标出"),
+    # ---- 媒体层：本机 ffmpeg/ffprobe 由 subprocess 调用，输出一律另存不覆盖 ----
+    Capability("media.trim", "按时间区间裁剪视频/音频（start+end 或 start+duration）",
+               params=(Param("src", "str", True, "源文件路径（也接受 input）"),
+                       Param("out", "str", True, "输出路径；已存在自动另取编号"),
+                       Param("start", "str", doc="起点：秒 / MM:SS / HH:MM:SS.mmm，默认 0"),
+                       Param("end", "str", doc="终点；与 duration 二选一"),
+                       Param("duration", "str", doc="时长；与 end 二选一")),
+               side_effect=True,
+               note="end<=start 或 duration<=0 直接报错；时间统一走 _secs() 解析"),
+    Capability("media.concat", "按顺序把多个文件拼成一个（concat demuxer + 临时列表）",
+               params=(Param("inputs", "list", True, "输入文件路径列表，至少两个"),
+                       Param("out", "str", True, "输出路径；已存在自动另取编号")),
+               side_effect=True,
+               note="要求输入流格式一致，否则如实报错；临时列表结束即清理"),
+    Capability("media.extract_audio", "抽出首条音轨存成单独文件",
+               params=(Param("src", "str", True, "源视频/音频路径"),
+                       Param("out", "str", True, "输出路径；已存在自动另取编号")),
+               side_effect=True,
+               note="只取首条音轨；源没有音轨时报错，不静默产空文件"),
+    Capability("media.thumb", "抽一帧存成图片",
+               params=(Param("src", "str", True, "源视频路径"),
+                       Param("out", "str", True, "输出图片路径（.png/.jpg）"),
+                       Param("start", "str", doc="取帧时刻，默认 0"),
+                       Param("width", "int", doc="缩放宽度，不填保持原宽")),
+               side_effect=True),
+    Capability("media.gif", "按区间生成 GIF（两遍法 palettegen + paletteuse）",
+               params=(Param("src", "str", True, "源视频路径"),
+                       Param("out", "str", True, "输出 .gif 路径"),
+                       Param("start", "str", doc="起点"),
+                       Param("duration", "str", doc="时长"),
+                       Param("fps", "int", doc="帧率，默认 12"),
+                       Param("width", "int", doc="宽度，默认 480")),
+               side_effect=True,
+               note="单遍法画质差，这里固定走两遍调色板；输出后缀必须是 .gif"),
+    Capability("media.speed", "改变播放速度但保持音调（视频 setpts + 音频 atempo 链）",
+               params=(Param("src", "str", True, "源视频/音频路径"),
+                       Param("out", "str", True, "输出路径；已存在自动另取编号"),
+                       Param("factor", "float", True, "倍速，如 2 / 0.5 / 4")),
+               side_effect=True,
+               note="单个 atempo 只支持 0.5-2.0，超出范围自动串联多个；"
+                    "factor<=0 或非数报错"),
+    # ---- 能力索引层：索引常驻用于匹配，完整规格按名字按需读取 ----
+    Capability("cap.index", "列能力轻量索引（名字/域/标题/触发词/标记），不含参数表",
+               params=(Param("domain", "str", doc="只看某个域，不传则全量"),
+                       Param("limit", "int", doc="最多返回多少条")),
+               note="用于发现能力；调用前用 cap.detail 取完整规格"),
+    Capability("cap.find", "按名字、域或中英文关键词检索能力，按匹配度排序",
+               params=(Param("q", "str", True, "检索词"),
+                       Param("limit", "int", doc="最多返回多少条，默认 10")),
+               note="返回命中名与分数，不返回参数表"),
+    Capability("cap.detail", "取单条能力的完整规格（参数、审批档、说明）",
+               params=(Param("name", "str", True, "能力名，如 chart.bar")),
+               note="未知名返回错误，不返回近似结果"),
+    Capability("cap.bundle", "一次取多条能力的完整规格",
+               params=(Param("names", "json", True, "能力名列表或逗号分隔串")),
+               note="未知名单列在 missing，不静默丢弃"),
+    Capability("cap.stats", "索引层与完整规格的体积对比",
+               note="用于判断分层是否仍然划算"),
+    # ---- 流程编排：把能力调用串成带依赖、可续跑的流程 ----
+    Capability("flow.save", "保存一份流程定义（步骤数组，人工可审）",
+               params=(Param("name", "str", True, "流程名"),
+                       Param("steps", "json", True, "步骤数组：id/cap/args/deps"),
+                       Param("desc", "str"), Param("fail_fast", "bool"),
+                       Param("check_catalog", "bool", doc="校验步骤能力是否在表里")),
+               note="落到 ~/.fleet/flows/；同名覆盖，名字只许字母数字下划线连字符"),
+    Capability("flow.list", "列出已保存的流程名",
+               note="只读"),
+    Capability("flow.get", "读回一份流程定义",
+               params=(Param("name", "str", True, "流程名")),
+               note="不存在返回错误，不返回近似结果"),
+    Capability("flow.validate", "静态校验流程（结构、引用、依赖、环）",
+               params=(Param("name", "str", doc="已保存的流程名"),
+                       Param("steps", "json", doc="也可直接传步骤数组"),
+                       Param("check_catalog", "bool", doc="校验能力是否存在")),
+               note="拓扑执行由 doit 负责；这里只把坏流程挡在调度器之外"),
+    Capability("flow.plan", "出执行计划（每步依赖与结果落点），不执行",
+               params=(Param("name", "str"), Param("steps", "json"),
+                       Param("run_id", "str"), Param("check_catalog", "bool")),
+               note="执行顺序由 doit 按依赖决定，不预先排序"),
+    Capability("flow.run", "执行流程：按依赖调度，已成功的步骤自动跳过",
+               params=(Param("name", "str"), Param("steps", "json"),
+                       Param("run_id", "str", doc="同一 id 续跑，默认用流程名"),
+                       Param("fail_fast", "bool", doc="上游失败时下游标跳过"),
+                       Param("reset", "bool", doc="流程定义变了要显式重置"),
+                       Param("check_catalog", "bool")),
+               note="每步结果独立落盘；审批档由各步骤自己的能力决定，外层不重复套闸门"),
+    Capability("flow.status", "查看某次运行每一步的状态与结果",
+               params=(Param("run_id", "str", True, "运行 id")),
+               note="读到的是落盘结果，不是内存态"),
     # ---- 远程 shell 通道（D4：把别人的机器当设备管；只连你拥有/获授权的机器）----
     Capability("ssh.banner", "SSH 版本探测：真读 SSH-2.0 版本行，确认 22 端口上跑的是 sshd",
                params=(Param("host", "str", True, "主机/IP"),
@@ -788,8 +910,7 @@ CAPABILITIES = [
                params=(Param("sid", "str", doc="不给就什么都不做")),
                side_effect=True, note="收摊有次序，避免留半条连接"),
     # ---- 地址动态层（rdv）：设备指纹不变，地址随时漂 ----
-    # 主人 2026-11-01：「会变的地址只要给它加一个动态就行了」
-    #                 「动态检测、动态自检、切换，这不本质就是另类的固态吗」
+    # 指纹稳定、地址漂移时，以持久映射代替固定地址；切换由动态自检驱动。
     # 所以这一层的产物不是「一个地址」，是 `self_id → 当前地址` 这个**持久映射**：
     # 映射本身稳定，映射的内容易变。IPv6 临时地址因此不再是缺点，只是需要刷新。
     Capability("rdv.self", "我是谁、现在在哪、变了没有（指纹稳定，地址可漂）",
@@ -877,7 +998,7 @@ CAPABILITIES = [
                check=_netforce_reason,
                note="看的是本地已攒的那本账，跑 web.diffuse 才会涨"),
     # ---- 本地资料库（2026-11-03）：数据面攒出来的东西，接进总线才能被 agent 调 ----
-    # 只读、纯本地、不联网；不建索引（主人：按需解析，不做预建全文检索）。
+    # 只读、纯本地、不联网；按需解析，不预建全文检索。
     Capability("paper.stats", "本地论文库规模（篇数 / 方向 / 来源 / 磁盘）",
                note="只统计元数据，不解析正文"),
     Capability("paper.search", "在本地论文库里搜题目/摘要/作者/编号（纯本地，不联网）",
@@ -1200,7 +1321,7 @@ CAPABILITIES = [
                        Param("out_dir", "str", doc="输出目录；默认 <源目录>/_<op>")),
                side_effect=True,
                note="永不覆盖源文件。单张失败不影响其余，failed 里带每张的错因"),
-    # ---- 通用格式转换（2026-11-06）：一个入口，引擎按媒体类型自动分派 ----
+    # ---- 通用格式转换：一个入口，引擎按媒体类型自动分派 ----
     Capability("convert.engines", "本机有哪些转换引擎、各吃哪些格式、还缺什么",
                note="只报实际探测到的，不报「理论上支持」"),
     Capability("convert.probe", "一个文件到底是什么（按魔数判，不信扩展名）",
@@ -1273,7 +1394,7 @@ CAPABILITIES = [
                        Param("out_dir", "str", doc="输出目录，默认 <源目录>/_<格式>")),
                side_effect=True,
                note="默认预演：批量 500 张参数错一次就是 500 个废文件"),
-    # ---- 压缩包（2026-11-06）：打包/解包/看内容。7-Zip + 标准库 ----
+    # ---- 压缩包：打包/解包/看内容。7-Zip + 标准库 ----
     Capability("archive.info", "这个压缩包里有什么：几个文件、解压后多大、有没有坏条目",
                params=(Param("path", "str", True, "压缩包路径"),),
                note="unsafe_count>0 表示包含越界路径（zip-slip），解包会被拒"),
@@ -1544,7 +1665,7 @@ CAPABILITIES = [
                params=(),
                note="「PDF 转图片」需要渲染器（pdftoppm/gs/mutool），"
                     "缺了会如实报，不用 pypdf 硬凑白图"),
-    # ---- 表格层：xlsx 的**改**，不是抽成文本就完事（2026-11-06）----
+    # ---- 表格层：xlsx 的**改**，不是抽成文本就完事----
     # 选型：openpyxl 3.1.5（MIT，纯 Python，本机已装）。它不算公式——这是它的边界，
     # 不是 bug；要算值就走 Excel 打开或后续接 formualizer/pycel。
     Capability("sheet.info", "工作簿概览：几张表、各多少行列、多少公式、表头猜哪行",
@@ -1660,7 +1781,21 @@ CAPABILITIES = [
                        Param("limit", "int", doc="最多导几行")),
                side_effect=True,
                note="每张表一个文件；默认 utf-8-sig，Excel 双击不乱码"),
-    # ---- 文档层：docx 的**写**与模板填充（2026-11-06）----
+    Capability("sheet.chart", "往 xlsx 里插**原生图表对象**（读者改数，图跟着刷新）",
+               params=(Param("path", "str", True, "xlsx 路径"),
+                       Param("data", "str", True, '数据区引用，如 "A1:C10"，首行是系列名'),
+                       Param("type", "str", doc="bar（默认）/ line / pie / scatter / area"),
+                       Param("title", "str"), Param("xlabel", "str"),
+                       Param("ylabel", "str"),
+                       Param("cats", "str", doc="分类轴引用；散点必给 x 值否则 x 轴是 1,2,3"),
+                       Param("anchor", "str", doc="图放哪格，默认数据右侧两列"),
+                       Param("titles_from_data", "bool", doc="首行是否系列名，默认 True"),
+                       Param("show_percent", "bool", doc="饼图显示百分比，默认 True"),
+                       Param("out", "str", doc="另存路径；不给就在源文件旁加后缀")),
+               side_effect=True,
+               note="和 chart.* 的分工：这个出的是**表里的图**（改数会刷新），"
+                    "chart.* 出的是**报告用的 PNG**（贴文档、发人看）。两件事，别混"),
+    # ---- 文档层：docx 的**写**与模板填充----
     # 选型：python-docx 1.2.0 + docxtpl 0.20.2（都 MIT，本机已装）。
     # docxtpl 替我们处理了 Word 最脏的部分：占位符被拆到多个 run 里
     # （Word 会因拼写检查/格式变化把 {{ name }} 切成 {{ na + me }}）。
@@ -1763,7 +1898,7 @@ CAPABILITIES = [
                        Param("comments", "str", doc="备注"),
                        Param("out", "str", doc="输出路径")),
                side_effect=True),
-    # ---- 演示层：pptx 的读、建、模板填充（2026-11-06）----
+    # ---- 演示层：pptx 的读、建、模板填充----
     # 选型：python-pptx 1.0.2（MIT，已装）+ python-pptx-text-replacer 0.0.6（MIT）。
     # 后者的价值只有一个：PowerPoint 会把 {name} 拆成多个 run（{na + me}），
     # 纯字符串替换 100% 漏。它按字符级把替换文本分配回各 run，格式不动。
@@ -1846,7 +1981,7 @@ CAPABILITIES = [
                side_effect=True,
                note="不做「复制页」：deepcopy 的页会复用原 slideN.xml 的 part 名，"
                     "保存后 zip 有重名条目，PowerPoint 会提示修复——如实不做"),
-    # ---- 活状态层：人和 AI 读写同一棵运行态树（2026-11-06 主人提的想法）----
+    # ---- 活状态层：人和 AI 读写同一棵运行态树----
     # 不是 RPC、不是 MCP、不是 CLI——是把程序当前状态摊开成一块可寻址的活内存，
     # 谁改谁广播，双方读到的都是同一份。真正的难点不是共享，是「谁赢了」：
     # 所以每次写入带版本号、写者身份、时间戳，改动进有界事件环。
@@ -1897,9 +2032,9 @@ CAPABILITIES = [
                params=(Param("path", "str", True, "快照文件路径"),
                        Param("writer", "str", doc="记成谁灌的，默认 load")),
                side_effect=True),
-    # ---- AI 代理层：把本机 codex CLI 接成能力（2026-11-06）----
-    # 主人原话：「本质的话你就把它当一个智能体去调就行了」「真实的智能体是有写入权限，
-    # 是能调用工具，因为它本身是有命令行」⇒ 这层不做权限收敛，只做调用与记录。
+    # ---- AI 代理层：把本机 codex CLI 接成能力----
+    # codex CLI 本身带命令行、能调工具、具备写入权限；
+    # 这层不做权限收敛，只负责调用与记录。
     Capability("agent.status", "通道体检：codex CLI / 本地网关端口 / 代理 / 在跑任务数",
                note="出问题先跑这个，别靠猜。网关没起会直接给启动命令"),
     Capability("agent.models", "列本地网关可用的模型清单",
@@ -1925,11 +2060,12 @@ CAPABILITIES = [
     Capability("agent.gpt", "直调 AgentRouter（比免费车道强，按美元计费，走代理）",
                params=(Param("prompt", "str", True, "问题"),
                        Param("model", "str", doc="gpt-6.1-sol（默认）/ gpt-6-astra / gpt-5.6-sol"),
-                       Param("max_tokens", "int", doc="默认 10 万；给少了会被推理吃光变成空回复"),
+                       Param("max_tokens", "int", doc="🔴 默认不传。设上限会让推理被掐断、正文为空"),
                        Param("timeout", "float", doc="秒，默认 300")),
                side_effect=True,
-               note="这站有三道暗门：必须伪装 UA、只走 /v1/responses、"
-                    "中文长句易被内容审核拦（英文技术提问正常）"),
+               note="这站有三条接入约束：必须伪装 UA、只走 /v1/responses、"
+                    "中文长句易被内容审核拦（英文技术提问正常）。"
+                    "**不设 max_output_tokens**——上限不是省钱，是花钱买空气"),
     Capability("agent.spawn", "后台派长活，进度实时写进 live 树",
                params=(Param("prompt", "str", True, "任务描述"),
                        Param("cwd", "str", doc="工作目录"),
@@ -1948,7 +2084,7 @@ CAPABILITIES = [
                params=(Param("job", "str", True, "任务 id"),),
                side_effect=True, destructive=True,
                note="Windows 走 taskkill /F /T；已结束的报 already 而不是报错"),
-    # ---- 图表层：数据画成图（2026-11-06）----
+    # ---- 图表层：数据画成图----
     # 表内原生图归 sheet 域（openpyxl.chart，读者改数能跟着刷新）；
     # 这里出的是报告用的 PNG —— 贴进文档、发给别人看。
     Capability("chart.bar", "柱状图（第 1 列分类，第 2 列起每列一个系列）",
@@ -2549,6 +2685,14 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 图表层：sheet 能算数，但人看报表先看形状——一张图画完的事，
     # 用表说半天。表内原生图归 sheet，报告图归这里。
     reg.add(ChartOps())
+    # 静态代码分析：只看结构不执行，给「这块能不能动」提供事实底稿。
+    reg.add(CodeOps())
+    # 媒体处理：ffmpeg 是本机外部命令，缺了 probe() 就如实报不可用。
+    reg.add(MediaOps())
+    # 能力索引：只读目录表，不接触外部世界。
+    reg.add(CapIndexOps())
+    # 流程编排：调度交给 doit，设备本身只管定义与结果落盘。
+    reg.add(FlowOps())
     # D4 两条新通道：都是「目标地址是参数」的探路设备，不依赖本机有什么外设
     reg.add(SshShell())
     reg.add(MqttBus())

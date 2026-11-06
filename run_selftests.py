@@ -167,6 +167,12 @@ CASES = [
     ("fleet_live", ["-m", "fleet.live", "--selftest"], HERE, 180),
     ("fleet_agentops", ["-m", "fleet.kinds.aiops", "--selftest"], HERE, 600),
     ("fleet_chartops", ["-m", "fleet.kinds.chartops", "--selftest"], HERE, 240),
+    ("fleet_codeops", ["-m", "fleet.kinds.codeops", "--selftest"], HERE, 120),
+    ("fleet_mediaops", ["-m", "fleet.kinds.mediaops", "--selftest"], HERE, 300),
+    ("fleet_capindex", ["-m", "fleet.capindex", "--selftest"], HERE, 120),
+    ("fleet_netproxy", ["-m", "fleet.netproxy", "--selftest"], HERE, 60),
+    ("fleet_flowops", ["-m", "fleet.kinds.flowops", "--selftest"], HERE, 180),
+    ("fleet_endpoints", ["-c", "import sys; from fleet.endpoints import _selftest; sys.exit(_selftest())"], HERE, 60),
     # 热点叠加编队（2026-10-24 P2）：全离线——shell/creative.hotspot 全打桩，
     # ARP 解析（真机格式+IPv6/残缺行）/基线差异（MAC 主键）/deploy 流水线顺序
     # 都覆盖，自测自清理不碰真 HOME。
@@ -373,12 +379,12 @@ CASES = [
     # 这一层是「两个手机端 + 三个网络层」的底座：三家免费网关（freellmapi /
     # zen-gate / dsh）+ 本地 llama.cpp 抽象成同一种资源的多个实例。
     # 门禁必须全离线——任何一家没起、没配 Key 都不能让它变红，
-    # 它验的是「注册表与探测逻辑」，不是「网关今天活着」。
+    # 验的是「注册表与探测逻辑」，不是「网关当前是否在线」。
     ("eval_t38_providers", ["-m", "fleet.providers", "--selftest"], HERE, 120),
     # ---- T39：能力表 → 云端 function-calling 工具表（融合计划书 P4 的云侧那一步）
     # 149 项能力已经有了 MCP 形状（t14 覆盖），这一层补的是 OpenAI / Anthropic
     # 两种信封 + 回环解析（模型吐回来的 tool_call 要还原成能力真名）。
-    # 全离线：不连任何网关，验的是「投影与解析」，不是「模型今天调得对」。
+    # 全离线：不连任何网关，验的是「投影与解析」，不是「模型当前输出」。
     ("eval_t39_toolschema", ["-m", "fleet.toolschema", "--selftest"], HERE, 120),
     # ---- T40：云端 agent loop（P4 的「跑」那一半）
     # toolschema 只管信封，这一层才是「真执行并把结果喂回模型」。
@@ -445,7 +451,7 @@ CASES = [
     ("eval_t56_tunnel", ["evals/t56_tunnel.py"], HERE, 120),
     # t57 是「会变的地址不是问题」：t56 把中继当注入替身，数据面并没接通。
     #     t57 钉对等中继（两端各接进来、中继转发彼此字节）+ 地址簿 + 墙外自检，
-    #     以及主人口中那个「另类的固态」—— 指纹不变、地址随便漂。
+    #     覆盖指纹稳定、地址漂移的场景。
     ("eval_t57_relay_rdv", ["evals/t57_relay_rdv.py"], HERE, 180),
     # t58 是「把上面那些手动能力接成一条自己会跑的循环」。
     #     复用天网已有的 beat（心跳骨架此前没有任何循环在用）+ Rendezvous，

@@ -24,6 +24,7 @@ YouTube/Google 是「TLS 握手阶段按 IP 段整段切断」→ 分片无效�
     python netaccel.py system-proxy off  # 关系统代理
     python netaccel.py --selftest
 """
+from . import endpoints
 import json
 import os
 import re
@@ -49,8 +50,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 IS_WIN = sys.platform.startswith("win")
 
-PROXY_PORT = 7810
-WEBUI_PORT = 7811
+PROXY_PORT = endpoints.port_num("NETACCEL_PROXY", 7810)
+WEBUI_PORT = endpoints.port_num("NETACCEL_WEBUI", 7811)
 PROXY_ADDR = f"127.0.0.1:{PROXY_PORT}"
 
 # gitport 二进制候选路径。
@@ -75,7 +76,7 @@ _SITES_EXAMPLE = os.path.join(_GITPORT_DIR, "SITES_EXAMPLE.toml")
 # 内置受管域名（必须镜像 src/site.rs 的 default_profiles 域名）。
 # 这是 PAC 路由的真相来源之一；用户通过 sites.toml 追加的站点会被自动并入。
 # 旧 GitHub 生态域名（*.github.com / *.githubusercontent.com）覆盖全部 GitHub 流量。
-# 2026-10-31 实测定调：只登记「gitport 确实救得动」的站。
+# 只登记经实测 gitport 可加速的站点。
 #
 # YouTube / Twitter / Google 已从名单里剔除，理由是量出来的，不是猜的：
 #   ① DNS 就被污染（www.youtube.com 返回 31.13.92.37 = Facebook 的 IP）；
@@ -278,7 +279,7 @@ def stop():
 # 分层而不是重写：proxy.py 只负责「把局域网来的连接转交给 127.0.0.1:7810」，
 # 真正的 IP 池、失败沉底、ClientHello 分片全在 gitport 里。
 # 这样热点下的设备只填一个 代理=192.168.137.1:7822，不用装任何东西。
-LAN_PORT = 7822
+LAN_PORT = endpoints.port_num("NETACCEL_LAN", 7822)
 _GATEWAY_PY = os.path.normpath(
     os.path.join(_HERE, "..", "tools", "cloudnode", "proxy.py")
 )

@@ -14,7 +14,8 @@
    建 key 时不选「Gemini API」限制，列表里那一项是灰的、选不中，
    会卡在「无法与当前选择的 API 限制结合使用」。
 
-3. **本机网络：直连不通，必须走代理 127.0.0.1:7890**
+3. **本机网络：直连通常不通，出网代理由 netproxy 自适应解析**
+   （环境变量 → 系统代理 → 本机端口探测 → 直连），不再写死端口
    直连 TLS 直接断。但代理是**规则代理**，到 Google 的握手会间歇性
    失败（`schannel: failed to receive handshake`），实测要重试 1~6 次
    才拿到一次成功连接。所以这里必须带重试，不能一次定生死。
@@ -38,11 +39,13 @@ import subprocess
 import sys
 import tempfile
 
+from . import netproxy
 from . import vault
 from . import text as _fleet_text
 
 KEY_NAME = "gemini_api_key"
-PROXY = "http://127.0.0.1:7890"
+# 兼容别名；实际请求时重新解析，改环境变量或系统代理立即生效
+PROXY = netproxy.proxy_url()
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-3.8-flash"
 # 降级链：主模型 503（高负载）或 404（下架）时依次往后退
@@ -65,9 +68,11 @@ def _curl(url, method="GET", body=None, timeout=45):
     cmd = [
         "curl", "-s", "-o", path, "-w", "%{http_code}",
         "--max-time", str(timeout), "--http1.1",
-        "-x", PROXY,
         "-H", f"x-goog-api-key: {_key()}",
     ]
+    proxy = netproxy.proxy_url()
+    if proxy:                       # 没解析到代理就直连，不硬塞一个不存在的端口
+        cmd += ["-x", proxy]
     if body is not None:
         rfd, rpath = tempfile.mkstemp(suffix=".json")
         with os.fdopen(rfd, "w", encoding="utf-8") as f:

@@ -18,6 +18,7 @@ sing-box 能吃的 JSON，并管好核心进程 + 系统代理开关。
 
 GBK 防线（2026-11-01 铁律）：输出含 ✓ ✗ → 等外字符，入口重配 UTF-8 兜底。
 """
+from . import endpoints
 import json
 import os
 import re
@@ -44,7 +45,7 @@ SB_VERSION = "1.14.4"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SB_DIR = os.path.normpath(os.path.join(_HERE, "..", "vendor", "sing-box"))
 SB_EXE = "sing-box.exe"
-MIXED_PORT = 7891                      # mixed 入站（HTTP+SOCKS 同端口；避开妙妙屋 7890）
+MIXED_PORT = endpoints.port_num("MIXED", 7891)                      # mixed 入站（HTTP+SOCKS 同端口；避开妙妙屋 7890）
 MIXED_ADDR = f"127.0.0.1:{MIXED_PORT}"
 CONFIG_PATH = os.path.join(SB_DIR, "config.json")
 LOG_PATH = os.path.join(SB_DIR, "sing-box.log")

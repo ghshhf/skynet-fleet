@@ -28,6 +28,7 @@ import os
 import re
 import socket
 import time
+from . import endpoints
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 
@@ -95,42 +96,42 @@ _SECRET_FIELDS = ("key", "key_hint")
 BUILTIN = [
     Provider(
         id="llmgw", label="天网 llmgw 网关", kind="gateway",
-        base="http://127.0.0.1:8790/v1", source="self",
+        base=endpoints.url("PROVIDER_LLMGW", "http://127.0.0.1:8790/v1"), source="self",
         note="8 类模型链（claude/gpt/cn/coder/big/fast/vision/flash）；串行流式 + 上游并发闸；"
              "http://127.0.0.1:8790/v1/models 会列出分类名",
     ),
     Provider(
         id="freellmapi", label="FreeLLMAPI", kind="gateway",
-        base="http://127.0.0.1:3001/v1", source="freellmapi",
+        base=endpoints.url("PROVIDER_FREE_LLMAPI", "http://127.0.0.1:3001/v1"), source="freellmapi",
         key_env="FREELMAPI_KEY",
         note="34 家 / 635 端点；鉴权用仪表盘「密钥」页顶部的统一 Key",
     ),
     Provider(
         id="dsh-local", label="dsh 本机网关", kind="gateway",
-        base="http://127.0.0.1:8326/v1", source="dsh",
+        base=endpoints.url("PROVIDER_DSH_LOCAL", "http://127.0.0.1:8326/v1"), source="dsh",
         key_env="DSH_KEY",
         note="Chat Completions + Responses；免登录免 Key，凭据在宿主凭据库",
     ),
     Provider(
         id="dsh-relay", label="dsh 局域网中继", kind="gateway",
-        base="http://127.0.0.1:18899/v1", source="dsh",
+        base=endpoints.url("PROVIDER_DSH_RELAY", "http://127.0.0.1:18899/v1"), source="dsh",
         key_env="DSH_LAN_KEY",
         note="独立 LAN Key（与本机 Key 不通用）；默认关，开了才活",
     ),
     Provider(
         id="zen-gate", label="Zen Gate", kind="gateway",
-        base="http://127.0.0.1:18765/v1", source="zen-gate",
+        base=endpoints.url("PROVIDER_ZEN_GATE", "http://127.0.0.1:18765/v1"), source="zen-gate",
         key_env="ZENGATE_KEY",
         note="端口在面板里配；这里只是候选，discover() 会读它自己的配置改正",
     ),
     Provider(
         id="llama-8080", label="本机 llama.cpp · 8080", kind="local",
-        base="http://127.0.0.1:8080/v1", source="llama.cpp",
+        base=endpoints.url("PROVIDER_LLAMA_8080", "http://127.0.0.1:8080/v1"), source="llama.cpp",
         note="常驻 Qwen3.5-4B（Vulkan，32K ctx）",
     ),
     Provider(
         id="llama-8090", label="本机 llama.cpp · 8090", kind="local",
-        base="http://127.0.0.1:8090/v1", source="llama.cpp",
+        base=endpoints.url("PROVIDER_LLAMA_8090", "http://127.0.0.1:8090/v1"), source="llama.cpp",
         note="Meissa Qwen2.5-7B（q8_0）",
     ),
 ]
@@ -279,7 +280,7 @@ def discover():
                     by_id[pid].key_hint = k
                 notes.append("dsh 端口 %d 读自 %s" % (p, f))
 
-    # 用户手填的覆盖（"咱们的"配置，不进仓库）
+    # 用户手填的覆盖（本地配置，不进仓库）
     cfg = os.path.expanduser("~/.fleet/providers.json")
     d = _read_json(cfg)
     if isinstance(d, dict):
@@ -493,7 +494,7 @@ def pick_model(p, need=None, skip=(), blocked=()):
 
     `blocked` 是**跨调用**记住的坏车道（Quota.blocked_models）。
     skip 只活在一次 chat() 里，blocked 活 6 小时——不加它，下一轮对话会
-    把刚才打过的 429 再撞一遍。
+    把已返回 429 的端点再试一遍。
     """
     if not p.models:
         return None
@@ -553,7 +554,7 @@ class Quota:
     # tried_models，但**只在单次调用内有效**——下一次调用（下一轮对话、重启进程）
     # 又从头撞一遍同样的两条车道。撞一次 429 就是一趟完整 HTTP + 一次失败降级。
     #
-    # 所以要把「这条车道刚才打过我」记下来，跨调用生效。
+    # 所以要把「该端点近期返回过 429」记下来，跨调用生效。
     # 记的是**事件**不是额度上限：各家免费车道的真实上限谁也不知道，
     # 编一个数字当上限就是拿估算当事实（红线）。能确定的只有「它刚拒绝过我」。
 
@@ -922,7 +923,7 @@ def _selftest():
        "全试过必须返回 None（好让上层换 provider），不许回头重复试")
 
     # 15) 车道记忆（跨调用）：429 记的是车道，403 记的是整家，两者别混。
-    #     没有这一层，下一次 chat() 会把刚才打过的 429 原样再撞一遍。
+    #     没有这一层，下一次 chat() 会再次命中已返回 429 的端点。
     with tempfile.TemporaryDirectory() as td:
         q2 = Quota(os.path.join(td, "q2.sqlite"))
         q2.mark_lane("lane-a", "zen-gate", "429", "FreeUsageLimitError")

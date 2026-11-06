@@ -1,6 +1,6 @@
 """表格层：Excel 的结构化读写。
 
-为什么单独一台（2026-11-06）：
+为什么单独一台：
   `doc.convert` 把 xlsx 抽成 Markdown 文本，那是**读**的一条死路——抽出来就回不去了。
   真正每天要用的是**改**：给一张表加一列表头、把三个月的表堆成一张、按 key 拼两张表、
   把公式导出来看看谁引用了谁、再导成 CSV 交给别的工具。
@@ -334,7 +334,7 @@ class SheetOps(BaseDevice):
     def caps(self):
         return ("sheet.info", "sheet.read", "sheet.write", "sheet.edit",
                 "sheet.append", "sheet.style", "sheet.formula", "sheet.sheets",
-                "sheet.merge", "sheet.export")
+                "sheet.merge", "sheet.export", "sheet.chart")
 
     # ------------------------------------------------ 分派
 
@@ -351,6 +351,7 @@ class SheetOps(BaseDevice):
             "sheet.sheets": self._sheets,
             "sheet.merge": self._merge,
             "sheet.export": self._export,
+            "sheet.chart": self._chart,
         }.get(cap)
         if fn is None:
             return R.unsupported(cap, f"{self.name} 没有 {cap}",
@@ -1013,6 +1014,87 @@ class SheetOps(BaseDevice):
 
     # ------------------------------------------------ sheet.export
 
+    # ------------------------------------------------ sheet.chart（Excel 原生图）
+
+    def _chart(self, a):
+        """往 xlsx 里插**原生图表对象**，不是图片。
+
+        为什么这件事值得单做：图片一插进去就跟数据脱钩了，读者在表里改了数字，
+        图还是老样子——那是最容易骗到自己的东西。原生图存的是「数据区引用」，
+        Excel/WPS 打开时自己渲染，改数就跟着变。
+
+        和 `chart.*` 域的分工：这里出的是**表里的图**，那边出的是**报告用的 PNG**。
+        要贴进 Word/发人看，用 chart.*；要让人自己在表里改数看变化，用这个。
+        """
+        from openpyxl.chart import (AreaChart, BarChart, LineChart, PieChart,
+                                    Reference, ScatterChart)
+        from openpyxl.utils import get_column_letter
+
+        p = _require_file(_norm_path(a.get("path")))
+        wb = _load(p)
+        ws = _sheet_of(wb, a.get("sheet"))
+
+        kind = (a.get("type") or "bar").strip().lower()
+        if kind not in ("bar", "line", "pie", "scatter", "area"):
+            raise ValueError("type 只支持 bar / line / pie / scatter / area，收到 %r" % kind)
+
+        rng = a.get("data") or a.get("range")
+        if not rng:
+            raise ValueError('缺 data：要给数据区引用，如 "A1:C10"（首行是系列名）')
+        r1, c1, r2, c2 = _parse_range(rng)
+        if r2 <= r1:
+            raise ValueError("数据区至少 2 行（一行系列名 + 一行数据），收到 %s" % rng)
+        if c2 < c1:
+            raise ValueError("数据区列范围不对：%s" % rng)
+
+        titles = bool(a.get("titles_from_data", True))
+        head = r1 + (1 if titles else 0)
+        data_ref = Reference(ws, min_col=c1, min_row=head, max_col=c2, max_row=r2)
+
+        chart = {"bar": BarChart, "line": LineChart, "pie": PieChart,
+                 "scatter": ScatterChart, "area": AreaChart}[kind]()
+        if a.get("title"):
+            chart.title = str(a["title"])
+        chart.style = int(a.get("style") or 10)
+        chart.height = float(a.get("height") or 9)
+        chart.width = float(a.get("width") or 16)
+
+        cats = a.get("cats")
+        if kind == "scatter":
+            chart.add_data(data_ref, titles_from_data=titles)
+            # 散点必须单独给 x 值，不给的话 x 轴会变成 1,2,3...
+            if cats:
+                k1, kc1, k2, kc2 = _parse_range(cats)
+                xref = Reference(ws, min_col=kc1, min_row=k1 + (1 if titles else 0),
+                                 max_col=kc2, max_row=k2)
+            else:
+                xref = Reference(ws, min_col=c1, min_row=head, max_row=r2)
+            chart.set_categories(xref)
+        else:
+            chart.add_data(data_ref, titles_from_data=titles)
+            if cats:
+                k1, kc1, k2, kc2 = _parse_range(cats)
+                chart.set_categories(Reference(ws, min_col=kc1, min_row=k1 + (1 if titles else 0),
+                                               max_col=kc2, max_row=k2))
+
+        if a.get("xlabel"):
+            chart.x_axis.title = str(a["xlabel"])
+        if a.get("ylabel"):
+            chart.y_axis.title = str(a["ylabel"])
+        if kind == "pie" and a.get("show_percent", True):
+            from openpyxl.chart.label import DataLabelList
+            chart.dataLabels = DataLabelList()
+            chart.dataLabels.showPercent = True
+
+        # 默认放数据右侧两列，别压在数据上
+        anchor = a.get("anchor") or ("%s%d" % (get_column_letter(c2 + 2), r1))
+        ws.add_chart(chart, anchor)
+
+        out, _preview = self._save(wb, p, a, "chart")
+        return {"path": out, "type": kind, "data": rng, "anchor": anchor,
+                "charts_on_sheet": len(ws._charts),
+                "note": "原生图表对象：读者改表里的数字，图会跟着刷新（图片做不到）"}
+
     def _export(self, a):
         p = _require_file(_norm_path(a.get("path")))
         to = (a.get("to") or "csv").lower()
@@ -1348,6 +1430,46 @@ def _selftest():
 
         r = dev.invoke("sheet.export", {"path": src, "to": "pdf"})
         ck((not r.ok) and "csv/tsv" in (r.err or ""), "错误：未知导出格式")
+
+        # ============ sheet.chart：Excel 原生图 ============
+        ch_src = os.path.join(td, "图源.xlsx")
+        dev.invoke("sheet.write", {"out": ch_src, "data": [
+            ["月份", "北区", "南区"],
+            ["一月", 120, 80], ["二月", 150, 95], ["三月", 90, 110]]})
+
+        r = dev.invoke("sheet.chart", {"path": ch_src, "data": "A1:C4",
+                                       "type": "bar", "title": "月度对比",
+                                       "out": os.path.join(td, "柱图.xlsx")})
+        ck(r.ok, "chart：能插柱状图 %s" % (r.err if not r.ok else ""))
+        if r.ok:
+            ck(r.data["charts_on_sheet"] == 1, "chart：表里 1 张图")
+            ck(os.path.exists(r.data["path"]), "chart：产物真的落盘")
+            # 关键：重新打开还能看到图，说明是原生对象不是一次性内存态
+            from openpyxl import load_workbook as _lw
+            _wb = _lw(r.data["path"])
+            ck(len(_wb.active._charts) == 1, "chart：重开文件图还在（原生对象，不是图片）")
+            ck(_wb.active._charts[0].title is not None, "chart：标题写进去了")
+            chart_path = r.data["path"]
+
+        for t in ("line", "pie", "area", "scatter"):
+            rr = dev.invoke("sheet.chart", {"path": ch_src, "data": "A1:C4", "type": t,
+                                            "out": os.path.join(td, "%s图.xlsx" % t)})
+            ck(rr.ok, "chart：%s 能插 %s" % (t, rr.err if not rr.ok else ""))
+
+        r = dev.invoke("sheet.chart", {"path": ch_src, "data": "A1:C4", "type": "radar"})
+        ck((not r.ok) and "bar" in (r.err or ""), "chart：未知图型要列可选项")
+
+        r = dev.invoke("sheet.chart", {"path": ch_src})
+        ck((not r.ok) and "data" in (r.err or ""), "chart：缺数据区要报错")
+
+        r = dev.invoke("sheet.chart", {"path": ch_src, "data": "A1:C1"})
+        ck((not r.ok) and "2 行" in (r.err or ""), "chart：只有表头不画")
+
+        # 不覆盖
+        if chart_path:
+            r = dev.invoke("sheet.chart", {"path": ch_src, "data": "A1:C4",
+                                           "type": "bar", "out": chart_path})
+            ck(r.ok and r.data["path"] != chart_path, "chart：重名自动让号")
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

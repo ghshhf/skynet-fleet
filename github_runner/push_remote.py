@@ -9,8 +9,7 @@
     python push_remote.py --dry        # 只列出会推哪些文件
 
 不做的事：
-  · 不推 data/（云端自己爬，本地存量一条都不上去 —— 主人的原话：
-    「不至于把本地的上传到云端吧？那它自己循环不就行了吗？」）
+  · 不推 data/（云端自己爬，本地存量一条都不上去）
   · 不推 __pycache__ / *.pyc
 """
 import base64
@@ -23,8 +22,19 @@ import urllib.request
 
 REPO = "skynet93560862-creator/x-harvest"
 BRANCH = "main"
-PROXY = "http://127.0.0.1:7890"
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# 出网代理走共享解析层（环境变量 → 系统代理 → 端口探测 → 直连），不写死端口。
+# 这个脚本也可能从子目录单独跑，所以先把仓库根加进搜索路径；解析层不可用时退回直连。
+sys.path.insert(0, os.path.dirname(HERE))
+try:
+    from fleet.netproxy import proxies as _proxies
+except ImportError:                                    # noqa: BLE001
+    _proxies = None
+
+
+def _proxy_map():
+    return _proxies() if _proxies else {}
 
 # 本地路径 → 仓库内路径
 FILES = [
@@ -56,8 +66,7 @@ def _token():
 def _call(method, path, data, tok, retries=3):
     url = "https://api.github.com" + path
     body = json.dumps(data).encode() if data is not None else None
-    op = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
+    op = urllib.request.build_opener(urllib.request.ProxyHandler(_proxy_map()))
 
     last = None
     for i in range(retries):

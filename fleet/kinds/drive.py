@@ -43,6 +43,7 @@ davfs2 也是同一条路。
     drive.read(path="pan:/notes.md")
     drive.write(path="pan:/notes.md", text="...")
 """
+from .. import endpoints
 import base64
 import ctypes
 import hashlib
@@ -74,7 +75,7 @@ from .. import net
 
 DEFAULT_HOST = "0.0.0.0"      # 必须绑全网卡：绑 127.0.0.1 时 Windows 的 WebDAV 客户端
                               # 会拒绝映射（回环限制，报错 67 且不说原因）
-DEFAULT_PORT = 8731
+DEFAULT_PORT = endpoints.port_num("DRIVE", 8731)
 VAR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "var")
 MOUNTS_FILE = os.path.join(VAR_DIR, "drive_mounts.json")

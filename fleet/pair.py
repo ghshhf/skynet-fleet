@@ -31,6 +31,7 @@
 线程安全：验证码状态与会话表都有锁——GUI 线程点刷新、网络线程 try_pair、
      被控端一键熔断，三处并发是常态。
 """
+from . import endpoints
 import json
 import secrets
 import socket
@@ -40,10 +41,10 @@ import time
 # ---------------------------------------------------------------- 常量
 
 #: 配对广播端口（UDP）。避开 AudioSync 的 24548 族。
-PAIR_UDP_PORT = 24560
+PAIR_UDP_PORT = endpoints.port_num("PAIR_UDP", 24560)
 #: 配对会话端口（TCP，TLS）。被控端点 /api/pair 与 /api/remote/* 只在这个
 #: 独立监听器上服务；GUI 主循环仍只绑 127.0.0.1，两边攻击面不互通。
-PAIR_TCP_PORT = 24561
+PAIR_TCP_PORT = endpoints.port_num("PAIR_TCP", 24561)
 #: 组播组：239.255.0.0/16 是管理域内组播，配合 TTL=1 路由器不转发
 MCAST_GRP = ("239.77.7.77", PAIR_UDP_PORT)
 #: 公告间隔（秒，估）：1s 足够主控端秒级发现，又不至于刷屏
