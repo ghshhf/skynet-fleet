@@ -58,6 +58,44 @@ class ResourceSourceTest {
     }
 
     @Test
+    fun 播客enclosure与分类能抽取() {
+        val xml = """
+            <rss><item>
+              <title>Episode 12</title>
+              <link>https://example.com/ep12</link>
+              <description>Great talk about agents</description>
+              <enclosure url="https://example.com/e.mp4" type="video/mp4" length="123"/>
+              <category>AI</category>
+              <category>播客</category>
+            </item></rss>
+        """.trimIndent()
+        val hits = ResourceCrawler.parseFeedXml(xml, "订阅")
+        assertEquals(1, hits.size)
+        assertEquals("video", hits[0].kind)
+        assertEquals("https://example.com/e.mp4", hits[0].video)
+        assertTrue(hits[0].tags.contains("AI"))
+        assertTrue(hits[0].tags.contains("播客"))
+        assertTrue(hits[0].tags.contains("视频"))
+    }
+
+    @Test
+    fun mediaContent缩略图与YouTube链接能抽() {
+        val rss = """
+            <rss><item>
+              <title>Cool demo</title>
+              <link>https://www.youtube.com/watch?v=abc123</link>
+              <description>See the demo</description>
+              <media:content url="https://cdn.example.com/shot.jpg" medium="image"/>
+            </item></rss>
+        """.trimIndent()
+        val hits = ResourceCrawler.parseFeedXml(rss, "国际")
+        assertEquals(1, hits.size)
+        assertEquals("https://cdn.example.com/shot.jpg", hits[0].image)
+        assertEquals("video", hits[0].kind)
+        assertTrue(hits[0].video.contains("youtube.com"))
+    }
+
+    @Test
     fun 英文判定与切换脚本() {
         assertTrue(
             ArticleTranslator.isEnglish(
