@@ -33,11 +33,12 @@ object LanHub {
     private var server: LanServer? = null
     private var discovery: LanDiscovery? = null
 
-    fun start(ctx: Context, requestedPort: Int = Prefs.lanPort): ToolResult {
+    fun start(ctx: Context, requestedPort: Int = Prefs.lanPort, rotate: Boolean = false): ToolResult {
         lastError = ""
+        if (rotate || Prefs.lanToken.isBlank()) Prefs.lanToken = LanProto.newToken()
         val token = Prefs.ensureLanToken()
         if (running) {
-            if (server?.boundPort == requestedPort) {
+            if (server?.boundPort == requestedPort && !rotate) {
                 return ToolResult(true, text = "局域网直连已在运行（端口 $port）。\n" + pairingText(token))
             }
             stop(ctx, keepService = true)
@@ -45,7 +46,7 @@ object LanHub {
         val s = LanServer(
             token, requestedPort, Prefs.deviceName,
             meta = { LanMeta.hello() },
-            handler = { PhoneMcp.handleLine(it) },
+            handler = { PhoneMcp.handleLanLine(it) },
         )
         if (!s.start()) {
             lastError = s.lastError.ifBlank { "端口绑定失败" }
@@ -218,7 +219,8 @@ object LanHub {
         } else {
             sb.append("集群名册：").append(list.size).append(" 台\n\n")
             list.forEach { sb.append(PeerBook.line(it)).append("\n\n") }
-            sb.append("写操作只派给 self.peer.probe 后 actions=允许 的机器；失败不自动换机重试。")
+            sb.append("权限只有一档：控制方（发起派单的这台）允许写操作即可派；执行方只判断有没有这个工具。\n")
+            sb.append("写操作只派一台，失败不自动换机重试。")
         }
         val found = runCatching { discovery?.peerList() ?: emptyList() }.getOrDefault(emptyList())
         val unknown = found.filter { f -> list.none { it.name.equals(f.name, true) } }
@@ -265,23 +267,28 @@ object LanHub {
             ?: return ToolResult(false, err = "本机没有这个工具：$tool")
         val list = peers()
         if (list.isEmpty()) return ToolResult(false, err = "集群名册为空，先 self.peer.add")
-        val ranked = PeerBook.rank(list, tool, meta.sideEffect, int(args["min_battery"], 15))
+        val ranked = PeerBook.rank(list, tool, int(args["min_battery"], 15))
         if (ranked.isEmpty()) {
-            return ToolResult(false, err = buildString {
-                append("没有能接 $tool 的机器。")
-                if (meta.sideEffect) append("写操作要求对端 actions=允许，先 self.peer.probe。")
-                else append("先 self.peer.probe 确认在线与工具表。")
-            })
+            return ToolResult(false, err = "没有能接 $tool 的机器。先 self.peer.probe 确认在线与工具表。")
         }
         val sb = StringBuilder()
         sb.append("按 suitability 排序（").append(tool)
-        if (meta.sideEffect) sb.append(" · 写操作，只派一台且失败不重试")
+        if (meta.sideEffect) {
+            if (!Prefs.mcpAllowActions) {
+                return ToolResult(
+                    false,
+                    err = "本机（控制方）没开动作权限，写操作派不出去。整个项目只有这一档：" +
+                        "在「手机本机 → 入网设置」里打开「允许操作」后重试。",
+                )
+            }
+            sb.append(" · 写操作，只派一台且失败不重试")
+        }
         sb.append("）：\n")
         ranked.forEachIndexed { i, p ->
             sb.append(i + 1).append(". ").append(p.name).append(" · ").append(p.endpoint())
             sb.append(" · ").append(if (p.battery < 0) "电量未知" else "${p.battery}%")
             if (p.charging) sb.append("（充电中）")
-            sb.append(if (p.actions) " · 可写" else " · 只读").append('\n')
+            sb.append('\n')
         }
         return ToolResult(true, text = sb.toString().trimEnd())
     }
@@ -296,6 +303,14 @@ object LanHub {
             ?: return ToolResult(false, err = "args 不是合法 JSON 对象：${argText.take(80)}")
         val all = peers()
         if (all.isEmpty()) return ToolResult(false, err = "集群名册为空，先 self.peer.add")
+        // 整个项目只有一档权限：控制方允许写操作，才把写操作派出去。
+        if (meta.sideEffect && !Prefs.mcpAllowActions) {
+            return ToolResult(
+                false,
+                err = "本机（控制方）没开动作权限，写操作派不出去。整个项目只有这一档：" +
+                    "在「手机本机 → 入网设置」里打开「允许操作」后重试。",
+            )
+        }
 
         val named = str(args["name"])
         val candidates = if (named.isNotBlank()) {
@@ -303,10 +318,10 @@ object LanHub {
                 ?: return ToolResult(false, err = "名册里没有 $named")
             listOf(one)
         } else {
-            PeerBook.rank(all, tool, meta.sideEffect, int(args["min_battery"], 15))
+            PeerBook.rank(all, tool, int(args["min_battery"], 15))
         }
         if (candidates.isEmpty()) {
-            return ToolResult(false, err = "没有能接 $tool 的机器；先 self.peer.probe，写操作还要对端 actions=允许")
+            return ToolResult(false, err = "没有能接 $tool 的机器；先 self.peer.probe 确认在线与工具表")
         }
         // 写操作只派一台：回包丢了不代表没执行，换机重试就是重复点击/重复发送。
         val plan = if (meta.sideEffect) candidates.take(1) else candidates
@@ -362,7 +377,6 @@ object LanHub {
             screenOn = hello.optBoolean("screenOn", p.screenOn),
             caps = hello.optInt("caps", p.caps),
             tools = if (tools.isEmpty()) p.tools else tools,
-            actions = hello.optBoolean("actions", p.actions),
             platform = hello.optString("platform", p.platform),
             android = hello.optString("android", p.android),
             lastSeen = System.currentTimeMillis(),
@@ -391,7 +405,9 @@ object LanHub {
             append("  ").append(LanProto.bracket(it.host)).append(':').append(port)
                 .append("  ").append(it.family.label).append('\n')
         }
-        append("口令只在本机与对端之间用；不要发到群里或写进截图。")
+        append("口令只在本机与对端之间用；不要发到群里或写进截图。\n")
+        append("口令即授权：谁拿到口令，就能调用本机全部工具（包括写操作）。")
+        append("要收回，跑 self.lan.start rotate=true 换口令；已入册的对端要重新填新口令。")
     }
 
     private fun mask(token: String): String =

@@ -59,8 +59,8 @@ object LanClient {
     }
 
     /**
-     * 只握手：拿对端 hello 自述（电量/充电/工具表/动作开关），不发工具调用。
-     * 集群选路前先 probe，避免把写操作派给一台只读的手机。
+     * 只握手：拿对端 hello 自述（电量/充电/工具表），不发工具调用。
+     * 集群选路前先 probe，避免把任务派给没有这个工具的机器。
      */
     fun probe(target: LanProto.Target, token: String, timeoutMs: Int = 8_000): Reply =
         withSocket(target, token, timeoutMs) { _, _, _ -> }

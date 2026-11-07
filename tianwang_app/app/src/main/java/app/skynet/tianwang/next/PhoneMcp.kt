@@ -252,7 +252,13 @@ object PhoneMcp {
         McpTool(
             "self_lan_start",
             "开手机直连服务（TCP + mDNS）。回执含完整口令；同一 Wi-Fi 走 fe80，跨网走全局 IPv6，不经过中继。",
-            schema(mapOf("port" to prop("integer", "监听端口，默认 18765，范围 1024–65535")), emptyList()),
+            schema(
+                mapOf(
+                    "port" to prop("integer", "监听端口，默认 18765，范围 1024–65535"),
+                    "rotate" to prop("boolean", "true=换新口令并重启服务（旧口令立即失效）"),
+                ),
+                emptyList(),
+            ),
             sideEffect = true,
         ),
         McpTool(
@@ -308,15 +314,15 @@ object PhoneMcp {
             sideEffect = true,
         ),
         McpTool(
-            "self_peer_list", "集群名册：电量、充电、亮屏、能力数、是否允许写操作、最近错误。",
+            "self_peer_list", "集群名册：电量、充电、亮屏、能力数、最近错误。",
             schema(emptyMap()),
         ),
         McpTool(
-            "self_peer_probe", "逐台握手，刷新机型、工具表、动作开关、电量与充电状态。",
+            "self_peer_probe", "逐台握手，刷新机型、工具表、电量与充电状态。",
             schema(emptyMap()),
         ),
         McpTool(
-            "self_peer_pick", "按 suitability 排序候选手机；写操作只考虑对端明确允许动作的机器。",
+            "self_peer_pick", "按 suitability 排序候选手机；只按对端有没有这个工具过滤。",
             schema(
                 mapOf(
                     "tool" to prop("string", "要派给对端的 MCP 工具名"),
@@ -383,6 +389,19 @@ object PhoneMcp {
 
     /** 一行原始 JSON → 一行回包；通知返回 null。传输层直接写回。 */
     fun handleLine(line: String): String? = core.handleLine(line)
+
+    /**
+     * 局域网直连的权限标准：**口令即授权**。
+     * 执行方只判断「自己有没有这个工具」，不叠加本机只读开关；
+     * 否则同一个项目里会同时存在「控制方」和「执行方」两套标准。
+     */
+    private val lanCore = McpCore(
+        tools = tools,
+        actionsAllowed = { true },
+        call = { name, args -> runBlocking { executeTool(name, args) } },
+    )
+
+    fun handleLanLine(line: String): String? = lanCore.handleLine(line)
 
     fun toolCount(): Int = tools.size
 

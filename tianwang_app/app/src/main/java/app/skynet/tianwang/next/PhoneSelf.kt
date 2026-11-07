@@ -253,8 +253,11 @@ object PhoneSelf {
         ),
         SelfCap(
             "self.lan.start", "开手机直连服务",
-            "在本机开 TCP 服务并广播 mDNS。回执里有完整口令和对端可填的地址；同一 Wi-Fi 走 fe80 链路本地，跨网络走全局 IPv6，流量不经过中继。",
-            listOf(CapParam("port", "int", "监听端口，默认 18765，范围 1024–65535", false)),
+            "在本机开 TCP 服务并广播 mDNS。回执里有完整口令和对端可填的地址；同一 Wi-Fi 走 fe80 链路本地，跨网络走全局 IPv6，流量不经过中继。口令即授权，rotate=true 会立刻换掉旧口令。",
+            listOf(
+                CapParam("port", "int", "监听端口，默认 18765，范围 1024–65535", false),
+                CapParam("rotate", "bool", "true=换新口令并重启服务（旧口令立即失效）", false),
+            ),
         ),
         SelfCap(
             "self.lan.stop", "关手机直连服务",
@@ -300,15 +303,15 @@ object PhoneSelf {
         ),
         SelfCap(
             "self.peer.list", "集群名册",
-            "看每台的电量、充电、亮屏、能力数、是否允许写操作、最近一次错误；也会列出 mDNS 发现但还没入册的手机。",
+            "看每台的电量、充电、亮屏、能力数、最近一次错误；也会列出 mDNS 发现但还没入册的手机。写操作能不能派，只看控制方这一档。",
         ),
         SelfCap(
             "self.peer.probe", "探测集群里每台手机",
-            "逐台握手，拿回机型、Android 版本、工具表、动作开关、电量与充电状态。派单前先跑这条。",
+            "逐台握手，拿回机型、Android 版本、工具表、电量与充电状态。派单前先跑这条。",
         ),
         SelfCap(
             "self.peer.pick", "选最合适的一台",
-            "按「充电中 > 电量高 > 最近见到」排序；写操作只考虑对端明确开了动作权限的机器。只给建议，不执行。",
+            "按「充电中 > 电量高 > 最近见到」排序，只按对端有没有这个工具过滤。只给建议，不执行。",
             listOf(
                 CapParam("tool", "str", "要派给对端的 MCP 工具名，如 self_ui_tap", true),
                 CapParam("min_battery", "int", "电量低于此值且没充电的不派，默认 15", false),
@@ -316,7 +319,7 @@ object PhoneSelf {
         ),
         SelfCap(
             "self.peer.call", "把任务派给集群",
-            "按选路结果逐台尝试，成功即返回是哪台做的。写操作只派一台，失败不换机重试（避免重复点击/重复发送）。",
+            "按选路结果逐台尝试，成功即返回是哪台做的。写操作只派一台，失败不换机重试（避免重复点击/重复发送）。写操作能否派出，只看控制方这一档权限。",
             listOf(
                 CapParam("tool", "str", "MCP 工具名", true),
                 CapParam("args", "str", "工具参数 JSON，默认 {}", false),
@@ -434,7 +437,11 @@ object PhoneSelf {
                     // 手机直连也不依赖无障碍：LAN 服务是独立 TCP 监听。
                     "self.lan.status" -> ToolResult(true, text = LanHub.statusText())
                     "self.lan.start" -> withContext(Dispatchers.IO) {
-                        LanHub.start(App.ctx, intArg(args, "port", Prefs.lanPort))
+                        LanHub.start(
+                            App.ctx,
+                            intArg(args, "port", Prefs.lanPort),
+                            flagArg(args, "rotate"),
+                        )
                     }
                     "self.lan.stop" -> {
                         LanHub.stop(App.ctx)

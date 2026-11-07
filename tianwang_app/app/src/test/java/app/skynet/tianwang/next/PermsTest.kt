@@ -121,7 +121,7 @@ class PermsTest {
         val on = row(PermEnv(lanRunning = true), "fleet.peer")
         assertEquals(PermState.READY, on.state)
         assertTrue(on.next.contains("self.peer.call"))
-        assertTrue(on.next.contains("不换机重试"))
+        assertTrue(on.next.contains("权限只有一档"))
     }
 
     @Test

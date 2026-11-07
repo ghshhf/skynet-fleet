@@ -12,7 +12,6 @@ class PeerBookTest {
         battery: Int = 80,
         charging: Boolean = false,
         tools: Set<String> = setOf("self_status"),
-        actions: Boolean = false,
         lastSeen: Long = 0L,
     ) = PeerBook.Peer(
         name = name,
@@ -21,13 +20,12 @@ class PeerBookTest {
         battery = battery,
         charging = charging,
         tools = tools,
-        actions = actions,
         lastSeen = lastSeen,
     )
 
     @Test
     fun encodeDecodeKeepsRoster() {
-        val one = peer("b-phone", charging = true, actions = true)
+        val one = peer("b-phone", charging = true)
         val text = PeerBook.encode(listOf(one))
         val back = PeerBook.decode(text)
         assertEquals(1, back.size)
@@ -35,7 +33,6 @@ class PeerBookTest {
         assertEquals("fe80::1%wlan0", back[0].host)
         assertEquals(80, back[0].battery)
         assertTrue(back[0].charging)
-        assertTrue(back[0].actions)
         assertEquals(setOf("self_status"), back[0].tools)
         assertEquals(one.token, back[0].token)
     }
@@ -72,7 +69,6 @@ class PeerBookTest {
         val ranked = PeerBook.rank(
             listOf(peer("full", battery = 100), peer("plugged", battery = 40, charging = true)),
             "self_status",
-            needsAction = false,
         )
         assertEquals("plugged", ranked.first().name)
     }
@@ -86,7 +82,6 @@ class PeerBookTest {
                 peer("unknown", battery = -1),
             ),
             "self_status",
-            needsAction = false,
         )
         assertEquals(listOf("plugged", "unknown"), ranked.map { it.name })
     }
@@ -97,23 +92,21 @@ class PeerBookTest {
             peer("no-camera", tools = setOf("self_status")),
             peer("camera", tools = setOf("self_status", "self_ui_screenshot")),
         )
-        val ranked = PeerBook.rank(peers, "self_ui_screenshot", needsAction = false)
+        val ranked = PeerBook.rank(peers, "self_ui_screenshot")
         assertEquals(listOf("camera"), ranked.map { it.name })
         // 没探测过工具表（空集）按「可能有」处理。
-        val unknown = PeerBook.rank(listOf(peer("fresh", tools = emptySet())), "self_ui_tap", false)
+        val unknown = PeerBook.rank(listOf(peer("fresh", tools = emptySet())), "self_ui_tap")
         assertEquals(1, unknown.size)
     }
 
     @Test
-    fun writeNeedsExplicitActionPermission() {
+    fun writeToolsAreNotFilteredByPeerFlag() {
+        // 权限只有一档：选路只看能力，不看每台的「只读/可写」标记。
         val peers = listOf(
-            peer("readonly", actions = false, tools = setOf("self_ui_tap")),
-            peer("writable", actions = true, tools = setOf("self_ui_tap")),
+            peer("a", tools = setOf("self_ui_tap")),
+            peer("b", tools = setOf("self_ui_tap")),
         )
-        val ranked = PeerBook.rank(peers, "self_ui_tap", needsAction = true)
-        assertEquals(listOf("writable"), ranked.map { it.name })
-        val readOnly = PeerBook.rank(peers, "self_ui_tap", needsAction = false)
-        assertEquals(2, readOnly.size)
+        assertEquals(2, PeerBook.rank(peers, "self_ui_tap").size)
     }
 
     @Test
@@ -121,7 +114,6 @@ class PeerBookTest {
         val ranked = PeerBook.rank(
             listOf(peer("old", lastSeen = 1_000), peer("new", lastSeen = 9_000)),
             "self_status",
-            needsAction = false,
         )
         assertEquals("new", ranked.first().name)
     }
@@ -136,11 +128,11 @@ class PeerBookTest {
     }
 
     @Test
-    fun lineShowsBatteryAndPermission() {
-        val text = PeerBook.line(peer("b", battery = 66, charging = true, actions = true))
+    fun lineShowsBatteryAndCapability() {
+        val text = PeerBook.line(peer("b", battery = 66, charging = true))
         assertTrue(text.contains("b · "))
         assertTrue(text.contains("66%"))
         assertTrue(text.contains("充电中"))
-        assertTrue(text.contains("允许"))
+        assertTrue(text.contains("能力"))
     }
 }

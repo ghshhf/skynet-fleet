@@ -10,10 +10,12 @@ import org.json.JSONObject
  * 换那台做」——任务级调度对机型、系统版本、模型版本都不敏感，
  * 也不会因为两台手机 CPU 不同就整个跑不起来。
  *
- * 🔴 两条硬规则：
- *   1. 写操作只在「对端明确开了动作权限」时才派；不知道就不派。
- *   2. 写操作失败**不换机重试** —— 结果可能是「已执行但回包丢了」，
- *      换一台再执行一次就是重复点击 / 重复发送。
+ * 🔴 权限只有一档：**控制方（发起派单的这台）**的 `mcpAllowActions`。
+ *    执行方只判断「自己有没有这个工具」，有就接；LAN 口令就是授权凭证。
+ *    不再给每台手机单设「只读 / 可写」开关 —— 那等于项目里有两套标准。
+ *
+ * 🔴 写操作失败**不换机重试** —— 结果可能是「已执行但回包丢了」，
+ *    换一台再执行一次就是重复点击 / 重复发送。
  */
 object PeerBook {
     data class Peer(
@@ -27,7 +29,6 @@ object PeerBook {
         val screenOn: Boolean = false,
         val caps: Int = 0,
         val tools: Set<String> = emptySet(),
-        val actions: Boolean = false,
         val platform: String = "",
         val android: String = "",
         val lastError: String = "",
@@ -53,7 +54,6 @@ object PeerBook {
                     .put("screenOn", p.screenOn)
                     .put("caps", p.caps)
                     .put("tools", JSONArray(p.tools.toList()))
-                    .put("actions", p.actions)
                     .put("platform", p.platform)
                     .put("android", p.android)
                     .put("lastError", p.lastError)
@@ -89,7 +89,6 @@ object PeerBook {
                 screenOn = o.optBoolean("screenOn", false),
                 caps = o.optInt("caps", 0),
                 tools = tools,
-                actions = o.optBoolean("actions", false),
                 platform = o.optString("platform"),
                 android = o.optString("android"),
                 lastError = o.optString("lastError"),
@@ -113,17 +112,15 @@ object PeerBook {
     /**
      * 适合接单的顺序：充电中 > 电量高 > 最近见过。
      * - 没探测过电量（-1）不直接排除，但排在已知电量之后；
-     * - 写操作必须 `actions=true`，不知道就当不支持；
+     * - 只按「对端有没有这个工具」过滤；能不能执行由控制方这一档决定；
      * - 电量低于 [minBattery] 且没充电的机器不派活。
      */
     fun rank(
         peers: List<Peer>,
         tool: String,
-        needsAction: Boolean,
         minBattery: Int = 15,
     ): List<Peer> = peers
         .filter { it.supports(tool) }
-        .filter { !needsAction || it.actions }
         .filter { it.charging || it.battery < 0 || it.battery >= minBattery }
         .sortedWith(
             compareByDescending<Peer> { it.charging }
@@ -146,7 +143,6 @@ object PeerBook {
         if (p.charging) append("（充电中）")
         append(" · 屏幕：").append(if (p.screenOn) "亮" else "灭/未知")
         append(" · 能力：").append(if (p.caps > 0) "${p.caps} 个工具" else "未探测")
-        append(" · 动作：").append(if (p.actions) "允许" else "只读")
         if (p.lastSeen > 0) {
             val ago = (System.currentTimeMillis() - p.lastSeen) / 1000
             append(" · 最近见到：").append(ago).append(" 秒前")

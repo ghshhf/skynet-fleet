@@ -119,7 +119,7 @@ object Perms {
             PermRow(
                 "fleet.peer", "集群调度（把任务派给另一台）", "TCP/IPv6",
                 if (env.lanRunning) PermState.READY else PermState.NEEDS_GRANT,
-                if (env.lanRunning) "已可用：self.peer.add / self.peer.probe / self.peer.pick / self.peer.call；写操作失败不换机重试"
+                if (env.lanRunning) "已可用：self.peer.add / self.peer.probe / self.peer.pick / self.peer.call；权限只有一档，控制方允许写操作即可派，执行方只判断有没有这个工具"
                 else "先 self.lan.start 本机服务；跨机调度需要双方都在线且口令入册",
             ),
             PermRow(
