@@ -167,7 +167,7 @@ class MainActivity : ComponentActivity() {
                 var chars = 0
                 val tGen = System.currentTimeMillis()
                 val out = LlamaNative.nativeChatMessages(
-                    h, arrayOf("user"), arrayOf(prompt), 96, Prefs.noThink,
+                    h, arrayOf("user"), arrayOf(prompt), 96, Prefs.noThink, "",
                 ) { s -> chars += s.length }
                 val genMs = System.currentTimeMillis() - tGen
                 val st = LlamaNative.lastStats()
@@ -183,7 +183,7 @@ class MainActivity : ComponentActivity() {
                     h,
                     arrayOf("user", "assistant", "user"),
                     arrayOf(prompt, out, "再用两个字总结。"),
-                    32, Prefs.noThink,
+                    32, Prefs.noThink, "",
                 ) { }
                 val st2 = LlamaNative.lastStats()
                 Log.i(tag, "TURN2 total=${System.currentTimeMillis() - t2}ms " +

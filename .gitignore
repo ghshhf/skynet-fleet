@@ -91,6 +91,8 @@ tianwang_app/keystore.jks
 # 2026-10-25：cpp/ 里混进 213M 构建目录才想起来加这条
 tianwang_app/app/src/main/cpp/build-android-*/
 tianwang_app/app/src/main/cpp/build*/
+# 2026-11-07：llama.cpp 源码由 build-llama.sh 按固定 tag 浅克隆，几百 MB，不进库
+tianwang_app/third_party/
 tianwang_app/app/src/main/jniLibs/
 # 电脑/手机侧的验证可执行（verify_host.cpp 才是源码）
 tianwang_app/verify_host_arm64

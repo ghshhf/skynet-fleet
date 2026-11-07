@@ -76,7 +76,7 @@ cd tianwang_app
 JAVA_HOME=<jdk17+> ./gradlew :app:testDebugUnitTest
 ```
 
-72 个 JVM 单测，**不需要真机、不插 USB**，几十秒跑完：
+75 个 JVM 单测，**不需要真机、不插 USB**，几十秒跑完：
 
 | 文件 | 测什么 | 为什么值得测 |
 |---|---|---|
@@ -86,7 +86,7 @@ JAVA_HOME=<jdk17+> ./gradlew :app:testDebugUnitTest
 | `UiTreeTest` | 无障碍树的压缩 / 文字与 id 匹配 / 正则容错 / 顺序稳定 | 树这层判断错了，真机表现是「点到了别的按钮」或「明明有字却找不到」，adb 日志里看不出来 |
 | `McpCoreTest` | MCP 初始化 / 工具表 / 只读闸门 / 错误码 / 通知不执行 | 通知当请求执行、只读模式漏放行，都是「看起来能调、实际点错了」的安全事故 |
 | `PairTokenTest` | `/pair` HMAC 向量 + 地址归一化 | token 错一位，真机表现只是「中继一直 waiting」，从手机界面上看不出原因 |
-| `LocalToolProtocolTest` | 围栏 JSON / 前后废话 / 嵌套花括号 / 字符串化参数 / 非工具 JSON | 小模型最常见的坏习惯；解析乱猜会导致点错按钮 |
+| `LocalToolProtocolTest` | 围栏 JSON / 前后废话 / 嵌套花括号 / 字符串化参数 / 非工具 JSON / GBNF 生成 / 半截工具调用判定 | 小模型最常见的坏习惯；解析乱猜会导致点错按钮；文法写错会让约束解码在设备上直接失效 |
 | `WavWriterTest` | 44 字节 WAV 头 / 16k 单声道字段 / RIFF 长度 | 头写错后端的表现是「识别出乱码」，不是报错 |
 | `PairClaimTest` | `/api/pair/claim` 请求字段 / 成功解析 / HTTP 与业务错误 / 缺凭据 | 配对失败时界面只显示一句原因；原因丢了就只能「再试一次」 |
 | `PhoneMcpToolsTest` | 工具名唯一 / 新工具在册 / 写操作标记 / 只读闸门 | 漏标 sideEffect 会让只读模式偷偷改手机状态 |
@@ -194,6 +194,24 @@ python -m fleet.mcp.pair --url ... --room ... --secret ... --serve-stdio
 - token 仍保留：老电脑端只认 `X-Fleet-Token`，新电脑端认长期凭据，装一版同时对付两种。
 - 请求头里**不打印 secret**，只落 SharedPreferences。
 
+## 本地推理 .so 构建（2026-11-07）
+
+本地 GGUF 推理要一个 `libfleet_llama.so`（llama.cpp 静态链进单库）。
+`build-llama.sh` 已改成可复现构建，不再依赖某台机器的盘符：
+
+```bash
+cd tianwang_app
+./build-llama.sh                       # 默认 arm64-v8a
+ABIS="arm64-v8a armeabi-v7a" ./build-llama.sh
+LLAMA_REF=v0.9.0 ./build-llama.sh      # 固定上游版本（默认就是这个）
+```
+
+- NDK / cmake / ninja 全部自动探测（也认 `ANDROID_NDK_HOME`、`ANDROID_HOME/ndk/*`）；
+- 仓库里没有 llama.cpp 源码时，按 `LLAMA_REF` 浅克隆到 `third_party/llama.cpp`；
+- 编之前校验上游 API 与 `llama_jni.cpp` 一致（penalties 签名、`llama_sampler_init_grammar`），
+  上游改接口会立刻失败，而不是装到手机上才崩；
+- 产物落 `app/src/main/jniLibs/<abi>/`。**这是构建产物，不进 git**：换机器重跑脚本即可。
+
 ## 本地模型工具闭环（2026-11-07）
 
 无网也能跑：`LocalAgent` 在系统提示里给本地模型工具表，模型按
@@ -205,6 +223,12 @@ python -m fleet.mcp.pair --url ... --room ... --secret ... --serve-stdio
 - 解析失败**不猜**，原样当回答；工具名必须命中当前工具表。
 - 通道不在线时不启用工具协议，避免模型拿到一串「没开」把回答带偏。
 - `model.tools == false` 或只读入网时，有副作用的工具不会进提示词。
+
+**GBNF 约束解码（2026-11-07）**：如果模型明显想调工具、但 JSON 写坏了
+（漏右括号 / 多写解释），会用 `LocalToolProtocol.toolGrammar()` 生成的文法**重试一次**。
+JNI 每轮重建采样链（`penalties → grammar → top_k → top_p → temp → dist`），
+文法把在册工具名穷举成分支 —— 编造的工具名在采样层就生成不出来。
+正常聊天**不加** grammar：长期强制 JSON 会让模型连话都不会说。
 
 ## 语音输入与常驻（2026-11-07）
 
@@ -229,8 +253,8 @@ python -m fleet.mcp.pair --url ... --room ... --secret ... --serve-stdio
 ## 还没接的
 
 - Shizuku 特权通道：装应用 / 改设置 / 跨 App shell（无障碍做不到的才用它）
-- GBNF 原生约束解码：当前是「提示词 + 严格 JSON 解析」，JNI 还没把 grammar 接到 sampler 链
-- 本机 Whisper：语音录完目前走云侧识别，老工程的 `whisper.cpp` 还没接
+- 真机验收：`.so` 需在带 NDK 的机器上编一次；断网工具闭环、`/pair` 公网中继、开机恢复都待真机跑
+- 本机 Whisper：语音录完目前走云侧识别；离线可用 sherpa-onnx 的 AAR（v2.0.1，GitHub Releases 直接发，不需要 JitPack）
 - PC 审批流：长期凭据已接，但「危险操作先让电脑点确认」还没做
 - 悬浮窗：通知与剪贴板已接，悬浮窗/悬浮球还没做
 - 老工程删除：等本工程把 `tianwang_android` 的能力接完再谈

@@ -77,6 +77,48 @@ object LocalToolProtocol {
         return null
     }
 
+    /**
+     * 生成 GBNF：把这一轮输出钉死成 `{"tool":"<在册工具名>","arguments":{...}}`。
+     *
+     * 为什么需要：0.6B~3B 的小模型「知道该调工具，但 JSON 写不完整」是常态
+     * （漏右括号、加解释、键名写成 name）。提示词只能劝，GBNF 是在采样层
+     * **直接屏蔽不合法的下一个 token** —— 这是开源社区（llama.cpp server 的
+     * json_schema、android-agent、LiteRT-LM constrained decoding）的通行解法。
+     *
+     * 只用于「解析失败后重试一次」；普通聊天绝不开，否则模型连话都不会说。
+     * 工具名用文法分支穷举，编造的工具名在第一步就生成不出来。
+     */
+    fun toolGrammar(tools: List<McpTool>): String {
+        if (tools.isEmpty()) return ""
+        val alts = tools.map { "\"\\\"${escapeName(it.name)}\\\"\"" }.joinToString(" | ")
+        return """
+            root ::= "{" ws "\"tool\"" ws ":" ws tool ws "," ws "\"arguments\"" ws ":" ws value ws "}"
+            tool ::= $alts
+            value ::= object | array | string | number | ("true" | "false" | "null") ws
+            object ::= "{" ws (string ":" ws value ("," ws string ":" ws value)*)? "}" ws
+            array ::= "[" ws (value ("," ws value)*)? "]" ws
+            string ::= "\"" ([^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}))* "\"" ws
+            number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+            ws ::= | " "
+        """.trimIndent()
+    }
+
+    /**
+     * 输出看起来在「试图调工具」却没通过 [parse] —— 只有这种情况才值得开 GBNF 重试。
+     *
+     * 判据故意收紧：宁可漏判（当普通回答），也不要把正常聊天硬掰成 JSON。
+     */
+    fun looksLikeActionAttempt(text: String): Boolean {
+        val t = text.lowercase()
+        if (t.contains("\"tool\"") || t.contains("tool_calls")) return true
+        // 半截 JSON：有左括号没右括号，且提到了 arguments —— 典型的被截断工具调用
+        return t.contains("arguments") && t.count { it == '{' } > t.count { it == '}' }
+    }
+
+    /** GBNF 字符串字面量里的转义（工具名理论上只有字母数字下划线，这里兜底）。 */
+    private fun escapeName(s: String): String =
+        s.replace("\\", "\\\\").replace("\"", "\\\"")
+
     private fun signature(t: McpTool): String {
         val props = t.inputSchema.optJSONObject("properties") ?: return ""
         val required = t.inputSchema.optJSONArray("required") ?: JSONArray()

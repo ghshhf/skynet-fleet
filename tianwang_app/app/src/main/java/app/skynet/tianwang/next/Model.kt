@@ -120,6 +120,26 @@ object LocalBackend : ModelBackend {
         messages: List<ChatMsg>,
         onDelta: (String) -> Unit,
         onTool: (ToolCall) -> Unit,
+    ): Result<String> = generate(profile, messages, "", onDelta)
+
+    /**
+     * 带 GBNF 语法约束生成。
+     *
+     * 只给「模型想调工具但 JSON 没写对」的重试路径用（见 [LocalAgent]）。
+     * 普通聊天必须走 [chat]（grammar 为空）：长期强制 JSON 会让它连话都不会说。
+     */
+    suspend fun chatWithGrammar(
+        profile: ModelProfile,
+        messages: List<ChatMsg>,
+        grammar: String,
+        onDelta: (String) -> Unit,
+    ): Result<String> = generate(profile, messages, grammar, onDelta)
+
+    private suspend fun generate(
+        profile: ModelProfile,
+        messages: List<ChatMsg>,
+        grammar: String,
+        onDelta: (String) -> Unit,
     ): Result<String> = withContext(Dispatchers.IO) {
         val loaded = sessionFor(profile).getOrElse { return@withContext Result.failure(it) }
 
@@ -160,6 +180,7 @@ object LocalBackend : ModelBackend {
                 contents.toTypedArray(),
                 maxTok,
                 Prefs.noThink,
+                grammar,
                 LlamaNative.TokenCallback { onDelta(it) },
             )
             Result.success(full)

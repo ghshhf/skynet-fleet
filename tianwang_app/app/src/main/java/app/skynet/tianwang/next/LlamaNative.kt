@@ -68,6 +68,9 @@ object LlamaNative {
      * 套（Qwen3 的 ChatML 等），Kotlin 不自己拼模板。
      *
      * [noThink] 仅对混合思考模型（模板带 enable_thinking）生效。
+     *
+     * [grammar] GBNF 文本；空串 = 不约束。工具调用重试时用它把输出钉成可解析 JSON，
+     * 普通对话传空 —— 全程强制 JSON 会毁掉正常回答。
      */
     external fun nativeChatMessages(
         handle: Long,
@@ -75,6 +78,7 @@ object LlamaNative {
         contents: Array<String>,
         maxTokens: Int,
         noThink: Boolean,
+        grammar: String,
         callback: TokenCallback,
     ): String
 

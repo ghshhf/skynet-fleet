@@ -2,17 +2,21 @@ cmake_minimum_required(VERSION 3.18)
 # 顶层显式开 C：ggml 里混着 C 源（老工程踩过「No known features for C compiler」）
 project(fleet_llama C CXX)
 
-# llama.cpp 源码目录由 build-llama.sh 用 -DLLAMA_SRC_DIR= 传入；给个默认值兜底
+# llama.cpp 源码目录由 build-llama.sh 用 -DLLAMA_SRC_DIR= 传入。
+# 默认指向仓库内 third_party（脚本会自动浅克隆到这里），不再写死某台 Windows 机器的盘符。
 if(NOT DEFINED LLAMA_SRC_DIR)
-    set(LLAMA_SRC_DIR "G:/dev/llama.cpp-fork")
+    set(LLAMA_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/llama.cpp")
 endif()
 message(STATUS "fleet_llama: LLAMA_SRC_DIR=${LLAMA_SRC_DIR}")
 
-# 只留库，别把上游 examples/tests/tools 拖进来；首版纯 CPU（不开 Vulkan）
+# 只留库，别把上游 examples/tests/tools 拖进来；首版纯 CPU（不开 Vulkan）。
+# COMMON 我们一行都没用到（JNI 直接调 libllama），关掉能少编一堆东西。
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS   OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_COMMON  ON  CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_COMMON  OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_APP     OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_MTMD    OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL          OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS   OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE         OFF CACHE BOOL "" FORCE)

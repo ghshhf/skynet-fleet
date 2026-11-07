@@ -5,10 +5,19 @@
 // 不必每次编译 APK、装机、抓 logcat 才知道对不对。
 // 修 JNI 逻辑时先改这里、本地跑通，再同步到 llama_jni.cpp。
 //
-// 编译（仓库根 /g/dev/llama.cpp-fork）：
-//   g++ -O2 -std=c++17 -I include -I ggml/include \
-//       E:/xmanbian/skynet-fleet/tianwang_app/tools/verify_host.cpp \
-//       -L build/bin -lllama -lggml -lggml-base -lggml-cpu -o build/bin/verify_host.exe
+// 编译（先在仓库根建一份宿主 llama.cpp；2026-11-07 用 v0.9.0 实测通过）：
+//   cmake -S third_party/llama.cpp -B build/host -G Ninja \
+//       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+//       -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_COMMON=OFF -DGGML_NATIVE=ON
+//   cmake --build build/host -j8
+//   g++ -O2 -std=c++17 -fopenmp -o build/host/verify_host tools/verify_host.cpp \
+//       -I third_party/llama.cpp/include -I third_party/llama.cpp/ggml/include \
+//       build/host/src/libllama.a build/host/ggml/src/libggml{,-base,-cpu}.a \
+//       build/host/vendor/hash/libvendor-hash.a -lpthread -ldl -lm
+//
+// 用法：
+//   verify_host model.gguf "你好" 128
+//   verify_host model.gguf "把搜索框点开" 128 --grammar /tmp/tool.gbnf
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,18 +62,20 @@ int main(int argc, char** argv) {
     if (userStr.empty()) userStr = "你好，用一句话介绍你自己。";
     int maxTokens = (argc > 3 && argv[3][0] != '-') ? atoi(argv[3]) : 96;
 
-    // 具名参数：--threads N / --gpu N / --ctx N / --clear-kv
+    // 具名参数：--threads N / --gpu N / --ctx N / --clear-kv / --grammar FILE
     // 手机和电脑的核数、GPU 完全不同，写死会把「机器差异」误读成「程序差异」。
     int nThreads = 6;     // 默认沿用手机端配置，电脑请显式 --threads 16
     int nGpuLayers = 0;   // 0 = 纯 CPU；-1 = 全部层 offload
     int nCtx = 8192;
     bool clearKv = false;
+    std::string grammarPath;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--threads" && i + 1 < argc)      nThreads = atoi(argv[++i]);
         else if (a == "--gpu" && i + 1 < argc)     nGpuLayers = atoi(argv[++i]);
         else if (a == "--ctx" && i + 1 < argc)     nCtx = atoi(argv[++i]);
         else if (a == "--clear-kv")                clearKv = true;
+        else if (a == "--grammar" && i + 1 < argc) grammarPath = argv[++i];
     }
 
     llama_backend_init();
@@ -86,13 +97,30 @@ int main(int argc, char** argv) {
            nThreads, nGpuLayers, (int) llama_n_ctx(ctx),
            llama_supports_gpu_offload() ? "YES" : "NO(本次构建无 GPU 后端)");
 
+    // 与 llama_jni.cpp 的 rebuildSampler() 保持同一条链，顺序也一样：
+    // penalties → grammar(可选) → top_k → top_p → temp → dist。
+    const llama_vocab* vocab = llama_model_get_vocab(model);
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(smpl,
+        llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 64, 1.1f, 0.0f, 0.0f));
+    if (!grammarPath.empty()) {
+        std::string g = read_file(grammarPath.c_str());
+        if (g.empty()) {
+            fprintf(stderr, "[FAIL] grammar 文件为空或读不到: %s\n", grammarPath.c_str());
+            return 1;
+        }
+        llama_sampler* gs = llama_sampler_init_grammar(vocab, g.c_str(), "root");
+        if (!gs) {
+            fprintf(stderr, "[FAIL] GBNF 解析失败（%zu 字节）\n", g.size());
+            return 1;
+        }
+        llama_sampler_chain_add(smpl, gs);
+        printf("[gbnf] 已加载 %s（%zu 字节）\n", grammarPath.c_str(), g.size());
+    }
     llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(0x5EED1234u));
-
-    const llama_vocab* vocab = llama_model_get_vocab(model);
 
     llama_chat_message m;
     m.role = "user";

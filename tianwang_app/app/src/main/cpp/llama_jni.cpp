@@ -87,6 +87,50 @@ static void readGgufMeta(const char* path, int* outLayer, int* outCtxTrain) {
     gguf_free(g);
 }
 
+/**
+ * 重建采样链。每轮都重建，因为 grammar 只随「单次请求」变化：
+ * 工具调用重试那一轮用 GBNF 强制 JSON，普通聊天则一个字节都不约束。
+ *
+ * 🔴 关键点：grammar 放进采样链，是在 logits 层**直接屏蔽不合法 token**，
+ *    不是「生成完再校验」。0.6B~3B 的小模型没有能力自己守住输出格式，
+ *    只能在源头约束 —— 这也是开源社区（android-agent / llama.cpp server）
+ *    让本地小模型稳定做 tool call 的通行做法。
+ *
+ * 语法解析失败时 llama_sampler_init_grammar 返回 NULL，本轮退回无约束：
+ * 宁可让它自由回答，也不要让整轮生成直接失败。
+ */
+static void rebuildSampler(LlamaSession* s, const std::string& grammar) {
+    if (s->smpl) { llama_sampler_free(s->smpl); s->smpl = nullptr; }
+    const llama_vocab* vocab = llama_model_get_vocab(s->model);
+    auto sp = llama_sampler_chain_default_params();
+    s->smpl = llama_sampler_chain_init(sp);
+
+    // 🔴 重复惩罚必须在最前（2026-10-26 加）。
+    //    原先链里只有 temp → top_k → top_p → dist，**没有任何重复惩罚**。
+    //    小模型（尤其 1B 以下）没有这道约束时，会卡在同一个词/同一句话上原地
+    //    打转 —— 用户看到的就是「无限循环」。这不是模型坏，是采样器缺了一道闸。
+    //    last_n=64：只惩罚最近 64 个 token，短到能抓住局部循环、长到不会把
+    //    整段回答的词都压平（设 -1 = 全上下文，长回答会越写越僵）。
+    //    顺序照 llama.cpp 的惯例：penalties → grammar → top_k → top_p → temp → dist。
+    llama_sampler_chain_add(s->smpl,
+        llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 64, 1.1f, 0.0f, 0.0f));
+
+    if (!grammar.empty()) {
+        llama_sampler* g = llama_sampler_init_grammar(vocab, grammar.c_str(), "root");
+        if (g) {
+            llama_sampler_chain_add(s->smpl, g);
+            LOGI("[gbnf] 已启用语法约束（%zu 字节）", grammar.size());
+        } else {
+            LOGE("[gbnf] 语法解析失败，本轮退回无约束");
+        }
+    }
+
+    llama_sampler_chain_add(s->smpl, llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(s->smpl, llama_sampler_init_top_p(0.9f, 1));
+    llama_sampler_chain_add(s->smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(s->smpl, llama_sampler_init_dist(0x5EED1234u));
+}
+
 extern "C" {
 
 /**
@@ -168,20 +212,7 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeLoadModel(
         return 0;
     }
 
-    auto sp = llama_sampler_chain_default_params();
-    s->smpl = llama_sampler_chain_init(sp);
-    // 🔴 重复惩罚必须在最前（2026-10-26 加）。
-    //    原先链里只有 temp → top_k → top_p → dist，**没有任何重复惩罚**。
-    //    小模型（尤其 1B 以下）没有这道约束时，会卡在同一个词/同一句话上原地
-    //    打转 —— 用户看到的就是「无限循环」。这不是模型坏，是采样器缺了一道闸。
-    //    last_n=64：只惩罚最近 64 个 token，短到能抓住局部循环、长到不会把
-    //    整段回答的词都压平（设 -1 = 全上下文，长回答会越写越僵）。
-    //    顺序照 llama.cpp 的惯例：penalties → top_k → top_p → temp → dist。
-    llama_sampler_chain_add(s->smpl, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
-    llama_sampler_chain_add(s->smpl, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(s->smpl, llama_sampler_init_top_p(0.9f, 1));
-    llama_sampler_chain_add(s->smpl, llama_sampler_init_temp(0.7f));
-    llama_sampler_chain_add(s->smpl, llama_sampler_init_dist(0x5EED1234u));
+    // 采样链不在这里建：grammar 是「单轮」参数，见 rebuildSampler()。
 
     // 模板有没有、支不支持思考开关 —— 「为什么这个模型答非所问」第一个要看的东西。
     // 有模板 ≠ 是对话模型：base 检查点也可能带着 instruct 模板（SmolLM2 系列就是），
@@ -232,11 +263,14 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeLastStats(JNIEnv* env, jobject) 
  * [noThink] 只对「模板里带 enable_thinking 的模型」生效（Qwen3 混合思考系）：
  *   在该模板里，assistant 开头插入空的 ` thinking\n\n\n\n` 就等于告诉模型「跳过思考」。
  *   这是模板本身的写法，不是我们发明的小动作；不满足条件的模型一律原样透传。
+ *
+ * [grammar] GBNF 文本（空 = 无约束）。只用于「工具调用格式没守住时重试一次」，
+ *   普通聊天绝不传 —— 全程强制 JSON 会把正常回答毁掉。
  */
 JNIEXPORT jstring JNICALL
 Java_app_skynet_tianwang_next_LlamaNative_nativeChatMessages(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jobjectArray jroles, jobjectArray jcontents,
-        jint maxTokens, jboolean noThink, jobject callback) {
+        jint maxTokens, jboolean noThink, jstring jgrammar, jobject callback) {
     auto* s = reinterpret_cast<LlamaSession*>(handle);
     if (!s || !s->ctx || !s->model) return env->NewStringUTF("");
 
@@ -266,6 +300,8 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeChatMessages(
     }
 
     const llama_vocab* vocab = llama_model_get_vocab(s->model);
+    // 每轮重建采样链：GBNF 只影响本轮，不能把上一轮的工具约束带到下一轮聊天。
+    rebuildSampler(s, jstr2std(env, jgrammar));
     const char* tmpl = llama_model_chat_template(s->model, nullptr);
 
     std::string prompt;

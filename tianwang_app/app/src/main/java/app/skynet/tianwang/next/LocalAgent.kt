@@ -32,31 +32,48 @@ object LocalAgent {
             // 工具 JSON 不流式显示：先攒完再判断，避免用户看见半截 {"tool":...
             var full = ""
             val r = LocalBackend.chat(profile, convo.toList(), onDelta = { full += it })
-            val out = r.getOrElse { return Result.failure(it) }
+            var out = r.getOrElse { return Result.failure(it) }
             if (out.isBlank()) {
                 return Result.failure(IllegalStateException("本地模型没有产出（可能是上下文/显存不够）"))
             }
 
-            val intent = LocalToolProtocol.parse(out)
-            if (intent == null) {
+            var intent = LocalToolProtocol.parse(out)
+            if (intent == null && visible.isNotEmpty() &&
+                LocalToolProtocol.looksLikeActionAttempt(out)) {
+                // 🔴 小模型「想调工具但 JSON 没守住」：用 GBNF 把它钉成 JSON 再试一次。
+                //    只在这一次重试里加约束 —— 全程强制 JSON 会把正常聊天毁掉。
+                //    同 prompt 再跑一遍，KV 前缀全部复用，代价只有重新采样的几十个 token。
+                var retry = ""
+                val grammar = LocalToolProtocol.toolGrammar(visible)
+                val r2 = LocalBackend.chatWithGrammar(profile, convo.toList(), grammar) { retry += it }
+                val fixed = r2.getOrNull()
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { LocalToolProtocol.parse(it) }
+                if (fixed != null) {
+                    intent = fixed
+                    out = retry
+                }
+            }
+            val picked = intent
+            if (picked == null) {
                 // 正常回答：一次性交给 UI；本地小模型的文本不值得为了"流式"再切碎。
                 onDelta(out)
                 return Result.success(out)
             }
 
-            val tool = visible.firstOrNull { it.name == intent.name }
+            val tool = visible.firstOrNull { it.name == picked.name }
             if (tool == null) {
                 convo.add(ChatMsg(role = ChatMsg.Role.ASSISTANT, text = out))
                 convo.add(ChatMsg(role = ChatMsg.Role.USER,
-                    text = "错误：没有工具 ${intent.name}。只能从这些里选：" +
+                    text = "错误：没有工具 ${picked.name}。只能从这些里选：" +
                         visible.joinToString("、") { it.name }))
                 return@repeat
             }
 
             val started = System.currentTimeMillis()
-            val running = ToolCall(name = intent.name, args = intent.args.toString())
+            val running = ToolCall(name = picked.name, args = picked.args.toString())
             onTool(running)
-            val result = runCatching { execute(intent.name, intent.args) }
+            val result = runCatching { execute(picked.name, picked.args) }
                 .getOrElse { ToolResult(false, err = "${it.javaClass.simpleName}: ${it.message ?: "执行失败"}") }
             val ms = System.currentTimeMillis() - started
             onTool(running.copy(
@@ -67,7 +84,7 @@ object LocalAgent {
 
             convo.add(ChatMsg(role = ChatMsg.Role.ASSISTANT, text = out))
             convo.add(ChatMsg(role = ChatMsg.Role.USER,
-                text = "工具 ${intent.name} 执行结果（${if (result.ok) "成功" else "失败"}）：\n" +
+                text = "工具 ${picked.name} 执行结果（${if (result.ok) "成功" else "失败"}）：\n" +
                     (if (result.ok) result.text else result.err)))
         }
         return Result.failure(IllegalStateException(

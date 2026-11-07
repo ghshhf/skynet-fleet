@@ -102,4 +102,35 @@ class LocalToolProtocolTest {
         assertTrue(prompt.contains("只读"))
         assertTrue(prompt.contains("query:string"))
     }
+
+    @Test
+    fun grammarEnumeratesEveryToolName() {
+        val g = LocalToolProtocol.toolGrammar(
+            listOf(tool("self_status"), tool("self_ui_tap", sideEffect = true))
+        )
+        // 工具名必须是文法的合法分支，编造的名字在采样层就生成不出来。
+        // 注意 GBNF 里每个名字本身要带引号，所以文本是 "\"self_status\""。
+        assertTrue(g.contains("root ::="))
+        assertTrue(g.contains("\\\"self_status\\\""))
+        assertTrue(g.contains("\\\"self_ui_tap\\\""))
+        assertTrue(g.contains(" | "))
+        // JSON 基础规则齐全（否则 grammar 解析会在设备上失败）
+        for (rule in listOf("value ::=", "object ::=", "array ::=", "string ::=", "number ::=", "ws ::=")) {
+            assertTrue("缺规则 $rule", g.contains(rule))
+        }
+    }
+
+    @Test
+    fun grammarIsEmptyWithoutTools() {
+        assertEquals("", LocalToolProtocol.toolGrammar(emptyList()))
+    }
+
+    @Test
+    fun detectsHalfWrittenToolCall() {
+        assertTrue(LocalToolProtocol.looksLikeActionAttempt("{\"tool\":\"self_ui_tap\",\"arguments\":{\"query\":"))
+        assertTrue(LocalToolProtocol.looksLikeActionAttempt("{\"tool\": \"self_ui_tap\""))
+        // 正常中文回答不能被误判，否则会莫名被强制成 JSON
+        assertTrue(!LocalToolProtocol.looksLikeActionAttempt("好的，我帮你看一下屏幕。"))
+        assertTrue(!LocalToolProtocol.looksLikeActionAttempt("这个 JSON 示例是 {\"a\":1}"))
+    }
 }
