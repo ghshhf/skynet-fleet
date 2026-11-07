@@ -107,12 +107,21 @@ class PermsTest {
     }
 
     @Test
+    fun lanRowFollowsServerState() {
+        assertEquals(PermState.NEEDS_GRANT, row(PermEnv(), "lan.peer").state)
+        assertTrue(row(PermEnv(), "lan.peer").next.contains("self.lan.start"))
+        assertEquals(PermState.READY, row(PermEnv(lanRunning = true), "lan.peer").state)
+        assertTrue(row(PermEnv(lanRunning = true), "lan.peer").next.contains("self.lan.call"))
+    }
+
+    @Test
     fun formatReportsChannelStatusCountsAndNextSteps() {
         val txt = Perms.format(PermEnv())
         assertTrue(txt.contains("无障碍：未开启"))
         assertTrue(txt.contains("通知使用权：未授权"))
         assertTrue(txt.contains("Shizuku：未运行"))
         assertTrue(txt.contains("设备所有者：未就绪"))
+        assertTrue(txt.contains("局域网直连：未启动"))
         assertTrue(txt.contains("需 Shizuku"))
         assertTrue(txt.contains("→"))
         assertTrue(txt.contains("不重试"))

@@ -67,6 +67,8 @@ class PhoneMcpToolsTest {
             "self_perm_matrix", "self_shizuku_status", "self_shizuku_request", "self_shell_exec",
             "self_owner_status", "self_owner_provision", "self_owner_grant_perm",
             "self_owner_restriction", "self_owner_reboot",
+            "self_lan_status", "self_lan_start", "self_lan_stop",
+            "self_lan_call", "self_lan_speed",
         )) {
             assertTrue("缺少工具 $n", n in names)
         }
@@ -80,6 +82,11 @@ class PhoneMcpToolsTest {
         assertTrue(byName.getValue("self_owner_grant_perm").sideEffect)
         assertTrue(byName.getValue("self_owner_restriction").sideEffect)
         assertTrue(byName.getValue("self_owner_reboot").sideEffect)
+        assertTrue(byName.getValue("self_lan_start").sideEffect)
+        assertTrue(byName.getValue("self_lan_stop").sideEffect)
+        assertTrue(byName.getValue("self_lan_call").sideEffect)
+        assertTrue(byName.getValue("self_lan_speed").sideEffect)
+        assertFalse(byName.getValue("self_lan_status").sideEffect)
         assertFalse(byName.getValue("self_perm_matrix").sideEffect)
         assertFalse(byName.getValue("self_shizuku_status").sideEffect)
         assertFalse(byName.getValue("self_owner_status").sideEffect)
@@ -112,6 +119,22 @@ class PhoneMcpToolsTest {
         )
         val resp = core.handleLine(
             """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"self_clipboard_set","arguments":{"text":"x"}}}"""
+        )
+        val o = JSONObject(resp!!)
+        assertTrue(o.getJSONObject("result").getBoolean("isError"))
+        assertFalse(called)
+    }
+
+    @Test
+    fun readOnlyGateBlocksLanCall() {
+        var called = false
+        val core = McpCore(
+            tools = PhoneMcp.toolList(),
+            actionsAllowed = { false },
+            call = { _, _ -> called = true; ToolResult(true, text = "should-not-run") },
+        )
+        val resp = core.handleLine(
+            """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"self_lan_call","arguments":{"host":"fe80::1%wlan0","token":"x","tool":"self_status"}}}"""
         )
         val o = JSONObject(resp!!)
         assertTrue(o.getJSONObject("result").getBoolean("isError"))

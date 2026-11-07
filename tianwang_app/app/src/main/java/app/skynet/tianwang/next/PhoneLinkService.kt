@@ -30,11 +30,13 @@ class PhoneLinkService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!Prefs.mcpConfigured()) {
+        // 这个服务现在管两条链路：云中继（MCP）和手机直连（LAN/IPv6）。
+        // 只要有一条在跑就得钉住进程；两条都没有才停。
+        if (!Prefs.mcpConfigured() && !LanHub.running) {
             stopSelf()
             return START_NOT_STICKY
         }
-        PhoneMcpLink.start()
+        if (Prefs.mcpConfigured()) PhoneMcpLink.start()
         return START_STICKY
     }
 
@@ -42,6 +44,7 @@ class PhoneLinkService : Service() {
         // 只停这次连接，不把用户的「开着」改成「关着」：
         // 系统回收后 START_STICKY 会重新拉起，读到的仍是 enabled=true。
         PhoneMcpLink.pause()
+        LanHub.stop()
         super.onDestroy()
     }
 
@@ -60,8 +63,8 @@ class PhoneLinkService : Service() {
         }
         return builder
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)
-            .setContentTitle("天网手机入网")
-            .setContentText("正在保持 /pair 连接；点开可查看或断开")
+            .setContentTitle("天网手机链路")
+            .setContentText("正在保持入网 / 局域网直连；点开可查看或断开")
             .setOngoing(true)
             .setContentIntent(open)
             .build()

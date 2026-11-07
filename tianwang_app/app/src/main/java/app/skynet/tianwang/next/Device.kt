@@ -284,6 +284,8 @@ object Prefs {
     private const val K_MCP_SECRET = "mcp_pair_secret"
     private const val K_MCP_ALLOW = "mcp_allow_actions"
     private const val K_MCP_ENABLED = "mcp_enabled"
+    private const val K_LAN_TOKEN = "lan_token"
+    private const val K_LAN_PORT = "lan_port"
     private const val K_DEV_ID = "device_id"
     private const val K_DEV_SEC = "device_secret"
     private const val K_DEV_NAME = "device_name"
@@ -344,6 +346,28 @@ object Prefs {
         set(v) { sp.edit().putBoolean(K_MCP_ENABLED, v).apply() }
 
     fun mcpConfigured(): Boolean = mcpUrl.isNotBlank() && mcpRoom.isNotBlank() && mcpSecret.isNotBlank()
+
+    // ---------------- 手机直连（局域网 / IPv6） ----------------
+
+    /**
+     * 对端口令。首次用时生成并落盘；换口令没有入口，避免「随手一改」把已配对的对端全踢掉。
+     * 不进日志、不进 UI，只在 self.lan.start 的回执里出现一次。
+     */
+    var lanToken: String
+        get() = sp.getString(K_LAN_TOKEN, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_LAN_TOKEN, v.trim()).apply() }
+
+    var lanPort: Int
+        get() = sp.getInt(K_LAN_PORT, LanProto.DEFAULT_PORT).coerceIn(1024, 65535)
+        set(v) { sp.edit().putInt(K_LAN_PORT, v.coerceIn(1024, 65535)).apply() }
+
+    fun ensureLanToken(): String {
+        val cur = lanToken
+        if (cur.length >= 16) return cur
+        val fresh = LanProto.newToken()
+        lanToken = fresh
+        return fresh
+    }
 
     // ---------------- 长期设备凭据（配对得来） ----------------
 

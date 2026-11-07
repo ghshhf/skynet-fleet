@@ -247,6 +247,42 @@ object PhoneSelf {
             "self.owner.reboot", "远程重启设备",
             "设备所有者专用重启。手机立刻重启，远程连接会断，重启后自动重连。",
         ),
+        SelfCap(
+            "self.lan.status", "局域网 / IPv6 直连状态",
+            "看直连服务开没开、端口、本机所有可入站地址（IPv6 优先，链路本地带 %网卡）、mDNS 发现的手机。排「连不上」先跑这条。",
+        ),
+        SelfCap(
+            "self.lan.start", "开手机直连服务",
+            "在本机开 TCP 服务并广播 mDNS。回执里有完整口令和对端可填的地址；同一 Wi-Fi 走 fe80 链路本地，跨网络走全局 IPv6，流量不经过中继。",
+            listOf(CapParam("port", "int", "监听端口，默认 18765，范围 1024–65535", false)),
+        ),
+        SelfCap(
+            "self.lan.stop", "关手机直连服务",
+            "停掉 TCP 服务与 mDNS 广播；不影响云中继（如果还开着）。",
+        ),
+        SelfCap(
+            "self.lan.call", "直连调另一台手机的工具",
+            "连另一台手机的 LAN 服务并调一个 MCP 工具，回包压成文字。走 Wi-Fi/IPv6 直连，比云中继少一跳。",
+            listOf(
+                CapParam("host", "str", "对端地址：fe80::1%wlan0 / [2408:...] / 192.168.1.7", true),
+                CapParam("port", "int", "对端端口，默认 18765", false),
+                CapParam("token", "str", "对端 self.lan.start 回执里的完整口令", true),
+                CapParam("tool", "str", "MCP 工具名，如 self_status / self_ui_dump", true),
+                CapParam("args", "str", "工具参数 JSON，如 {\"limit\":20}；默认 {}", false),
+                CapParam("timeout", "int", "超时毫秒，默认 30000，上限 120000", false),
+            ),
+        ),
+        SelfCap(
+            "self.lan.speed", "手机直连测速",
+            "在两台手机之间灌数据，实测 TCP 有效载荷速度（MB/s 与 Mbps）。Wi-Fi 6 跑几百 Mbps 是正常的，别拿中继的体感当上限。",
+            listOf(
+                CapParam("host", "str", "对端地址", true),
+                CapParam("port", "int", "对端端口，默认 18765", false),
+                CapParam("token", "str", "对端口令", true),
+                CapParam("mb", "int", "传输多少 MB，默认 8，上限 64", false),
+                CapParam("down", "bool", "true=测下行，默认测上行", false),
+            ),
+        ),
     )
 
     /** 用户在系统设置里给本 App 开了无障碍服务。 */
@@ -324,6 +360,18 @@ object PhoneSelf {
                         enabled = flagArg(args, "enabled"),
                     )
                     "self.owner.reboot" -> OwnerBridge.reboot(App.ctx)
+                    // 手机直连也不依赖无障碍：LAN 服务是独立 TCP 监听。
+                    "self.lan.status" -> ToolResult(true, text = LanHub.statusText())
+                    "self.lan.start" -> withContext(Dispatchers.IO) {
+                        LanHub.start(App.ctx, intArg(args, "port", Prefs.lanPort))
+                    }
+                    "self.lan.stop" -> {
+                        LanHub.stop(App.ctx)
+                        ToolResult(true, text = "局域网直连已停止")
+                    }
+                    // 直连是阻塞 socket，必须离开主线程，否则测速会把 UI 卡死。
+                    "self.lan.call" -> withContext(Dispatchers.IO) { LanHub.call(args) }
+                    "self.lan.speed" -> withContext(Dispatchers.IO) { LanHub.speed(args) }
                     "self.audit" -> audit(args)
                     "self.screen.state" -> screenState(App.ctx)
                     "self.app.list" -> appList(App.ctx, args)
@@ -837,6 +885,10 @@ object PhoneSelf {
             append("；状态：").append(PhoneMcpLink.status).append('\n')
             append("Shizuku：").append(ShizukuBridge.status().line()).append('\n')
             append("设备所有者：").append(OwnerBridge.status(App.ctx).line()).append('\n')
+            append("局域网直连：").append(
+                if (LanHub.running) "运行中 · 端口 ${LanHub.port}"
+                else "未启动（跑 self.lan.start）"
+            ).append('\n')
             append("本地模型：").append(ModelCatalog.local().size).append(" 个 GGUF")
         }
         return ToolResult(true, text = txt)

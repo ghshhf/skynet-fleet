@@ -244,6 +244,51 @@ object PhoneMcp {
             schema(emptyMap()),
             sideEffect = true,
         ),
+        McpTool(
+            "self_lan_status",
+            "局域网 / IPv6 直连状态：服务端口、本机可入站地址（IPv6 优先，链路本地带 %网卡）、mDNS 发现的手机。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_lan_start",
+            "开手机直连服务（TCP + mDNS）。回执含完整口令；同一 Wi-Fi 走 fe80，跨网走全局 IPv6，不经过中继。",
+            schema(mapOf("port" to prop("integer", "监听端口，默认 18765，范围 1024–65535")), emptyList()),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_lan_stop", "停手机直连服务与 mDNS 广播；不影响云中继。",
+            schema(emptyMap()),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_lan_call", "直连另一台手机并调一个 MCP 工具，回包压成文字。",
+            schema(
+                mapOf(
+                    "host" to prop("string", "对端地址：fe80::1%wlan0 / [2408:...] / 192.168.1.7"),
+                    "port" to prop("integer", "对端端口，默认 18765"),
+                    "token" to prop("string", "对端 self_lan_start 回执里的完整口令"),
+                    "tool" to prop("string", "MCP 工具名，如 self_status"),
+                    "args" to prop("string", "工具参数 JSON，默认 {}"),
+                    "timeout" to prop("integer", "超时毫秒，默认 30000"),
+                ),
+                listOf("host", "token", "tool"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_lan_speed", "两台手机之间实测 TCP 有效载荷速度（MB/s 与 Mbps）。",
+            schema(
+                mapOf(
+                    "host" to prop("string", "对端地址"),
+                    "port" to prop("integer", "对端端口，默认 18765"),
+                    "token" to prop("string", "对端口令"),
+                    "mb" to prop("integer", "传输多少 MB，默认 8，上限 64"),
+                    "down" to prop("boolean", "true=下行，默认上行"),
+                ),
+                listOf("host", "token"),
+            ),
+            sideEffect = true,
+        ),
     )
 
     private val core = McpCore(
@@ -290,6 +335,11 @@ object PhoneMcp {
             "self_screen_state" -> "self.screen.state"
             "self_diag" -> "self.diag"
             "self_audit" -> "self.audit"
+            "self_lan_status" -> "self.lan.status"
+            "self_lan_start" -> "self.lan.start"
+            "self_lan_stop" -> "self.lan.stop"
+            "self_lan_call" -> "self.lan.call"
+            "self_lan_speed" -> "self.lan.speed"
             "self_perm_matrix" -> "self.perm.matrix"
             "self_shizuku_status" -> "self.shizuku.status"
             "self_shizuku_request" -> "self.shizuku.request"

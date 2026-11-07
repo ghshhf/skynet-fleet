@@ -31,6 +31,7 @@ data class PermEnv(
     val screenshotSupported: Boolean = true,
     val rootAvailable: Boolean = false,
     val deviceOwner: Boolean = false,
+    val lanRunning: Boolean = false,
 )
 
 data class PermRow(
@@ -99,6 +100,12 @@ object Perms {
             PermRow("app.install", "安装 / 卸载应用", "Shizuku", shizukuState(env), shizukuNext(env)),
             PermRow("app.force_stop", "强制停止后台应用", "Shizuku", shizukuState(env), shizukuNext(env)),
             PermRow(
+                "lan.peer", "手机直连（局域网 / IPv6）", "TCP/IPv6",
+                if (env.lanRunning) PermState.READY else PermState.NEEDS_GRANT,
+                if (env.lanRunning) "已可用：self.lan.call / self.lan.speed，直连不经过中继"
+                else "跑 self.lan.start；同一 Wi-Fi 用 fe80 链路本地，跨网用全局 IPv6",
+            ),
+            PermRow(
                 "device.owner", "设备所有者 / 企业策略", "设备所有者",
                 if (env.deviceOwner) PermState.READY else PermState.NEEDS_GRANT,
                 if (env.deviceOwner) "已就绪：self.owner.status" else
@@ -148,6 +155,7 @@ object Perms {
             ).append('\n')
             append("Root：").append(if (env.rootAvailable) "检测到 su" else "未检测到").append('\n')
             append("设备所有者：").append(if (env.deviceOwner) "已就绪" else "未就绪").append('\n')
+            append("局域网直连：").append(if (env.lanRunning) "运行中" else "未启动").append('\n')
             append("—— 可用 ").append(count[PermState.READY] ?: 0)
             append(" / 待授权 ").append(count[PermState.NEEDS_GRANT] ?: 0)
             append(" / 需 Shizuku ").append(count[PermState.NEEDS_SHIZUKU] ?: 0)
@@ -178,6 +186,7 @@ object Perms {
             screenshotSupported = Build.VERSION.SDK_INT >= 30,
             rootAvailable = hasRootHint(),
             deviceOwner = OwnerBridge.status(ctx).deviceOwner,
+            lanRunning = LanHub.running,
         )
     }
 
