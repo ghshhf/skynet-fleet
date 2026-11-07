@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   apk:
@@ -54,3 +54,19 @@ jobs:
           name: tianwang-next-debug
           path: tianwang_app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # Actions 的 artifact 在手机浏览器里基本下不动；挂到固定 tag 的 Release，
+      # 手机打开 https://github.com/ghshhf/skynet-fleet/releases/tag/apk-latest 就能直装。
+      - name: 发布到「最新 APK」Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APK=tianwang_app/app/build/outputs/apk/debug/app-debug.apk
+          if gh release view apk-latest >/dev/null 2>&1; then
+            gh release upload apk-latest "$APK" --clobber
+          else
+            gh release create apk-latest "$APK" \
+              --title "天网 APK（最新）" \
+              --notes "由 build-app 自动更新；提交 ${GITHUB_SHA}。手机可直接下载安装。" \
+              --prerelease
+          fi
