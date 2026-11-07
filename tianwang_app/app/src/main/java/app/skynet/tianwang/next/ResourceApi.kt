@@ -27,6 +27,10 @@ data class ResourceCard(
     val liked: Boolean,
     val faved: Boolean,
     val comments: Int,
+    /** 抓取阶段抽到的封面图（enclosure / media / 首图 / 大站规则封面），空则用 OG 兜底。 */
+    val image: String = "",
+    /** 视频地址，非空即视频资源。 */
+    val video: String = "",
 )
 
 data class ResourceOrigin(val source: String, val url: String, val externalId: String, val at: String)
@@ -75,6 +79,8 @@ object ResourceApi {
             liked = o.optBoolean("liked", false),
             faved = o.optBoolean("faved", false),
             comments = o.optInt("comments", 0),
+            image = o.optString("image"),
+            video = o.optString("video"),
         )
     }
 

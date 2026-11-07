@@ -72,6 +72,7 @@ fun ResourceViewer(card: ResourceCard, onClose: () -> Unit, onDetail: () -> Unit
     var autoTried by remember { mutableStateOf(false) }
     var translating by remember { mutableStateOf(false) }
     var trJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var lightbox by remember { mutableStateOf<String?>(null) }
 
     fun applyChinese(v: WebView?, m: Map<Int, String>) {
         val o = JSONObject()
@@ -184,6 +185,9 @@ fun ResourceViewer(card: ResourceCard, onClose: () -> Unit, onDetail: () -> Unit
                         )
                     }
                     TextButton(onClick = onDetail) { Text("详情", fontSize = 11.sp) }
+                    if (card.image.isNotBlank()) {
+                        TextButton(onClick = { lightbox = card.image }) { Text("原图", fontSize = 11.sp) }
+                    }
                     TextButton(onClick = {
                         runCatching {
                             ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(card.url)))
@@ -205,6 +209,11 @@ fun ResourceViewer(card: ResourceCard, onClose: () -> Unit, onDetail: () -> Unit
                         color = MaterialTheme.colorScheme.error,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                     )
+                }
+                // 直链视频（mp4/webm/m3u8 等）内嵌播放，不跳浏览器；
+                // YouTube/B站等页面型视频交给下面的 WebView，移动网页本身能播。
+                if (card.video.isNotBlank() && isDirectMedia(card.video)) {
+                    VideoInline(card.video)
                 }
                 AndroidView(
                     modifier = Modifier.fillMaxWidth().weight(1f),
@@ -280,5 +289,8 @@ fun ResourceViewer(card: ResourceCard, onClose: () -> Unit, onDetail: () -> Unit
                 )
             }
         }
+    }
+    lightbox?.let { u ->
+        ImageLightbox(url = u, onClose = { lightbox = null })
     }
 }

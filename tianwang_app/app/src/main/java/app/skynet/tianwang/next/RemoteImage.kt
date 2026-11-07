@@ -38,6 +38,16 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.draw.alpha
 
 /**
  * 卡片图片：手机自己下载、自己缓存，不引第三方图片库。
@@ -135,7 +145,11 @@ object ImageCache {
     }
 }
 
-/** 有图就出图，没图/加载中就一块带站点首字母的占位，不空着也不弹错误。 */
+/**
+ * 有图就出图，没图/加载中就一块带站点首字母的占位，不空着也不弹错误。
+ * 加载中显示「呼吸骨架」(大厂两段式加载的第一段：先占位、后淡入真图)，
+ * 真图解码完成后 200ms 交叉淡入，避免突兀弹出——对齐微信/飞猪的图片体验。
+ */
 @Composable
 fun RemoteImage(url: String, modifier: Modifier = Modifier, label: String = "") {
     val ctx = LocalContext.current
@@ -152,16 +166,36 @@ fun RemoteImage(url: String, modifier: Modifier = Modifier, label: String = "") 
         modifier.background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center,
     ) {
-        if (bmp != null) {
-            Image(
-                bitmap = bmp!!,
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop,
+        // 加载中：呼吸骨架占位（轻量 alpha 脉动，不引第三方 shimmer 库）。
+        if (bmp == null && !done) {
+            val tr = rememberInfiniteTransition(label = "skeleton")
+            val a = tr.animateFloat(
+                0.30f, 0.65f,
+                infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Reverse),
+                label = "skeletonAlpha",
             )
-        } else if (!done) {
-            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-        } else if (label.isNotBlank()) {
+            Box(
+                Modifier.fillMaxSize().alpha(a.value)
+                    .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.14f)),
+            )
+        }
+        // 真图就位后淡入覆盖在骨架之上。
+        AnimatedVisibility(
+            visible = bmp != null,
+            enter = fadeIn(tween(220)),
+            exit = fadeOut(tween(120)),
+        ) {
+            bmp?.let {
+                Image(
+                    bitmap = it,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            }
+        }
+        // 加载失败且无图：退化成站点首字母占位，不弹错误。
+        if (bmp == null && done && label.isNotBlank()) {
             Text(
                 label.removePrefix("www.").take(1).uppercase(),
                 fontSize = 30.sp,

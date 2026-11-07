@@ -37,6 +37,10 @@ object ResourceCrawler {
         val quality: Double = 0.55,
         val externalId: String = "",
         val publishedAt: Double = 0.0,
+        /** 抓取阶段顺手抽到的封面图（enclosure / media:content / 正文首图 / 大站规则封面）。 */
+        val image: String = "",
+        /** 视频地址（enclosure type=video / 视频站链接），有值即视为视频资源。 */
+        val video: String = "",
     )
 
     private class Source(val id: String, val name: String, val fetch: () -> List<Hit>)
@@ -109,6 +113,15 @@ object ResourceCrawler {
 
         // ---- 开源清单：电脑上那批 awesome 种子的链接，手机一样自己抓 ----
         Source("awesome-lists", "开源清单", ::awesome),
+
+        // ---- 手机软件 / APK：F-Droid 开源市场 RSS，自带截图/描述，归类「手机软件」 ----
+        Source("fdroid", "F-Droid") { rss("手机软件", "https://f-droid.org/feed/") },
+        Source("fdroid-zh", "F-Droid 中文") { rss("手机软件", "https://f-droid.org/feed?lang=zh") },
+        // ---- 更多市场源：APKMirror（WordPress feed，稳）/ IzzyOnDroid（F-Droid 第三方仓，稳）----
+        // 这两个都是应用市场生态、自带 RSS，归类「手机软件」，让分类更丰富。
+        // CoolAPK 无公开 RSS/API、易被反爬污染失败日志，暂不加；要加可后续写网页解析版。
+        Source("apkmirror", "APKMirror") { rss("手机软件", "https://www.apkmirror.com/feed/") },
+        Source("izzyon", "IzzyOnDroid") { rss("手机软件", "https://www.izzyonandroid.de/category/apps/feed/") },
     )
 
     /** 电脑侧 resource_finder 里的种子清单，抽里面的外链就是一大批资源。 */
@@ -182,6 +195,7 @@ object ResourceCrawler {
                     summary = ResourceLogic.cleanSummary(r.optString("description")),
                     kind = "repo", tags = tags,
                     quality = 0.62 + (r.optInt("stargazers_count", 0) / 100000.0).coerceAtMost(0.28),
+                    image = "https://opengraph.githubassets.com/1/$full",
                     externalId = full, publishedAt = isoEpoch(r.optString("pushed_at")),
                 )
             )
@@ -266,16 +280,102 @@ object ResourceCrawler {
             if (!link.startsWith("http", true)) continue
             val desc = pick(b, "description").ifBlank { pick(b, "summary") }
                 .ifBlank { pick(b, "content") }
+            val (image, video) = feedMedia(b, link)
+            val baseKind = when {
+                video.isNotBlank() -> "video"
+                image.isNotBlank() && stripTags(desc).isBlank() -> "image"
+                else -> "article"
+            }
+            // 手机软件源（F-Droid 等）无 enclosure，统一标成「应用」便于分类筛选。
+            val kind = if (baseKind == "article" && tag == "手机软件") "app" else baseKind
+            val tags = ArrayList<String>()
+            tags.add(tag); tags.add("订阅")
+            tags.addAll(feedCategories(b))
+            if (video.isNotBlank()) tags.add("视频")
+            if (kind == "image") tags.add("图片")
             out.add(
                 Hit(
                     title = title, url = link,
                     summary = ResourceLogic.cleanSummary(stripTags(desc)),
-                    kind = "article", tags = listOf(tag, "订阅"), quality = 0.55,
-                    externalId = link,
+                    kind = kind, tags = tags.distinct(), quality = 0.55,
+                    image = image, video = video, externalId = link,
                     publishedAt = isoEpoch(stripTags(pick(b, "pubDate").ifBlank { pick(b, "updated") })),
                 )
             )
             if (out.size >= 20) break
+        }
+        return out
+    }
+
+    /** 单条 feed 里的媒体：enclosure / media:content / media:thumbnail / 正文首图 / 视频站链接。 */
+    private fun feedMedia(block: String, link: String): Pair<String, String> {
+        var image = ""
+        var video = ""
+        Regex("<enclosure\\b[^>]*>", RegexOption.IGNORE_CASE).find(block)?.let { enc ->
+            val a = tagAttrs(enc.value)
+            val u = a["url"].orEmpty()
+            val t = a["type"].orEmpty().lowercase()
+            if (u.isNotBlank()) when {
+                t.startsWith("video") -> video = u
+                t.startsWith("image") -> image = u
+                looksLikeVideo(u) -> video = u
+                looksLikeImage(u) -> image = u
+            }
+        }
+        for (m in Regex("<media:(?:content|thumbnail)\\b[^>]*>", RegexOption.IGNORE_CASE).findAll(block)) {
+            val a = tagAttrs(m.value)
+            val u = a["url"].orEmpty()
+            if (u.isBlank()) continue
+            val medium = a["medium"].orEmpty().lowercase()
+            val t = a["type"].orEmpty().lowercase()
+            when {
+                medium == "video" || t.startsWith("video") || looksLikeVideo(u) ->
+                    if (video.isBlank()) video = u
+                medium == "image" || t.startsWith("image") || looksLikeImage(u) ->
+                    if (image.isBlank()) image = u
+            }
+        }
+        if (image.isBlank()) {
+            val desc = pick(block, "description").ifBlank { pick(block, "content:encoded") }
+                .ifBlank { pick(block, "content") }
+            Regex("<img\\b[^>]*>", RegexOption.IGNORE_CASE).find(desc)?.let { img ->
+                val a = tagAttrs(img.value)
+                val src = (a["src"] ?: a["data-src"]).orEmpty()
+                val w = a["width"]?.toIntOrNull() ?: 0
+                if (src.isNotBlank() && !src.startsWith("data:", true) && w != 1) image = src
+            }
+        }
+        // 链接本身是视频站（YouTube/B站等）：给缩略图，卡片能直接出图
+        if (video.isBlank() && looksLikeVideo(link)) {
+            video = link
+            if (image.isBlank()) image = LinkPreviewLogic.coverOf(link)
+        }
+        return image to video
+    }
+
+    /** 一条 feed 里的 <category> 也收进标签，让分类更贴合内容而不是只有源名。 */
+    private fun feedCategories(block: String): List<String> {
+        val out = ArrayList<String>()
+        for (m in Regex("<category\\b[^>]*>([\\s\\S]*?)</category>", RegexOption.IGNORE_CASE).findAll(block)) {
+            val c = stripTags(m.groupValues[1]).trim().take(24)
+            if (c.isNotBlank() && out.size < 4 && !out.contains(c)) out.add(c)
+        }
+        return out
+    }
+
+    private fun looksLikeImage(u: String): Boolean =
+        Regex("""\.(jpe?g|png|webp|gif|avif)(\?.*)?$""", RegexOption.IGNORE_CASE).containsMatchIn(u)
+
+    private fun looksLikeVideo(u: String): Boolean =
+        Regex("""\.(mp4|webm|m4v|mov|avi)(\?.*)?$""", RegexOption.IGNORE_CASE).containsMatchIn(u) ||
+            u.contains("youtube.com", true) || u.contains("youtu.be", true) ||
+            u.contains("vimeo.com", true) || u.contains("bilibili.com", true)
+
+    private fun tagAttrs(tag: String): Map<String, String> {
+        val out = HashMap<String, String>()
+        for (m in Regex("""([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""").findAll(tag)) {
+            val v = m.groupValues[2].ifEmpty { m.groupValues[3].ifEmpty { m.groupValues[4] } }
+            out[m.groupValues[1].lowercase()] = v
         }
         return out
     }
@@ -326,6 +426,7 @@ object ResourceCrawler {
                 JSONObject()
                     .put("url", h.url).put("title", h.title).put("summary", h.summary)
                     .put("kind", h.kind).put("tags", tags).put("quality", h.quality)
+                    .put("image", h.image).put("video", h.video)
                     .put("id", h.externalId).put("published_at", h.publishedAt)
             )
         }

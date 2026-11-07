@@ -30,13 +30,14 @@ object ResourceStore {
         val id: String, val url: String, val title: String, val summary: String,
         val kind: String, val domain: String, val quality: Double,
         val publishedAt: Double, val createdAt: Double,
+        val image: String, val video: String,
     )
 
     private class Ranked(val card: ResourceCard, val score: Double)
 
     private val SCHEMA = arrayOf(
         "CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, name TEXT, kind TEXT DEFAULT '', config TEXT DEFAULT '{}', created_at REAL, last_seen REAL)",
-        "CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY, canonical_url TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, title TEXT, summary TEXT, kind TEXT DEFAULT '', domain TEXT DEFAULT '', quality REAL DEFAULT 0.5, published_at REAL, created_at REAL, updated_at REAL)",
+        "CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY, canonical_url TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, title TEXT, summary TEXT, kind TEXT DEFAULT '', domain TEXT DEFAULT '', quality REAL DEFAULT 0.5, published_at REAL, created_at REAL, updated_at REAL, image TEXT DEFAULT '', video TEXT DEFAULT '')",
         "CREATE INDEX IF NOT EXISTS idx_res_fp ON resources(fingerprint)",
         "CREATE INDEX IF NOT EXISTS idx_res_domain ON resources(domain)",
         "CREATE INDEX IF NOT EXISTS idx_res_created ON resources(created_at)",
@@ -60,6 +61,9 @@ object ResourceStore {
             if (!f.exists() || f.length() < 4096) copySeed(ctx, f)
             val d = SQLiteDatabase.openDatabase(f.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
             for (sql in SCHEMA) d.execSQL(sql)
+            // 老 seed 库建表时还没有 image/video 列，这里补齐，避免 SELECT 报 no such column。
+            ensureColumn(d, "resources", "image", "TEXT DEFAULT ''")
+            ensureColumn(d, "resources", "video", "TEXT DEFAULT ''")
             handle = d
             return d
         }
@@ -106,7 +110,7 @@ object ResourceStore {
         val rows = ArrayList<Row>()
         d.rawQuery(
             "SELECT r.id,r.canonical_url,r.title,r.summary,r.kind,r.domain,r.quality," +
-                "r.published_at,r.created_at FROM resources r $where " +
+                "r.published_at,r.created_at,r.image,r.video FROM resources r $where " +
                 "ORDER BY r.created_at DESC LIMIT 500",
             args.toTypedArray(),
         ).use { c ->
@@ -116,6 +120,7 @@ object ResourceStore {
                         c.getString(0), c.getString(1) ?: "", c.getString(2) ?: "",
                         c.getString(3) ?: "", c.getString(4) ?: "", c.getString(5) ?: "",
                         c.getDouble(6), c.getDouble(7), c.getDouble(8),
+                        c.getString(9) ?: "", c.getString(10) ?: "",
                     )
                 )
             }
@@ -191,6 +196,7 @@ object ResourceStore {
                         why = why.take(2).joinToString(" · ").ifBlank { "随机看看" },
                         at = ResourceLogic.isoTs(ts),
                         liked = false, faved = false, comments = 0,
+                        image = r.image, video = r.video,
                     ),
                     sc,
                 )
@@ -252,8 +258,8 @@ object ResourceStore {
         val d = open()
         var card: ResourceCard? = null
         d.rawQuery(
-            "SELECT id,canonical_url,title,summary,kind,domain,quality,published_at,created_at " +
-                "FROM resources WHERE id=?", arrayOf(id),
+            "SELECT id,canonical_url,title,summary,kind,domain,quality,published_at,created_at," +
+                "image,video FROM resources WHERE id=?", arrayOf(id),
         ).use { c ->
             if (c.moveToFirst()) {
                 val ts = if (c.getDouble(7) > 0.0) c.getDouble(7) else c.getDouble(8)
@@ -276,6 +282,7 @@ object ResourceStore {
                     liked = acts.any { it.action == "like" },
                     faved = acts.any { it.action == "favorite" },
                     comments = acts.count { it.action == "comment" },
+                    image = c.getString(9) ?: "", video = c.getString(10) ?: "",
                 )
             }
         }
@@ -442,6 +449,8 @@ object ResourceStore {
                 val summary = it.optString("summary").ifBlank { it.optString("desc") }.trim()
                 val kind = it.optString("kind").ifBlank { it.optString("type") }.ifBlank { "article" }
                 val quality = it.optDouble("quality", 0.5)
+                val image = it.optString("image").ifBlank { it.optString("img") }.trim()
+                val video = it.optString("video").ifBlank { it.optString("vid") }.trim()
                 val fp = ResourceLogic.fingerprint(title, summary, canonical)
                 var rid = d.rawQuery(
                     "SELECT id FROM resources WHERE canonical_url=? OR fingerprint=? LIMIT 1",
@@ -451,9 +460,11 @@ object ResourceStore {
                     d.execSQL(
                         "UPDATE resources SET updated_at=?, " +
                             "title=CASE WHEN COALESCE(title,'')='' THEN ? ELSE title END, " +
-                            "summary=CASE WHEN COALESCE(summary,'')='' THEN ? ELSE summary END " +
+                            "summary=CASE WHEN COALESCE(summary,'')='' THEN ? ELSE summary END, " +
+                            "image=CASE WHEN COALESCE(image,'')='' THEN ? ELSE image END, " +
+                            "video=CASE WHEN COALESCE(video,'')='' THEN ? ELSE video END " +
                             "WHERE id=?",
-                        arrayOf<Any>(now, title, summary, rid),
+                        arrayOf<Any>(now, title, summary, image, video, rid),
                     )
                     merged++
                 } else {
@@ -462,6 +473,7 @@ object ResourceStore {
                         put("id", rid); put("canonical_url", canonical); put("fingerprint", fp)
                         put("title", title); put("summary", summary); put("kind", kind)
                         put("domain", domain); put("quality", quality)
+                        put("image", image); put("video", video)
                         put("published_at", it.optDouble("published_at", 0.0))
                         put("created_at", now); put("updated_at", now)
                     }
@@ -531,6 +543,16 @@ object ResourceStore {
         }
         return JSONObject().put("ok", true).put("scanned", n)
             .put("new", 0).put("merged", n)
+    }
+
+    /** 老 seed 库缺列时补齐，避免 SELECT 报 no such column（minSdk 28 SQLite 支持 ALTER）。 */
+    private fun ensureColumn(d: SQLiteDatabase, table: String, col: String, def: String) {
+        val has = d.rawQuery("PRAGMA table_info($table)", null).use { c ->
+            var found = false
+            while (c.moveToNext()) { if (c.getString(1) == col) { found = true; break } }
+            found
+        }
+        if (!has) runCatching { d.execSQL("ALTER TABLE $table ADD COLUMN $col $def") }
     }
 
     /** 自动抓取节流：半小时一次，不反复吃流量，也不做后台定时任务。 */

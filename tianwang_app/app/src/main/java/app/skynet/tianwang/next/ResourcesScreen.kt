@@ -21,6 +21,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChatBubbleOutline
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material3.AlertDialog
@@ -90,6 +91,7 @@ fun ResourcesScreen() {
     var info by remember { mutableStateOf("") }
     var detail by remember { mutableStateOf<ResourceDetail?>(null) }
     var viewer by remember { mutableStateOf<ResourceCard?>(null) }
+    var lightbox by remember { mutableStateOf<String?>(null) }
     var previews by remember { mutableStateOf<Map<String, LinkPreview>>(emptyMap()) }
     var commentFor by remember { mutableStateOf<ResourceCard?>(null) }
     var commentText by remember { mutableStateOf("") }
@@ -220,16 +222,20 @@ fun ResourcesScreen() {
         }
     }
 
-    /** 滑动补漏：首屏 20 条已预先备好，这里只兜住快速滑到很后面的情况。
-     *  复用同一套预热器（跳过已缓存、低并发），不会跟抓取器抢带宽。 */
+    /** 滑动补漏 + 大厂式「滚动提前预加载」：可见窗口及之后若干条，先把 OG 预览和
+     *  原生封面图都落磁盘，滚过去直接出图不转圈。零额外流量（只提前下，不重复下）。 */
     fun ensurePreviews(from: Int) {
         if (viewer != null || items.isEmpty()) return
-        val urls = items.drop(from).take(6).map { it.url }
-            .filter { it.startsWith("http", true) }.distinct()
-        if (urls.isEmpty()) return
+        val window = items.drop(from).take(10)
+        val urls = window.map { it.url }.filter { it.startsWith("http", true) }.distinct()
+        // 直接把卡片封面图也提前落磁盘：卡片图是 RemoteImage 进入视口才解码，
+        // 提前 prefetch 后滚过去秒出（骨架→淡入），快速滑动也不转圈。
+        val imgs = window.mapNotNull { it.image.takeIf { u -> u.isNotBlank() } }.distinct()
+        if (urls.isEmpty() && imgs.isEmpty()) return
         scope.launch {
             val got = runCatching { ResourceApi.prefetch(urls) }.getOrDefault(emptyMap())
             if (got.isNotEmpty()) previews = previews + got
+            runCatching { ImageCache.prefetch(ctx, imgs) }
         }
     }
 
@@ -336,7 +342,9 @@ fun ResourcesScreen() {
                 ) {
                     items(items, key = { it.id }) { c ->
                         ResourceRow(c, preview = previews[c.url],
-                            onOpen = { open(c) }, onAct = { a -> act(c, a) },
+                            onOpen = { open(c) },
+                            onImage = { lightbox = it },
+                            onAct = { a -> act(c, a) },
                             onComment = { commentFor = c; commentText = "" })
                     }
                     // 滚到底自动续页，这里只留一个轻量进度点，不用点按钮
@@ -426,6 +434,10 @@ fun ResourcesScreen() {
         )
     }
 
+    lightbox?.let { u ->
+        ImageLightbox(url = u, onClose = { lightbox = null })
+    }
+
     commentFor?.let { c ->
         AlertDialog(
             onDismissRequest = { commentFor = null },
@@ -458,6 +470,7 @@ private fun ResourceRow(
     c: ResourceCard,
     preview: LinkPreview?,
     onOpen: () -> Unit,
+    onImage: (String) -> Unit,
     onAct: (String) -> Unit,
     onComment: () -> Unit,
 ) {
@@ -500,7 +513,7 @@ private fun ResourceRow(
                         modifier = Modifier.padding(top = 3.dp))
                 }
                 if (c.url.startsWith("http", true)) {
-                    PreviewBlock(preview, c, onOpen)
+                    PreviewBlock(preview, c, onOpen, onImage)
                 }
                 if (c.tags.isNotEmpty()) {
                     Text(c.tags.take(4).joinToString("  #") { it }, fontSize = 11.sp,
@@ -547,26 +560,52 @@ private fun MiniAct(icon: ImageVector, label: String, tint: Color, onClick: () -
  * 不是一行裸链接。点整块直接在 App 内加载页面。
  */
 @Composable
-private fun PreviewBlock(p: LinkPreview?, c: ResourceCard, onClick: () -> Unit) {
+private fun PreviewBlock(
+    p: LinkPreview?,
+    c: ResourceCard,
+    onClick: () -> Unit,
+    onImage: (String) -> Unit,
+) {
     val shape = RoundedCornerShape(12.dp)
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
     val site = p?.site?.takeIf { it.isNotBlank() } ?: c.domain
     val head = p?.title?.takeIf { it.isNotBlank() } ?: c.title
     val desc = p?.description?.takeIf { it.isNotBlank() } ?: c.summary
+    // 优先用抓取阶段抽到的原生封面，抓不到再退 OG / 规则封面。
+    val img = c.image.takeIf { it.isNotBlank() } ?: p?.image?.takeIf { it.isNotBlank() }
+    val isVideo = c.kind == "video" || c.video.isNotBlank()
     Column(
         Modifier.fillMaxWidth().padding(top = 8.dp)
             .clip(shape)
             .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f), shape)
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
-            .clickable(onClick = onClick),
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)),
     ) {
-        if (p?.hasImage == true) {
-            RemoteImage(url = p.image, label = site,
-                modifier = Modifier.fillMaxWidth().height(168.dp))
+        if (img != null) {
+            // 图片区：非视频点开看大图，视频点开进播放器。
+            Box(
+                Modifier.fillMaxWidth().height(168.dp)
+                    .clickable {
+                        if (isVideo) onClick() else onImage(img)
+                    },
+            ) {
+                RemoteImage(url = img, label = site,
+                    modifier = Modifier.fillMaxWidth().height(168.dp))
+                if (isVideo) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Filled.PlayArrow, "播放", tint = Color.White,
+                            modifier = Modifier.size(40.dp)
+                                .background(Color.Black.copy(alpha = 0.45f), CircleShape)
+                                .padding(6.dp),
+                        )
+                    }
+                }
+            }
         } else {
             Box(
                 Modifier.fillMaxWidth().height(50.dp)
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)),
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                    .clickable(onClick = onClick),
                 contentAlignment = Alignment.CenterStart,
             ) {
                 Row(
@@ -580,7 +619,11 @@ private fun PreviewBlock(p: LinkPreview?, c: ResourceCard, onClick: () -> Unit) 
                 }
             }
         }
-        Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+        // 文字区点开进阅读 / 视频页。
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)
+                .clickable(onClick = onClick),
+        ) {
             Text(site, fontSize = 10.5.sp, color = dim, maxLines = 1)
             Text(head, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 2,
                 modifier = Modifier.padding(top = 2.dp))
@@ -598,6 +641,7 @@ private fun kindLabel(k: String): String = when (k) {
     "paper" -> "论文"
     "repo" -> "开源项目"
     "model" -> "模型"
+    "app" -> "应用"
     "tool" -> "工具"
     "image" -> "图片"
     "story" -> "帖子"
