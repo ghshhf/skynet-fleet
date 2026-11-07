@@ -19,6 +19,13 @@
   POST /api/compute/ask  用电脑/API 算力回答一句话（手机不落 key）
   POST /api/agent      SSE：一轮 agent loop，逐事件推 step/answer/error
   POST /api/tool/exec  工具箱单点执行（人直接点一个能力，不绕 LLM）
+  GET  /api/resources  混合信息流（资源卡片；topic/limit/cursor/session）
+  GET  /api/resources/detail?id=   资源详情（多源出处 + 行为）
+  GET  /api/resources/search?q=    资源搜索
+  GET  /api/resources/stats        资源/来源/行为/偏好统计
+  POST /api/resources/act          点赞/收藏/评论（写行为与标签权重）
+  POST /api/resources/import       导入 NetForce 已有 resources.json
+  GET  /resources                  资源流单页（静态，无数据；token 从 #t= 读）
 
 判据（对应计划书 P1 / P4）：
   - 手机能看见 ≥2 个网关真实状态（/api/providers）
@@ -62,6 +69,7 @@ from fleet import catalog               # noqa: E402
 from fleet import toolschema as TS      # noqa: E402
 from fleet import gate as G             # noqa: E402
 from fleet import compute as C          # noqa: E402
+from fleet import resource_center as RC  # noqa: E402
 from fleet.core import registry as regmod  # noqa: E402
 
 TOKEN_HEADER = "X-Fleet-Token"
@@ -160,6 +168,7 @@ class FleetAgentServer:
         self.httpd = None
         self.bind_port = port
         self._journal = None            # 懒加载，见 journal()
+        self._rc = None                 # 资源中心：首请求再开 SQLite
 
     # --- 懒加载 registry：catalog.build 会注册能力表 + 探测设备，首请求再建 ----------
     def registry(self):
@@ -186,6 +195,44 @@ class FleetAgentServer:
                     except Exception:
                         self._journal = False    # 试过了，别再试
         return self._journal or None
+
+    # --- 资源整合 MVP：统一卡片 / 混合信息流 / 行为（见 fleet/resource_center.py）---
+    def resource_center(self):
+        if self._rc is None:
+            with self._lock:
+                if self._rc is None:
+                    self._rc = RC.ResourceCenter()
+        return self._rc
+
+    @staticmethod
+    def _q1(q, key, default=""):
+        v = (q or {}).get(key)
+        if isinstance(v, list):
+            return (v[0] if v else default)
+        return v if v is not None else default
+
+    def resource_feed(self, q=None):
+        return self.resource_center().feed(
+            topic=self._q1(q, "topic"),
+            limit=self._q1(q, "limit", "20"),
+            cursor=self._q1(q, "cursor", "0"),
+            session_id=self._q1(q, "session", "default") or "default")
+
+    def resource_detail(self, rid):
+        return self.resource_center().detail(rid)
+
+    def resource_search(self, q=None):
+        return self.resource_center().search(
+            self._q1(q, "q"), limit=self._q1(q, "limit", "20"))
+
+    def resource_stats(self):
+        return self.resource_center().stats()
+
+    def resource_act(self, rid, action, text=""):
+        return self.resource_center().act(rid, action, text)
+
+    def resource_import(self, resources=None, classified=None):
+        return self.resource_center().import_existing(resources, classified)
 
     def executor(self, cap, args):
         """工具执行层：能力真在电脑侧跑。闸门（gate）交给 Registry 自己管。"""
@@ -609,7 +656,13 @@ class FleetAgentServer:
 
             def do_GET(self):
                 path = urlparse(self.path).path
-                if path == "/api/tts":
+                q = parse_qs(urlparse(self.path).query)
+                if path == "/resources":
+                    # 静态页，不含数据；token 由页面从 #t= 读，再放进请求头。
+                    from fleet.resource_page import PAGE
+                    self._send_bytes(200, PAGE.encode("utf-8"),
+                                     "text/html; charset=utf-8")
+                elif path == "/api/tts":
                     if not self._auth():
                         return
                     self._tts()
@@ -641,13 +694,30 @@ class FleetAgentServer:
                     if not self._auth():
                         return
                     self._send(200, server.approvals())
+                elif path == "/api/resources":
+                    if not self._auth():
+                        return
+                    self._send(200, server.resource_feed(q))
+                elif path == "/api/resources/detail":
+                    if not self._auth():
+                        return
+                    self._send(200, server.resource_detail(server._q1(q, "id")))
+                elif path == "/api/resources/search":
+                    if not self._auth():
+                        return
+                    self._send(200, server.resource_search(q))
+                elif path == "/api/resources/stats":
+                    if not self._auth():
+                        return
+                    self._send(200, server.resource_stats())
                 else:
                     self._send(404, {"ok": False, "err": "no route: %s" % path})
 
             def do_POST(self):
                 path = urlparse(self.path).path
                 if path not in ("/api/agent", "/api/tool/exec", "/api/approve",
-                                "/api/compute/ask"):
+                                "/api/compute/ask", "/api/resources/act",
+                                "/api/resources/import"):
                     self._send(404, {"ok": False, "err": "no route: %s" % path})
                     return
                 if not self._auth():
@@ -662,6 +732,17 @@ class FleetAgentServer:
 
                 if path == "/api/compute/ask":
                     self._send(200, server.compute_ask(body))
+                    return
+
+                if path == "/api/resources/act":
+                    self._send(200, server.resource_act(
+                        body.get("id") or "", body.get("action") or "",
+                        body.get("text") or ""))
+                    return
+
+                if path == "/api/resources/import":
+                    self._send(200, server.resource_import(
+                        body.get("resources"), body.get("classified")))
                     return
 
                 if path == "/api/tool/exec":

@@ -540,6 +540,9 @@ CASES = [
     # 随机/日期，10 个纯 stdlib 能力接进工具面，只占「玩」域（两级决策不让它们
     # 拖慢其他域）。守 ①核心结果对 ②TOOLS/权限表/schema/分域接线不漏 ③execute 真路由。
     ("eval_t81_fun_tools", ["evals/t81_fun_tools.py"], HERE, 120),
+    # 资源整合 MVP（11-07）：SQLite 资源卡 + 双层去重 + 透明信息流 + 行为偏好 +
+    # NetForce 既有 JSON 导入 + HTTP/单页接线；全离线，不依赖 LLM。
+    ("eval_t82_resource_center", ["evals/t82_resource_center.py"], HERE, 180),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),
