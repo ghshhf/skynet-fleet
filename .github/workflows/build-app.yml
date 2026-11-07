@@ -1,0 +1,52 @@
+name: build-app
+
+# 新一代手机端（tianwang_app）独立一条流水线。
+# 老的 tianwang_android 走 build-android.yml，两份互不影响；
+# 这里只认 tianwang_app/**，改老工程不会连带重启这条。
+#
+# 为什么放 CI：本机可以没有 Android SDK / NDK，但 GitHub 的 ubuntu 镜像自带 SDK，
+# 整包编译 + JVM 单测在这里跑，比“等一台真机插上 USB”可靠。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tianwang_app/**"
+      - ".github/workflows/build-app.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 只补 SDK 命令行工具和 licenses；compileSdk 35 由 AGP 自己装。
+      - uses: android-actions/setup-android@v3
+
+      # 固定 8.14：AGP 8.7.3 的受支持区间是 Gradle 8.9–8.x，
+      # 不要跟着 wrapper 的 9.x 走（那份只在真机脚本里手动指定）。
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14"
+
+      - name: JVM 单测（纯 Kotlin，不占真机）
+        working-directory: tianwang_app
+        run: gradle :app:testDebugUnitTest --console=plain --no-daemon
+
+      - name: 构建 debug APK
+        working-directory: tianwang_app
+        run: gradle :app:assembleDebug --console=plain --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tianwang-next-debug
+          path: tianwang_app/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
