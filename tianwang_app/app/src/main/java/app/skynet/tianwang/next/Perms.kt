@@ -123,6 +123,12 @@ object Perms {
                 else "先 self.lan.start 本机服务；跨机调度需要双方都在线且口令入册",
             ),
             PermRow(
+                "model.compute", "双机并行算力（本地模型）", "本地模型 + TCP/IPv6",
+                if (env.lanRunning) PermState.READY else PermState.NEEDS_GRANT,
+                if (env.lanRunning) "已可用：self.model.ask 本机单问；self.peer.pool 两台同时答，第一波没结果或本机超限时自动升级到名册其余手机"
+                else "单机仍可用 self.model.ask；并行需要先 self.lan.start 并把对端 self.peer.add 入册",
+            ),
+            PermRow(
                 "device.owner", "设备所有者 / 企业策略", "设备所有者",
                 if (env.deviceOwner) PermState.READY else PermState.NEEDS_GRANT,
                 if (env.deviceOwner) "已就绪：self.owner.status" else

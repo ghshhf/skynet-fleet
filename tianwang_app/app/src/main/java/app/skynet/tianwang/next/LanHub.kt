@@ -4,6 +4,11 @@ import android.content.Context
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentLinkedQueue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 /**
@@ -32,6 +37,9 @@ object LanHub {
 
     private var server: LanServer? = null
     private var discovery: LanDiscovery? = null
+
+    /** 并行算力里给本机留的固定名字；对端名册不允许重名，所以不会撞。 */
+    private const val LOCAL_NODE = "本机"
 
     fun start(ctx: Context, requestedPort: Int = Prefs.lanPort, rotate: Boolean = false): ToolResult {
         lastError = ""
@@ -373,6 +381,114 @@ object LanHub {
         call["min_battery"] = args["min_battery"]
         if (str(args["name"]).isNotBlank()) call["name"] = str(args["name"])
         return peerCall(call)
+    }
+
+    /**
+     * 双机并行算力：同一句话同时交给本机与对端的本地模型。
+     *
+     * - 默认两台（本机 + 一台对端），[mode]=race 谁先回用谁，all 两边都列出；
+     * - 第一波全失败、或本机模型报上下文/显存不够时，自动升级到名册里其余手机；
+     * - 只问不写：内层固定 self_model_ask，不会把写操作同时发到两台机器上。
+     */
+    suspend fun poolAsk(args: Map<String, Any?>): ToolResult {
+        val prompt = str(args["prompt"])
+        if (prompt.isBlank()) return ToolResult(false, err = "缺 prompt：写清要问什么")
+        val includeLocal = when (val v = args["local"]) {
+            null -> true
+            is Boolean -> v
+            else -> str(v).lowercase() != "false"
+        }
+        val all = peers()
+        if (!includeLocal && all.isEmpty()) {
+            return ToolResult(false, err = "本机不参与且集群名册为空；先 self.peer.add 或 local=true")
+        }
+        val minBattery = int(args["min_battery"], 15)
+        val parallel = int(args["max_peers"], PeerPool.DEFAULT_PARALLEL)
+        val timeout = int(args["timeout"], 120_000).coerceIn(5_000, 600_000)
+        val maxTokens = int(args["max_tokens"], 256).coerceIn(32, 2048)
+        val mode = PeerPool.mode(str(args["mode"]))
+        val escalate = when (val v = args["escalate"]) {
+            null -> true
+            is Boolean -> v
+            else -> str(v).lowercase() != "false"
+        }
+        val nodes = all.map { PeerPool.Node(it.name, it.battery, it.charging, it.lastSeen) }
+        val firstNames = PeerPool.firstWave(nodes, parallel, minBattery).map { it.name }
+        val first = all.filter { it.name in firstNames }
+        val request = LanProto.toolRequest(
+            "self_model_ask",
+            JSONObject().put("prompt", prompt).put("max_tokens", maxTokens),
+        )
+        val out = ConcurrentLinkedQueue<PeerPool.Attempt>()
+        val tried = HashSet<String>()
+        if (includeLocal) tried.add(LOCAL_NODE)
+        first.forEach { tried.add(it.name) }
+
+        suspend fun wave(local: Boolean, targets: List<PeerBook.Peer>) {
+            coroutineScope {
+                if (local) {
+                    launch(Dispatchers.Default) {
+                        val t0 = System.currentTimeMillis()
+                        val r = runCatching { LocalAsk.ask(prompt, maxTokens) }
+                            .getOrElse { ToolResult(false, err = it.message ?: it.javaClass.simpleName) }
+                        out += PeerPool.Attempt(
+                            LOCAL_NODE, r.ok, System.currentTimeMillis() - t0, r.text, r.err,
+                        )
+                    }
+                }
+                targets.forEach { p ->
+                    launch(Dispatchers.IO) {
+                        val t0 = System.currentTimeMillis()
+                        val r = LanClient.call(
+                            LanProto.Target(p.host, p.port), p.token, request, timeout,
+                        )
+                        val ms = System.currentTimeMillis() - t0
+                        out += attemptOf(p.name, r, ms)
+                        touch(p, r)
+                    }
+                }
+            }
+        }
+
+        withTimeoutOrNull(timeout.toLong()) { wave(includeLocal, first) }
+        var escalated = false
+        if (PeerPool.shouldEscalate(out.toList(), escalate, false, LOCAL_NODE)) {
+            val nextNames = PeerPool.escalateWave(nodes, tried, minBattery).map { it.name }
+            val next = all.filter { it.name in nextNames }
+            if (next.isNotEmpty()) {
+                escalated = true
+                next.forEach { tried.add(it.name) }
+                withTimeoutOrNull(timeout.toLong()) { wave(false, next) }
+            }
+        }
+
+        val attempts = out.toList()
+        if (attempts.isEmpty()) {
+            return ToolResult(false, err = "没有机器接单：本机与对端都没能在 ${timeout}ms 内回包")
+        }
+        val head = "并行算力：${attempts.size} 台参与" +
+            (if (escalated) "（第一波没跑出结果，已超限升级）" else "") +
+            " · " + mode.name.lowercase()
+        val body = PeerPool.aggregate(attempts, mode)
+        return if (attempts.any { it.ok }) {
+            ToolResult(true, text = "$head\n$body")
+        } else {
+            ToolResult(false, err = "$head\n$body")
+        }
+    }
+
+    private fun attemptOf(name: String, r: LanClient.Reply, ms: Long): PeerPool.Attempt {
+        if (!r.ok) return PeerPool.Attempt(name, false, ms, err = r.err)
+        val j = runCatching { JSONObject(r.text) }.getOrNull()
+        val rpcErr = j?.optJSONObject("error")?.optString("message").orEmpty()
+        val text = LanProto.summarizeMcpReply(r.text)
+        val isErr = rpcErr.isNotBlank() ||
+            j?.optJSONObject("result")?.optBoolean("isError", false) == true
+        return if (isErr) {
+            PeerPool.Attempt(name, false, ms, err = rpcErr.ifBlank { text })
+        } else {
+            PeerPool.Attempt(name, true, ms, text = text)
+        }
     }
 
     private fun touch(p: PeerBook.Peer, r: LanClient.Reply) {

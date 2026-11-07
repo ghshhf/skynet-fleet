@@ -1,7 +1,6 @@
 package app.skynet.tianwang.next
 
 import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 把一句自然语言目标整单交给本机本地模型执行。
@@ -15,16 +14,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 3. 不暴露会切断当前连接的工具（停 LAN、换口令、重启），否则回包永远到不了控制方。
  */
 object LocalGoal {
-    private val busy = AtomicBoolean(false)
-
     internal val blockedNames = setOf(
-        "self_agent_goal", "self_peer_goal", "self_peer_call",
-        "self_lan_start", "self_lan_stop", "self_owner_reboot",
+        "self_agent_goal", "self_peer_goal", "self_peer_call", "self_peer_pool",
+        "self_model_ask", "self_lan_start", "self_lan_stop", "self_owner_reboot",
     )
 
     suspend fun run(goal: String, maxSteps: Int = 3): ToolResult {
         if (goal.isBlank()) return ToolResult(false, err = "缺 goal：写清要让这台手机做什么")
-        if (!busy.compareAndSet(false, true)) {
+        if (!ModelGate.enter()) {
             return ToolResult(false, err = "本机正在执行另一个目标；等它跑完再派")
         }
         try {
@@ -53,7 +50,7 @@ object LocalGoal {
             }
             return ToolResult(true, text = "由本机模型 ${profile.label} 完成：\n$answer")
         } finally {
-            busy.set(false)
+            ModelGate.exit()
         }
     }
 }

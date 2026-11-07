@@ -479,6 +479,11 @@ object PhoneSelf {
                         LocalGoal.run(strArg(args, "goal"), intArg(args, "max_steps", 3))
                     }
                     "self.peer.goal" -> withContext(Dispatchers.IO) { LanHub.peerGoal(args) }
+                    // 双机并行算力：内部自己并发，本机与对端同时跑。
+                    "self.model.ask" -> withContext(Dispatchers.Default) {
+                        LocalAsk.ask(strArg(args, "prompt"), intArg(args, "max_tokens", 256))
+                    }
+                    "self.peer.pool" -> LanHub.poolAsk(args)
                     // 名字解析与 DDNS 都是网络操作，必须离开主线程。
                     "self.dns.resolve" -> withContext(Dispatchers.IO) {
                         val name = strArg(args, "name")

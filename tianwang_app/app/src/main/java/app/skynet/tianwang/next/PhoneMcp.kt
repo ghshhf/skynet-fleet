@@ -374,6 +374,35 @@ object PhoneMcp {
             sideEffect = true,
         ),
         McpTool(
+            "self_model_ask",
+            "用本机本地模型单轮回答一句话（只读；不调工具；执行期间独占模型）。",
+            schema(
+                mapOf(
+                    "prompt" to prop("string", "要问的话"),
+                    "max_tokens" to prop("integer", "最多生成多少 token，默认 256，上限 2048"),
+                ),
+                listOf("prompt"),
+            ),
+        ),
+        McpTool(
+            "self_peer_pool",
+            "双机并行算力：本机与对端同时用各自的本地模型回答同一句话；" +
+                "第一波全失败或本机上下文/显存不够时，自动升级到名册里其余手机。只问不写。",
+            schema(
+                mapOf(
+                    "prompt" to prop("string", "要问的话"),
+                    "mode" to prop("string", "race=谁先回用谁（默认），all=两边答案都列出"),
+                    "local" to prop("boolean", "本机是否参与，默认 true"),
+                    "max_peers" to prop("integer", "第一波最多叫几台对端，默认 1，上限 4"),
+                    "timeout" to prop("integer", "总超时毫秒，默认 120000，上限 600000"),
+                    "max_tokens" to prop("integer", "每台最多生成多少 token，默认 256，上限 2048"),
+                    "min_battery" to prop("integer", "自动选路最低电量，默认 15"),
+                    "escalate" to prop("boolean", "第一波没结果时是否升级到其余手机，默认 true"),
+                ),
+                listOf("prompt"),
+            ),
+        ),
+        McpTool(
             "self_dns_resolve", "把域名解析成地址并标出类型，顺序就是直连时优先尝试的顺序。",
             schema(mapOf("name" to prop("string", "域名或 IP 字面量")), listOf("name")),
         ),
@@ -478,6 +507,8 @@ object PhoneMcp {
             "self_peer_call" -> "self.peer.call"
             "self_agent_goal" -> "self.agent.goal"
             "self_peer_goal" -> "self.peer.goal"
+            "self_model_ask" -> "self.model.ask"
+            "self_peer_pool" -> "self.peer.pool"
             "self_dns_resolve" -> "self.dns.resolve"
             "self_ddns_status" -> "self.ddns.status"
             "self_ddns_config" -> "self.ddns.config"
