@@ -27,6 +27,8 @@ object LocalAgent {
         convo.add(ChatMsg(role = ChatMsg.Role.SYSTEM,
             text = LocalToolProtocol.systemPrompt(visible, allowActions)))
         convo.addAll(history.filter { it.text.isNotBlank() })
+        // 每一步的事实账本：失败分类、重复动作、停手时的已完成清单都从这里来。
+        val steps = ArrayList<Replan.Step>()
 
         repeat(maxSteps) {
             // 工具 JSON 不流式显示：先攒完再判断，避免用户看见半截 {"tool":...
@@ -63,11 +65,22 @@ object LocalAgent {
 
             val tool = visible.firstOrNull { it.name == picked.name }
             if (tool == null) {
+                val argKey = argFingerprint(picked.args)
+                steps.add(Replan.Step(picked.name, argKey, false, "工具不在册"))
                 convo.add(ChatMsg(role = ChatMsg.Role.ASSISTANT, text = out))
                 convo.add(ChatMsg(role = ChatMsg.Role.USER,
                     text = "错误：没有工具 ${picked.name}。只能从这些里选：" +
                         visible.joinToString("、") { it.name }))
+                Replan.stall(steps)?.let { why ->
+                    return Result.failure(IllegalStateException("$why。\n${Replan.summary(steps)}"))
+                }
                 return@repeat
+            }
+
+            val argKey = argFingerprint(picked.args)
+            // 🔴 写操作防重放：同一次目标里已经成功过的同一动作，不许再执行。
+            Replan.blockBefore(steps, picked.name, argKey, tool.sideEffect)?.let { why ->
+                return Result.failure(IllegalStateException("$why。\n${Replan.summary(steps)}"))
             }
 
             val started = System.currentTimeMillis()
@@ -81,13 +94,39 @@ object LocalAgent {
                 result = if (result.ok) result.text else result.err,
                 ms = ms,
             ))
+            steps.add(Replan.Step(
+                name = picked.name,
+                argKey = argKey,
+                ok = result.ok,
+                err = result.err,
+                text = result.text,
+                sideEffect = tool.sideEffect,
+            ))
 
             convo.add(ChatMsg(role = ChatMsg.Role.ASSISTANT, text = out))
             convo.add(ChatMsg(role = ChatMsg.Role.USER,
-                text = "工具 ${picked.name} 执行结果（${if (result.ok) "成功" else "失败"}）：\n" +
-                    (if (result.ok) result.text else result.err)))
+                text = if (result.ok) {
+                    "工具 ${picked.name} 执行结果（成功）：\n${result.text}"
+                } else {
+                    // 失败不只回错误原文：附一条确定的换路建议，避免小模型原样重试。
+                    val kind = Replan.classify(result.err)
+                    "工具 ${picked.name} 执行结果（失败）：\n${result.err}\n\n" +
+                        "下一步建议（${kind.label}）：${Replan.hint(kind, picked.name)}"
+                }))
+
+            // 硬止损：权限没开 / 锁屏 / 同一动作重复失败 / 累计失败，
+            // 都不该把剩下的步数烧在同一个死胡同里。
+            Replan.stall(steps)?.let { why ->
+                return Result.failure(IllegalStateException("$why。\n${Replan.summary(steps)}"))
+            }
         }
         return Result.failure(IllegalStateException(
-            "连续 $maxSteps 步都在调工具，已停手。最后一步的结果见上面的工具卡片。"))
+            "连续 $maxSteps 步都在调工具，已停手。\n${Replan.summary(steps)}"))
+    }
+
+    /** 参数判重键：按键名排序，避免模型换一个字段顺序就被当成「新动作」。 */
+    private fun argFingerprint(args: JSONObject): String {
+        val keys = args.keys().asSequence().toList().sorted()
+        return keys.joinToString("&") { "$it=${args.opt(it)}" }
     }
 }
