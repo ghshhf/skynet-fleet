@@ -289,6 +289,39 @@ object PhoneMcp {
             ),
             sideEffect = true,
         ),
+        McpTool(
+            "self_dns_resolve", "把域名解析成地址并标出类型，顺序就是直连时优先尝试的顺序。",
+            schema(mapOf("name" to prop("string", "域名或 IP 字面量")), listOf("name")),
+        ),
+        McpTool(
+            "self_ddns_status", "DDNS 配置、当前全局 IPv6、上次发布结果（不回显密钥）。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_ddns_config",
+            "把动态 IPv6 绑到稳定域名：duckdns 填子域 + token；custom 填含 {ipv6} 的更新 URL。",
+            schema(
+                mapOf(
+                    "provider" to prop("string", "duckdns｜custom｜off"),
+                    "domain" to prop("string", "DuckDNS 子域"),
+                    "token" to prop("string", "更新密钥；留空沿用已存的"),
+                    "url" to prop("string", "custom 更新 URL 模板，必须含 {ipv6}"),
+                    "enabled" to prop("boolean", "配置后是否自动发布，默认 true"),
+                ),
+                listOf("provider"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ddns_publish", "立刻把当前全局 IPv6 发布到已配置的域名。",
+            schema(emptyMap()),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ddns_watch", "开/关自动发布：网络或 IPv6 变化时更新，另有 10 分钟兜底。",
+            schema(mapOf("enabled" to prop("boolean", "true=开，false=关")), listOf("enabled")),
+            sideEffect = true,
+        ),
     )
 
     private val core = McpCore(
@@ -340,6 +373,11 @@ object PhoneMcp {
             "self_lan_stop" -> "self.lan.stop"
             "self_lan_call" -> "self.lan.call"
             "self_lan_speed" -> "self.lan.speed"
+            "self_dns_resolve" -> "self.dns.resolve"
+            "self_ddns_status" -> "self.ddns.status"
+            "self_ddns_config" -> "self.ddns.config"
+            "self_ddns_publish" -> "self.ddns.publish"
+            "self_ddns_watch" -> "self.ddns.watch"
             "self_perm_matrix" -> "self.perm.matrix"
             "self_shizuku_status" -> "self.shizuku.status"
             "self_shizuku_request" -> "self.shizuku.request"

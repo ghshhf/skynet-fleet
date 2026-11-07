@@ -115,6 +115,20 @@ class PermsTest {
     }
 
     @Test
+    fun ddnsRowFollowsConfigAndPublishState() {
+        assertEquals(PermState.NEEDS_GRANT, row(PermEnv(), "net.ddns").state)
+        assertTrue(row(PermEnv(), "net.ddns").next.contains("self.ddns.config"))
+
+        val configured = PermEnv(ddnsConfigured = true)
+        assertEquals(PermState.NEEDS_GRANT, row(configured, "net.ddns").state)
+        assertTrue(row(configured, "net.ddns").next.contains("self.ddns.publish"))
+
+        val published = PermEnv(ddnsConfigured = true, ddnsPublished = true)
+        assertEquals(PermState.READY, row(published, "net.ddns").state)
+        assertTrue(row(published, "net.ddns").next.contains("host=<名字>"))
+    }
+
+    @Test
     fun formatReportsChannelStatusCountsAndNextSteps() {
         val txt = Perms.format(PermEnv())
         assertTrue(txt.contains("无障碍：未开启"))
@@ -122,6 +136,7 @@ class PermsTest {
         assertTrue(txt.contains("Shizuku：未运行"))
         assertTrue(txt.contains("设备所有者：未就绪"))
         assertTrue(txt.contains("局域网直连：未启动"))
+        assertTrue(txt.contains("动态 IPv6 名字：未配置"))
         assertTrue(txt.contains("需 Shizuku"))
         assertTrue(txt.contains("→"))
         assertTrue(txt.contains("不重试"))

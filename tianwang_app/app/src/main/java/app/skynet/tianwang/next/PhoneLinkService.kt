@@ -27,12 +27,14 @@ class PhoneLinkService : Service() {
             ).apply { description = "控制面通过 /pair 调用本机工具时保持在线" })
         }
         startForeground(NOTIFICATION_ID, buildNotification())
+        // DDNS 也要靠这个前台服务保活：进程被杀，IPv6 换了就没人去更新域名。
+        Ddns.startWatch(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 这个服务现在管两条链路：云中继（MCP）和手机直连（LAN/IPv6）。
-        // 只要有一条在跑就得钉住进程；两条都没有才停。
-        if (!Prefs.mcpConfigured() && !LanHub.running) {
+        // 这个服务现在管三条链路：云中继（MCP）、手机直连（LAN/IPv6）、动态域名（DDNS）。
+        // 只要有一条在跑就得钉住进程；都没有才停。
+        if (!Prefs.mcpConfigured() && !LanHub.running && !Prefs.ddnsEnabled) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -45,6 +47,7 @@ class PhoneLinkService : Service() {
         // 系统回收后 START_STICKY 会重新拉起，读到的仍是 enabled=true。
         PhoneMcpLink.pause()
         LanHub.stop()
+        Ddns.stopWatch()
         super.onDestroy()
     }
 
@@ -64,7 +67,7 @@ class PhoneLinkService : Service() {
         return builder
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)
             .setContentTitle("天网手机链路")
-            .setContentText("正在保持入网 / 局域网直连；点开可查看或断开")
+            .setContentText("正在保持入网 / 局域网直连 / 动态域名；点开可查看或断开")
             .setOngoing(true)
             .setContentIntent(open)
             .build()

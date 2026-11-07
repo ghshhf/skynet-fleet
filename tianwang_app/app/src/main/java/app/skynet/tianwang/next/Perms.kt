@@ -32,6 +32,8 @@ data class PermEnv(
     val rootAvailable: Boolean = false,
     val deviceOwner: Boolean = false,
     val lanRunning: Boolean = false,
+    val ddnsConfigured: Boolean = false,
+    val ddnsPublished: Boolean = false,
 )
 
 data class PermRow(
@@ -106,6 +108,15 @@ object Perms {
                 else "跑 self.lan.start；同一 Wi-Fi 用 fe80 链路本地，跨网用全局 IPv6",
             ),
             PermRow(
+                "net.ddns", "动态 IPv6 → 稳定域名", "DNS/DDNS",
+                if (env.ddnsPublished) PermState.READY else PermState.NEEDS_GRANT,
+                when {
+                    env.ddnsPublished -> "已发布：对端用 self.lan.call host=<名字>，地址变了也不用改"
+                    env.ddnsConfigured -> "已配置未发布：跑 self.ddns.publish，或 self.ddns.watch enabled=true"
+                    else -> "跑 self.ddns.config provider=duckdns domain=... token=...（或 custom URL）"
+                },
+            ),
+            PermRow(
                 "device.owner", "设备所有者 / 企业策略", "设备所有者",
                 if (env.deviceOwner) PermState.READY else PermState.NEEDS_GRANT,
                 if (env.deviceOwner) "已就绪：self.owner.status" else
@@ -156,6 +167,13 @@ object Perms {
             append("Root：").append(if (env.rootAvailable) "检测到 su" else "未检测到").append('\n')
             append("设备所有者：").append(if (env.deviceOwner) "已就绪" else "未就绪").append('\n')
             append("局域网直连：").append(if (env.lanRunning) "运行中" else "未启动").append('\n')
+            append("动态 IPv6 名字：").append(
+                when {
+                    env.ddnsPublished -> "已发布"
+                    env.ddnsConfigured -> "已配置未发布"
+                    else -> "未配置"
+                }
+            ).append('\n')
             append("—— 可用 ").append(count[PermState.READY] ?: 0)
             append(" / 待授权 ").append(count[PermState.NEEDS_GRANT] ?: 0)
             append(" / 需 Shizuku ").append(count[PermState.NEEDS_SHIZUKU] ?: 0)
@@ -187,6 +205,8 @@ object Perms {
             rootAvailable = hasRootHint(),
             deviceOwner = OwnerBridge.status(ctx).deviceOwner,
             lanRunning = LanHub.running,
+            ddnsConfigured = Prefs.ddnsProvider != Ddns.PROVIDER_OFF,
+            ddnsPublished = Prefs.ddnsEnabled && Prefs.ddnsLastIp.isNotBlank(),
         )
     }
 

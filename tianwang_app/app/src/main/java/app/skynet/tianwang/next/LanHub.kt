@@ -75,7 +75,7 @@ object LanHub {
         server = null
         running = false
         port = 0
-        if (!keepService && ctx != null && !Prefs.mcpEnabled) {
+        if (!keepService && ctx != null && !Prefs.mcpEnabled && !Prefs.ddnsEnabled) {
             runCatching { ctx.stopService(android.content.Intent(ctx, PhoneLinkService::class.java)) }
         }
     }
@@ -119,6 +119,11 @@ object LanHub {
             }
         }
         if (lastError.isNotBlank()) sb.append("最近错误：").append(lastError).append('\n')
+        if (Prefs.ddnsProvider != Ddns.PROVIDER_OFF) {
+            sb.append("稳定名字：").append(Ddns.nameOf(Ddns.cfg()))
+            if (Prefs.ddnsEnabled) sb.append("（自动发布）") else sb.append("（自动发布关闭）")
+            sb.append('\n')
+        }
         sb.append("\n提示：同一 Wi-Fi 优先走 fe80 链路本地（必须带 %网卡）；")
         sb.append("跨网络要求两端都有全局 IPv6，且运营商/路由器不拦入站。")
         return sb.toString().trimEnd()
@@ -139,7 +144,8 @@ object LanHub {
         val r = LanClient.call(target, token, request, int(args["timeout"], 30_000).coerceIn(1_000, 120_000))
         if (!r.ok) return ToolResult(false, err = "直连 ${target.endpoint()} 失败：${r.err}")
         val text = LanProto.summarizeMcpReply(r.text)
-        return ToolResult(true, text = "对端 ${target.endpoint()} · ${tool} · ${r.ms}ms\n$text")
+        val via = if (r.via.isBlank()) "" else " · 经 ${r.via}"
+        return ToolResult(true, text = "对端 ${target.endpoint()} · ${tool} · ${r.ms}ms$via\n$text")
     }
 
     fun speed(args: Map<String, Any?>): ToolResult {
@@ -150,9 +156,10 @@ object LanHub {
         val down = args["down"] == true || str(args["down"]) == "true"
         val r = LanClient.speed(target, token, mb * 1024 * 1024, down)
         if (!r.ok) return ToolResult(false, err = "测速 ${target.endpoint()} 失败：${r.err}")
+        val via = if (r.via.isBlank()) "" else " · 经 ${r.via}"
         return ToolResult(
             true,
-            text = "直连 ${target.endpoint()} · ${if (down) "下行" else "上行"} ${mb}MB · ${r.text}",
+            text = "直连 ${target.endpoint()}$via · ${if (down) "下行" else "上行"} ${mb}MB · ${r.text}",
         )
     }
 

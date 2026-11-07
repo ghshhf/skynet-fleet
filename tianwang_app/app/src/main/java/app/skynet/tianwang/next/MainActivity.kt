@@ -80,6 +80,7 @@ class MainActivity : ComponentActivity() {
         Net.init(applicationContext)
         // 上次若开着「手机入网」，进程重启后自己接回中继；不要求用户每次手动重连。
         if (Prefs.mcpEnabled && Prefs.mcpConfigured()) PhoneLinkService.start(this)
+        if (Prefs.ddnsEnabled) PhoneLinkService.start(this)
         // 出声（总纲第 1 条空白）。默认关，界面上那个喇叭点了才念。
         Speech.init(applicationContext)
         // 云侧连接可由 adb 一次性注入，免得每次装机都要在手机上手动敲一遍：

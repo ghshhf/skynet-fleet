@@ -286,6 +286,14 @@ object Prefs {
     private const val K_MCP_ENABLED = "mcp_enabled"
     private const val K_LAN_TOKEN = "lan_token"
     private const val K_LAN_PORT = "lan_port"
+    private const val K_DDNS_PROVIDER = "ddns_provider"
+    private const val K_DDNS_DOMAIN = "ddns_domain"
+    private const val K_DDNS_TOKEN = "ddns_token"
+    private const val K_DDNS_URL = "ddns_url"
+    private const val K_DDNS_ENABLED = "ddns_enabled"
+    private const val K_DDNS_LAST_IP = "ddns_last_ip"
+    private const val K_DDNS_LAST_AT = "ddns_last_at"
+    private const val K_DDNS_LAST_RESULT = "ddns_last_result"
     private const val K_DEV_ID = "device_id"
     private const val K_DEV_SEC = "device_secret"
     private const val K_DEV_NAME = "device_name"
@@ -368,6 +376,43 @@ object Prefs {
         lanToken = fresh
         return fresh
     }
+
+    // ---------------- 动态 IPv6 → 稳定名字（DDNS） ----------------
+
+    /** duckdns｜custom｜off。默认 off，不替用户做外发请求。 */
+    var ddnsProvider: String
+        get() = sp.getString(K_DDNS_PROVIDER, Ddns.PROVIDER_OFF)?.trim() ?: Ddns.PROVIDER_OFF
+        set(v) { sp.edit().putString(K_DDNS_PROVIDER, v.trim().lowercase()).apply() }
+
+    var ddnsDomain: String
+        get() = sp.getString(K_DDNS_DOMAIN, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_DDNS_DOMAIN, v.trim().lowercase()).apply() }
+
+    /** 第三方更新密钥。只留在本机，status 里只报是否已配置。 */
+    var ddnsToken: String
+        get() = sp.getString(K_DDNS_TOKEN, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_DDNS_TOKEN, v.trim()).apply() }
+
+    /** 自定义更新 URL 模板，必须含 `{ipv6}`，可选 `{token}`。 */
+    var ddnsUrl: String
+        get() = sp.getString(K_DDNS_URL, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_DDNS_URL, v.trim()).apply() }
+
+    var ddnsEnabled: Boolean
+        get() = sp.getBoolean(K_DDNS_ENABLED, false)
+        set(v) { sp.edit().putBoolean(K_DDNS_ENABLED, v).apply() }
+
+    var ddnsLastIp: String
+        get() = sp.getString(K_DDNS_LAST_IP, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_DDNS_LAST_IP, v.trim()).apply() }
+
+    var ddnsLastAt: Long
+        get() = sp.getLong(K_DDNS_LAST_AT, 0L)
+        set(v) { sp.edit().putLong(K_DDNS_LAST_AT, v).apply() }
+
+    var ddnsLastResult: String
+        get() = sp.getString(K_DDNS_LAST_RESULT, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_DDNS_LAST_RESULT, v.take(160)).apply() }
 
     // ---------------- 长期设备凭据（配对得来） ----------------
 

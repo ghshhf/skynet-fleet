@@ -69,6 +69,8 @@ class PhoneMcpToolsTest {
             "self_owner_restriction", "self_owner_reboot",
             "self_lan_status", "self_lan_start", "self_lan_stop",
             "self_lan_call", "self_lan_speed",
+            "self_dns_resolve", "self_ddns_status", "self_ddns_config",
+            "self_ddns_publish", "self_ddns_watch",
         )) {
             assertTrue("缺少工具 $n", n in names)
         }
@@ -87,6 +89,11 @@ class PhoneMcpToolsTest {
         assertTrue(byName.getValue("self_lan_call").sideEffect)
         assertTrue(byName.getValue("self_lan_speed").sideEffect)
         assertFalse(byName.getValue("self_lan_status").sideEffect)
+        assertTrue(byName.getValue("self_ddns_config").sideEffect)
+        assertTrue(byName.getValue("self_ddns_publish").sideEffect)
+        assertTrue(byName.getValue("self_ddns_watch").sideEffect)
+        assertFalse(byName.getValue("self_ddns_status").sideEffect)
+        assertFalse(byName.getValue("self_dns_resolve").sideEffect)
         assertFalse(byName.getValue("self_perm_matrix").sideEffect)
         assertFalse(byName.getValue("self_shizuku_status").sideEffect)
         assertFalse(byName.getValue("self_owner_status").sideEffect)

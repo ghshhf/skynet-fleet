@@ -159,6 +159,17 @@ class LanServerTest {
     }
 
     @Test
+    fun clientAcceptsHostnameAndResolvesIt() {
+        withServer { server ->
+            val r = LanClient.speed(
+                LanProto.Target("localhost", server.boundPort), token, 1, false, 15_000,
+            )
+            assertTrue(r.err, r.ok)
+            assertTrue("via=${r.via}", r.via.isNotBlank())
+        }
+    }
+
+    @Test
     fun speedWithoutTokenIsRejected() {
         withServer { server ->
             val w = connect(server)

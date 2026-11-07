@@ -283,6 +283,35 @@ object PhoneSelf {
                 CapParam("down", "bool", "true=测下行，默认测上行", false),
             ),
         ),
+        SelfCap(
+            "self.dns.resolve", "用名字查当前地址",
+            "把域名解析成地址并标出类型（全局 IPv6 / ULA / 私网 IPv4…），顺序就是直连时优先尝试的顺序。动态 IPv6 换地址后，用名字不用改配置。",
+            listOf(CapParam("name", "str", "域名，如 myphone.duckdns.org；也接受 IP 字面量", true)),
+        ),
+        SelfCap(
+            "self.ddns.status", "动态 IPv6 名字状态",
+            "看 DDNS 配置、当前全局 IPv6、上次发布结果。不显示密钥。",
+        ),
+        SelfCap(
+            "self.ddns.config", "配置动态 IPv6 名字",
+            "把会自动变化的全局 IPv6 绑定到一个稳定域名：duckdns 填子域 + token；custom 填含 {ipv6}（可选 {token}）的更新 URL。密钥只存本机、不回显。",
+            listOf(
+                CapParam("provider", "str", "duckdns｜custom｜off", true),
+                CapParam("domain", "str", "DuckDNS 子域，如 myphone 或 myphone.duckdns.org", false),
+                CapParam("token", "str", "更新密钥；留空表示沿用已存的", false),
+                CapParam("url", "str", "custom 的更新 URL 模板，必须含 {ipv6}", false),
+                CapParam("enabled", "bool", "配置后是否自动发布，默认 true", false),
+            ),
+        ),
+        SelfCap(
+            "self.ddns.publish", "立刻发布当前 IPv6",
+            "把当前全局 IPv6 发到已配置的域名。成功只代表 DNS 已更新，不代表运营商允许入站。",
+        ),
+        SelfCap(
+            "self.ddns.watch", "开/关自动发布",
+            "网络变化或全局 IPv6 变化时自动更新域名；每 10 分钟兜底检查一次（隐私地址会轮换）。",
+            listOf(CapParam("enabled", "bool", "true=开，false=关", true)),
+        ),
     )
 
     /** 用户在系统设置里给本 App 开了无障碍服务。 */
@@ -372,6 +401,29 @@ object PhoneSelf {
                     // 直连是阻塞 socket，必须离开主线程，否则测速会把 UI 卡死。
                     "self.lan.call" -> withContext(Dispatchers.IO) { LanHub.call(args) }
                     "self.lan.speed" -> withContext(Dispatchers.IO) { LanHub.speed(args) }
+                    // 名字解析与 DDNS 都是网络操作，必须离开主线程。
+                    "self.dns.resolve" -> withContext(Dispatchers.IO) {
+                        val name = strArg(args, "name")
+                        if (name.isBlank()) {
+                            ToolResult(false, err = "缺 name：填域名或 IP")
+                        } else {
+                            ToolResult(true, text = Dns6.describe(name))
+                        }
+                    }
+                    "self.ddns.status" -> ToolResult(true, text = Ddns.statusText())
+                    "self.ddns.config" -> Ddns.save(
+                        provider = strArg(args, "provider"),
+                        domain = strArg(args, "domain"),
+                        token = strArg(args, "token"),
+                        url = strArg(args, "url"),
+                        enabled = if (args.containsKey("enabled")) flagArg(args, "enabled") else true,
+                    )
+                    "self.ddns.publish" -> withContext(Dispatchers.IO) { Ddns.publish() }
+                    "self.ddns.watch" -> if (!args.containsKey("enabled")) {
+                        ToolResult(false, err = "缺 enabled：true=开自动发布，false=关")
+                    } else {
+                        Ddns.setWatch(flagArg(args, "enabled"))
+                    }
                     "self.audit" -> audit(args)
                     "self.screen.state" -> screenState(App.ctx)
                     "self.app.list" -> appList(App.ctx, args)

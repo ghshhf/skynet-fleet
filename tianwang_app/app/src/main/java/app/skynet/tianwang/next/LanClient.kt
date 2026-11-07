@@ -17,10 +17,19 @@ import org.json.JSONObject
  * 为省一次握手去维护长连接池，反而会引入「看起来在线、其实半死」的假状态。
  */
 object LanClient {
-    data class Reply(val ok: Boolean, val text: String, val err: String, val ms: Long)
-    data class Speed(val ok: Boolean, val text: String, val err: String)
+    data class Reply(
+        val ok: Boolean,
+        val text: String,
+        val err: String,
+        val ms: Long,
+        val via: String = "",
+    )
+    data class Speed(val ok: Boolean, val text: String, val err: String, val via: String = "")
 
     private const val CONNECT_TIMEOUT_MS = 8_000
+
+    /** 单个地址的等待上限。域名可能同时有 v6/v4，别让一个坏地址把整次调用拖死。 */
+    private const val PER_ADDR_TIMEOUT_MS = 4_000
 
     /**
      * 调对端一个 MCP 工具。[request] 是单行 JSON-RPC。
@@ -41,11 +50,11 @@ object LanClient {
             Unit
         }
         val ms = (System.nanoTime() - started) / 1_000_000
-        if (!r.ok) return Reply(false, "", r.err, ms)
+        if (!r.ok) return Reply(false, "", r.err, ms, r.via)
         if (outText.length > 8 * 1024 * 1024) {
-            return Reply(true, outText.take(8 * 1024 * 1024) + "\n…（回包超过 8MB，已截断）", "", ms)
+            return Reply(true, outText.take(8 * 1024 * 1024) + "\n…（回包超过 8MB，已截断）", "", ms, r.via)
         }
-        return Reply(true, outText, "", ms)
+        return Reply(true, outText, "", ms, r.via)
     }
 
     /**
@@ -99,7 +108,7 @@ object LanClient {
             } else ""
             if (reported.isBlank()) reported = LanProto.speedLine(n, ms)
         }
-        return if (r.ok) Speed(true, reported, "") else Speed(false, "", r.err)
+        return if (r.ok) Speed(true, reported, "", r.via) else Speed(false, "", r.err, r.via)
     }
 
     private fun withSocket(
@@ -110,12 +119,29 @@ object LanClient {
     ): Reply {
         val started = System.nanoTime()
         var socket: Socket? = null
+        var lastErr: Throwable? = null
+        var lastAddr: InetAddress? = null
+        var tried = 0
         return try {
-            val addr = InetAddress.getByName(target.host)
-            val s = Socket()
-            s.tcpNoDelay = true
-            s.connect(InetSocketAddress(addr, target.port), CONNECT_TIMEOUT_MS)
-            socket = s
+            val addrs = Dns6.resolve(target.host)
+            for (addr in addrs) {
+                tried++
+                lastAddr = addr
+                val cand = Socket()
+                try {
+                    cand.tcpNoDelay = true
+                    cand.connect(
+                        InetSocketAddress(addr, target.port),
+                        minOf(CONNECT_TIMEOUT_MS, PER_ADDR_TIMEOUT_MS),
+                    )
+                    socket = cand
+                    break
+                } catch (t: Throwable) {
+                    lastErr = t
+                    runCatching { cand.close() }
+                }
+            }
+            val s = socket ?: throw (lastErr ?: IllegalStateException("没有可用地址"))
             s.soTimeout = timeoutMs
             val input = BufferedInputStream(s.getInputStream(), 64 * 1024)
             val output = BufferedOutputStream(s.getOutputStream(), 64 * 1024)
@@ -131,16 +157,25 @@ object LanClient {
             }
             block(input, output, s)
             val ms = (System.nanoTime() - started) / 1_000_000
-            Reply(true, "", "", ms)
+            Reply(true, "", "", ms, s.inetAddress?.hostAddress ?: "")
         } catch (t: Throwable) {
+            val via = socket?.inetAddress?.hostAddress
+                ?: lastAddr?.hostAddress
+                ?: target.host
             val hint = when {
-                t is java.net.SocketTimeoutException -> "连接/读写超时（${timeoutMs}ms）"
-                t is java.net.ConnectException -> "连不上 ${target.endpoint()}（端口没开或 Wi-Fi 隔离）"
-                t is java.net.NoRouteToHostException -> "没有到 ${target.endpoint()} 的路由（链路本地 IPv6 要带 %网卡）"
+                t is java.net.SocketTimeoutException -> "连接/读写超时（${timeoutMs}ms，经 $via）"
+                t is java.net.ConnectException ->
+                    if (tried > 1) {
+                        "连不上 ${target.endpoint()}：试了 $tried 个地址都失败（最后 $via，端口没开或 Wi-Fi 隔离）"
+                    } else {
+                        "连不上 ${target.endpoint()}（经 $via，端口没开或 Wi-Fi 隔离）"
+                    }
+                t is java.net.NoRouteToHostException ->
+                    "没有到 ${target.endpoint()} 的路由（经 $via；链路本地 IPv6 要带 %网卡）"
                 t is java.net.UnknownHostException -> "解析不了地址 ${target.host}"
                 else -> "${t.javaClass.simpleName}: ${t.message ?: "连接失败"}"
             }
-            Reply(false, "", hint, (System.nanoTime() - started) / 1_000_000)
+            Reply(false, "", hint, (System.nanoTime() - started) / 1_000_000, via)
         } finally {
             runCatching { socket?.close() }
         }

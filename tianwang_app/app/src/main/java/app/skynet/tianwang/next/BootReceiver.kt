@@ -13,7 +13,11 @@ import android.content.Intent
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
-        if (!Prefs.mcpConfigured() || !Prefs.mcpEnabled) return
+        if (!Prefs.mcpConfigured() || !Prefs.mcpEnabled) {
+            // 没接入网也要把 DDNS 接回来：动态 IPv6 换了，域名必须跟着更新。
+            if (Prefs.ddnsEnabled) PhoneLinkService.start(context)
+            return
+        }
         PhoneLinkService.start(context)
     }
 }
