@@ -69,6 +69,8 @@ class PhoneMcpToolsTest {
             "self_owner_restriction", "self_owner_reboot",
             "self_lan_status", "self_lan_start", "self_lan_stop",
             "self_lan_call", "self_lan_speed",
+            "self_peer_add", "self_peer_remove", "self_peer_list",
+            "self_peer_probe", "self_peer_pick", "self_peer_call",
             "self_dns_resolve", "self_ddns_status", "self_ddns_config",
             "self_ddns_publish", "self_ddns_watch",
         )) {
@@ -88,6 +90,12 @@ class PhoneMcpToolsTest {
         assertTrue(byName.getValue("self_lan_stop").sideEffect)
         assertTrue(byName.getValue("self_lan_call").sideEffect)
         assertTrue(byName.getValue("self_lan_speed").sideEffect)
+        assertTrue(byName.getValue("self_peer_add").sideEffect)
+        assertTrue(byName.getValue("self_peer_remove").sideEffect)
+        assertTrue(byName.getValue("self_peer_call").sideEffect)
+        assertFalse(byName.getValue("self_peer_list").sideEffect)
+        assertFalse(byName.getValue("self_peer_probe").sideEffect)
+        assertFalse(byName.getValue("self_peer_pick").sideEffect)
         assertFalse(byName.getValue("self_lan_status").sideEffect)
         assertTrue(byName.getValue("self_ddns_config").sideEffect)
         assertTrue(byName.getValue("self_ddns_publish").sideEffect)

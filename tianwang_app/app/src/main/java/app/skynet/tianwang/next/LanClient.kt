@@ -23,6 +23,7 @@ object LanClient {
         val err: String,
         val ms: Long,
         val via: String = "",
+        val hello: JSONObject? = null,
     )
     data class Speed(val ok: Boolean, val text: String, val err: String, val via: String = "")
 
@@ -56,6 +57,13 @@ object LanClient {
         }
         return Reply(true, outText, "", ms, r.via)
     }
+
+    /**
+     * 只握手：拿对端 hello 自述（电量/充电/工具表/动作开关），不发工具调用。
+     * 集群选路前先 probe，避免把写操作派给一台只读的手机。
+     */
+    fun probe(target: LanProto.Target, token: String, timeoutMs: Int = 8_000): Reply =
+        withSocket(target, token, timeoutMs) { _, _, _ -> }
 
     /**
      * IPv6 / Wi-Fi 有效载荷测速。默认上行（本机往对端灌），`down=true` 测下行。
@@ -122,6 +130,7 @@ object LanClient {
         var lastErr: Throwable? = null
         var lastAddr: InetAddress? = null
         var tried = 0
+        var helloMeta: JSONObject? = null
         return try {
             val addrs = Dns6.resolve(target.host)
             for (addr in addrs) {
@@ -155,9 +164,10 @@ object LanClient {
             if (helloJson.optString("lan") != "ok") {
                 throw IllegalStateException(helloJson.optString("err", "对端拒绝连接"))
             }
+            helloMeta = helloJson
             block(input, output, s)
             val ms = (System.nanoTime() - started) / 1_000_000
-            Reply(true, "", "", ms, s.inetAddress?.hostAddress ?: "")
+            Reply(true, "", "", ms, s.inetAddress?.hostAddress ?: "", helloMeta)
         } catch (t: Throwable) {
             val via = socket?.inetAddress?.hostAddress
                 ?: lastAddr?.hostAddress
@@ -175,7 +185,7 @@ object LanClient {
                 t is java.net.UnknownHostException -> "解析不了地址 ${target.host}"
                 else -> "${t.javaClass.simpleName}: ${t.message ?: "连接失败"}"
             }
-            Reply(false, "", hint, (System.nanoTime() - started) / 1_000_000, via)
+            Reply(false, "", hint, (System.nanoTime() - started) / 1_000_000, via, helloMeta)
         } finally {
             runCatching { socket?.close() }
         }

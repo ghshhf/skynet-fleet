@@ -42,7 +42,11 @@ object LanHub {
             }
             stop(ctx, keepService = true)
         }
-        val s = LanServer(token, requestedPort, Prefs.deviceName) { PhoneMcp.handleLine(it) }
+        val s = LanServer(
+            token, requestedPort, Prefs.deviceName,
+            meta = { LanMeta.hello() },
+            handler = { PhoneMcp.handleLine(it) },
+        )
         if (!s.start()) {
             lastError = s.lastError.ifBlank { "端口绑定失败" }
             return ToolResult(false, err = "局域网直连启动失败：$lastError")
@@ -160,6 +164,209 @@ object LanHub {
         return ToolResult(
             true,
             text = "直连 ${target.endpoint()}$via · ${if (down) "下行" else "上行"} ${mb}MB · ${r.text}",
+        )
+    }
+
+    // ---------------- 手机集群：名册 / 探测 / 选路 / 派单 ----------------
+
+    fun peers(): List<PeerBook.Peer> = PeerBook.decode(Prefs.fleetPeers)
+
+    private fun savePeers(list: List<PeerBook.Peer>) {
+        Prefs.fleetPeers = PeerBook.encode(list)
+    }
+
+    fun peerAdd(args: Map<String, Any?>): ToolResult {
+        val name = str(args["name"])
+        if (name.isBlank()) return ToolResult(false, err = "缺 name：给这台对端起个短名，如 b-phone")
+        val token = str(args["token"])
+        if (token.isBlank()) {
+            return ToolResult(false, err = "缺 token：在手机 B 上跑 self.lan.start，把回执里的完整口令填进来")
+        }
+        val t = targetOf(args) ?: return ToolResult(
+            false,
+            err = "host 为空或格式不对：支持 <域名>、<IPv4>、<IPv6>、[<IPv6>]:端口",
+        )
+        val list = peers()
+        val old = PeerBook.find(list, name)
+        val p = (old ?: PeerBook.Peer(name = name, host = t.host, port = t.port))
+            .copy(name = name, host = t.host, port = t.port, token = token, lastError = "")
+        savePeers(PeerBook.upsert(list, p))
+        return ToolResult(true, text = buildString {
+            append(if (old == null) "已加入集群：" else "已更新：").append(name)
+                .append(" · ").append(t.endpoint()).append('\n')
+            append("口令：").append(PeerBook.mask(token)).append('\n')
+            append("下一步跑 self.peer.probe 拿电量与工具表，再 self.peer.pick / self.peer.call。")
+        })
+    }
+
+    fun peerRemove(args: Map<String, Any?>): ToolResult {
+        val name = str(args["name"])
+        if (name.isBlank()) return ToolResult(false, err = "缺 name")
+        val list = peers()
+        if (PeerBook.find(list, name) == null) return ToolResult(false, err = "名册里没有 $name")
+        savePeers(PeerBook.remove(list, name))
+        return ToolResult(true, text = "已移出集群：$name（只删本机名册，不影响对端）")
+    }
+
+    fun peerList(): ToolResult {
+        val list = peers()
+        val sb = StringBuilder()
+        if (list.isEmpty()) {
+            sb.append("集群名册为空。\n")
+            sb.append("在 B 机跑 self.lan.start 拿地址与完整口令，然后在 A 机：\n")
+            sb.append("  self.peer.add name=b-phone host=<B 的地址> token=<口令>\n")
+        } else {
+            sb.append("集群名册：").append(list.size).append(" 台\n\n")
+            list.forEach { sb.append(PeerBook.line(it)).append("\n\n") }
+            sb.append("写操作只派给 self.peer.probe 后 actions=允许 的机器；失败不自动换机重试。")
+        }
+        val found = runCatching { discovery?.peerList() ?: emptyList() }.getOrDefault(emptyList())
+        val unknown = found.filter { f -> list.none { it.name.equals(f.name, true) } }
+        if (unknown.isNotEmpty()) {
+            sb.append("\n\nmDNS 发现但未入册：\n")
+            unknown.take(8).forEach {
+                sb.append("  ").append(it.name).append(" · ")
+                    .append(LanProto.bracket(it.host)).append(':').append(it.port).append('\n')
+            }
+            sb.append("  入册需要它的口令：self.peer.add name=... host=... token=...")
+        }
+        return ToolResult(true, text = sb.toString().trimEnd())
+    }
+
+    fun peerProbe(): ToolResult {
+        val list = peers()
+        if (list.isEmpty()) return ToolResult(false, err = "集群名册为空，先 self.peer.add")
+        val out = StringBuilder()
+        var good = 0
+        val updated = list.map { p ->
+            val r = LanClient.probe(LanProto.Target(p.host, p.port), p.token)
+            if (!r.ok) {
+                out.append("✗ ").append(p.name).append("：").append(r.err).append('\n')
+                p.copy(lastError = r.err)
+            } else {
+                good++
+                val u = applyHello(p, r.hello)
+                out.append("✓ ").append(PeerBook.line(u)).append("\n\n")
+                u
+            }
+        }
+        savePeers(updated)
+        return ToolResult(
+            good > 0,
+            text = out.toString().trimEnd(),
+            err = if (good == 0) "没有一台能握手成功" else "",
+        )
+    }
+
+    fun peerPick(args: Map<String, Any?>): ToolResult {
+        val tool = str(args["tool"]).replace('.', '_')
+        if (tool.isBlank()) return ToolResult(false, err = "缺 tool：填 MCP 工具名，如 self_ui_tap")
+        val meta = PhoneMcp.toolList().firstOrNull { it.name == tool }
+            ?: return ToolResult(false, err = "本机没有这个工具：$tool")
+        val list = peers()
+        if (list.isEmpty()) return ToolResult(false, err = "集群名册为空，先 self.peer.add")
+        val ranked = PeerBook.rank(list, tool, meta.sideEffect, int(args["min_battery"], 15))
+        if (ranked.isEmpty()) {
+            return ToolResult(false, err = buildString {
+                append("没有能接 $tool 的机器。")
+                if (meta.sideEffect) append("写操作要求对端 actions=允许，先 self.peer.probe。")
+                else append("先 self.peer.probe 确认在线与工具表。")
+            })
+        }
+        val sb = StringBuilder()
+        sb.append("按 suitability 排序（").append(tool)
+        if (meta.sideEffect) sb.append(" · 写操作，只派一台且失败不重试")
+        sb.append("）：\n")
+        ranked.forEachIndexed { i, p ->
+            sb.append(i + 1).append(". ").append(p.name).append(" · ").append(p.endpoint())
+            sb.append(" · ").append(if (p.battery < 0) "电量未知" else "${p.battery}%")
+            if (p.charging) sb.append("（充电中）")
+            sb.append(if (p.actions) " · 可写" else " · 只读").append('\n')
+        }
+        return ToolResult(true, text = sb.toString().trimEnd())
+    }
+
+    fun peerCall(args: Map<String, Any?>): ToolResult {
+        val tool = str(args["tool"]).replace('.', '_')
+        if (tool.isBlank()) return ToolResult(false, err = "缺 tool：填 MCP 工具名")
+        val meta = PhoneMcp.toolList().firstOrNull { it.name == tool }
+            ?: return ToolResult(false, err = "本机没有这个工具：$tool")
+        val argText = str(args["args"])
+        val argObj = if (argText.isBlank()) JSONObject() else runCatching { JSONObject(argText) }.getOrNull()
+            ?: return ToolResult(false, err = "args 不是合法 JSON 对象：${argText.take(80)}")
+        val all = peers()
+        if (all.isEmpty()) return ToolResult(false, err = "集群名册为空，先 self.peer.add")
+
+        val named = str(args["name"])
+        val candidates = if (named.isNotBlank()) {
+            val one = PeerBook.find(all, named)
+                ?: return ToolResult(false, err = "名册里没有 $named")
+            listOf(one)
+        } else {
+            PeerBook.rank(all, tool, meta.sideEffect, int(args["min_battery"], 15))
+        }
+        if (candidates.isEmpty()) {
+            return ToolResult(false, err = "没有能接 $tool 的机器；先 self.peer.probe，写操作还要对端 actions=允许")
+        }
+        // 写操作只派一台：回包丢了不代表没执行，换机重试就是重复点击/重复发送。
+        val plan = if (meta.sideEffect) candidates.take(1) else candidates
+        val timeout = int(args["timeout"], 30_000).coerceIn(1_000, 120_000)
+        val request = LanProto.toolRequest(tool, argObj)
+        val tried = StringBuilder()
+        plan.forEachIndexed { i, p ->
+            val r = LanClient.call(LanProto.Target(p.host, p.port), p.token, request, timeout)
+            if (r.ok) {
+                touch(p, r)
+                val via = if (r.via.isBlank()) "" else " · 经 ${r.via}"
+                return ToolResult(true, text = buildString {
+                    append("由 ").append(p.name).append(" 完成（第 ").append(i + 1)
+                        .append(" 个候选）· ").append(tool).append(" · ").append(r.ms).append("ms")
+                        .append(via).append('\n')
+                    append(LanProto.summarizeMcpReply(r.text))
+                })
+            }
+            touch(p, r)
+            tried.append("✗ ").append(p.name).append("：").append(r.err).append('\n')
+            if (meta.sideEffect) {
+                return ToolResult(false, err = buildString {
+                    append("已派给 ").append(p.name).append(" 但没拿到回包：").append(r.err).append('\n')
+                    append("写操作可能已经执行。按规则不自动换机重试；先人工确认对端状态。")
+                })
+            }
+            if (i == plan.lastIndex) {
+                return ToolResult(false, err = "全部候选失败：\n" + tried.toString().trimEnd())
+            }
+        }
+        return ToolResult(false, err = "没有执行任何候选")
+    }
+
+    private fun touch(p: PeerBook.Peer, r: LanClient.Reply) {
+        val cur = peers()
+        val old = PeerBook.find(cur, p.name) ?: p
+        val u = if (r.ok) applyHello(old, r.hello) else old.copy(lastError = r.err)
+        savePeers(PeerBook.upsert(cur, u))
+    }
+
+    private fun applyHello(p: PeerBook.Peer, hello: JSONObject?): PeerBook.Peer {
+        if (hello == null) return p.copy(lastSeen = System.currentTimeMillis(), lastError = "")
+        val tools = HashSet<String>()
+        hello.optJSONArray("tools")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val v = arr.optString(i).trim()
+                if (v.isNotEmpty()) tools.add(v)
+            }
+        }
+        return p.copy(
+            battery = hello.optInt("battery", p.battery).coerceIn(-1, 100),
+            charging = hello.optBoolean("charging", p.charging),
+            screenOn = hello.optBoolean("screenOn", p.screenOn),
+            caps = hello.optInt("caps", p.caps),
+            tools = if (tools.isEmpty()) p.tools else tools,
+            actions = hello.optBoolean("actions", p.actions),
+            platform = hello.optString("platform", p.platform),
+            android = hello.optString("android", p.android),
+            lastSeen = System.currentTimeMillis(),
+            lastError = "",
         )
     }
 

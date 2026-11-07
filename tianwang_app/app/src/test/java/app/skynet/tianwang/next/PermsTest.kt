@@ -115,6 +115,16 @@ class PermsTest {
     }
 
     @Test
+    fun fleetRoutingFollowsLanChannel() {
+        assertEquals(PermState.NEEDS_GRANT, row(PermEnv(), "fleet.peer").state)
+        assertTrue(row(PermEnv(), "fleet.peer").next.contains("self.lan.start"))
+        val on = row(PermEnv(lanRunning = true), "fleet.peer")
+        assertEquals(PermState.READY, on.state)
+        assertTrue(on.next.contains("self.peer.call"))
+        assertTrue(on.next.contains("不换机重试"))
+    }
+
+    @Test
     fun ddnsRowFollowsConfigAndPublishState() {
         assertEquals(PermState.NEEDS_GRANT, row(PermEnv(), "net.ddns").state)
         assertTrue(row(PermEnv(), "net.ddns").next.contains("self.ddns.config"))

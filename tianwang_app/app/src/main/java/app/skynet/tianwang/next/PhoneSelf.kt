@@ -284,6 +284,48 @@ object PhoneSelf {
             ),
         ),
         SelfCap(
+            "self.peer.add", "把另一台手机加入集群",
+            "登记名字、地址、对端口令。名字是以后派单用的短名；口令只存本机、列表里只露头尾。",
+            listOf(
+                CapParam("name", "str", "对端短名，如 b-phone", true),
+                CapParam("host", "str", "地址或域名，支持 IPv6 / [IPv6]:端口 / 域名", true),
+                CapParam("port", "int", "端口，默认 18765", false),
+                CapParam("token", "str", "对端 self.lan.start 回执里的完整口令", true),
+            ),
+        ),
+        SelfCap(
+            "self.peer.remove", "把手机移出集群",
+            "只删本机名册，不影响对端。",
+            listOf(CapParam("name", "str", "对端短名", true)),
+        ),
+        SelfCap(
+            "self.peer.list", "集群名册",
+            "看每台的电量、充电、亮屏、能力数、是否允许写操作、最近一次错误；也会列出 mDNS 发现但还没入册的手机。",
+        ),
+        SelfCap(
+            "self.peer.probe", "探测集群里每台手机",
+            "逐台握手，拿回机型、Android 版本、工具表、动作开关、电量与充电状态。派单前先跑这条。",
+        ),
+        SelfCap(
+            "self.peer.pick", "选最合适的一台",
+            "按「充电中 > 电量高 > 最近见到」排序；写操作只考虑对端明确开了动作权限的机器。只给建议，不执行。",
+            listOf(
+                CapParam("tool", "str", "要派给对端的 MCP 工具名，如 self_ui_tap", true),
+                CapParam("min_battery", "int", "电量低于此值且没充电的不派，默认 15", false),
+            ),
+        ),
+        SelfCap(
+            "self.peer.call", "把任务派给集群",
+            "按选路结果逐台尝试，成功即返回是哪台做的。写操作只派一台，失败不换机重试（避免重复点击/重复发送）。",
+            listOf(
+                CapParam("tool", "str", "MCP 工具名", true),
+                CapParam("args", "str", "工具参数 JSON，默认 {}", false),
+                CapParam("name", "str", "指定某一台，不填则自动选路", false),
+                CapParam("timeout", "int", "超时毫秒，默认 30000，上限 120000", false),
+                CapParam("min_battery", "int", "自动选路时的最低电量，默认 15", false),
+            ),
+        ),
+        SelfCap(
             "self.dns.resolve", "用名字查当前地址",
             "把域名解析成地址并标出类型（全局 IPv6 / ULA / 私网 IPv4…），顺序就是直连时优先尝试的顺序。动态 IPv6 换地址后，用名字不用改配置。",
             listOf(CapParam("name", "str", "域名，如 myphone.duckdns.org；也接受 IP 字面量", true)),
@@ -401,6 +443,12 @@ object PhoneSelf {
                     // 直连是阻塞 socket，必须离开主线程，否则测速会把 UI 卡死。
                     "self.lan.call" -> withContext(Dispatchers.IO) { LanHub.call(args) }
                     "self.lan.speed" -> withContext(Dispatchers.IO) { LanHub.speed(args) }
+                    "self.peer.add" -> LanHub.peerAdd(args)
+                    "self.peer.remove" -> LanHub.peerRemove(args)
+                    "self.peer.list" -> LanHub.peerList()
+                    "self.peer.probe" -> withContext(Dispatchers.IO) { LanHub.peerProbe() }
+                    "self.peer.pick" -> LanHub.peerPick(args)
+                    "self.peer.call" -> withContext(Dispatchers.IO) { LanHub.peerCall(args) }
                     // 名字解析与 DDNS 都是网络操作，必须离开主线程。
                     "self.dns.resolve" -> withContext(Dispatchers.IO) {
                         val name = strArg(args, "name")

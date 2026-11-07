@@ -25,6 +25,7 @@ class LanServer(
     private val token: String,
     private val requestedPort: Int = LanProto.DEFAULT_PORT,
     private val deviceName: String = "phone",
+    private val meta: () -> JSONObject = { JSONObject() },
     private val handler: (String) -> String?,
 ) {
     @Volatile
@@ -138,12 +139,20 @@ class LanServer(
                 return
             }
             "hello" -> {
-                writeLine(output, JSONObject()
+                val reply = JSONObject()
                     .put("lan", "ok")
                     .put("name", deviceName)
                     .put("proto", 1)
                     .put("ipv6", LanProto.localAddresses().any { it.host.contains(':') })
-                    .toString())
+                // 自述字段可以被 meta 补，但不能覆盖 lan/name/proto 这些协议字段。
+                runCatching { meta() }.getOrNull()?.let { extra ->
+                    val keys = extra.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (!reply.has(k)) reply.put(k, extra.get(k))
+                    }
+                }
+                writeLine(output, reply.toString())
             }
             else -> {
                 errorLine(output, "首帧必须是 hello 或 speed")

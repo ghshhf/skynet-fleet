@@ -27,7 +27,7 @@ class LanServerTest {
         },
         block: (LanServer) -> Unit,
     ) {
-        val server = LanServer(token, 0, "测试机", handler)
+        val server = LanServer(token, 0, "测试机", handler = handler)
         assertTrue("server 应能绑定回环端口：${server.lastError}", server.start())
         try {
             block(server)
@@ -64,6 +64,30 @@ class LanServerTest {
         s.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), server.boundPort), 3000)
         s.soTimeout = 5000
         return Wire(s)
+    }
+
+    @Test
+    fun helloCarriesMetaWithoutOverridingProtocolFields() {
+        val meta = JSONObject()
+            .put("battery", 77)
+            .put("charging", true)
+            .put("name", "不该覆盖")
+        val server = LanServer(
+            token, 0, "测试机",
+            meta = { meta },
+            handler = { null },
+        )
+        assertTrue(server.start())
+        try {
+            val w = connect(server)
+            w.line(JSONObject().put("lan", "hello").put("token", token).toString())
+            val reply = JSONObject(w.read())
+            assertEquals(77, reply.getInt("battery"))
+            assertTrue(reply.getBoolean("charging"))
+            assertEquals("测试机", reply.getString("name"))
+        } finally {
+            server.stop()
+        }
     }
 
     @Test

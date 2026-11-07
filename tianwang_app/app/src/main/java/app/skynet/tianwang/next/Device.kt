@@ -286,6 +286,7 @@ object Prefs {
     private const val K_MCP_ENABLED = "mcp_enabled"
     private const val K_LAN_TOKEN = "lan_token"
     private const val K_LAN_PORT = "lan_port"
+    private const val K_FLEET_PEERS = "fleet_peers"
     private const val K_DDNS_PROVIDER = "ddns_provider"
     private const val K_DDNS_DOMAIN = "ddns_domain"
     private const val K_DDNS_TOKEN = "ddns_token"
@@ -376,6 +377,11 @@ object Prefs {
         lanToken = fresh
         return fresh
     }
+
+    /** 手机集群名册（JSON）。含对端口令，只在本机落盘，不进日志、不回显。 */
+    var fleetPeers: String
+        get() = sp.getString(K_FLEET_PEERS, "") ?: ""
+        set(v) { sp.edit().putString(K_FLEET_PEERS, v).apply() }
 
     // ---------------- 动态 IPv6 → 稳定名字（DDNS） ----------------
 

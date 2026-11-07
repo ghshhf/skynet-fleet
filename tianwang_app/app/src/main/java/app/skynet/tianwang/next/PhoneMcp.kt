@@ -290,6 +290,57 @@ object PhoneMcp {
             sideEffect = true,
         ),
         McpTool(
+            "self_peer_add", "把另一台手机加入集群名册（名字 + 地址 + 对端口令；口令只存本机）。",
+            schema(
+                mapOf(
+                    "name" to prop("string", "对端短名，如 b-phone"),
+                    "host" to prop("string", "地址或域名，支持 IPv6 / [IPv6]:端口"),
+                    "port" to prop("integer", "端口，默认 18765"),
+                    "token" to prop("string", "对端 self.lan.start 回执里的完整口令"),
+                ),
+                listOf("name", "host", "token"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_peer_remove", "把手机移出集群名册（只删本机，不影响对端）。",
+            schema(mapOf("name" to prop("string", "对端短名")), listOf("name")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_peer_list", "集群名册：电量、充电、亮屏、能力数、是否允许写操作、最近错误。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_peer_probe", "逐台握手，刷新机型、工具表、动作开关、电量与充电状态。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_peer_pick", "按 suitability 排序候选手机；写操作只考虑对端明确允许动作的机器。",
+            schema(
+                mapOf(
+                    "tool" to prop("string", "要派给对端的 MCP 工具名"),
+                    "min_battery" to prop("integer", "最低电量，默认 15"),
+                ),
+                listOf("tool"),
+            ),
+        ),
+        McpTool(
+            "self_peer_call",
+            "把任务派给集群：读操作失败可换机重试；写操作只派一台，失败不自动重试。",
+            schema(
+                mapOf(
+                    "tool" to prop("string", "MCP 工具名"),
+                    "args" to prop("string", "工具参数 JSON，默认 {}"),
+                    "name" to prop("string", "指定某一台；不填自动选路"),
+                    "timeout" to prop("integer", "超时毫秒，默认 30000"),
+                    "min_battery" to prop("integer", "自动选路最低电量，默认 15"),
+                ),
+                listOf("tool"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
             "self_dns_resolve", "把域名解析成地址并标出类型，顺序就是直连时优先尝试的顺序。",
             schema(mapOf("name" to prop("string", "域名或 IP 字面量")), listOf("name")),
         ),
@@ -373,6 +424,12 @@ object PhoneMcp {
             "self_lan_stop" -> "self.lan.stop"
             "self_lan_call" -> "self.lan.call"
             "self_lan_speed" -> "self.lan.speed"
+            "self_peer_add" -> "self.peer.add"
+            "self_peer_remove" -> "self.peer.remove"
+            "self_peer_list" -> "self.peer.list"
+            "self_peer_probe" -> "self.peer.probe"
+            "self_peer_pick" -> "self.peer.pick"
+            "self_peer_call" -> "self.peer.call"
             "self_dns_resolve" -> "self.dns.resolve"
             "self_ddns_status" -> "self.ddns.status"
             "self_ddns_config" -> "self.ddns.config"
