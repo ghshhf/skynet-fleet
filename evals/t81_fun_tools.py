@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""t81：生活小工具（fun_*）—— 8 个纯 stdlib 能力 + 工具面接线。
+"""t81：生活小工具（fun_*）—— 10 个纯 stdlib 能力 + 工具面接线。
 
 守三件事：
   ① 每个小工具的核心结果对（哈希已知值、温度/数据换算、摩斯往返、编解码往返）；
@@ -37,6 +37,21 @@ check(r["ok"] and "ba7816bf8f01cfea414140de5dae2223" in r["text"], "SHA-256(abc)
 r = call("fun_password", "24 位")
 check(r["ok"] and len(r["text"].split("：")[-1]) == 24, "密码长度按参数生成")
 check(any(c in r["text"] for c in "!@#$%^&*-_=+"), "密码含符号")
+
+r = call("fun_passphrase", "6 词")
+phrase = r["text"].split("：")[-1]
+check(r["ok"] and len(phrase.split("-")) == 7, "口令短语 = 6 词 + 2 位数字")
+check("约 49 bit" in r["text"], "6 词口令熵约 49 bit")
+
+r = call("fun_pwdict", "123456")
+check(r["ok"] and "命中" in r["text"] and "评分 0/4" in r["text"], "常见弱密码命中且 0 分")
+r = call("fun_pwdict", "P@ssw0rd")
+check(r["ok"] and "命中" in r["text"] and "leet" in r["text"], "leet 变体被字典还原")
+r = call("fun_pwdict", "dragon2026")
+check(r["ok"] and "去尾号" in r["text"], "词表词 + 尾号仍命中")
+r = call("fun_pwdict", "Tr0ub4dor&3")
+check(r["ok"] and "命中" not in r["text"] and "评分 3/4" in r["text"], "非字典密码给 3/4")
+check("123456" not in r["text"], "检查结果不回显密码")
 
 r = call("fun_color", "#ff0000")
 check(r["ok"] and "rgb(255, 0, 0)" in r["text"] and "hsl(0, 100%, 50%)" in r["text"],
@@ -78,7 +93,7 @@ check(r["ok"] and "星期六" in r["text"], "今天报星期（2026-11-07 是周
 
 print("② 工具面接线")
 fun_tools = [t for t in AT.TOOLS if t.name.startswith("fun_")]
-check(len(fun_tools) == 8, "8 个 fun_* 都在 TOOLS 里")
+check(len(fun_tools) == 10, "10 个 fun_* 都在 TOOLS 里")
 check(all(t.cap is None and t.perm == AT.PERM_AUTO and not t.side for t in fun_tools),
       "fun_* 不走注册表、auto 档、无副作用")
 check(all(t.name in AT.DEFAULT_TIERS for t in fun_tools), "fun_* 都进了权限表")
@@ -93,7 +108,7 @@ for dom, (_label, names) in toolselect.DOMAINS.items():
 check(all(len(owners.get(t.name, [])) == 1 for t in fun_tools),
       "每个 fun_* 只属于一个域（分域没漏也没重）")
 check(all(any(n == t.name for n in toolselect.DOMAINS["玩"][1]) for t in fun_tools),
-      "8 个 fun_* 都在「玩」域")
+      "10 个 fun_* 都在「玩」域")
 
 check(toolselect.guess_domain("帮我算 sha256")[0] == "玩", "规则把「sha256」判进玩域")
 check(toolselect.guess_domain("把 10 公里换算成英里")[0] == "玩", "规则把「换算」判进玩域")

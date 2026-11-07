@@ -14,6 +14,7 @@ import base64
 import codecs
 import colorsys
 import hashlib
+import math
 import random
 import re
 import secrets
@@ -81,6 +82,114 @@ def _password(s, _today):
     random.SystemRandom().shuffle(chars)
     # 每字符 log2(68) ≈ 6.09 bit，只报保守值
     return _ok("%d 位强密码（约 %.0f bit）：%s" % (n, n * 6.0, "".join(chars)))
+
+
+# ---------------------------------------------------------------- 口令短语 / 弱密码字典
+
+#: 137 个具体、无歧义、3–7 字母的英文词。保守按 7 bit/词算，离线可复现。
+_WORDS = """
+acorn amber anchor apple basket beacon blossom bridge bronze butter cactus camera
+candle canyon cavern cedar cloud copper daisy desert dolphin drizzle dynamo eagle
+ember emerald engine estuary falcon feather fjord flint forest funnel garden
+ginger glacier goblet grove guitar hammer harbor hazel heron horizon igloo inlet
+insect island ivory jacket jade jaguar jungle juniper kelp kernel kettle kitten
+koala ladder lagoon lantern lemon lily lizard magnet maple marble meadow mist
+muffin napkin nectar nebula needle nickel nutmeg oasis ocean olive opal orbit
+orange oyster parrot pebble pencil pepper pearl prairie quartz quill quilt rabbit
+raven reef ribbon riddle rocket rose saddle sage sailor silver slope spider stone
+summit teapot temple thistle tiger tide topaz tulip umbrella upland urchin valley
+velvet vine violet vortex wagon walnut whisper willow window yacht yarrow yogurt
+yonder zebra zenith zipper zucchini
+""".split()
+
+_COMMON = """
+123456 password 123456789 12345678 12345 qwerty abc123 111111 123123 admin
+letmein welcome monkey dragon iloveyou sunshine princess football charlie
+aa123456 qwerty123 1q2w3e4r zxcvbnm p@ssw0rd passw0rd woaini 5201314 1314520
+888888 666666 000000 123qwe qazwsx asdfgh 1qaz2wsx password1 admin123 root
+guest test test123 123456a a123456 1234567890 qwertyuiop 1q2w3e abc123456
+987654321 159357 112233 123321 666888 woaini1314 520520 1314521 147258 258000
+iloveyou1314 qwertyabc abcdef 123abc 321321 5201314520 7758521 1314520a
+password123 admin888 root123 test1234 123456789a qwe123 asd123 zxc123
+qazwsxedc 1qazxsw2 1q2w3e4r5t 123456q 12345678910 88888888 11111111
+5201314a love123 loveme missing youandme 1234567890q abc12345
+""".split()
+
+_WORD_RANK = {w: i + 1 for i, w in enumerate(_COMMON)}
+_LEET = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s",
+                       "7": "t", "@": "a", "$": "s", "!": "i", "|": "l"})
+_SEQ = ("0123456789", "abcdefghijklmnopqrstuvwxyz",
+        "qwertyuiop", "asdfghjkl", "zxcvbnm")
+
+
+def _passphrase(s, _today):
+    m = re.search(r"\d+", s)
+    n = max(4, min(12, int(m.group()) if m else 7))
+    sep = " " if ("空格" in s or "space" in s.lower()) else "-"
+    words = [secrets.choice(_WORDS) for _ in range(n)]
+    num = secrets.randbelow(100)
+    phrase = sep.join(words) + sep + "%02d" % num
+    bits = n * 7 + math.log2(100)
+    return _ok("%d 词口令（约 %.0f bit，未计词表外因素）：%s" % (n, bits, phrase))
+
+
+def _pwdict(s, _today):
+    pw = (s or "").strip()
+    if not pw:
+        return _err("给一个要检查的密码（只在本机算，不回显、不写审计）")
+    plain = re.sub(r"[^a-z0-9]", "", pw.lower())
+    norm = re.sub(r"[^a-z0-9]", "", pw.lower().translate(_LEET))
+    hit, rank, how = None, 0, ""
+    for cand, label in ((plain, "原样"), (norm, "leet 还原")):
+        if cand in _WORD_RANK:
+            hit, rank, how = cand, _WORD_RANK[cand], label
+            break
+        base = re.sub(r"\d+$", "", cand)
+        if base and base in _WORD_RANK:
+            hit, rank, how = base, _WORD_RANK[base], label + "（去尾号）"
+            break
+
+    flags = []
+    if len(pw) < 8:
+        flags.append("长度不足 8")
+    if pw.isdigit():
+        flags.append("纯数字")
+    elif pw.isalpha():
+        flags.append("纯字母")
+    if len(set(pw)) == 1:
+        flags.append("单一字符重复")
+    if re.fullmatch(r"(.{1,4})\1+", plain or "x"):
+        flags.append("短片段循环")
+    seq_hit = any(x[i:i + 4] in plain for x in _SEQ for i in range(len(x) - 3))
+    if seq_hit:
+        flags.append("键盘/字母顺序")
+    if re.search(r"(19|20)\d{2}", pw):
+        flags.append("含年份")
+
+    charset = 0
+    if re.search(r"[a-z]", pw):
+        charset += 26
+    if re.search(r"[A-Z]", pw):
+        charset += 26
+    if re.search(r"\d", pw):
+        charset += 10
+    if re.search(r"[^A-Za-z0-9]", pw):
+        charset += 32
+    bits = len(pw) * math.log2(charset) if charset else 0
+    if hit:
+        bits = min(bits, 12.0)
+    if flags:
+        bits *= max(0.25, 1 - 0.15 * len(flags))
+    score = 0 if (hit or bits < 28) else 1 if bits < 36 else 2 if bits < 60 else 3 if bits < 80 else 4
+    label = ("很弱", "弱", "一般", "强", "很强")[score]
+    lines = ["评分 %d/4（%s）；长度 %d；估算熵 %.1f bit" % (score, label, len(pw), bits)]
+    if hit:
+        lines.append("命中常见弱密码字典第 %d 位（%s）" % (rank, how))
+    if flags:
+        lines.append("问题：" + "、".join(flags))
+    if score <= 1:
+        lines.append("建议：至少 12 位，混合大小写/数字/符号，别用词表词+年份")
+    return _ok("\n".join(lines))
 
 
 # ---------------------------------------------------------------- 颜色
@@ -398,6 +507,8 @@ def _date(s, today):
 _TOOLS = {
     "fun_hash": _hash,
     "fun_password": _password,
+    "fun_passphrase": _passphrase,
+    "fun_pwdict": _pwdict,
     "fun_color": _color,
     "fun_unit": _unit,
     "fun_morse": _morse,

@@ -1895,25 +1895,31 @@ TOOLS = (
     # ---- 生活小工具（fun.py；纯 stdlib、不联网、不落盘）----
     # 描述刻意压到一行：全量模式的提示词预算是按 25s 超时线反推的，不是摆设。
     Tool("fun_hash", None,
-         "算哈希（md5/sha1/sha256/sha512）。",
+         "算哈希 md5/sha1/sha256/sha512。",
          render=_render_fun),
     Tool("fun_password", None,
-         "生成随机强密码（默认 20 位）。",
+         "随机强密码（默认 20 位）。",
+         render=_render_fun),
+    Tool("fun_passphrase", None,
+         "词表口令短语（默认 7 词）。",
+         render=_render_fun),
+    Tool("fun_pwdict", None,
+         "弱密码字典命中与强度评分。",
          render=_render_fun),
     Tool("fun_color", None,
-         "颜色 HEX/RGB/HSL 互转与配色。",
+         "颜色 HEX/RGB/HSL 互转。",
          render=_render_fun),
     Tool("fun_unit", None,
          "单位换算：10 km mi / 100 c f。",
          render=_render_fun),
     Tool("fun_morse", None,
-         "摩斯编码/解码，如「摩斯解码 ...」。",
+         "摩斯编码/解码，支持常用标点。",
          render=_render_fun),
     Tool("fun_codec", None,
-         "Base64/Hex/URL 编解码，如 b64e 你好。",
+         "Base64/Hex/URL 编解码。",
          render=_render_fun),
     Tool("fun_random", None,
-         "骰子 dice 2d6、硬币 coin、抽签 pick。",
+         "骰子 dice/硬币 coin/抽签 pick。",
          render=_render_fun),
     Tool("fun_date", None,
          "日期差/倒计时，如 2026-12-31。",
@@ -2068,8 +2074,8 @@ def execute(tool, arg, caller, tiers=None):
 
     if tool.startswith("fun_"):
         from . import fun
-        # 哈希/密码的输入可能是秘密，不写审计原文；只记「谁用过这个工具」。
-        shown = "" if tool in ("fun_hash", "fun_password") else arg
+        # 哈希/密码/字典检查的输入可能是秘密，不写审计原文。
+        shown = "" if tool in ("fun_hash", "fun_password", "fun_pwdict") else arg
         r = fun.run(tool, arg)
         _audit(tool, shown, tier, "ok" if r.get("ok") else "failed")
         return (tool, _clip(r.get("text") or ""), bool(r.get("ok")))

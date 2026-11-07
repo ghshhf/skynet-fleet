@@ -56,9 +56,10 @@ DOMAINS = {
         "re_bits_extract", "re_ask", "net_dissect"]),
     "记": ("记录与哨兵：生活流记录/日报、环境与生活异常检查", [
         "life_log", "life_digest", "life_sentinel", "sentinel_check"]),
-    "玩": ("算生活小东西：哈希、密码、配色、单位换算、摩斯、编解码、随机、日期", [
-        "fun_hash", "fun_password", "fun_color", "fun_unit",
-        "fun_morse", "fun_codec", "fun_random", "fun_date"]),
+    "玩": ("算生活小东西：哈希、密码、口令短语、弱密码字典、配色、单位、摩斯、编解码、随机、日期", [
+        "fun_hash", "fun_password", "fun_passphrase", "fun_pwdict",
+        "fun_color", "fun_unit", "fun_morse", "fun_codec",
+        "fun_random", "fun_date"]),
 }
 
 #: 规则关键词。权重 = 词长（长词更具体，压过短词的噪声命中）。
@@ -78,7 +79,8 @@ RULES = {
     "拆": ["脉冲", "编码", "广播", "固件", "二进制", "协议", "解码", "解析",
            "ble", "比特", "流量", "抓包"],
     "记": ["生活流", "哨兵", "陌生人", "日报", "这周我都在", "有没有人进来"],
-    "玩": ["哈希", "md5", "sha1", "sha256", "sha512", "密码", "配色", "色值", "颜色",
+    "玩": ["哈希", "md5", "sha1", "sha256", "sha512", "密码", "口令", "短语",
+           "弱密码", "字典", "强度", "词表", "配色", "色值", "颜色",
            "换算", "单位", "摩斯", "morse", "base64", "url编码", "hex", "rot13",
            "骰子", "抽签", "硬币", "倒计时", "几天", "周年", "第几周"],
 }
