@@ -536,6 +536,10 @@ CASES = [
     # 工作区跑，所以本地有、仓库没有的模块永远是绿的」这个盲区——
     # 当天就抓到 fleet/gemini.py 裸引用了从没入库的 fleet/vault.py。
     ("eval_t79_repo_selfcheck", ["evals/t79_repo_selfcheck.py"], HERE, 120),
+    # 生活小工具（11-07）：哈希/密码/配色/单位/摩斯/编解码/随机/日期，8 个纯 stdlib
+    # 能力接进工具面，只占「玩」域（两级决策不让它们拖慢其他域）。
+    # 守 ①核心结果对 ②TOOLS/权限表/schema/分域接线不漏 ③execute 真路由。
+    ("eval_t81_fun_tools", ["evals/t81_fun_tools.py"], HERE, 120),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),

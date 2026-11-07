@@ -42,8 +42,9 @@ check(all(t.name in AT._TOOLS_LINE for t in AT.TOOLS),
 check(all(t.render is not None for t in AT.TOOLS), "每个工具都有渲染器（没有 = 回填空白）")
 check(all(t.perm in (AT.PERM_AUTO, AT.PERM_ASK, AT.PERM_FORBID) for t in AT.TOOLS),
       "每个工具的权限档位都合法")
-check(all(t.cap is not None or t.name == "web_search" for t in AT.TOOLS),
-      "每个工具都指向真实能力（web_search 走 webtool，是唯一例外）")
+check(all(t.cap is not None or t.name == "web_search" or t.name.startswith("fun_")
+          for t in AT.TOOLS),
+      "每个工具都指向真实能力（web_search 走 webtool，fun_* 走本机 fun.run，是仅有的例外）")
 
 # 有副作用的必须不是 auto——模型说要跑不代表就该跑
 risky = [t.name for t in AT.TOOLS if t.side and t.perm == AT.PERM_AUTO]

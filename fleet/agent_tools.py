@@ -1141,6 +1141,11 @@ class Tool:
         return f"- {self.name}：{self.desc}\n"
 
 
+def _render_fun(r, arg):
+    """本机小工具直接带回结果文本（fun.run 已经算好）。"""
+    return (r or {}).get("text") or ""
+
+
 # ------------------------------------------------- 创意能力渲染器
 
 def _render_scene(r, arg):
@@ -1886,6 +1891,33 @@ TOOLS = (
          "关键结论要交叉验证；没额度时如实说不可用。",
          argkey="question", render=lambda r, a: (
              (r.get("data") or {}).get("answer", r.get("err") or "")[:300])),
+
+    # ---- 生活小工具（fun.py；纯 stdlib、不联网、不落盘）----
+    # 描述刻意压到一行：全量模式的提示词预算是按 25s 超时线反推的，不是摆设。
+    Tool("fun_hash", None,
+         "算哈希（md5/sha1/sha256/sha512）。",
+         render=_render_fun),
+    Tool("fun_password", None,
+         "生成随机强密码（默认 20 位）。",
+         render=_render_fun),
+    Tool("fun_color", None,
+         "颜色 HEX/RGB/HSL 互转与配色。",
+         render=_render_fun),
+    Tool("fun_unit", None,
+         "单位换算：10 km mi / 100 c f。",
+         render=_render_fun),
+    Tool("fun_morse", None,
+         "摩斯编码/解码，如「摩斯解码 ...」。",
+         render=_render_fun),
+    Tool("fun_codec", None,
+         "Base64/Hex/URL 编解码，如 b64e 你好。",
+         render=_render_fun),
+    Tool("fun_random", None,
+         "骰子 dice 2d6、硬币 coin、抽签 pick。",
+         render=_render_fun),
+    Tool("fun_date", None,
+         "日期差/倒计时，如 2026-12-31。",
+         render=_render_fun),
 )
 
 
@@ -2033,6 +2065,14 @@ def execute(tool, arg, caller, tiers=None):
             _audit(tool, q2, tier, f"error: {type(e).__name__}")
             return ("web_search",
                     f"搜索失败：{type(e).__name__}: {e}（暂时状态，可稍后重试）", False)
+
+    if tool.startswith("fun_"):
+        from . import fun
+        # 哈希/密码的输入可能是秘密，不写审计原文；只记「谁用过这个工具」。
+        shown = "" if tool in ("fun_hash", "fun_password") else arg
+        r = fun.run(tool, arg)
+        _audit(tool, shown, tier, "ok" if r.get("ok") else "failed")
+        return (tool, _clip(r.get("text") or ""), bool(r.get("ok")))
 
     spec = EXECUTORS.get(tool)
     if spec is None:
