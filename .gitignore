@@ -93,7 +93,7 @@ tianwang_app/app/src/main/cpp/build-android-*/
 tianwang_app/app/src/main/cpp/build*/
 # 2026-11-07：llama.cpp 源码由 build-llama.sh 按固定 tag 浅克隆，几百 MB，不进库
 tianwang_app/third_party/
-tianwang_app/app/src/main/jniLibs/
+# jniLibs 内为运行时引擎，随代码入库备份（CI 构建完整 APK 需要）
 # 电脑/手机侧的验证可执行（verify_host.cpp 才是源码）
 tianwang_app/verify_host_arm64
 tianwang_app/verify_host.exe
@@ -210,3 +210,7 @@ _delegate_media.py
 _gen_media.py
 _*.log
 *.py.partial
+
+# 第三方源码快照：只读参考，不入库
+vendor/termux-app-master/
+vendor/termux-app.zip

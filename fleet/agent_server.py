@@ -19,11 +19,11 @@
   POST /api/compute/ask  用电脑/API 算力回答一句话（手机不落 key）
   POST /api/agent      SSE：一轮 agent loop，逐事件推 step/answer/error
   POST /api/tool/exec  工具箱单点执行（人直接点一个能力，不绕 LLM）
-  GET  /api/resources  混合信息流（资源卡片；topic/limit/cursor/session）
+  GET  /api/resources  混合信息流（topic/limit/cursor/session + 可选 kind/domain 筛选）
   GET  /api/resources/detail?id=   资源详情（多源出处 + 行为）
   GET  /api/resources/search?q=    资源搜索
-  GET  /api/resources/stats        资源/来源/行为/偏好统计
-  POST /api/resources/act          点赞/收藏/评论（写行为与标签权重）
+  GET  /api/resources/stats        资源/来源/行为/偏好统计（含关注主题 focus）
+  POST /api/resources/act          点赞/收藏/评论/关注主题（写行为与标签权重）
   POST /api/resources/import       导入 NetForce 已有 resources.json
   GET  /resources                  资源流单页（静态，无数据；token 从 #t= 读）
 
@@ -214,6 +214,9 @@ class FleetAgentServer:
     def resource_feed(self, q=None):
         return self.resource_center().feed(
             topic=self._q1(q, "topic"),
+            kind=self._q1(q, "kind"),
+            domain=self._q1(q, "domain"),
+            mine=self._q1(q, "mine"),
             limit=self._q1(q, "limit", "20"),
             cursor=self._q1(q, "cursor", "0"),
             session_id=self._q1(q, "session", "default") or "default")

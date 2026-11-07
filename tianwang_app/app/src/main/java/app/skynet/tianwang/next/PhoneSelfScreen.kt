@@ -1,8 +1,6 @@
 package app.skynet.tianwang.next
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -14,8 +12,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,7 +30,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,30 +39,23 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import org.json.JSONObject
 
 /**
- * 「手机本机」页：无障碍通道的开关状态 + 本机能力清单 + 单点执行。
+ * 「设备与权限」页：只放人要看的三项状态（无障碍 / 入网 / 通知）。
  *
- * 验收对齐文档第一步：**不连电脑也能打开指定 App、读出界面文字、点中控件**。
- * 所以这一页自己就是验收入口 —— 不需要 adb，也不需要云侧。
+ * 🔴 本机能力清单是后台给 AI 调用的工具，**不在前台展示**（主人在 2026-11-07 定）。
+ * 能力本体仍在 `PhoneSelf.caps` / `PhoneMcp`，AI 与对等节点照常调用，界面不摆条目。
  */
 @Composable
 fun PhoneSelfPane() {
     val ctx = LocalContext.current
     var connected by remember { mutableStateOf(PhoneSelf.connected()) }
     var enabled by remember { mutableStateOf(PhoneSelf.enabled(ctx)) }
-    var sel by remember { mutableStateOf<SelfCap?>(null) }
-    var argText by remember { mutableStateOf("{}") }
-    var result by remember { mutableStateOf<ToolResult?>(null) }
-    var busy by remember { mutableStateOf(false) }
     var linkStatus by remember { mutableStateOf(PhoneMcpLink.status) }
     var linkConnected by remember { mutableStateOf(PhoneMcpLink.connected) }
     var linkError by remember { mutableStateOf(PhoneMcpLink.lastError) }
     var showLink by remember { mutableStateOf(false) }
     var notifOn by remember { mutableStateOf(NotificationWatch.enabled(ctx)) }
-    val scope = rememberCoroutineScope()
 
     // 用户去系统设置开完再回来时，Compose 不会自己知道 —— 轮询是最省事的衔接。
     LaunchedEffect(Unit) {
@@ -85,7 +73,7 @@ fun PhoneSelfPane() {
     Column(Modifier.fillMaxSize().padding(12.dp)) {
         Text("手机本机", style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface)
-        Text("无障碍通道 · 读界面 / 点控件 / 输入 / 开 App，全程不出本机",
+        Text("无障碍通道 · 后台供 AI 调用，全程不出本机",
             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(8.dp))
 
@@ -112,7 +100,7 @@ fun PhoneSelfPane() {
                 Spacer(Modifier.height(6.dp))
                 Text(
                     when {
-                        connected -> "通道在线。下面每条都真在这台手机上执行。"
+                        connected -> "通道在线。后台能力已就绪，供 AI 与对等节点调用。"
                         enabled -> "系统已授权，但服务还没绑上来。退出设置等 1–2 秒；仍不通就重开 App。"
                         else -> "第一步：点下面的按钮去系统设置；第二步：无障碍 → 天网 Next → 打开开关。"
                     },
@@ -156,7 +144,7 @@ fun PhoneSelfPane() {
                     fontWeight = FontWeight.SemiBold)
                 Text(
                     if (linkConnected) {
-                        "控制面已配对。可调 ${PhoneMcp.toolCount()} 个本机工具；" +
+                        "控制面已配对，后台能力可供调用；" +
                             if (Prefs.mcpAllowActions) "当前允许操作。" else "当前只读。"
                     } else {
                         "手机只主动往外连中继，不开端口、不走 adb。"
@@ -207,7 +195,7 @@ fun PhoneSelfPane() {
                     )
                 }
                 Text(
-                    if (notifOn) "最近通知会留在本机内存（最多 40 条），可用 self_notif_list 读；进程重启即清空。"
+                    if (notifOn) "最近通知会留在本机内存（最多 40 条），供后台读取；进程重启即清空。"
                     else "很多验证码 / 到账 / 消息不必截图，直接读通知更快。去系统设置授予通知使用权。",
                     fontSize = 10.5.sp, lineHeight = 15.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -225,37 +213,6 @@ fun PhoneSelfPane() {
             }
         }
 
-        Spacer(Modifier.height(10.dp))
-        Text("本机能力", fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.padding(start = 2.dp, bottom = 6.dp))
-
-        LazyColumn(
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            items(PhoneSelf.caps) { cap ->
-                Card(
-                    Modifier.fillMaxWidth().clickable {
-                        sel = cap
-                        argText = defaultArgs(cap)
-                        result = null
-                    },
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                        Text(cap.title, fontSize = 13.sp,
-                            color = MaterialTheme.colorScheme.onSurface)
-                        Text(cap.name, fontSize = 10.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text(cap.desc, fontSize = 10.5.sp, lineHeight = 15.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(top = 3.dp))
-                    }
-                }
-            }
-        }
     }
 
     if (showLink) {
@@ -335,78 +292,4 @@ fun PhoneSelfPane() {
         )
     }
 
-    val cap = sel
-    if (cap != null) {
-        AlertDialog(
-            onDismissRequest = { if (!busy) sel = null },
-            title = { Text(cap.title) },
-            text = {
-                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
-                    Text(cap.desc, fontSize = 12.sp, lineHeight = 17.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (cap.params.isNotEmpty()) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            cap.params.joinToString("\n") {
-                                "· ${it.name}(${it.type})${if (it.required) " 必填" else " 可选"} — ${it.desc}"
-                            },
-                            fontSize = 10.5.sp, lineHeight = 16.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text("参数（JSON）", fontSize = 11.sp)
-                        Spacer(Modifier.height(4.dp))
-                        OutlinedTextField(
-                            argText, { argText = it },
-                            modifier = Modifier.fillMaxWidth(), singleLine = false,
-                        )
-                    }
-                    if (busy) {
-                        Spacer(Modifier.height(8.dp))
-                        Text("执行中…", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
-                    }
-                    result?.let { r ->
-                        Spacer(Modifier.height(10.dp))
-                        Text(
-                            if (r.ok) r.text else "失败：${r.err}",
-                            fontSize = 11.5.sp, lineHeight = 17.sp,
-                            color = if (r.ok) MaterialTheme.colorScheme.onSurface
-                            else MaterialTheme.colorScheme.error,
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = !busy,
-                    onClick = {
-                        val args = runCatching { JSONObject(argText).toMap() }.getOrNull() ?: emptyMap()
-                        scope.launch {
-                            busy = true
-                            result = PhoneSelf.run(cap.name, args)
-                            busy = false
-                        }
-                    },
-                ) { Text(if (busy) "执行中" else "执行") }
-            },
-            dismissButton = {
-                TextButton(enabled = !busy, onClick = { sel = null }) { Text("关闭") }
-            },
-        )
-    }
-}
-
-/** 按能力声明的必填参数拼一份可改的模板，省得用户每次从 `{}` 开始猜字段名。 */
-private fun defaultArgs(cap: SelfCap): String {
-    if (cap.params.none { it.required }) return "{}"
-    val o = JSONObject()
-    for (p in cap.params) {
-        if (!p.required) continue
-        when (p.type) {
-            "int", "number" -> o.put(p.name, 0)
-            "bool", "boolean" -> o.put(p.name, false)
-            else -> o.put(p.name, "")
-        }
-    }
-    return o.toString()
 }

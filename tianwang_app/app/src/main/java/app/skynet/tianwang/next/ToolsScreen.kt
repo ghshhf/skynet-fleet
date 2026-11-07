@@ -5,26 +5,32 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.Brush
+import androidx.compose.material.icons.filled.CloudQueue
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,6 +40,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -41,162 +48,115 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 /**
- * 工具箱入口：电脑侧 / 手机本机两条能力面。
+ * 工具箱 —— 只摆「人点一下就做一件事」的动作。
  *
- * 分开但放在同一页，是因为对用户来说都是「点一下真跑」；
- * 区别只在执行端 —— 电脑侧要云连接，手机本机要无障碍通道。
+ * 2026-11-07 主人给的标准：**摆出来的界面是给人用的；给 AI / 别的模块调的
+ * 能力可以有，但不一定要摆出来**。所以这里不再列电脑侧能力清单、本机能力清单，
+ * 不再有坐标点击 / 滑动界面 / 往输入框写字，也不再有让人手填 JSON 参数的执行框。
+ * 那些能力仍在 `PhoneSelf` / `PhoneMcp` / catalog 里，由本地模型与编队调用。
+ *
+ * 布局照国内外大厂的「服务 / 工具」宫格：一屏看完、不用往下滑、顶部不压一块固定区。
  */
 @Composable
-fun ToolsScreen() {
-    var side by remember { mutableStateOf(0) }
-
-    Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            SideChip("电脑侧", side == 0) { side = 0 }
-            SideChip("手机本机", side == 1) { side = 1 }
-        }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-        if (side == 0) RemoteToolsPane() else PhoneSelfPane()
-    }
-}
-
-@Composable
-private fun SideChip(label: String, selected: Boolean, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(
-                if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
-                else MaterialTheme.colorScheme.surfaceVariant
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 7.dp)
-    ) {
-        Text(
-            label,
-            fontSize = 12.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            color = if (selected) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
-/** 电脑侧真实能力按类别列出来，点一下就在电脑上真跑。 */
-@Composable
-private fun RemoteToolsPane() {
-    var groups by remember { mutableStateOf<Map<String, List<Capability>>>(emptyMap()) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf("") }
-    var sel by remember { mutableStateOf<Capability?>(null) }
-    var argText by remember { mutableStateOf("{}") }
-    var result by remember { mutableStateOf<ToolResult?>(null) }
+fun ToolsScreen(
+    onNewChat: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenDevice: () -> Unit,
+    onOpenAbout: () -> Unit,
+    onOpenImage: () -> Unit,
+    speakOn: Boolean,
+    onToggleSpeak: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
+    var info by remember { mutableStateOf("") }
 
-    // 首次进入即拉取（即使已配置也拉；未配置给出明确提示）。
-    if (loading && groups.isEmpty() && err.isEmpty()) {
-        androidx.compose.runtime.LaunchedEffect(Unit) {
-            if (!Net.hasConfig()) {
-                err = "未连接云侧：去「设置」填地址和 Token"
-                loading = false
-                return@LaunchedEffect
-            }
-            runCatching { Net.getCaps() }
-                .onSuccess { groups = it; loading = false }
-                .onFailure { err = it.message ?: "拉取失败"; loading = false }
-        }
-    }
-
-    Column(Modifier.fillMaxSize().padding(12.dp)) {
-        Text("工具箱", style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurface)
-        Text("电脑侧真实能力（按类别）—— 点一下就在电脑上真跑，不是演示",
-            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(8.dp))
-        if (loading) Text("加载中…", fontSize = 12.sp)
-        if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            groups.forEach { (domain, caps) ->
-                item {
-                    Spacer(Modifier.height(4.dp))
-                    Text(domain.uppercase(), fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.primary)
-                }
-                items(caps) { cap ->
-                    Card(
-                        Modifier.fillMaxWidth().clickable {
-                            sel = cap; argText = "{}"; result = null
-                        },
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                        shape = RoundedCornerShape(10.dp),
-                    ) {
-                        Row(Modifier.fillMaxWidth().padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(cap.title.ifEmpty { cap.name },
-                                    fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface)
-                                Text(cap.name, fontSize = 10.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                if (cap.destructive)
-                                    Text("⚠ 不可逆操作", fontSize = 10.sp,
-                                        color = MaterialTheme.colorScheme.error)
-                            }
-                            Spacer(Modifier.width(8.dp))
-                        }
+    val actions = listOf(
+        ToolAction("新对话", "开一段新的", Icons.Filled.Add) { onNewChat() },
+        ToolAction("抓取资源", "自己联网抓一轮", Icons.Filled.Download) {
+            scope.launch {
+                info = "抓取中…"
+                runCatching { ResourceApi.crawl() }
+                    .onSuccess { o ->
+                        info = "抓了 ${o.optInt("sources")}/${o.optInt("sources_total")} 个源，" +
+                            "新增 ${o.optInt("new")} 条"
                     }
-                }
+                    .onFailure { info = it.message ?: "抓取失败" }
+            }
+        },
+        ToolAction("大模型端点", "添加 / 密钥 / 模型", Icons.Filled.CloudQueue) {
+            onOpenSettings()
+        },
+        ToolAction("本机出图", "提示词 → 本机 NPU 出片", Icons.Filled.Brush) {
+            onOpenImage()
+        },
+        ToolAction("朗读", if (speakOn) "当前：开" else "当前：关",
+            if (speakOn) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff) {
+            onToggleSpeak()
+        },
+        ToolAction("设备与权限", "授权 / 通知 / 入网", Icons.Filled.PhoneAndroid) {
+            onOpenDevice()
+        },
+        ToolAction("版本与更新", "关于与后端", Icons.Filled.Info) {
+            onOpenAbout()
+        },
+    )
+
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(2),
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 14.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            Text("常用", fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 2.dp, bottom = 2.dp))
+        }
+        item { Text("") }
+        items(actions) { a -> ToolCard(a) }
+        item {
+            if (info.isNotBlank()) {
+                Text(info, fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 2.dp, top = 4.dp))
             }
         }
-    }
-
-    val cap = sel
-    if (cap != null) {
-        AlertDialog(
-            onDismissRequest = { sel = null },
-            title = { Text(cap.title.ifEmpty { cap.name }) },
-            text = {
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Text(cap.note.ifEmpty { cap.name }, fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (cap.params.isNotEmpty()) {
-                        Spacer(Modifier.height(8.dp))
-                        Text("参数（JSON，例：{\"x\":1}）", fontSize = 11.sp)
-                        Spacer(Modifier.height(4.dp))
-                        OutlinedTextField(argText, { argText = it },
-                            modifier = Modifier.fillMaxWidth(), singleLine = false)
-                    }
-                    result?.let { r ->
-                        Spacer(Modifier.height(10.dp))
-                        Text(
-                            if (r.ok) r.text else "失败：${r.err}",
-                            fontSize = 12.sp, maxLines = 12,
-                            color = if (r.ok) MaterialTheme.colorScheme.onSurface
-                            else MaterialTheme.colorScheme.error)
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val args = runCatching { JSONObject(argText).toMap() }.getOrNull() ?: emptyMap()
-                    scope.launch {
-                        runCatching { Net.execTool(cap.name, args) }.onSuccess { result = it }
-                    }
-                }) { Text("执行") }
-            },
-            dismissButton = { TextButton({ sel = null }) { Text("关闭") } },
-        )
     }
 }
 
+private data class ToolAction(
+    val title: String,
+    val sub: String,
+    val icon: ImageVector,
+    val run: () -> Unit,
+)
+
+@Composable
+private fun ToolCard(a: ToolAction) {
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .clickable(onClick = a.run)
+            .padding(horizontal = 13.dp, vertical = 15.dp),
+    ) {
+        Icon(a.icon, null, tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(23.dp))
+        Spacer(Modifier.height(11.dp))
+        Text(a.title, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface)
+        Spacer(Modifier.height(3.dp))
+        Text(a.sub, fontSize = 10.5.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** 给底层链路 / AI 调用用的参数转换，不摆到人看的界面里。
+ *  PhoneSelfScreen 的手填参数面板仍直接复用它；工具箱本身已不再展示这一层。 */
 fun JSONObject.toMap(): Map<String, Any> {
     val m = mutableMapOf<String, Any>()
     val it = keys()
-    while (it.hasNext()) { val k = it.next(); m[k] = opt(k) }
+    while (it.hasNext()) { val k = it.next(); m[k] = opt(k) ?: JSONObject.NULL }
     return m
 }

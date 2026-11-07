@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS exposures (
   PRIMARY KEY (resource_id, session_id));
 CREATE TABLE IF NOT EXISTS prefs (
   tag TEXT PRIMARY KEY, weight REAL DEFAULT 0, updated_at REAL);
+CREATE TABLE IF NOT EXISTS focus (
+  tag TEXT PRIMARY KEY, created_at REAL);
 """
 
 _TRACK = {
@@ -265,8 +267,17 @@ class ResourceCenter:
 
     # ------------------------------------------------------------ 信息流
 
-    def feed(self, topic="", limit=20, cursor=0, session_id="default"):
+    def feed(self, topic="", limit=20, cursor=0, session_id="default",
+             kind="", domain="", mine=""):
+        """混合信息流。topic 按标题/摘要/标签模糊匹配，kind / domain 精确筛选。
+
+        计划书 P13：来源（domain）是筛选项，不是主分类；分类按内容（tags/kind）。
+        mine = favorite / like：只看本人有该行为的资源（「我」页的收藏/赞过）。
+        """
         topic = (topic or "").strip()
+        kind = (kind or "").strip()
+        domain = (domain or "").strip()
+        mine = (mine or "").strip()
         try:
             limit = max(1, min(50, int(limit)))
             cursor = max(0, int(cursor))
@@ -274,12 +285,23 @@ class ResourceCenter:
             limit, cursor = 20, 0
         now = _now()
         with self._conn() as c:
-            where, args = "", []
+            conds, args = [], []
             if topic:
                 like = "%" + topic + "%"
-                where = ("WHERE r.title LIKE ? OR r.summary LIKE ? OR EXISTS("
-                         "SELECT 1 FROM tags t WHERE t.resource_id=r.id AND t.tag LIKE ?)")
-                args = [like, like, like]
+                conds.append("(r.title LIKE ? OR r.summary LIKE ? OR EXISTS("
+                             "SELECT 1 FROM tags t WHERE t.resource_id=r.id AND t.tag LIKE ?))")
+                args += [like, like, like]
+            if kind:
+                conds.append("r.kind = ?")
+                args.append(kind)
+            if domain:
+                conds.append("r.domain = ?")
+                args.append(domain)
+            if mine in ("favorite", "like"):
+                conds.append("EXISTS(SELECT 1 FROM actions a WHERE a.resource_id=r.id "
+                             "AND a.action=?)")
+                args.append(mine)
+            where = ("WHERE " + " AND ".join(conds)) if conds else ""
             rows = c.execute(
                 "SELECT r.* FROM resources r %s ORDER BY r.created_at DESC LIMIT 500" % where,
                 args).fetchall()
@@ -414,11 +436,30 @@ class ResourceCenter:
             "published_at": _iso(r["published_at"] or r["created_at"]),
         }}
 
+    def list_focus(self):
+        """关注的主题存服务端：换机 / 多台手机打开同一地址，关注列表都还在。"""
+        with self._conn() as c:
+            return [x["tag"] for x in c.execute(
+                "SELECT tag FROM focus ORDER BY created_at DESC").fetchall()]
+
     def act(self, resource_id, action, text=""):
         action = (action or "").strip().lower()
-        if action not in ("like", "favorite", "comment"):
-            return {"ok": False, "err": "action 只支持 like / favorite / comment"}
         text = (text or "").strip()[:500]
+        if action == "focus":
+            tag = text[:24]
+            if not tag:
+                return {"ok": False, "err": "关注主题不能为空"}
+            with self._conn() as c:
+                old = c.execute("SELECT 1 FROM focus WHERE tag=?", (tag,)).fetchone()
+                if old:
+                    c.execute("DELETE FROM focus WHERE tag=?", (tag,))
+                else:
+                    c.execute("INSERT OR IGNORE INTO focus(tag,created_at) VALUES(?,?)",
+                              (tag, _now()))
+            return {"ok": True, "action": "focus", "added": not bool(old),
+                    "focus": self.list_focus()}
+        if action not in ("like", "favorite", "comment"):
+            return {"ok": False, "err": "action 只支持 like / favorite / comment / focus"}
         if action == "comment" and not text:
             return {"ok": False, "err": "评论不能为空"}
         with self._conn() as c:
@@ -458,7 +499,7 @@ class ResourceCenter:
                 "origins": one("SELECT COUNT(*) FROM origins"),
                 "actions": one("SELECT COUNT(*) FROM actions"),
                 "tags": one("SELECT COUNT(DISTINCT tag) FROM tags"),
-                "prefs": prefs}
+                "prefs": prefs, "focus": self.list_focus()}
 
 
 def _diverse(items, limit):

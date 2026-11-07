@@ -11,7 +11,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
-/** 云侧连接 + 对话 SSE + 工具箱 + 进度。单例，配置存 SharedPreferences。 */
+/** 局域网/对等节点连接（可选）+ 对话 SSE + 工具箱 + 进度。 */
 object Net {
     private const val SP = "tianwang_agent"
     private const val K_URL = "agent_url"
@@ -42,8 +42,11 @@ object Net {
         )
     }
 
+    /** 界面显示真实保存值：空就是空，不折回 USB 反代默认地址。 */
+    fun rawUrl(): String = sp.getString(K_URL, "") ?: ""
+
     /**
-     * 能连云侧吗。两种钥匙任一即可：
+     * 能连局域网节点吗。两种钥匙任一即可：
      *   · token —— 老的一次性令牌（本机调试、老版本电脑端）；
      *   · deviceId/secret —— 配对换来的长期凭据（电脑重启也不变）。
      * 只认 token 会让「配对后清空 token」的流程永远显示未配置。

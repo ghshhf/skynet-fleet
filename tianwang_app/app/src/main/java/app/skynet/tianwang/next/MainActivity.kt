@@ -15,11 +15,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,12 +33,23 @@ import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.ThumbUp
+import androidx.compose.material.icons.filled.Label
+import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
@@ -47,7 +57,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -56,7 +65,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
@@ -79,12 +87,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         App.bind(this)
         Net.init(applicationContext)
+        // 电脑上已有凭据按「端点列表」格式一次性交给手机：只落本机，接完即删源件，日志不写内容。
+        // 之后加端点在设置页手动完成，不再需要改代码或重装。
+        val dropped = LlmConfig.importDropped(applicationContext)
+        if (dropped > 0) {
+            Log.i("TianwangLlm", "已导入 $dropped 条本机大模型端点")
+        }
         // 上次若开着「手机入网」，进程重启后自己接回中继；不要求用户每次手动重连。
         if (Prefs.mcpEnabled && Prefs.mcpConfigured()) PhoneLinkService.start(this)
         if (Prefs.ddnsEnabled) PhoneLinkService.start(this)
         // 出声（总纲第 1 条空白）。默认关，界面上那个喇叭点了才念。
         Speech.init(applicationContext)
-        // 云侧连接可由 adb 一次性注入，免得每次装机都要在手机上手动敲一遍：
+        // 可选的局域网节点配置可由 adb 一次性注入，免得每次装机都要在手机上手动敲一遍：
         //   adb shell am start -n app.skynet.tianwang.next/.MainActivity \
         //       --es agentUrl http://127.0.0.1:9124 --es agentToken <token>
         intent?.getStringExtra("agentUrl")?.takeIf { it.isNotBlank() }?.let { u ->
@@ -94,7 +108,7 @@ class MainActivity : ComponentActivity() {
         // 模型目录必须由系统给：`/sdcard/...` 硬编码在 targetSdk 35 下读不到
         // 自己的 Android/data（File.exists() 恒 false ⇒ UI 谎报「没下载完」）。
         Demo.modelDir = java.io.File(getExternalFilesDir(null), "models").absolutePath
-        Log.i("TianwangModels", "dir=${Demo.modelDir}")
+        Log.i("TianwangModels", "dir=${Demo.modelDir} 本机 GGUF ${ModelCatalog.local().size} 个")
         val found = ModelCatalog.local()
         Log.i("TianwangModels", "扫描到 ${found.size} 个 GGUF")
         found.forEach { Log.i("TianwangModels", "${it.label} ${it.sizeMb}MB ${it.target}") }
@@ -199,14 +213,48 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class Tab(val label: String) {
-    CHAT("对话"), MODELS("模型"), TOOLS("工具箱"), RES("资源"), TASKS("任务"),
-    FLEET("编队"), SETTINGS("设置")
+    CHAT("对话"), RES("资源"), TOOLS("工具箱"), ME("我")
+}
+
+/**
+ * 二级页：从底栏收进抽屉的低频页 + 「我」页里点开的内容页。
+ * 底栏只放 4 个「每天要用」的，其余一律点一下再进 —— 这是国内外大厂的
+ * 共同做法，也是 Material 官方 3–5 个顶级入口的上限。
+ */
+private enum class Overlay(val title: String, val sub: String) {
+    MODELS("模型与网关", "本地 GGUF + 云端网关"),
+    TASKS("任务进度", "项目整体进度"),
+    FLEET("编队节点", "我在编队里的位置"),
+    FAVORITES("我的收藏", "收藏过的资源卡片"),
+    LIKED("我赞过的", "点过赞的资源卡片"),
+    FOCUS("关注主题", "决定信息流里先看到什么"),
+    SETTINGS("设置", "会改变行为的开关"),
+    DEVICE("设备与权限", "无障碍 / 通知 / 手机入网"),
+    ABOUT("关于与版本", "版本与后端信息"),
+    IMAGE("本机出图", "手机自己跑 diffusion · 提示词出片"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun App() {
     var tab by remember { mutableStateOf(Tab.CHAT) }
+    // 一条命令直达二级页 / 自动自检：HyperOS 拦了 adb input（INJECT_EVENTS），
+    // 点不了屏，所以留 intent 入口给机主和验收用，跟已有的 speaktest 一个路子。
+    //   adb shell am start -n app.skynet.tianwang.next/.MainActivity \
+    //       --es tw_page image --ez tw_selftest true
+    //   adb shell am start -n app.skynet.tianwang.next/.MainActivity \
+    //       --es tw_page image --es tw_prompt "a lighthouse at dawn"
+    val launchIntent = (androidx.compose.ui.platform.LocalContext.current
+        as? android.app.Activity)?.intent
+    val launchImage = launchIntent?.getStringExtra("tw_page") == "image"
+    val launchSelftest = launchIntent?.getBooleanExtra("tw_selftest", false) == true
+    val launchPrompt = launchIntent?.getStringExtra("tw_prompt") ?: ""
+    // 验收用：启动即展开左侧抽屉，便于在不模拟点击的机器上直接截图核对历史布局。
+    //   adb shell am start -n app.skynet.tianwang.next/.MainActivity --ez tw_drawer true
+    val launchDrawer = launchIntent?.getBooleanExtra("tw_drawer", false) == true
+    // 二级页 + 全局左侧抽屉。overlay 非空时顶栏变返回箭头，底栏保持不变。
+    var overlay by remember { mutableStateOf<Overlay?>(if (launchImage) Overlay.IMAGE else null) }
+    val drawerState = rememberDrawerState(if (launchDrawer) DrawerValue.Open else DrawerValue.Closed)
     // 默认选「这台手机真跑得动」的那个：1.7B 是普适甜点——本机（K70E/天玑8300）
     // 实测 9.8 tok/s，4B 只有 2.9 tok/s（首字 4.2s），明显卡手。
     // 强机（另一台能跑 4B 的）在模型页手动切，不靠这里猜。
@@ -215,8 +263,7 @@ private fun App() {
     //    一台没装模型的手机就真的显示「没有模型」，而不是编三个文件名出来。
     val models = remember { mutableStateListOf<ModelProfile>() }
     var current by remember { mutableStateOf<ModelProfile?>(null) }
-    var sheet by remember { mutableStateOf(false) }
-    val sheetState = rememberModalBottomSheetState()
+    // 历史对话直接列在左侧抽屉里，不再从主页面中间弹面板（2026-11-07 主人）。
     val scope = rememberCoroutineScope()
     // 她出不出声。初值从存储读——上次开过的这次还开着，不是每次启动都重置。
     var speakOn by remember { mutableStateOf(Speech.enabled()) }
@@ -224,14 +271,33 @@ private fun App() {
     // （踩过：@Composable invocations can only happen from the context of a @Composable function）
     val ctx = androidx.compose.ui.platform.LocalContext.current
 
+    // 启动后台把首页 20 条的封面 / 摘要预先备好，进资源页直接出图，不等网络。
+    // 单独一条协程，不跟下面的模型初始化串行。
+    LaunchedEffect(Unit) { runCatching { ResourceApi.prefetchFirstPage() } }
+    // 验收用：启动直接落在资源页，方便核对首屏预热效果。
+    //   adb shell am start -n app.skynet.tianwang.next/.MainActivity --es tw_tab res
+    LaunchedEffect(Unit) {
+        if (launchIntent?.getStringExtra("tw_tab") == "res") tab = Tab.RES
+    }
+
     LaunchedEffect(Unit) {
         val local = ModelCatalog.local()
         models.clear()
         models.addAll(local)
-        // 默认选「这台机器最可能跑得动」的：本地最小那个。上次选过就沿用上次。
+        // 默认选本机跑得动又够用的：1.7B 优先（真机实测 9.8 tok/s），
+        // 没装就挑最小那个；上次选过的一律沿用上次。
         val remembered = Prefs.lastModelId
-        current = local.firstOrNull { it.id == remembered }
+        val preferred = local.firstOrNull { it.id.contains("1.7B", true) }
             ?: local.minByOrNull { it.sizeMb }
+        current = local.firstOrNull { it.id == remembered } ?: preferred
+        // 手机拿本机密钥直连厂商：每一条手动添加的端点都在模型页有一条，选哪条用哪把钥匙。
+        val directs = LlmConfig.cloudModels()
+        models.addAll(directs)
+        if (current == null || current?.id == remembered) {
+            current = local.firstOrNull { it.id == remembered }
+                ?: preferred ?: directs.firstOrNull()
+        }
+        // 对等节点是可选加分项：登记过才拉网关，没登记本机直连照常能聊。
         if (Net.hasConfig()) {
             runCatching { Net.getProviders() }.onSuccess { gws ->
                 val cloud = ModelCatalog.cloud(gws, Net.loadConfig().token)
@@ -251,8 +317,8 @@ private fun App() {
     //    模型是 adb push / 删除出来的，进程不重启就永远看不到变化 ——
     //    删掉的文件还挂在列表里点得动，新推的模型要杀进程才出现，这是实测撞到的。
     //    重扫只在没在推理时做，避免把正在加载的模型踢掉。
-    LaunchedEffect(tab) {
-        if (tab != Tab.MODELS) return@LaunchedEffect
+    LaunchedEffect(overlay) {
+        if (overlay != Overlay.MODELS) return@LaunchedEffect
         val local = ModelCatalog.local()
         val ids = local.map { it.id }.toSet()
         // 本地项整段换新；云端项保留（重扫不该把网关丢掉）
@@ -367,8 +433,41 @@ private fun App() {
                 }
             }
         }
+        else if (model.id.startsWith("llm-direct:") ||
+            (!Net.hasConfig() && LlmConfig.get().ready)) {
+            // 手机拿本机密钥直连厂商：不经过电脑，也不需要任何节点在线。
+            val profile = if (model.id.startsWith("llm-direct:")) model
+            else LlmConfig.cloudModel()
+            if (profile == null) {
+                update(msgs, replyId) {
+                    it.copy(failed = "还没填好大模型 API 配置", streaming = false)
+                }
+                busy = false
+            } else {
+                scope.launch {
+                    val history = msgs.filter { it.id != replyId }
+                    CloudBackend.chat(
+                        profile, history,
+                        onDelta = { d -> update(msgs, replyId) { it.copy(text = it.text + d) } },
+                        onTool = {},
+                    ).onSuccess { full ->
+                        update(msgs, replyId) {
+                            it.copy(text = full.ifEmpty { it.text }, streaming = false)
+                        }
+                        busy = false
+                        persist()
+                        Speech.speak(full)
+                    }.onFailure { e ->
+                        update(msgs, replyId) {
+                            it.copy(failed = e.message ?: "直连失败", streaming = false)
+                        }
+                        busy = false
+                    }
+                }
+            }
+        }
         else if (Net.hasConfig()) {
-            // 真链路：手机 → 云侧 SSE → 电脑侧 agentloop 真跑（工具 + 回答都是真的）
+            // 可选：登记过的对等节点，手机 → 节点 SSE → agentloop（工具 + 回答都是真的）
             val steps = androidx.compose.runtime.mutableStateListOf<ToolCall>()
             scope.launch {
                 Net.streamAgent(text,
@@ -391,10 +490,10 @@ private fun App() {
             }
         }
         else {
-            // 云模型但没连云侧：直接说清楚，不再演一段假流式糊过去
+            // 既没把密钥交给手机、也没登记可选节点：说清楚缺的是哪一样
             update(msgs, replyId) {
                 it.copy(
-                    failed = "云模型需要先连云侧：去「设置」填地址和 Token",
+                    failed = "去「设置」把大模型 API 密钥交给手机；或登记可选的局域网节点",
                     streaming = false,
                 )
             }
@@ -402,6 +501,44 @@ private fun App() {
         }
     }
 
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                AppDrawer(
+                    sessions = sessions,
+                    currentSessionId = currentSessionId,
+                    onSelect = { s ->
+                        // 点历史 = 先保住当前这段，再把那段装进来；抽屉当场收起。
+                        persist()
+                        msgs.clear()
+                        msgs.addAll(s.msgs)
+                        currentSessionId = s.id
+                        s.modelId.takeIf { it.isNotBlank() }?.let { mid ->
+                            models.firstOrNull { it.id == mid }?.let {
+                                current = it
+                                Prefs.lastModelId = it.id
+                            }
+                        }
+                        tab = Tab.CHAT
+                        scope.launch { drawerState.close() }
+                    },
+                    onNewChat = {
+                        scope.launch { drawerState.close() }
+                        overlay = null
+                        persist()
+                        msgs.clear()
+                        currentSessionId = null
+                        tab = Tab.CHAT
+                    },
+                    onOpen = { ov ->
+                        scope.launch { drawerState.close() }
+                        overlay = ov
+                    },
+                )
+            }
+        },
+    ) {
     Scaffold(
         modifier = Modifier.fillMaxSize().statusBarsPadding(),
         containerColor = MaterialTheme.colorScheme.background,
@@ -410,20 +547,17 @@ private fun App() {
                 title = {
                     Column {
                         Text(
-                            "天网 Next",
+                            overlay?.title ?: "天网 Next",
                             fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
                         Text(
-                            when (tab) {
+                            overlay?.sub ?: when (tab) {
                                 Tab.CHAT -> msgs.lastOrNull { it.role == ChatMsg.Role.USER }?.text
                                     ?.take(20) ?: "新对话"
-                                Tab.MODELS -> "本地 + 云端，一个列表"
-                                Tab.TOOLS -> "电脑侧真实能力"
-                                Tab.RES -> "电脑侧资源流"
-                                Tab.TASKS -> "项目整体进度"
-                                Tab.FLEET -> "我在编队里的位置"
-                                Tab.SETTINGS -> "会改变行为的开关"
+                                Tab.RES -> "按内容分类的信息流"
+                                Tab.TOOLS -> "常用动作，点一下就做"
+                                Tab.ME -> "我的内容与设置"
                             },
                             fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -432,15 +566,21 @@ private fun App() {
                     }
                 },
                 navigationIcon = {
-                    if (tab == Tab.CHAT) {
-                        IconButton(onClick = { sheet = true }) {
-                            Icon(Icons.Filled.Menu, "会话",
+                    val ov = overlay
+                    if (ov != null) {
+                        IconButton(onClick = { overlay = null }) {
+                            Icon(Icons.Filled.ArrowBack, "返回",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    } else {
+                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                            Icon(Icons.Filled.Menu, "菜单",
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 },
                 actions = {
-                    if (tab == Tab.CHAT) {
+                    if (tab == Tab.CHAT && overlay == null) {
                         IconButton(onClick = {
                             // 新对话 = 先把当前这段存好再清空。
                             // 旧版只 add 一个空 Session，当前对话直接蒸发（第三条 bug 的另一半）。
@@ -473,12 +613,9 @@ private fun App() {
                                 Icon(
                                     when (t) {
                                         Tab.CHAT -> Icons.Filled.ChatBubbleOutline
-                                        Tab.MODELS -> Icons.Filled.Memory
-                                        Tab.TOOLS -> Icons.Filled.Build
                                         Tab.RES -> Icons.Filled.Explore
-                                        Tab.TASKS -> Icons.Filled.Assignment
-                                        Tab.FLEET -> Icons.Filled.Devices
-                                        Tab.SETTINGS -> Icons.Filled.Settings
+                                        Tab.TOOLS -> Icons.Filled.Build
+                                        Tab.ME -> Icons.Filled.Person
                                     },
                                     t.label,
                                 )
@@ -498,15 +635,16 @@ private fun App() {
         },
     ) { pad ->
         Box(Modifier.fillMaxSize().padding(pad)) {
-            when (tab) {
+            when (val ov = overlay) {
+                null -> when (tab) {
                 Tab.CHAT -> ChatScreen(
                     msgs = msgs,
                     model = current,
                     busy = busy,
-                    onPickModel = { tab = Tab.MODELS },
+                    onPickModel = { overlay = Overlay.MODELS },
                     onSend = { send(it) },
                     onStop = { LocalBackend.abort() },
-                    onOpenSettings = { tab = Tab.SETTINGS },
+                    onOpenSettings = { overlay = Overlay.SETTINGS },
                     speakOn = speakOn,
                     onToggleSpeak = {
                         speakOn = Speech.toggle()
@@ -518,128 +656,210 @@ private fun App() {
                         }
                     },
                 )
-                Tab.MODELS -> ModelsScreen(models, current?.id ?: "",
+                Tab.RES -> ResourcesScreen()
+                Tab.TOOLS -> ToolsScreen(
+                    onNewChat = {
+                        persist()
+                        msgs.clear()
+                        currentSessionId = null
+                        tab = Tab.CHAT
+                    },
+                    onOpenSettings = { overlay = Overlay.SETTINGS },
+                    onOpenDevice = { overlay = Overlay.DEVICE },
+                    onOpenAbout = { overlay = Overlay.ABOUT },
+                    onOpenImage = { overlay = Overlay.IMAGE },
+                    speakOn = speakOn,
+                    onToggleSpeak = { speakOn = Speech.toggle() },
+                )
+                Tab.ME -> MineScreen(
+                    onFavorites = { overlay = Overlay.FAVORITES },
+                    onLiked = { overlay = Overlay.LIKED },
+                    onFocus = { overlay = Overlay.FOCUS },
+                    onSettings = { overlay = Overlay.SETTINGS },
+                    onDevice = { overlay = Overlay.DEVICE },
+                    onAbout = { overlay = Overlay.ABOUT },
+                )
+                }
+                Overlay.MODELS -> ModelsScreen(models, current?.id ?: "",
                     onPick = {
                         current = it
                         Prefs.lastModelId = it.id
                     },
                     onChanged = {
-                        // 导入/删除后重扫目录：新模型立刻出现在列表里，
-                        // 不用杀进程（这是实测撞到的坑，见 2026-10-26 日志）
                         val local = ModelCatalog.local()
                         val cloud = models.filter { it.kind != BackendKind.LOCAL }
                         models.clear()
                         models.addAll(local)
                         models.addAll(cloud)
                     })
-                Tab.TOOLS -> ToolsScreen()
-                Tab.RES -> ResourcesScreen()
-                Tab.TASKS -> TasksScreen()
-                Tab.FLEET -> FleetScreen()
-                Tab.SETTINGS -> SettingsScreen()
+                Overlay.TASKS -> TasksScreen()
+                Overlay.FLEET -> FleetScreen()
+                Overlay.SETTINGS -> SettingsScreen()
+                Overlay.DEVICE -> PhoneSelfPane()
+                Overlay.FAVORITES -> MineListScreen("favorite")
+                Overlay.LIKED -> MineListScreen("like")
+                Overlay.FOCUS -> MineFocusScreen()
+                Overlay.ABOUT -> MineAboutScreen()
+                Overlay.IMAGE -> ImageScreen(
+                    autoSelftest = launchSelftest,
+                    autoPrompt = launchPrompt,
+                )
             }
         }
     }
+    }
+}
 
-    if (sheet) {
-        ModalBottomSheet(
-            onDismissRequest = { sheet = false },
-            sheetState = sheetState,
-            containerColor = MaterialTheme.colorScheme.surface,
+/**
+ * 左侧抽屉（点 ☰ 或侧滑）：历史对话就在侧边，不再从主页面中间弹面板。
+ *
+ * 参考主流对话 App 的排法：顶部「新对话」+ 搜索，中间按今天 / 昨天 / 7 天内
+ * 分组的历史列表，点一条直接切过去并收起抽屉；低频页放列表末尾跟着滚，
+ * 不占固定高度，历史再少也不会把列表挤没。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppDrawer(
+    sessions: List<Session>,
+    currentSessionId: String?,
+    onSelect: (Session) -> Unit,
+    onNewChat: () -> Unit,
+    onOpen: (Overlay) -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    Column(
+        Modifier.fillMaxWidth()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .padding(horizontal = 12.dp, vertical = 14.dp),
+    ) {
+        Text("天网 Next", fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface)
+        Text("本机节点 · 历史对话", fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(14.dp))
+
+        // 新对话置顶：主流 AI App 的第一入口，不用再点进二级页。
+        NavigationDrawerItem(
+            label = { Text("新对话", fontSize = 13.sp, fontWeight = FontWeight.SemiBold) },
+            selected = false,
+            onClick = onNewChat,
+            icon = { Icon(Icons.Filled.Add, null, modifier = Modifier.size(20.dp)) },
+            modifier = Modifier.padding(bottom = 8.dp),
+        )
+
+        // 搜索：标题 + 消息正文都搜（历史多了以后，翻是翻不动的）
+        Box(
+            Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(22.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .padding(horizontal = 14.dp, vertical = 10.dp),
         ) {
-            Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp)) {
-                // 搜索：标题 + 消息正文都搜（历史多了以后，翻是翻不动的）
-                var query by remember { mutableStateOf("") }
-                Box(
-                    Modifier.fillMaxWidth()
-                        .clip(RoundedCornerShape(22.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                ) {
-                    if (query.isEmpty()) {
-                        Text("搜索对话…", fontSize = 13.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    BasicTextField(
-                        value = query,
-                        onValueChange = { query = it },
-                        singleLine = true,
-                        textStyle = TextStyle(
-                            fontSize = 13.sp,
-                            color = MaterialTheme.colorScheme.onSurface),
-                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                Spacer(Modifier.height(10.dp))
-
-                val q = query.trim()
-                val visible = if (q.isEmpty()) sessions else sessions.filter { s ->
-                    s.title.contains(q, true) || s.msgs.any { it.text.contains(q, true) }
-                }
-                when {
-                    sessions.isEmpty() -> Text(
-                        "还没有历史 —— 说过的话会自动存下来，重开 App 也还在。",
-                        fontSize = 11.5.sp, lineHeight = 17.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    visible.isEmpty() -> Text(
-                        "没搜到「$q」。",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    else -> LazyColumn(
-                        Modifier.heightIn(max = 520.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        items(historyRows(visible), key = { it.key }) { row ->
-                            val h = row.header
-                            if (h != null) {
-                                Text(h, fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(
-                                        start = 4.dp, top = 12.dp, bottom = 2.dp))
-                            } else {
-                                val s = row.session!!
-                                val active = s.id == currentSessionId
-                                Row(
-                                    Modifier.fillMaxWidth()
-                                        .clickable {
-                                            // 点历史 = 先保住当前这段，再把那段装进来
-                                            persist()
-                                            msgs.clear()
-                                            msgs.addAll(s.msgs)
-                                            currentSessionId = s.id
-                                            s.modelId.takeIf { it.isNotBlank() }?.let { mid ->
-                                                models.firstOrNull { it.id == mid }?.let {
-                                                    current = it
-                                                    Prefs.lastModelId = it.id
-                                                }
-                                            }
-                                            sheet = false
-                                            tab = Tab.CHAT
-                                        }
-                                        .padding(horizontal = 4.dp, vertical = 12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Text(
-                                        s.title, fontSize = 14.sp, maxLines = 1,
-                                        color = if (active) MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurface,
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    if (active) {
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("当前", fontSize = 10.5.sp,
-                                            color = MaterialTheme.colorScheme.primary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(24.dp))
+            if (query.isEmpty()) {
+                Text("搜索对话…", fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            BasicTextField(
+                value = query,
+                onValueChange = { query = it },
+                singleLine = true,
+                textStyle = TextStyle(
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurface),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+
+        val q = query.trim()
+        val visible = if (q.isEmpty()) sessions else sessions.filter { s ->
+            s.title.contains(q, true) || s.msgs.any { it.text.contains(q, true) }
+        }
+        LazyColumn(
+            Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            item { DrawerGroup("历史对话 · ${sessions.size} 段") }
+            when {
+                sessions.isEmpty() -> item {
+                    Text("还没有历史 —— 说过的话会自动存下来，重开 App 也还在。",
+                        fontSize = 11.5.sp, lineHeight = 17.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 8.dp, top = 6.dp))
+                }
+                visible.isEmpty() -> item {
+                    Text("没搜到「$q」。", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 8.dp, top = 6.dp))
+                }
+                else -> items(historyRows(visible), key = { it.key }) { row ->
+                    val h = row.header
+                    if (h != null) {
+                        Text(h, fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 8.dp, top = 12.dp, bottom = 2.dp))
+                    } else {
+                        val s = row.session!!
+                        val active = s.id == currentSessionId
+                        NavigationDrawerItem(
+                            label = {
+                                Text(s.title, fontSize = 13.sp, maxLines = 1,
+                                    color = if (active) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurface)
+                            },
+                            selected = active,
+                            onClick = { onSelect(s) },
+                            icon = {
+                                Icon(Icons.Filled.ChatBubbleOutline, null,
+                                    modifier = Modifier.size(18.dp))
+                            },
+                            badge = {
+                                if (active) Text("当前", fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.primary)
+                            },
+                            modifier = Modifier.padding(bottom = 2.dp),
+                        )
+                    }
+                }
+            }
+            item {
+                Spacer(Modifier.height(14.dp))
+                DrawerGroup("从底栏收进来")
+            }
+            item { DrawerItem(Icons.Filled.Memory, "模型与网关", "本地 GGUF / 云侧") { onOpen(Overlay.MODELS) } }
+            item { DrawerItem(Icons.Filled.Assignment, "任务进度", "项目整体进度") { onOpen(Overlay.TASKS) } }
+            item { DrawerItem(Icons.Filled.Devices, "编队节点", "我在编队里的位置") { onOpen(Overlay.FLEET) } }
+            item { DrawerGroup("设备") }
+            item { DrawerItem(Icons.Filled.PhoneAndroid, "设备与权限", "授权与入网") { onOpen(Overlay.DEVICE) } }
+            item { Spacer(Modifier.height(16.dp)) }
         }
     }
+}
+
+@Composable
+private fun DrawerGroup(t: String) {
+    Text(t, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(start = 8.dp, bottom = 6.dp))
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DrawerItem(icon: ImageVector, label: String, sub: String, onClick: () -> Unit) {
+    NavigationDrawerItem(
+        label = { Text(label, fontSize = 13.sp) },
+        selected = false,
+        onClick = onClick,
+        icon = { Icon(icon, null, modifier = Modifier.size(20.dp)) },
+        badge = {
+            if (sub.isNotBlank()) {
+                Text(sub, fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        modifier = Modifier.padding(bottom = 4.dp),
+    )
 }
 
 /** 原地改列表里某条消息。原型用它模拟流式；真链路也走同一个入口。 */
@@ -693,20 +913,3 @@ private fun midnight(at: Long): Long =
         set(java.util.Calendar.SECOND, 0)
         set(java.util.Calendar.MILLISECOND, 0)
     }.timeInMillis
-
-/**
- * 会话时间：今天只给时分，其余给月日。
- * 一年前的会话在抽屉里显示 "14:32" 会让人以为是今天的 —— 所以先判天数。
- */
-private fun clock(at: Long): String {
-    if (at <= 0) return ""
-    val now = java.util.Calendar.getInstance()
-    val t = java.util.Calendar.getInstance().apply { timeInMillis = at }
-    val sameDay = now.get(java.util.Calendar.YEAR) == t.get(java.util.Calendar.YEAR) &&
-        now.get(java.util.Calendar.DAY_OF_YEAR) == t.get(java.util.Calendar.DAY_OF_YEAR)
-    return if (sameDay) {
-        "%02d:%02d".format(t.get(java.util.Calendar.HOUR_OF_DAY), t.get(java.util.Calendar.MINUTE))
-    } else {
-        "%d月%d日".format(t.get(java.util.Calendar.MONTH) + 1, t.get(java.util.Calendar.DAY_OF_MONTH))
-    }
-}

@@ -236,7 +236,8 @@ object CloudBackend : ModelBackend {
                 IllegalStateException("端点和模型名都得填（模型页里还没选具体模型）"))
         }
         val url = profile.target.trimEnd('/') + "/chat/completions"
-        val key = Net.loadConfig().token
+        // 每个端点用自己那把密钥，不能拿「当前选中」的去请求别的厂商
+        val key = LlmConfig.keyFor(profile.target)
 
         val arr = JSONArray()
         // 直连网关时没有云侧的 system 提示可用，语言约束只能本机自己加
@@ -307,7 +308,7 @@ object CloudBackend : ModelBackend {
         try {
             conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                val k = Net.loadConfig().token
+                val k = LlmConfig.keyFor(profile.target)
                 if (k.isNotBlank()) setRequestProperty("Authorization", "Bearer $k")
                 connectTimeout = 8000
                 readTimeout = 12_000

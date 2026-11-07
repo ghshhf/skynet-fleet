@@ -5,15 +5,13 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URLEncoder
 
 /**
- * 资源流客户端：只跟电脑侧的 /api/resources* 说话。
+ * 资源流门面：本机库 + 自己联网。
  *
- * 为什么单独一个文件：手机不抓取、不做推荐、不存资源库——这些都在电脑侧
- * `resource_center.py`。手机只负责把卡片刷出来、把赞/收藏/评论送回去。
- * 这样换手机、重装 App 都不丢行为数据。
+ * 手机是完整节点 —— 存、抓、查、显示都在本机闭环，不需要别的软件先装好、先开着。
+ * 电脑或其他节点只是可选共享来源：调得到就合并一批，调不到本机库照常能刷。
+ * 方法签名保持不变，界面不用关心数据是从本机库还是从共享来的。
  */
 data class ResourceCard(
     val id: String,
@@ -44,50 +42,24 @@ data class ResourceDetail(
 data class ResourceFeed(val items: List<ResourceCard>, val next: Int?, val total: Int)
 
 object ResourceApi {
-    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
 
-    private fun read(c: HttpURLConnection): String {
-        val stream = if (c.responseCode in 200..299) c.inputStream else c.errorStream
-        return stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-    }
+    /** 进程内固定的信息流会话：预热器与资源页取到同一批，预热才不会白做。 */
+    val FEED_SESSION: String = "phone-" + java.util.UUID.randomUUID().toString().take(8)
 
-    private fun get(path: String, timeout: Int = 15_000): JSONObject {
-        val c = Net.auth(Api.endpoint(Net.loadConfig().url, path))
-        c.readTimeout = timeout
-        try {
-            val body = read(c)
-            if (c.responseCode !in 200..299) {
-                throw IOException("HTTP ${c.responseCode} ${body.take(120)}")
-            }
-            return JSONObject(body)
-        } finally {
-            c.disconnect()
-        }
-    }
+    /** App 启动时后台把首页 20 条的封面 / 摘要预先备好。 */
+    suspend fun prefetchFirstPage(): Unit = ResourcePrefetch.warmFirstPage(FEED_SESSION)
 
-    private fun post(path: String, body: JSONObject): JSONObject {
-        val c = Net.auth(Api.endpoint(Net.loadConfig().url, path))
-        c.requestMethod = "POST"
-        c.doOutput = true
-        c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        // 导入要读电脑侧两个 JSON，可能比普通请求慢；15s 不够时会误报「连不上」。
-        c.readTimeout = 60_000
-        try {
-            c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            val raw = read(c)
-            if (c.responseCode !in 200..299) {
-                throw IOException("HTTP ${c.responseCode} ${raw.take(120)}")
-            }
-            return JSONObject(raw)
-        } finally {
-            c.disconnect()
-        }
-    }
+    /** 预热任意一批（新一页 / 滑动补漏）；返回可立即显示的预览。 */
+    suspend fun prefetch(urls: List<String>): Map<String, LinkPreview> =
+        ResourcePrefetch.warm(urls)
 
+    /** 共享接口拿到的 JSON 卡片仍走这套解析，字段名与电脑侧 /api/resources 一致。 */
     internal fun parseCard(o: JSONObject): ResourceCard {
         val tags = ArrayList<String>()
         o.optJSONArray("tags")?.let { a: JSONArray ->
-            for (i in 0 until a.length()) a.optString(i).takeIf { it.isNotBlank() }?.let { tags.add(it) }
+            for (i in 0 until a.length()) {
+                a.optString(i).takeIf { it.isNotBlank() }?.let { tags.add(it) }
+            }
         }
         return ResourceCard(
             id = o.optString("id"),
@@ -117,48 +89,52 @@ object ResourceApi {
     }
 
     suspend fun feed(topic: String, cursor: Int, session: String): ResourceFeed =
-        withContext(Dispatchers.IO) {
-            val q = StringBuilder("/api/resources?limit=20&cursor=$cursor&session=${enc(session)}")
-            if (topic.isNotBlank()) q.append("&topic=${enc(topic)}")
-            parseFeed(get(q.toString()))
-        }
+        withContext(Dispatchers.IO) { ResourceStore.feed(topic, cursor, session) }
 
-    suspend fun detail(id: String): ResourceDetail = withContext(Dispatchers.IO) {
-        val o = get("/api/resources/detail?id=${enc(id)}")
-        if (!o.optBoolean("ok", false)) throw IOException(o.optString("err", "详情失败"))
-        val it = o.getJSONObject("item")
-        val origins = ArrayList<ResourceOrigin>()
-        it.optJSONArray("origins")?.let { a ->
-            for (i in 0 until a.length()) a.optJSONObject(i)?.let { x ->
-                origins.add(
-                    ResourceOrigin(
-                        x.optString("source_id"),
-                        x.optString("url"),
-                        x.optString("external_id"),
-                        x.optString("fetched_at"),
-                    )
-                )
-            }
-        }
-        val actions = ArrayList<ResourceAction>()
-        it.optJSONArray("actions")?.let { a ->
-            for (i in 0 until a.length()) a.optJSONObject(i)?.let { x ->
-                actions.add(ResourceAction(x.optString("action"), x.optString("text"), x.optString("created_at")))
-            }
-        }
-        ResourceDetail(parseCard(it), origins, actions)
-    }
+    suspend fun detail(id: String): ResourceDetail =
+        withContext(Dispatchers.IO) { ResourceStore.detail(id) }
 
     suspend fun act(id: String, action: String, text: String = ""): JSONObject =
+        withContext(Dispatchers.IO) { ResourceStore.act(id, action, text) }
+
+    /** 兼容旧按钮名：现在报告随包成果的落地条数，不再去别的软件里搬。 */
+    suspend fun importExisting(): JSONObject =
+        withContext(Dispatchers.IO) { ResourceStore.seedStatus() }
+
+    suspend fun stats(): JSONObject =
+        withContext(Dispatchers.IO) { ResourceStore.stats() }
+
+    suspend fun mine(kind: String, cursor: Int, session: String): ResourceFeed =
+        withContext(Dispatchers.IO) { ResourceStore.feed("", cursor, session, mine = kind) }
+
+    suspend fun focus(): List<String> =
+        withContext(Dispatchers.IO) { ResourceStore.focus() }
+
+    suspend fun toggleFocus(tag: String): List<String> = withContext(Dispatchers.IO) {
+        val o = ResourceStore.act("", "focus", tag)
+        if (!o.optBoolean("ok", false)) {
+            throw IllegalArgumentException(o.optString("err", "操作失败"))
+        }
+        val a = o.optJSONArray("focus") ?: JSONArray()
+        (0 until a.length()).mapNotNull { a.optString(it).takeIf { s -> s.isNotBlank() } }
+    }
+
+    /** 自己联网抓一轮，成果直接进本机库。 */
+    suspend fun crawl(): JSONObject = ResourceCrawler.crawl()
+
+    /** 可选：跟登记过的对等节点共享一批；拉不到不影响本机任何功能。 */
+    suspend fun syncPeers(): JSONObject = ResourceCrawler.syncPeers()
+
+    /** 半小时内抓过就不再自动抓，避免反复吃流量。 */
+    fun crawlDue(): Boolean = runCatching { ResourceStore.crawlDue() }.getOrDefault(false)
+
+    /** 卡片预览第一段：本机缓存 + 规则封面，零请求、立刻能显示。 */
+    suspend fun previewInstant(urls: List<String>): Map<String, LinkPreview> =
         withContext(Dispatchers.IO) {
-            post("/api/resources/act", JSONObject().put("id", id).put("action", action).put("text", text))
+            urls.distinct().mapNotNull { u -> LinkPreviewStore.instant(u)?.let { u to it } }.toMap()
         }
 
-    suspend fun importExisting(): JSONObject = withContext(Dispatchers.IO) {
-        post("/api/resources/import", JSONObject())
-    }
-
-    suspend fun stats(): JSONObject = withContext(Dispatchers.IO) {
-        get("/api/resources/stats")
-    }
+    /** 卡片预览第二段：手机自己联网解析 OG / Twitter Card，结果落本机库。 */
+    suspend fun previewFetch(urls: List<String>): Map<String, LinkPreview> =
+        LinkPreviewLoader.ensure(urls)
 }

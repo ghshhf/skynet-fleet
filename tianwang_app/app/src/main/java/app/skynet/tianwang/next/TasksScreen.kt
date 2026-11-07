@@ -40,7 +40,7 @@ fun TasksScreen() {
                 .onSuccess { board = it; loading = false }
                 .onFailure { err = it.message ?: "失败"; loading = false }
         } else {
-            err = "未连接云侧：去「设置」填地址和 Token"
+            err = "没登记局域网节点（可选项）；本机功能照常可用"
             loading = false
         }
     }

@@ -83,6 +83,18 @@ android {
 
     packaging {
         resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
+        jniLibs {
+            // diffusion 引擎是「可执行 .so」，QNN 运行库要能被 dlopen。
+            // AGP 8 默认不开解包：.so 只留在 APK 里 mmap，nativeLibraryDir 是空目录，
+            // 于是既 exec 不到引擎、也加载不了 HTP（真机自检踩到，2026-11-07）。
+            useLegacyPackaging = true
+        }
+    }
+
+    // 随包那份已爬完的 SQLite 不做二次压缩：首次启动按流复制更快，也避免
+    // AssetManager 对压缩大文件 openFd 的限制。
+    androidResources {
+        noCompress += "db"
     }
 }
 

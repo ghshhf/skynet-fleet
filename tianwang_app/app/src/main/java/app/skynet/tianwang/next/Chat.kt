@@ -108,12 +108,30 @@ object ModelCatalog {
 
     /** 扫本地目录，返回所有可用的 GGUF。空目录就是空列表 —— 不编造。 */
     fun local(): List<ModelProfile> {
-        val dir = Demo.modelDir.takeIf { it.isNotBlank() }?.let { java.io.File(it) } ?: return emptyList()
-        if (!dir.isDirectory) return emptyList()
-        return dir.listFiles { f -> f.isFile && f.name.endsWith(".gguf", true) }
-            ?.sortedByDescending { it.length() }
-            ?.map { f -> fromFile(f) }
-            ?: emptyList()
+        // 🔴 本机模型可能放在好几个地方：App 外部私有 models（默认落点）、
+        //    内部私有 files/models、公共 Download（用户自己丢进去的）。
+        //    只扫一个目录就会把「手机明明有模型」报成 0 个（2026-11-07 实测踩到）。
+        //    按绝对路径去重，同一个文件在两个目录里也只出一条。
+        val dirs = linkedSetOf<java.io.File>()
+        Demo.modelDir.takeIf { it.isNotBlank() }?.let { dirs.add(java.io.File(it)) }
+        runCatching {
+            App.ctx.getExternalFilesDir(null)?.let { dirs.add(java.io.File(it, "models")) }
+            dirs.add(java.io.File(App.ctx.filesDir, "models"))
+        }
+        runCatching { dirs.add(java.io.File("/sdcard/Download")) }
+
+        val seen = mutableSetOf<String>()
+        val out = mutableListOf<ModelProfile>()
+        for (dir in dirs) {
+            if (!dir.isDirectory) continue
+            val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".gguf", true) }
+                ?: continue
+            for (f in files) {
+                if (!seen.add(f.absolutePath)) continue
+                runCatching { out.add(fromFile(f)) }
+            }
+        }
+        return out.sortedByDescending { it.bytes }
     }
 
     private fun fromFile(f: java.io.File): ModelProfile {
@@ -266,7 +284,7 @@ data class Media(
     enum class Kind { IMAGE, VIDEO }
 }
 
-/** 云侧连接配置（存在 SharedPreferences，设置页读写）。 */
+/** 局域网节点配置（可选）；大模型 API 密钥另存 LlmConfig，与此无关。 */
 data class AgentConfig(
     val url: String = Api.DEFAULT_BASE,
     val token: String = "",

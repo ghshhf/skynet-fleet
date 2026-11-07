@@ -92,7 +92,7 @@ fun ModelsScreen(
                 icon = { Icon(Icons.Filled.Memory, null, Modifier.size(14.dp),
                     tint = StatusColors.ok) },
                 title = "本地引擎",
-                sub = "llama.cpp / GGUF · 断网也能跑 · 数据不出手机",
+                sub = "llama.cpp / GGUF · 本机 ${models.count { it.kind == BackendKind.LOCAL }} 个 · 断网也能跑",
             )
         }
         items(models.filter { it.kind == BackendKind.LOCAL }, key = { it.id }) {
@@ -111,7 +111,7 @@ fun ModelsScreen(
                 icon = { Icon(Icons.Filled.Cloud, null, Modifier.size(14.dp),
                     tint = MaterialTheme.colorScheme.primary) },
                 title = "云端引擎",
-                sub = "OpenAI 兼容端点 · 长上下文 · 需要联网",
+                sub = "手机拿本机密钥直连 · 长上下文 · 需要联网",
             )
         }
         // 🔴 P1 判据：这里要能看见至少 2 个网关的真实状态（活/死、延迟、模型数）。
@@ -120,7 +120,7 @@ fun ModelsScreen(
             if (gwErr.isNotEmpty()) {
                 Text(gwErr, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
             } else if (gateways.isEmpty()) {
-                Text("（未检测到网关 —— 云侧未启动，或本机还没在「设置」连上）",
+                Text("（没有登记对等节点网关 · 手机直连模型在下方列表）",
                     fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 // 🔴 Compose 铁律：forEach 的 lambda 不是 @Composable 上下文，

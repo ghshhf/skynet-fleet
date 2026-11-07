@@ -158,7 +158,7 @@ fun FleetScreen(modifier: Modifier = Modifier) {
                     )
                     Text(
                         when {
-                            !Net.hasConfig() -> "去「设置」填地址和 Token"
+                            !Net.hasConfig() -> "可选：在「设置」登记局域网节点"
                             s == null -> "数据未到，不显示占位节点"
                             s.cpAvailable -> "控制面可用 · 注册表已连"
                             else -> "控制面不可用${if (s.cpErr.isBlank()) "" else "：" + s.cpErr}"

@@ -543,6 +543,11 @@ CASES = [
     # 资源整合 MVP（11-07）：SQLite 资源卡 + 双层去重 + 透明信息流 + 行为偏好 +
     # NetForce 既有 JSON 导入 + HTTP/单页接线；全离线，不依赖 LLM。
     ("eval_t82_resource_center", ["evals/t82_resource_center.py"], HERE, 180),
+    # 手机节点桥（11-07 R1d）：8770 能力映射与转发；mock agent 全离线，秒级。
+    ("eval_t8x_phone_node_bridge", ["evals/t8x_phone_node_bridge.py"], HERE, 60),
+    # 资源流手机版 UI（11-07）：页面契约 / 内嵌素材 / 自适应 / 分类筛选 /
+    # 关注状态落服务端。纯静态 + 临时 SQLite，不跑半小时。
+    ("eval_t83_resource_ui", ["evals/t83_resource_ui.py"], HERE, 60),
     # 爬虫 B 线（14475ef）写的三个离线门禁：写了没登记 = 没写。
     # t63 的「游离门禁 0」**第三次**当场抓到 —— 这条断言存在的意义就在这儿。
     ("eval_t_cloud", ["evals/t_cloud.py"], HERE, 60),

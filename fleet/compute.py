@@ -118,7 +118,8 @@ def _builtin():
         Endpoint(id="siliconflow", title="硅基流动（自己的 key）",
                  base_url="https://api.siliconflow.cn/v1",
                  model="Qwen/Qwen3-8B", need_key=True, builtin=True,
-                 note="一个 key 调多家开源模型。key 在 cloud.siliconflow.cn 拿。"),
+                 note="默认 Qwen3-8B 是免费档；V4 / Pro / GLM-5 等付费模型要自己在算力页改，"
+                      "程序不替你选。key 在 cloud.siliconflow.cn 拿。"),
         Endpoint(id="openrouter", title="OpenRouter（自己的 key）",
                  base_url="https://openrouter.ai/api/v1",
                  model="qwen/qwen3-8b", need_key=True, builtin=True,
