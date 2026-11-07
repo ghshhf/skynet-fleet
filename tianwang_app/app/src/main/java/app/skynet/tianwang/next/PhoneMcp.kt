@@ -347,6 +347,33 @@ object PhoneMcp {
             sideEffect = true,
         ),
         McpTool(
+            "self_agent_goal",
+            "把一句自然语言目标整单交给本机本地模型：它自己选工具、执行、回最终答复。执行期间独占模型。",
+            schema(
+                mapOf(
+                    "goal" to prop("string", "要完成的目标"),
+                    "max_steps" to prop("integer", "最多连续调几次工具，默认 3，上限 6"),
+                ),
+                listOf("goal"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_peer_goal",
+            "把一句自然语言目标整单派给集群里最合适的手机，由它的本地模型跑完只回结果。",
+            schema(
+                mapOf(
+                    "goal" to prop("string", "要完成的目标"),
+                    "name" to prop("string", "指定某一台；不填自动选路"),
+                    "max_steps" to prop("integer", "对端最多连续调几次工具，默认 3，上限 6"),
+                    "timeout" to prop("integer", "超时毫秒，默认 300000，上限 600000"),
+                    "min_battery" to prop("integer", "自动选路最低电量，默认 15"),
+                ),
+                listOf("goal"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
             "self_dns_resolve", "把域名解析成地址并标出类型，顺序就是直连时优先尝试的顺序。",
             schema(mapOf("name" to prop("string", "域名或 IP 字面量")), listOf("name")),
         ),
@@ -449,6 +476,8 @@ object PhoneMcp {
             "self_peer_probe" -> "self.peer.probe"
             "self_peer_pick" -> "self.peer.pick"
             "self_peer_call" -> "self.peer.call"
+            "self_agent_goal" -> "self.agent.goal"
+            "self_peer_goal" -> "self.peer.goal"
             "self_dns_resolve" -> "self.dns.resolve"
             "self_ddns_status" -> "self.ddns.status"
             "self_ddns_config" -> "self.ddns.config"

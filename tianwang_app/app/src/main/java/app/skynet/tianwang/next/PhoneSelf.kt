@@ -324,7 +324,26 @@ object PhoneSelf {
                 CapParam("tool", "str", "MCP 工具名", true),
                 CapParam("args", "str", "工具参数 JSON，默认 {}", false),
                 CapParam("name", "str", "指定某一台，不填则自动选路", false),
-                CapParam("timeout", "int", "超时毫秒，默认 30000，上限 120000", false),
+                CapParam("timeout", "int", "超时毫秒，默认 30000，上限 600000", false),
+                CapParam("min_battery", "int", "自动选路时的最低电量，默认 15", false),
+            ),
+        ),
+        SelfCap(
+            "self.agent.goal", "把一句话目标整单交给本机模型",
+            "本机本地模型自己选工具、执行、回最终答复；适合只给目标、不想逐步指挥。执行期间独占模型；不会停 LAN、换口令、重启或再派整单目标。",
+            listOf(
+                CapParam("goal", "str", "要完成的目标，一句话说清", true),
+                CapParam("max_steps", "int", "最多连续调几次工具，默认 3，上限 6", false),
+            ),
+        ),
+        SelfCap(
+            "self.peer.goal", "把一句话目标派给集群",
+            "选一台最合适的手机，把整单目标交给它的本地模型跑完，只回结果。默认超时 5 分钟；写操作能否派出仍只看控制方这一档。",
+            listOf(
+                CapParam("goal", "str", "要完成的目标，一句话说清", true),
+                CapParam("name", "str", "指定某一台，不填则自动选路", false),
+                CapParam("max_steps", "int", "对端最多连续调几次工具，默认 3，上限 6", false),
+                CapParam("timeout", "int", "超时毫秒，默认 300000，上限 600000", false),
                 CapParam("min_battery", "int", "自动选路时的最低电量，默认 15", false),
             ),
         ),
@@ -456,6 +475,10 @@ object PhoneSelf {
                     "self.peer.probe" -> withContext(Dispatchers.IO) { LanHub.peerProbe() }
                     "self.peer.pick" -> LanHub.peerPick(args)
                     "self.peer.call" -> withContext(Dispatchers.IO) { LanHub.peerCall(args) }
+                    "self.agent.goal" -> withContext(Dispatchers.Default) {
+                        LocalGoal.run(strArg(args, "goal"), intArg(args, "max_steps", 3))
+                    }
+                    "self.peer.goal" -> withContext(Dispatchers.IO) { LanHub.peerGoal(args) }
                     // 名字解析与 DDNS 都是网络操作，必须离开主线程。
                     "self.dns.resolve" -> withContext(Dispatchers.IO) {
                         val name = strArg(args, "name")

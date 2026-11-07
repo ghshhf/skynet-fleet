@@ -325,7 +325,7 @@ object LanHub {
         }
         // 写操作只派一台：回包丢了不代表没执行，换机重试就是重复点击/重复发送。
         val plan = if (meta.sideEffect) candidates.take(1) else candidates
-        val timeout = int(args["timeout"], 30_000).coerceIn(1_000, 120_000)
+        val timeout = int(args["timeout"], 30_000).coerceIn(1_000, 600_000)
         val request = LanProto.toolRequest(tool, argObj)
         val tried = StringBuilder()
         plan.forEachIndexed { i, p ->
@@ -353,6 +353,26 @@ object LanHub {
             }
         }
         return ToolResult(false, err = "没有执行任何候选")
+    }
+
+    /**
+     * 整单目标：控制方只给一句话，对端用**它自己的本地模型**跑完再回结果。
+     *
+     * 🔴 默认超时 5 分钟：整单跑三步工具比单次工具调用慢得多。
+     *    仍然只派一台；写操作失败不换机（同 [peerCall]）。
+     */
+    fun peerGoal(args: Map<String, Any?>): ToolResult {
+        val goal = str(args["goal"])
+        if (goal.isBlank()) return ToolResult(false, err = "缺 goal：写清要让对端做什么")
+        val inner = JSONObject().put("goal", goal)
+        inner.put("max_steps", int(args["max_steps"], 3).coerceIn(1, 6))
+        val call = HashMap<String, Any?>()
+        call["tool"] = "self_agent_goal"
+        call["args"] = inner.toString()
+        call["timeout"] = int(args["timeout"], 300_000)
+        call["min_battery"] = args["min_battery"]
+        if (str(args["name"]).isNotBlank()) call["name"] = str(args["name"])
+        return peerCall(call)
     }
 
     private fun touch(p: PeerBook.Peer, r: LanClient.Reply) {
