@@ -30,6 +30,7 @@ data class PermEnv(
     val shellBound: Boolean = false,
     val screenshotSupported: Boolean = true,
     val rootAvailable: Boolean = false,
+    val deviceOwner: Boolean = false,
 )
 
 data class PermRow(
@@ -55,6 +56,12 @@ object Perms {
         env.shizukuAuthorized -> "已授权；首次执行 self.shell.exec 会自动绑定 shell"
         env.shizukuRunning -> "执行 self.shizuku.request，在 Shizuku 弹窗点「允许」"
         else -> "装 Shizuku 并启动服务后，执行 self.shizuku.request"
+    }
+
+    private fun ownerNext(env: PermEnv): String = if (env.deviceOwner) {
+        "已可用：self.owner.grant_perm / self.owner.restriction / self.owner.reboot"
+    } else {
+        "跑 self.owner.provision 看一条 adb 命令；已登录账号要先移除（全新手机最佳）"
     }
 
     fun rows(env: PermEnv): List<PermRow> {
@@ -92,8 +99,22 @@ object Perms {
             PermRow("app.install", "安装 / 卸载应用", "Shizuku", shizukuState(env), shizukuNext(env)),
             PermRow("app.force_stop", "强制停止后台应用", "Shizuku", shizukuState(env), shizukuNext(env)),
             PermRow(
-                "device.owner", "设备所有者 / 企业策略", "系统预置", PermState.UNSUPPORTED,
-                "普通安装拿不到，需要在刷机/恢复出厂时 provision",
+                "device.owner", "设备所有者 / 企业策略", "设备所有者",
+                if (env.deviceOwner) PermState.READY else PermState.NEEDS_GRANT,
+                if (env.deviceOwner) "已就绪：self.owner.status" else
+                    "全新手机无账号时跑 self.owner.provision（一条 adb，无需 root / 解锁 Bootloader）",
+            ),
+            PermRow(
+                "perm.grant", "静默授予 / 撤销运行时权限", "设备所有者",
+                if (env.deviceOwner) PermState.READY else PermState.NEEDS_GRANT, ownerNext(env),
+            ),
+            PermRow(
+                "device.restrict", "系统限制（相机 / USB / 截屏…）", "设备所有者",
+                if (env.deviceOwner) PermState.READY else PermState.NEEDS_GRANT, ownerNext(env),
+            ),
+            PermRow(
+                "device.reboot", "远程重启设备", "设备所有者",
+                if (env.deviceOwner) PermState.READY else PermState.NEEDS_GRANT, ownerNext(env),
             ),
             PermRow(
                 "root", "root shell", "Root",
@@ -126,6 +147,7 @@ object Perms {
                 }
             ).append('\n')
             append("Root：").append(if (env.rootAvailable) "检测到 su" else "未检测到").append('\n')
+            append("设备所有者：").append(if (env.deviceOwner) "已就绪" else "未就绪").append('\n')
             append("—— 可用 ").append(count[PermState.READY] ?: 0)
             append(" / 待授权 ").append(count[PermState.NEEDS_GRANT] ?: 0)
             append(" / 需 Shizuku ").append(count[PermState.NEEDS_SHIZUKU] ?: 0)
@@ -155,6 +177,7 @@ object Perms {
             shellBound = ShizukuBridge.bound(),
             screenshotSupported = Build.VERSION.SDK_INT >= 30,
             rootAvailable = hasRootHint(),
+            deviceOwner = OwnerBridge.status(ctx).deviceOwner,
         )
     }
 

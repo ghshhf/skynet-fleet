@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 本 App 只用设备所有者接口（静默授权 / 系统限制 / 重启），
+         不声明用不到的旧式 admin 策略，避免「看起来能擦数据」。 -->
+    <uses-policies />
+</device-admin>

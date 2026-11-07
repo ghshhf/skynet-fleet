@@ -37,6 +37,7 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
         <package android:name="moe.shizuku.manager" />
+        <package android:name="com.rosan.dhizuku" />
     </queries>
 
     <application
@@ -86,6 +87,21 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 设备所有者锚点。全新手机可用一条 adb 命令把本 App 设为设备所有者
+             （self.owner.provision 会给命令），不需要 root / 解锁 Bootloader。
+             只有系统能发 DEVICE_ADMIN_ENABLED，所以 exported=true + 系统签名权限。 -->
+        <receiver
+            android:name=".OwnerReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
             </intent-filter>
         </receiver>
 

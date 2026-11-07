@@ -208,6 +208,42 @@ object PhoneMcp {
             ),
             sideEffect = true,
         ),
+        McpTool(
+            "self_owner_status", "设备所有者状态：本 App 是否所有者、设备管理是否激活、是否有 Dhizuku。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_owner_provision", "给出把本 App 设为设备所有者的 adb 命令与前提（无账号）；只读，不改状态。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_owner_grant_perm", "以设备所有者身份静默授予/撤销某 App 的运行时权限。",
+            schema(
+                mapOf(
+                    "pkg" to prop("string", "目标包名"),
+                    "permission" to prop("string", "完整权限名，如 android.permission.CAMERA"),
+                    "mode" to prop("string", "granted｜denied｜default"),
+                ),
+                listOf("pkg", "permission", "mode"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_owner_restriction", "以设备所有者身份添加/解除用户限制（如 no_camera、no_usb_file_transfer）。",
+            schema(
+                mapOf(
+                    "key" to prop("string", "限制键名"),
+                    "enabled" to prop("boolean", "true=添加限制，false=解除"),
+                ),
+                listOf("key", "enabled"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_owner_reboot", "以设备所有者身份立刻重启手机（连接会断开后自动重连）。",
+            schema(emptyMap()),
+            sideEffect = true,
+        ),
     )
 
     private val core = McpCore(
@@ -258,6 +294,11 @@ object PhoneMcp {
             "self_shizuku_status" -> "self.shizuku.status"
             "self_shizuku_request" -> "self.shizuku.request"
             "self_shell_exec" -> "self.shell.exec"
+            "self_owner_status" -> "self.owner.status"
+            "self_owner_provision" -> "self.owner.provision"
+            "self_owner_grant_perm" -> "self.owner.grant_perm"
+            "self_owner_restriction" -> "self.owner.restriction"
+            "self_owner_reboot" -> "self.owner.reboot"
             else -> return ToolResult(false, err = "未知工具：$mcpName")
         }
         val map = LinkedHashMap<String, Any?>()

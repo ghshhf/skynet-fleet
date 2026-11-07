@@ -84,8 +84,24 @@ class PermsTest {
     }
 
     @Test
-    fun deviceOwnerIsAlwaysUnsupportedAndRootFollowsHint() {
-        assertEquals(PermState.UNSUPPORTED, row(PermEnv(), "device.owner").state)
+    fun deviceOwnerRowsFollowProvisionState() {
+        val off = PermEnv()
+        assertEquals(PermState.NEEDS_GRANT, row(off, "device.owner").state)
+        assertTrue(row(off, "device.owner").next.contains("self.owner.provision"))
+        assertEquals(PermState.NEEDS_GRANT, row(off, "perm.grant").state)
+        assertEquals(PermState.NEEDS_GRANT, row(off, "device.restrict").state)
+        assertEquals(PermState.NEEDS_GRANT, row(off, "device.reboot").state)
+
+        val owner = PermEnv(deviceOwner = true)
+        assertEquals(PermState.READY, row(owner, "device.owner").state)
+        assertEquals(PermState.READY, row(owner, "perm.grant").state)
+        assertEquals(PermState.READY, row(owner, "device.restrict").state)
+        assertEquals(PermState.READY, row(owner, "device.reboot").state)
+        assertTrue(row(owner, "device.reboot").next.contains("self.owner.reboot"))
+    }
+
+    @Test
+    fun rootFollowsHint() {
         assertEquals(PermState.NEEDS_ROOT, row(PermEnv(), "root").state)
         assertEquals(PermState.READY, row(PermEnv(rootAvailable = true), "root").state)
     }
@@ -96,6 +112,7 @@ class PermsTest {
         assertTrue(txt.contains("无障碍：未开启"))
         assertTrue(txt.contains("通知使用权：未授权"))
         assertTrue(txt.contains("Shizuku：未运行"))
+        assertTrue(txt.contains("设备所有者：未就绪"))
         assertTrue(txt.contains("需 Shizuku"))
         assertTrue(txt.contains("→"))
         assertTrue(txt.contains("不重试"))

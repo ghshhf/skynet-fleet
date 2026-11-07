@@ -218,6 +218,35 @@ object PhoneSelf {
                 CapParam("timeout", "int", "超时毫秒，默认 15000，上限 60000", false),
             ),
         ),
+        SelfCap(
+            "self.owner.status", "设备所有者状态（第二层假 root）",
+            "本 App 是不是设备所有者、有没有激活设备管理、设备上有没有 Dhizuku。全新手机无需 root / 解锁即可 provision。",
+        ),
+        SelfCap(
+            "self.owner.provision", "如何成为设备所有者",
+            "给出把本 App 设为设备所有者的那条 adb 命令与前提（无账号）。不改任何状态，只回步骤。",
+        ),
+        SelfCap(
+            "self.owner.grant_perm", "静默授予 / 撤销权限",
+            "以设备所有者身份直接改某个 App 的运行时权限，不弹系统框。目标 App 必须已安装且该权限是运行时权限。",
+            listOf(
+                CapParam("pkg", "str", "目标包名", true),
+                CapParam("permission", "str", "完整权限名，如 android.permission.CAMERA", true),
+                CapParam("mode", "str", "granted｜denied｜default", true),
+            ),
+        ),
+        SelfCap(
+            "self.owner.restriction", "添加 / 解除系统限制",
+            "以设备所有者身份开关用户限制，如 no_camera、no_usb_file_transfer、no_screen_capture。",
+            listOf(
+                CapParam("key", "str", "限制键名", true),
+                CapParam("enabled", "bool", "true=添加限制，false=解除", true),
+            ),
+        ),
+        SelfCap(
+            "self.owner.reboot", "远程重启设备",
+            "设备所有者专用重启。手机立刻重启，远程连接会断，重启后自动重连。",
+        ),
     )
 
     /** 用户在系统设置里给本 App 开了无障碍服务。 */
@@ -279,6 +308,22 @@ object PhoneSelf {
                         cwd = strArg(args, "cwd"),
                         timeoutMs = intArg(args, "timeout", 15_000),
                     )
+                    "self.owner.status" -> ownerStatus(App.ctx)
+                    "self.owner.provision" -> ToolResult(
+                        true, text = OwnerBridge.provisionHint(App.ctx),
+                    )
+                    "self.owner.grant_perm" -> OwnerBridge.grantPermission(
+                        App.ctx,
+                        pkg = strArg(args, "pkg"),
+                        permission = strArg(args, "permission"),
+                        mode = strArg(args, "mode"),
+                    )
+                    "self.owner.restriction" -> OwnerBridge.setRestriction(
+                        App.ctx,
+                        key = strArg(args, "key"),
+                        enabled = flagArg(args, "enabled"),
+                    )
+                    "self.owner.reboot" -> OwnerBridge.reboot(App.ctx)
                     "self.audit" -> audit(args)
                     "self.screen.state" -> screenState(App.ctx)
                     "self.app.list" -> appList(App.ctx, args)
@@ -791,7 +836,23 @@ object PhoneSelf {
             append("；开关：").append(if (Prefs.mcpEnabled) "自动连接" else "关闭")
             append("；状态：").append(PhoneMcpLink.status).append('\n')
             append("Shizuku：").append(ShizukuBridge.status().line()).append('\n')
+            append("设备所有者：").append(OwnerBridge.status(App.ctx).line()).append('\n')
             append("本地模型：").append(ModelCatalog.local().size).append(" 个 GGUF")
+        }
+        return ToolResult(true, text = txt)
+    }
+
+    private fun ownerStatus(ctx: Context): ToolResult {
+        val st = OwnerBridge.status(ctx)
+        val txt = buildString {
+            append("设备所有者：").append(st.line()).append('\n')
+            append("本 App 是设备所有者：").append(if (st.deviceOwner) "是" else "否").append('\n')
+            append("设备管理已激活：").append(if (st.adminActive) "是" else "否").append('\n')
+            append("检测到 Dhizuku：").append(if (st.dhizukuInstalled) "是（本 App 未接其 API）" else "否").append('\n')
+            append("能力边界：").append(
+                if (st.deviceOwner) "静默授权、系统限制、重启；不是 shell（shell 走 Shizuku）"
+                else "未解锁；先跑 self.owner.provision 看设置步骤"
+            )
         }
         return ToolResult(true, text = txt)
     }

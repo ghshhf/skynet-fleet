@@ -65,6 +65,8 @@ class PhoneMcpToolsTest {
         val names = PhoneMcp.toolList().map { it.name }
         for (n in listOf(
             "self_perm_matrix", "self_shizuku_status", "self_shizuku_request", "self_shell_exec",
+            "self_owner_status", "self_owner_provision", "self_owner_grant_perm",
+            "self_owner_restriction", "self_owner_reboot",
         )) {
             assertTrue("缺少工具 $n", n in names)
         }
@@ -75,8 +77,13 @@ class PhoneMcpToolsTest {
         val byName = PhoneMcp.toolList().associateBy { it.name }
         assertTrue(byName.getValue("self_shizuku_request").sideEffect)
         assertTrue(byName.getValue("self_shell_exec").sideEffect)
+        assertTrue(byName.getValue("self_owner_grant_perm").sideEffect)
+        assertTrue(byName.getValue("self_owner_restriction").sideEffect)
+        assertTrue(byName.getValue("self_owner_reboot").sideEffect)
         assertFalse(byName.getValue("self_perm_matrix").sideEffect)
         assertFalse(byName.getValue("self_shizuku_status").sideEffect)
+        assertFalse(byName.getValue("self_owner_status").sideEffect)
+        assertFalse(byName.getValue("self_owner_provision").sideEffect)
     }
 
     @Test
