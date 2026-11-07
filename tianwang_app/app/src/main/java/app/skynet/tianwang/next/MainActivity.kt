@@ -87,6 +87,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         App.bind(this)
         Net.init(applicationContext)
+        // 手机端爬虫后台常驻：每 30 分钟自动抓一轮全球资源，不靠用户下拉刷新。
+        runCatching { CrawlScheduler.ensure(this) }
         // 电脑上已有凭据按「端点列表」格式一次性交给手机：只落本机，接完即删源件，日志不写内容。
         // 之后加端点在设置页手动完成，不再需要改代码或重装。
         val dropped = LlmConfig.importDropped(applicationContext)
@@ -232,6 +234,7 @@ private enum class Overlay(val title: String, val sub: String) {
     DEVICE("设备与权限", "无障碍 / 通知 / 手机入网"),
     ABOUT("关于与版本", "版本与后端信息"),
     IMAGE("本机出图", "手机自己跑 diffusion · 提示词出片"),
+    CLOUDDRIVE("网盘聚合", "集中各网盘搜索"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -670,6 +673,7 @@ private fun App() {
                     onOpenImage = { overlay = Overlay.IMAGE },
                     speakOn = speakOn,
                     onToggleSpeak = { speakOn = Speech.toggle() },
+                    onOpenCloudDrive = { overlay = Overlay.CLOUDDRIVE },
                 )
                 Tab.ME -> MineScreen(
                     onFavorites = { overlay = Overlay.FAVORITES },
@@ -704,6 +708,7 @@ private fun App() {
                     autoSelftest = launchSelftest,
                     autoPrompt = launchPrompt,
                 )
+                Overlay.CLOUDDRIVE -> CloudDriveScreen(onBack = { overlay = null })
             }
         }
     }

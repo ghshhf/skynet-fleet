@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -64,6 +65,7 @@ fun ToolsScreen(
     onOpenDevice: () -> Unit,
     onOpenAbout: () -> Unit,
     onOpenImage: () -> Unit,
+    onOpenCloudDrive: () -> Unit,
     speakOn: Boolean,
     onToggleSpeak: () -> Unit,
 ) {
@@ -98,6 +100,9 @@ fun ToolsScreen(
         },
         ToolAction("版本与更新", "关于与后端", Icons.Filled.Info) {
             onOpenAbout()
+        },
+        ToolAction("网盘聚合", "集中各网盘搜索", Icons.Filled.Folder) {
+            onOpenCloudDrive()
         },
     )
 
