@@ -28,8 +28,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # 只补 SDK 命令行工具和 licenses；compileSdk 35 由 AGP 自己装。
-      - uses: android-actions/setup-android@v3
+      # ubuntu 镜像自带 SDK 且 licenses 已接受，不再跑 setup-android：
+      # 它的 v3 会无条件 `sdkmanager tools`，而 cmdline-tools 16 已经没有这个包。
+      - name: 打印 Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
 
       # 固定 8.14：AGP 8.7.3 的受支持区间是 Gradle 8.9–8.x，
       # 不要跟着 wrapper 的 9.x 走（那份只在真机脚本里手动指定）。
