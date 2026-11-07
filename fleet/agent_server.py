@@ -15,6 +15,8 @@
   GET  /api/health     健康 + 概览（活着的网关数 / 能力总数）
   GET  /api/providers  网关快照（剔除 key —— 绝不把密钥发到手机）
   GET  /api/caps       能力按 domain 分组（工具箱的数据源）
+  GET  /api/compute   算力注册表 + 当前路由（key 只回末四位）
+  POST /api/compute/ask  用电脑/API 算力回答一句话（手机不落 key）
   POST /api/agent      SSE：一轮 agent loop，逐事件推 step/answer/error
   POST /api/tool/exec  工具箱单点执行（人直接点一个能力，不绕 LLM）
 
@@ -59,6 +61,7 @@ from fleet import agentloop             # noqa: E402
 from fleet import catalog               # noqa: E402
 from fleet import toolschema as TS      # noqa: E402
 from fleet import gate as G             # noqa: E402
+from fleet import compute as C          # noqa: E402
 from fleet.core import registry as regmod  # noqa: E402
 
 TOKEN_HEADER = "X-Fleet-Token"
@@ -241,6 +244,26 @@ class FleetAgentServer:
     def providers(self):
         _, data = P.snapshot()           # 写盘但返回 data；snapshot 已剔除 key
         return data
+
+    def compute(self):
+        """算力注册表 + 当前路由。key 已在 to_public() 里遮掉。"""
+        return {"ok": True, "route": C.routes(), "endpoints": C.list_all()}
+
+    def compute_ask(self, body):
+        """用电脑侧选中的一块算力回答一句话 —— 手机不持有任何厂商 key。"""
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            return {"ok": False, "err": "缺 prompt：写清要问什么"}
+        try:
+            return C.ask(
+                prompt,
+                purpose=str(body.get("purpose") or "chat"),
+                endpoint_id=str(body.get("endpoint") or ""),
+                max_tokens=int(body.get("max_tokens") or 256),
+                timeout=int(body.get("timeout") or 60),
+            )
+        except Exception as e:
+            return {"ok": False, "err": "%s: %s" % (type(e).__name__, e)}
 
     def caps(self):
         caps = self.registry().capabilities()
@@ -598,6 +621,10 @@ class FleetAgentServer:
                     if not self._auth():
                         return
                     self._send(200, server.providers())
+                elif path == "/api/compute":
+                    if not self._auth():
+                        return
+                    self._send(200, server.compute())
                 elif path == "/api/caps":
                     if not self._auth():
                         return
@@ -619,7 +646,8 @@ class FleetAgentServer:
 
             def do_POST(self):
                 path = urlparse(self.path).path
-                if path not in ("/api/agent", "/api/tool/exec", "/api/approve"):
+                if path not in ("/api/agent", "/api/tool/exec", "/api/approve",
+                                "/api/compute/ask"):
                     self._send(404, {"ok": False, "err": "no route: %s" % path})
                     return
                 if not self._auth():
@@ -630,6 +658,10 @@ class FleetAgentServer:
                     body = json.loads(raw or b"{}")
                 except Exception as e:
                     self._send(400, {"ok": False, "err": "body 不是合法 JSON: %s" % e})
+                    return
+
+                if path == "/api/compute/ask":
+                    self._send(200, server.compute_ask(body))
                     return
 
                 if path == "/api/tool/exec":

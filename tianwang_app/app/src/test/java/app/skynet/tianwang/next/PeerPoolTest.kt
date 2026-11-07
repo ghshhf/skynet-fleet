@@ -32,6 +32,30 @@ class PeerPoolTest {
     }
 
     @Test
+    fun firstWaveIgnoresPcAndApiLanes() {
+        val nodes = listOf(
+            node("a-phone", 90),
+            PeerPool.Node("电脑", lane = PeerPool.Lane.PC),
+            PeerPool.Node("API·deepseek", lane = PeerPool.Lane.API),
+        )
+        assertEquals(listOf("a-phone"), PeerPool.firstWave(nodes, parallel = 4).map { it.name })
+    }
+
+    @Test
+    fun remoteWavePutsPcBeforeApi() {
+        val nodes = listOf(
+            PeerPool.Node("API·zhipu", lane = PeerPool.Lane.API),
+            PeerPool.Node("a-phone", 90),
+            PeerPool.Node("电脑", lane = PeerPool.Lane.PC),
+            PeerPool.Node("API·deepseek", lane = PeerPool.Lane.API),
+        )
+        assertEquals(
+            listOf("电脑", "API·deepseek", "API·zhipu"),
+            PeerPool.remoteWave(nodes).map { it.name },
+        )
+    }
+
+    @Test
     fun escalateOnlyAddsUntriedAndStopsAtCap() {
         val nodes = listOf(node("a", 90), node("b", 80), node("c", 70), node("d", 60), node("e", 50))
         val next = PeerPool.escalateWave(nodes, tried = setOf("a", "b"))

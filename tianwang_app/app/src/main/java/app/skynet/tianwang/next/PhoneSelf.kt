@@ -483,6 +483,13 @@ object PhoneSelf {
                     "self.model.ask" -> withContext(Dispatchers.Default) {
                         LocalAsk.ask(strArg(args, "prompt"), intArg(args, "max_tokens", 256))
                     }
+                    // 电脑/API 算力：key 在电脑上，手机只发问题。
+                    "self.api.ask" -> PcAsk.ask(
+                        prompt = strArg(args, "prompt"),
+                        maxTokens = intArg(args, "max_tokens", 256),
+                        purpose = strArg(args, "purpose").ifBlank { "chat" },
+                        endpoint = strArg(args, "endpoint"),
+                    )
                     "self.peer.pool" -> LanHub.poolAsk(args)
                     // 名字解析与 DDNS 都是网络操作，必须离开主线程。
                     "self.dns.resolve" -> withContext(Dispatchers.IO) {

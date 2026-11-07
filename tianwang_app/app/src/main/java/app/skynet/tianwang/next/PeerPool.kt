@@ -17,11 +17,15 @@ object PeerPool {
         ALL,
     }
 
+    /** 这块算力在哪：手机 / 电脑 / 云端 API。 */
+    enum class Lane { PHONE, PC, API }
+
     data class Node(
         val name: String,
         val battery: Int = -1,
         val charging: Boolean = false,
         val lastSeen: Long = 0L,
+        val lane: Lane = Lane.PHONE,
     )
 
     data class Attempt(
@@ -30,6 +34,7 @@ object PeerPool {
         val ms: Long,
         val text: String = "",
         val err: String = "",
+        val lane: Lane = Lane.PHONE,
     )
 
     /** 默认两台：本机 + 一台对端。再多就先把结果拿回来，别一上来把整个名册叫醒。 */
@@ -50,6 +55,7 @@ object PeerPool {
         parallel: Int = DEFAULT_PARALLEL,
         minBattery: Int = 15,
     ): List<Node> = nodes
+        .filter { it.lane == Lane.PHONE }
         .filter { it.charging || it.battery < 0 || it.battery >= minBattery }
         .sortedWith(
             compareByDescending<Node> { it.charging }
@@ -70,6 +76,11 @@ object PeerPool {
     ): List<Node> = firstWave(nodes, MAX_PARALLEL, minBattery)
         .filterNot { it.name in tried }
         .take(MAX_PARALLEL)
+
+    /** 电脑/API 车道：电脑排前面（通常更快、更可控），API 按名字排。 */
+    fun remoteWave(nodes: List<Node>): List<Node> = nodes
+        .filter { it.lane != Lane.PHONE }
+        .sortedWith(compareBy<Node> { if (it.lane == Lane.PC) 0 else 1 }.thenBy { it.name })
 
     /**
      * 是否值得再叫一波机器。

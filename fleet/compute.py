@@ -676,6 +676,104 @@ def routes():
 
 
 # ---------------------------------------------------------------------------
+# 单次问答：给手机/其它节点一个「用这块算力答一句话」的入口
+# ---------------------------------------------------------------------------
+
+def ask(prompt, purpose="chat", endpoint_id="", max_tokens=256, timeout=60):
+    """用选中的算力答一句话。返回 dict，**永远不含 key**。
+
+    `endpoint_id` 为空 = 按 `route(purpose)` 选；指定了就钉死那一条，
+    但它不可用（缺 key / 停用）时直接失败 —— 不静默换人顶上。
+
+    这是手机端「电脑 + API 算力」的唯一入口：手机不落任何厂商 key，
+    只把问题交给电脑，电脑按自己的注册表决定走本机还是云端。
+    """
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return {"ok": False, "err": "缺 prompt：写清要问什么", "ms": 0}
+
+    if purpose not in PURPOSES:
+        return {"ok": False, "err": "未知用途：%s（可选：%s）"
+                % (purpose, "、".join(PURPOSES)), "ms": 0}
+
+    ep = get(endpoint_id) if endpoint_id else route(purpose)
+    if ep is None:
+        return {"ok": False, "err": "没有可用算力端点（去算力页配一个，或检查 key）",
+                "ms": 0}
+    if endpoint_id and not ep.ready():
+        return {"ok": False, "err": "%s 现在不可用（停用或缺 key）" % ep.title, "ms": 0}
+
+    payload = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": max(16, min(int(max_tokens or 256), 4096)),
+        "stream": False,
+    }
+    if ep.model:
+        payload["model"] = ep.model
+
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(
+            ep.url("chat/completions"),
+            data=json.dumps(payload, ensure_ascii=False).encode(),
+            method="POST",
+            headers=_headers(ep))
+        raw = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        ms = int((time.time() - t0) * 1000)
+        err = _classify(e, body)
+        _remember(ep, False, ms, err)
+        return {"ok": False, "err": err, "ms": ms, "endpoint": ep.id}
+    except Exception as e:
+        ms = int((time.time() - t0) * 1000)
+        err = _classify(e, "")
+        _remember(ep, False, ms, err)
+        return {"ok": False, "err": err, "ms": ms, "endpoint": ep.id}
+
+    ms = int((time.time() - t0) * 1000)
+    try:
+        d = json.loads(raw)
+    except Exception:
+        _remember(ep, False, ms, "返回的不是 JSON（可能被网关拦截）")
+        return {"ok": False, "err": "返回的不是 JSON：%r" % raw[:120],
+                "ms": ms, "endpoint": ep.id}
+
+    if isinstance(d, dict) and d.get("error"):
+        e = d["error"]
+        err = "端点报错：%s" % (e.get("message") if isinstance(e, dict) else e)
+        _remember(ep, False, ms, err)
+        return {"ok": False, "err": err, "ms": ms, "endpoint": ep.id}
+
+    try:
+        text = d["choices"][0]["message"].get("content") or ""
+    except Exception:
+        text = ""
+    if not text.strip():
+        _remember(ep, False, ms, "回答是空的（可能上下文/额度不够）")
+        return {"ok": False, "err": "回答是空的（可能上下文/额度不够）",
+                "ms": ms, "endpoint": ep.id}
+
+    usage = d.get("usage") or {}
+    _remember(ep, True, ms, "")
+    ep.seen_model = str(d.get("model") or "")
+    return {
+        "ok": True,
+        "text": text,
+        "ms": ms,
+        "endpoint": ep.id,
+        "model": ep.seen_model or ep.model,
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 自测
 # ---------------------------------------------------------------------------
 
@@ -753,6 +851,42 @@ def _selftest():
     # route 视图
     rr = routes()
     ck(set(rr) == set(PURPOSES), "routes() 覆盖全部用途")
+
+    # ---- ask：真打一次 HTTP，确认「用算力答一句话」不是纸面路由 ----
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(n)
+            body = json.dumps({
+                "model": "fake-1",
+                "choices": [{"message": {"content": "收到：好的"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    upsert({"id": "fake", "title": "假端点",
+            "base_url": "http://127.0.0.1:%d/v1" % port,
+            "model": "fake-model"})
+    r = ask("你好", endpoint_id="fake")
+    ck(r.get("ok") is True and "收到" in (r.get("text") or ""),
+       "ask 走真实 HTTP 拿回回答")
+    ck(r.get("prompt_tokens") == 7, "ask 带回 usage")
+    ck(not ask("你好", endpoint_id="nope").get("ok"),
+       "指定不存在的端点直接失败，不静默换人")
+    srv.shutdown()
 
     print()
     print("compute selftest: %d ok / %d fail" % (ok, fail))

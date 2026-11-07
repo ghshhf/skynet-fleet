@@ -80,7 +80,7 @@ object Net {
             }
         }
 
-    private fun auth(url: String): HttpURLConnection {
+    internal fun auth(url: String): HttpURLConnection {
         val c = URL(url).openConnection() as HttpURLConnection
         val cfg = loadConfig()
         // 两把钥匙都带：新电脑认长期凭据，老电脑只认一次性令牌。

@@ -385,14 +385,32 @@ object PhoneMcp {
             ),
         ),
         McpTool(
+            "self_api_ask",
+            "用电脑/API 算力回答一句话：问题交给电脑，由电脑按自己的算力注册表" +
+                "选本机或云端端点；手机不持有任何厂商 key。",
+            schema(
+                mapOf(
+                    "prompt" to prop("string", "要问的话"),
+                    "max_tokens" to prop("integer", "最多生成多少 token，默认 256，上限 4096"),
+                    "purpose" to prop("string", "用途：chat（默认）/ decide / vision / voice"),
+                    "endpoint" to prop("string", "钉死电脑侧的算力端点 id；留空=按用途自动选"),
+                ),
+                listOf("prompt"),
+            ),
+        ),
+        McpTool(
             "self_peer_pool",
             "双机并行算力：本机与对端同时用各自的本地模型回答同一句话；" +
+                "电脑/API 也会同时参与（pc=true 且已配对时），" +
                 "第一波全失败或本机上下文/显存不够时，自动升级到名册里其余手机。只问不写。",
             schema(
                 mapOf(
                     "prompt" to prop("string", "要问的话"),
-                    "mode" to prop("string", "race=谁先回用谁（默认），all=两边答案都列出"),
+                    "mode" to prop("string", "race=谁先回用谁（默认），all=所有答案都列出"),
                     "local" to prop("boolean", "本机是否参与，默认 true"),
+                    "pc" to prop("boolean", "电脑/API 是否参与，默认 true（没配对则自动跳过）"),
+                    "api" to prop("string", "额外钉死电脑侧 API 端点 id，逗号分隔，如 deepseek,zhipu"),
+                    "purpose" to prop("string", "电脑算力用途，默认 chat"),
                     "max_peers" to prop("integer", "第一波最多叫几台对端，默认 1，上限 4"),
                     "timeout" to prop("integer", "总超时毫秒，默认 120000，上限 600000"),
                     "max_tokens" to prop("integer", "每台最多生成多少 token，默认 256，上限 2048"),
@@ -508,6 +526,7 @@ object PhoneMcp {
             "self_agent_goal" -> "self.agent.goal"
             "self_peer_goal" -> "self.peer.goal"
             "self_model_ask" -> "self.model.ask"
+            "self_api_ask" -> "self.api.ask"
             "self_peer_pool" -> "self.peer.pool"
             "self_dns_resolve" -> "self.dns.resolve"
             "self_ddns_status" -> "self.ddns.status"

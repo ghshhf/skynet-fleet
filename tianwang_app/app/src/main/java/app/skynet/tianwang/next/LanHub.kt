@@ -41,6 +41,9 @@ object LanHub {
     /** 并行算力里给本机留的固定名字；对端名册不允许重名，所以不会撞。 */
     private const val LOCAL_NODE = "本机"
 
+    /** 非手机车道：电脑默认路由，或电脑侧指定的某个 API 端点。 */
+    private data class RemoteLane(val label: String, val endpoint: String)
+
     fun start(ctx: Context, requestedPort: Int = Prefs.lanPort, rotate: Boolean = false): ToolResult {
         lastError = ""
         if (rotate || Prefs.lanToken.isBlank()) Prefs.lanToken = LanProto.newToken()
@@ -399,8 +402,22 @@ object LanHub {
             else -> str(v).lowercase() != "false"
         }
         val all = peers()
-        if (!includeLocal && all.isEmpty()) {
-            return ToolResult(false, err = "本机不参与且集群名册为空；先 self.peer.add 或 local=true")
+        val pc = when (val v = args["pc"]) {
+            null -> true
+            is Boolean -> v
+            else -> str(v).lowercase() != "false"
+        }
+        val purpose = str(args["purpose"]).ifBlank { "chat" }
+        val apiIds = str(args["api"]).split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it.length <= 40 }
+            .distinct()
+        val remotes = buildList {
+            if (pc && Net.hasConfig()) add(RemoteLane("电脑", ""))
+            apiIds.forEach { add(RemoteLane("API·$it", it)) }
+        }
+        if (!includeLocal && all.isEmpty() && remotes.isEmpty()) {
+            return ToolResult(false, err = "本机不参与、集群名册为空、电脑也没配；先 self.peer.add 或 local=true")
         }
         val minBattery = int(args["min_battery"], 15)
         val parallel = int(args["max_peers"], PeerPool.DEFAULT_PARALLEL)
@@ -424,7 +441,11 @@ object LanHub {
         if (includeLocal) tried.add(LOCAL_NODE)
         first.forEach { tried.add(it.name) }
 
-        suspend fun wave(local: Boolean, targets: List<PeerBook.Peer>) {
+        suspend fun wave(
+            local: Boolean,
+            targets: List<PeerBook.Peer>,
+            remote: List<RemoteLane>,
+        ) {
             coroutineScope {
                 if (local) {
                     launch(Dispatchers.Default) {
@@ -447,10 +468,25 @@ object LanHub {
                         touch(p, r)
                     }
                 }
+                // 电脑/API 与手机同时发出：不站在旁边等手机先失败。
+                remote.forEach { lane ->
+                    launch(Dispatchers.IO) {
+                        val t0 = System.currentTimeMillis()
+                        val r = runCatching {
+                            PcAsk.ask(prompt, maxTokens, purpose, lane.endpoint, timeout)
+                        }.getOrElse {
+                            ToolResult(false, err = it.message ?: it.javaClass.simpleName)
+                        }
+                        out += PeerPool.Attempt(
+                            lane.label, r.ok, System.currentTimeMillis() - t0, r.text, r.err,
+                            if (lane.endpoint.isBlank()) PeerPool.Lane.PC else PeerPool.Lane.API,
+                        )
+                    }
+                }
             }
         }
 
-        withTimeoutOrNull(timeout.toLong()) { wave(includeLocal, first) }
+        withTimeoutOrNull(timeout.toLong()) { wave(includeLocal, first, remotes) }
         var escalated = false
         if (PeerPool.shouldEscalate(out.toList(), escalate, false, LOCAL_NODE)) {
             val nextNames = PeerPool.escalateWave(nodes, tried, minBattery).map { it.name }
@@ -458,15 +494,17 @@ object LanHub {
             if (next.isNotEmpty()) {
                 escalated = true
                 next.forEach { tried.add(it.name) }
-                withTimeoutOrNull(timeout.toLong()) { wave(false, next) }
+                withTimeoutOrNull(timeout.toLong()) { wave(false, next, emptyList()) }
             }
         }
 
         val attempts = out.toList()
         if (attempts.isEmpty()) {
-            return ToolResult(false, err = "没有机器接单：本机与对端都没能在 ${timeout}ms 内回包")
+            return ToolResult(false, err = "没有机器接单：本机/对端/电脑都没能在 ${timeout}ms 内回包")
         }
-        val head = "并行算力：${attempts.size} 台参与" +
+        val remoteCount = attempts.count { it.lane != PeerPool.Lane.PHONE }
+        val head = "并行算力：${attempts.size} 条车道参与" +
+            (if (remoteCount > 0) "（其中电脑/API $remoteCount 条）" else "") +
             (if (escalated) "（第一波没跑出结果，已超限升级）" else "") +
             " · " + mode.name.lowercase()
         val body = PeerPool.aggregate(attempts, mode)
