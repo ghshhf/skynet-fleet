@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-11-07 03:40:57",
-  "gates_registered": 182,
-  "eval_files": 94,
+  "generated_at": "2026-11-07 08:03:48",
+  "gates_registered": 183,
+  "eval_files": 95,
   "orphan_evals": [],
   "retired_refs": [],
   "doc_md": 5,
@@ -10,7 +10,7 @@
   "capabilities_owned": 494,
   "capabilities_live": null,
   "capabilities_gated": 232,
-  "devices": 71,
+  "devices": 68,
   "devices_live": null,
   "domains": {
     "web": {

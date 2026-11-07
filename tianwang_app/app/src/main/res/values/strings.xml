@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">天网 Next</string>
+    <string name="accessibility_label">天网自持通道</string>
+    <string name="accessibility_desc">让天网在手机上读界面文字、点击控件、滚动和输入。判断与执行都在本机完成，界面内容不会发到任何外部服务。</string>
+    <string name="notification_listener_label">天网通知读取</string>
+</resources>

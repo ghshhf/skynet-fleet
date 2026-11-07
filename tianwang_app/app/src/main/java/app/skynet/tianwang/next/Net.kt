@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -15,6 +16,10 @@ object Net {
     private const val SP = "tianwang_agent"
     private const val K_URL = "agent_url"
     private const val K_TOKEN = "agent_token"
+
+    /** 长期设备凭据的头，值形如 `deviceId:secret`。 */
+    private const val DEVICE_HEADER = "X-Fleet-Device"
+
     private lateinit var sp: SharedPreferences
 
     fun init(ctx: Context) {
@@ -37,7 +42,17 @@ object Net {
         )
     }
 
-    fun hasConfig(): Boolean = loadConfig().valid()
+    /**
+     * 能连云侧吗。两种钥匙任一即可：
+     *   · token —— 老的一次性令牌（本机调试、老版本电脑端）；
+     *   · deviceId/secret —— 配对换来的长期凭据（电脑重启也不变）。
+     * 只认 token 会让「配对后清空 token」的流程永远显示未配置。
+     */
+    fun hasConfig(): Boolean {
+        val cfg = loadConfig()
+        return Api.normalizeBase(cfg.url).isNotEmpty() &&
+            (cfg.token.isNotBlank() || Prefs.paired())
+    }
 
     /**
      * 取一段合成好的语音（wav 字节）。失败返回 null —— 出声失败不该搞崩对话。
@@ -67,10 +82,88 @@ object Net {
 
     private fun auth(url: String): HttpURLConnection {
         val c = URL(url).openConnection() as HttpURLConnection
-        c.setRequestProperty("X-Fleet-Token", loadConfig().token)
+        val cfg = loadConfig()
+        // 两把钥匙都带：新电脑认长期凭据，老电脑只认一次性令牌。
+        if (cfg.token.isNotBlank()) c.setRequestProperty("X-Fleet-Token", cfg.token)
+        if (Prefs.paired()) c.setRequestProperty(DEVICE_HEADER, "${Prefs.deviceId}:${Prefs.deviceSecret}")
         c.connectTimeout = 8000
         c.readTimeout = if (url.contains("/api/agent")) 120_000 else 15_000
         return c
+    }
+
+    /**
+     * 拿电脑屏幕上的 6 位配对码换长期凭据。POST /api/pair/claim。
+     *
+     * 配对请求本身没有凭据（凭据是这次换来的），所以不走 [auth] ——
+     * 否则会把还没被电脑认下的旧钥匙带上去。
+     * 调用方拿到 [DeviceClaim] 后自己落盘，并清空旧 token。
+     */
+    suspend fun claim(
+        base: String,
+        code: String,
+        name: String,
+        platform: String = "android",
+    ): DeviceClaim = withContext(Dispatchers.IO) {
+        val c = URL(Api.endpoint(base, "/api/pair/claim")).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.setRequestProperty("Content-Type", "application/json")
+        c.connectTimeout = 8000
+        c.readTimeout = 15_000
+        c.doOutput = true
+        try {
+            c.outputStream.use {
+                it.write(
+                    JSONObject()
+                        .put("code", code.trim())
+                        .put("name", name.trim())
+                        .put("platform", platform.trim())
+                        .toString().toByteArray(Charsets.UTF_8)
+                )
+            }
+            val http = c.responseCode
+            val body = c.readBody()
+            if (http != 200) throw IOException("HTTP $http：${body.take(120)}")
+            val o = JSONObject(body)
+            if (!o.optBoolean("ok", false)) {
+                throw IOException(o.optString("err", "配对失败（电脑没给原因）"))
+            }
+            val id = o.optString("device_id", "").trim()
+            val secret = o.optString("secret", "").trim()
+            if (id.isEmpty() || secret.isEmpty()) {
+                throw IOException("配对响应缺 device_id/secret")
+            }
+            DeviceClaim(id, secret)
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    /**
+     * 裸 WAV 进 → 识别文字出。老工程同一个端点（`/api/voice/recognize`），
+     * 服务端只收 `audio/wav`，不要改成 multipart —— 那边不解析表单。
+     */
+    suspend fun recognize(wav: ByteArray): String = withContext(Dispatchers.IO) {
+        if (!hasConfig()) throw IOException("云侧未配置，没地方识别")
+        val c = auth(Api.endpoint(loadConfig().url, "/api/voice/recognize"))
+        c.requestMethod = "POST"
+        c.setRequestProperty("Content-Type", "audio/wav")
+        c.readTimeout = 180_000
+        c.doOutput = true
+        try {
+            c.outputStream.use { it.write(wav) }
+            val code = c.responseCode
+            val body = c.readBody()
+            if (code != 200) {
+                throw IOException("HTTP $code：${body.take(120)}")
+            }
+            val o = JSONObject(body)
+            if (!o.optBoolean("ok", false)) {
+                throw IOException(o.optString("err", "识别失败（服务端没给原因）"))
+            }
+            o.optString("text", "")
+        } finally {
+            c.disconnect()
+        }
     }
 
     suspend fun getProviders(): List<Gateway> = withContext(Dispatchers.IO) {
@@ -260,6 +353,9 @@ object Net {
     private fun HttpURLConnection.readBody(): String =
         (if (responseCode in 200..299) inputStream else errorStream).bufferedReader().readText()
 }
+
+/** 配对换来的长期凭据。secret 只落 SharedPreferences，不进日志/界面。 */
+data class DeviceClaim(val deviceId: String, val secret: String)
 
 fun JSONArray.toGateways(): List<Gateway> {
     val out = mutableListOf<Gateway>()

@@ -1,0 +1,265 @@
+package app.skynet.tianwang.next
+
+import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * 把手机本机能力映射成 MCP 工具。
+ *
+ * 工具名不用 `self.ui.dump`（MCP 工具名不允许点号），统一改成下划线；
+ * 调用时再翻回 `PhoneSelf` 的能力名。两层名字只在这里做一次映射，
+ * 避免控制面看到的工具名和手机实际能力各说各话。
+ */
+object PhoneMcp {
+    private val tools: List<McpTool> = listOf(
+        McpTool(
+            "self_status", "查看无障碍通道是否在线、当前前台 App、屏幕分辨率。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_ui_dump", "把当前界面压成紧凑控件树（文字/描述/id/坐标/可点可滚）。",
+            schema(mapOf("limit" to prop("integer", "最多返回多少个控件，默认 120，上限 600")), emptyList()),
+        ),
+        McpTool(
+            "self_ui_find", "按文字、内容描述或控件 id 查找，返回匹配项与坐标。",
+            schema(
+                mapOf(
+                    "query" to prop("string", "要匹配的文字/描述/控件 id 的一部分"),
+                    "regex" to prop("boolean", "把 query 当正则解释，默认 false"),
+                ),
+                listOf("query"),
+            ),
+        ),
+        McpTool(
+            "self_ui_tap", "点中匹配控件；不可点时向上找可点父容器，再不行按坐标点。",
+            schema(
+                mapOf(
+                    "query" to prop("string", "要点的控件文字/描述/控件 id"),
+                    "regex" to prop("boolean", "query 当正则解释"),
+                    "index" to prop("integer", "匹配到多个时点第几个，从 0 开始"),
+                    "long" to prop("boolean", "长按，默认 false"),
+                ),
+                listOf("query"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ui_tap_at", "按屏幕坐标点一下（WebView/自绘界面用），可长按。",
+            schema(
+                mapOf(
+                    "x" to prop("integer", "屏幕横坐标（像素）"),
+                    "y" to prop("integer", "屏幕纵坐标（像素）"),
+                    "long" to prop("boolean", "长按，默认 false"),
+                ),
+                listOf("x", "y"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ui_swipe", "按坐标从 (x1,y1) 滑到 (x2,y2)，可调持续时间。",
+            schema(
+                mapOf(
+                    "x1" to prop("integer", "起点横坐标"),
+                    "y1" to prop("integer", "起点纵坐标"),
+                    "x2" to prop("integer", "终点横坐标"),
+                    "y2" to prop("integer", "终点纵坐标"),
+                    "duration" to prop("integer", "滑动毫秒数，默认 400，范围 100–3000"),
+                ),
+                listOf("x1", "y1", "x2", "y2"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ui_text", "把文字写进当前焦点输入框；给 query 就写进匹配到的那个。",
+            schema(
+                mapOf(
+                    "text" to prop("string", "要写入的文字"),
+                    "query" to prop("string", "可选：定位输入框的文字/描述/id"),
+                ),
+                listOf("text"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ui_scroll", "向前或向后滚一屏；没有可滚控件时退化成滑动屏幕。",
+            schema(
+                mapOf(
+                    "direction" to prop("string", "down=向后滚（看下面），up=向前滚（看上面）"),
+                    "query" to prop("string", "可选：定位某个可滚容器"),
+                ),
+                listOf("direction"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ui_key", "发 back / home / recents / notifications 全局动作。",
+            schema(mapOf("key" to prop("string", "back｜home｜recents｜notifications")), listOf("key")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_ui_wait", "轮询当前界面，直到文字/描述/id 出现或超时。",
+            schema(
+                mapOf(
+                    "query" to prop("string", "要等的文字/描述/控件 id 的一部分"),
+                    "timeout" to prop("integer", "最多等多少毫秒，默认 5000，上限 30000"),
+                    "regex" to prop("boolean", "把 query 当正则解释，默认 false"),
+                ),
+                listOf("query"),
+            ),
+        ),
+        McpTool(
+            "self_app_launch", "按包名打开 App（例：com.android.settings）。",
+            schema(mapOf("pkg" to prop("string", "包名")), listOf("pkg")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_app_open_url", "用系统浏览器打开 http/https 链接（不是网页抓取）。",
+            schema(mapOf("url" to prop("string", "要打开的 http/https 链接")), listOf("url")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_app_list", "列出桌面有启动入口的应用（名称 + 包名），可按名称/包名过滤。",
+            schema(
+                mapOf(
+                    "query" to prop("string", "可选：按名称或包名过滤"),
+                    "limit" to prop("integer", "最多返回多少个，默认 40，上限 200"),
+                ),
+                emptyList(),
+            ),
+        ),
+        McpTool(
+            "self_ui_screenshot", "系统无障碍截图（Android 11+）：回传压缩后的 JPEG 图片内容，同时在手机私有目录留一张 PNG。",
+            schema(mapOf("max" to prop("integer", "JPEG 最长边像素，默认 1280，范围 320–2048")), emptyList()),
+        ),
+        McpTool(
+            "self_notif_list", "读最近通知（发件 App、标题、正文）。需用户先授予通知使用权。",
+            schema(mapOf("limit" to prop("integer", "最多返回多少条，默认 20，上限 40")), emptyList()),
+        ),
+        McpTool(
+            "self_notif_clear", "清空本机内存里的通知缓存；不删除系统通知。",
+            schema(emptyMap()),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_clipboard_get", "读当前剪贴板文字；后台读取可能被 Android 10+ 拒绝。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_clipboard_set", "把文字写进系统剪贴板。",
+            schema(mapOf("text" to prop("string", "要写入的文字")), listOf("text")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_battery_status", "电量、充电、省电模式、是否在电池优化白名单。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_audio_volume", "读媒体音量（索引 / 最大值 / 百分比）。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_audio_set_volume", "把媒体音量设成指定百分比（0–100），静默执行。",
+            schema(mapOf("percent" to prop("integer", "目标音量百分比，0–100")), listOf("percent")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_net_status", "当前网络类型、是否计费、是否已验证可上网。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_device_info", "厂商型号、Android 版本、ABI、包名、是否已长期配对。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_screen_state", "屏幕亮灭与锁屏状态（锁屏下无障碍点不到 App）。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_diag", "全通道自检：无障碍、通知、权限、电池白名单、云侧、MCP、本地模型。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_audit", "最近有副作用动作的审计记录（参数摘要，敏感值隐藏）。",
+            schema(mapOf("limit" to prop("integer", "最多返回多少条，默认 20，上限 50")), emptyList()),
+        ),
+    )
+
+    private val core = McpCore(
+        tools = tools,
+        actionsAllowed = { Prefs.mcpAllowActions },
+        call = { name, args -> runBlocking { executeTool(name, args) } },
+    )
+
+    /** 一行原始 JSON → 一行回包；通知返回 null。传输层直接写回。 */
+    fun handleLine(line: String): String? = core.handleLine(line)
+
+    fun toolCount(): Int = tools.size
+
+    /** 本机工具表。MCP 入网和本地模型的工具协议共用同一份，避免两边名字漂移。 */
+    fun toolList(): List<McpTool> = tools
+
+    /** 直接执行一次工具（本地模型工具闭环用）；失败不抛异常，统一走 ToolResult。 */
+    suspend fun executeTool(mcpName: String, args: JSONObject): ToolResult {
+        val startedAt = System.currentTimeMillis()
+        val selfName = when (mcpName) {
+            "self_status" -> "self.status"
+            "self_ui_dump" -> "self.ui.dump"
+            "self_ui_find" -> "self.ui.find"
+            "self_ui_tap" -> "self.ui.tap"
+            "self_ui_tap_at" -> "self.ui.tap_at"
+            "self_ui_swipe" -> "self.ui.swipe"
+            "self_ui_text" -> "self.ui.text"
+            "self_ui_scroll" -> "self.ui.scroll"
+            "self_ui_key" -> "self.ui.key"
+            "self_ui_wait" -> "self.ui.wait"
+            "self_app_launch" -> "self.app.launch"
+            "self_app_open_url" -> "self.app.open_url"
+            "self_app_list" -> "self.app.list"
+            "self_ui_screenshot" -> "self.ui.screenshot"
+            "self_notif_list" -> "self.notif.list"
+            "self_notif_clear" -> "self.notif.clear"
+            "self_clipboard_get" -> "self.clipboard.get"
+            "self_clipboard_set" -> "self.clipboard.set"
+            "self_battery_status" -> "self.battery.status"
+            "self_audio_volume" -> "self.audio.volume"
+            "self_audio_set_volume" -> "self.audio.set_volume"
+            "self_net_status" -> "self.net.status"
+            "self_device_info" -> "self.device.info"
+            "self_screen_state" -> "self.screen.state"
+            "self_diag" -> "self.diag"
+            "self_audit" -> "self.audit"
+            else -> return ToolResult(false, err = "未知工具：$mcpName")
+        }
+        val map = LinkedHashMap<String, Any?>()
+        val keys = args.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            map[k] = if (args.isNull(k)) null else args.get(k)
+        }
+        // 远端看不到手机文件系统，截屏必须把图片本体塞进 MCP 回包。
+        if (mcpName == "self_ui_screenshot") map["inline"] = true
+        val result = runBlocking { PhoneSelf.run(selfName, map) }
+        // 有副作用的工具才进审计；读界面/读电量这种不刷屏。
+        if (tools.firstOrNull { it.name == mcpName }?.sideEffect == true) {
+            ActionLog.add(mcpName, args, result.ok, result.err, System.currentTimeMillis() - startedAt)
+        }
+        return result
+    }
+
+    private fun prop(type: String, desc: String): JSONObject =
+        JSONObject().put("type", type).put("description", desc)
+
+    private fun schema(
+        props: Map<String, JSONObject>,
+        required: List<String> = emptyList(),
+    ): JSONObject {
+        val p = JSONObject()
+        props.forEach { (k, v) -> p.put(k, v) }
+        return JSONObject()
+            .put("type", "object")
+            .put("properties", p)
+            .put("required", JSONArray(required))
+            .put("additionalProperties", false)
+    }
+}

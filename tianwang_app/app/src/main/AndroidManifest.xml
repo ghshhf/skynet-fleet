@@ -6,12 +6,82 @@
          其余敏感权限（RECORD_AUDIO/前台服务…）仍按老工程清单逐条搬，不预开。 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- 手机入网要长期在线：前台服务 + Android 14 的 dataSync 类型。
+         通知权限只影响通知是否可见，不影响服务启动；开机自启是尽力而为
+         （Android 15 对 BOOT_COMPLETED 启动 dataSync 有限制，失败会回落直连）。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 语音输入：录音上传给云侧 /api/voice/recognize。没有麦克风的设备也能装，
+         只是聊天页的麦克风会提示不可用。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- 本机自持：读网络类型 + 调媒体音量。两条都是普通权限，装了就直接可用，
+         没有运行时授权弹窗。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- 按包名打开 App 需要「包可见性」。只放开带启动入口的应用，
+         不申请 QUERY_ALL_PACKAGES —— 少一个敏感权限，能力面没少。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
-        android:label="天网 Next"
+        android:label="@string/app_name"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.TianwangNext">
+
+        <!-- 手机自持通道。BIND_ACCESSIBILITY_SERVICE 是系统签名权限，
+             只有用户在设置里手动授权后系统才会绑上来。 -->
+        <service
+            android:name=".PhoneAccessService"
+            android:exported="true"
+            android:label="@string/accessibility_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service" />
+        </service>
+
+        <!-- 通知监听。BIND_NOTIFICATION_LISTENER_SERVICE 是系统签名权限，
+             只有用户在「通知使用权」里手动勾选后系统才会绑上来。 -->
+        <service
+            android:name=".NotificationWatch"
+            android:exported="true"
+            android:label="@string/notification_listener_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- 入网链接的常驻壳：只负责前台通知 + 把 PhoneMcpLink 拉起来。
+             真正的 WebSocket 与断线重连都在 PhoneMcpLink，不在 Service 里。 -->
+        <service
+            android:name=".PhoneLinkService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <activity
             android:name=".MainActivity"

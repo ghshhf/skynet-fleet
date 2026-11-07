@@ -27,12 +27,15 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -340,6 +343,10 @@ private data class ImportState(
 private fun AddModelCard(onChanged: () -> Unit) {
     val scope = rememberCoroutineScope()
     var st by remember { mutableStateOf<ImportState?>(null) }
+    var showUrl by remember { mutableStateOf(false) }
+    var urlText by remember { mutableStateOf("") }
+    var urlName by remember { mutableStateOf("") }
+    var urlErr by remember { mutableStateOf("") }
     // "*/*" 而不是 "application/octet-stream"：各家文件管理器对 .gguf 的 MIME
     // 判定不一致，限制太死会选不到文件。格式在拷之前自己校验。
     val picker = rememberLauncherForActivityResult(
@@ -400,6 +407,10 @@ private fun AddModelCard(onChanged: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 24.dp, top = 4.dp),
             )
+            TextButton(
+                onClick = { urlErr = ""; showUrl = true },
+                modifier = Modifier.padding(start = 16.dp),
+            ) { Text("从链接下载（不经过电脑）", fontSize = 11.sp) }
         } else if (s.err.isNotEmpty()) {
             Text(
                 s.err, fontSize = 10.5.sp, lineHeight = 16.sp,
@@ -437,6 +448,77 @@ private fun AddModelCard(onChanged: () -> Unit) {
                 modifier = Modifier.padding(start = 24.dp, top = 5.dp),
             )
         }
+    }
+
+    if (showUrl) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) showUrl = false },
+            title = { Text("从链接下载 .gguf") },
+            text = {
+                Column {
+                    Text(
+                        "手机自己下，不经过电脑。只收 http/https；下载先写 .part，" +
+                            "体积和 GGUF 魔数都过了才改名。",
+                        fontSize = 11.sp, lineHeight = 16.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        urlText, { urlText = it },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true,
+                        label = { Text("模型链接") },
+                        placeholder = { Text("https://…/Qwen2.5-0.5B-Q4_K_M.gguf") },
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(
+                        urlName, { urlName = it },
+                        modifier = Modifier.fillMaxWidth(), singleLine = true,
+                        label = { Text("文件名（可选）") },
+                        placeholder = { Text(ModelDownload.filenameFromUrl(urlText.ifBlank { "model.gguf" })) },
+                    )
+                    if (urlErr.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(urlErr, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = !busy, onClick = {
+                    val u = urlText.trim()
+                    if (!u.startsWith("http://") && !u.startsWith("https://")) {
+                        urlErr = "只支持 http/https 链接"
+                    } else {
+                        val name = urlName.trim().ifBlank { ModelDownload.filenameFromUrl(u) }
+                        if (!name.endsWith(".gguf", ignoreCase = true)) {
+                            urlErr = "文件名必须以 .gguf 结尾"
+                        } else {
+                            urlErr = ""
+                            showUrl = false
+                            st = ImportState(name = name, total = -1)
+                            scope.launch {
+                                val r = ModelDownload.fetch(
+                                    url = u,
+                                    dir = File(Demo.modelDir),
+                                    name = name,
+                                ) { d, t -> st = st?.copy(done = d, total = t) }
+                                r.onSuccess { f ->
+                                    st = ImportState(
+                                        name = f.name, done = f.length(),
+                                        total = f.length(), done100 = true,
+                                    )
+                                    onChanged()
+                                }.onFailure { e ->
+                                    st = ImportState(err = e.message ?: "下载失败")
+                                }
+                            }
+                        }
+                    }
+                }) { Text("开始下载") }
+            },
+            dismissButton = {
+                TextButton(enabled = !busy, onClick = { showUrl = false }) { Text("取消") }
+            },
+        )
     }
 }
 

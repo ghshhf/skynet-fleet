@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -32,15 +33,62 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
-/** 工具箱（Operit toolbox 风格）：电脑侧真实能力按类别列出来，点一下就在电脑上真跑。 */
+/**
+ * 工具箱入口：电脑侧 / 手机本机两条能力面。
+ *
+ * 分开但放在同一页，是因为对用户来说都是「点一下真跑」；
+ * 区别只在执行端 —— 电脑侧要云连接，手机本机要无障碍通道。
+ */
 @Composable
 fun ToolsScreen() {
+    var side by remember { mutableStateOf(0) }
+
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SideChip("电脑侧", side == 0) { side = 0 }
+            SideChip("手机本机", side == 1) { side = 1 }
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+        if (side == 0) RemoteToolsPane() else PhoneSelfPane()
+    }
+}
+
+@Composable
+private fun SideChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(
+                if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                else MaterialTheme.colorScheme.surfaceVariant
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 7.dp)
+    ) {
+        Text(
+            label,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** 电脑侧真实能力按类别列出来，点一下就在电脑上真跑。 */
+@Composable
+private fun RemoteToolsPane() {
     var groups by remember { mutableStateOf<Map<String, List<Capability>>>(emptyMap()) }
     var loading by remember { mutableStateOf(true) }
     var err by remember { mutableStateOf("") }

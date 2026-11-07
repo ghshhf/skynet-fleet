@@ -279,6 +279,14 @@ object Prefs {
     private const val K_MAXTOK = "max_tokens"
     private const val K_LAST_MODEL = "last_model_id"
     private const val K_LANG = "reply_lang"
+    private const val K_MCP_URL = "mcp_pair_url"
+    private const val K_MCP_ROOM = "mcp_pair_room"
+    private const val K_MCP_SECRET = "mcp_pair_secret"
+    private const val K_MCP_ALLOW = "mcp_allow_actions"
+    private const val K_MCP_ENABLED = "mcp_enabled"
+    private const val K_DEV_ID = "device_id"
+    private const val K_DEV_SEC = "device_secret"
+    private const val K_DEV_NAME = "device_name"
 
     private val sp get() = App.ctx.getSharedPreferences(SP, Context.MODE_PRIVATE)
 
@@ -308,4 +316,77 @@ object Prefs {
     var replyLang: ReplyLang
         get() = ReplyLang.of(sp.getString(K_LANG, ReplyLang.ZH_CN.key))
         set(v) { sp.edit().putString(K_LANG, v.key).apply() }
+
+    /**
+     * 手机入网（MCP over /pair）。凭据只存本机 SharedPreferences：
+     * room 是公开标识，secret 是 HMAC 密钥，**不写进日志、不进 UI 状态**。
+     */
+    var mcpUrl: String
+        get() = sp.getString(K_MCP_URL, "") ?: ""
+        set(v) { sp.edit().putString(K_MCP_URL, v.trim()).apply() }
+
+    var mcpRoom: String
+        get() = sp.getString(K_MCP_ROOM, "") ?: ""
+        set(v) { sp.edit().putString(K_MCP_ROOM, v.trim()).apply() }
+
+    var mcpSecret: String
+        get() = sp.getString(K_MCP_SECRET, "") ?: ""
+        set(v) { sp.edit().putString(K_MCP_SECRET, v.trim()).apply() }
+
+    /** 默认只读。打开后 PC 才能通过 MCP 调 tap/text/key/launch。 */
+    var mcpAllowActions: Boolean
+        get() = sp.getBoolean(K_MCP_ALLOW, false)
+        set(v) { sp.edit().putBoolean(K_MCP_ALLOW, v).apply() }
+
+    /** 用户上次点了「连接」。App 重启后按这个字段自动重连。 */
+    var mcpEnabled: Boolean
+        get() = sp.getBoolean(K_MCP_ENABLED, false)
+        set(v) { sp.edit().putBoolean(K_MCP_ENABLED, v).apply() }
+
+    fun mcpConfigured(): Boolean = mcpUrl.isNotBlank() && mcpRoom.isNotBlank() && mcpSecret.isNotBlank()
+
+    // ---------------- 长期设备凭据（配对得来） ----------------
+
+    /**
+     * 配对换来的 deviceId/secret。和 token 的区别：
+     * token 是电脑那枚一次性令牌，电脑重启就变；这一对**配一次管到被撤销**。
+     * 两把钥匙都存、都带 —— 新电脑认长期凭据，老电脑只认令牌。
+     */
+    var deviceId: String
+        get() = sp.getString(K_DEV_ID, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_DEV_ID, v.trim()).apply() }
+
+    var deviceSecret: String
+        get() = sp.getString(K_DEV_SEC, "")?.trim() ?: ""
+        set(v) { sp.edit().putString(K_DEV_SEC, v.trim()).apply() }
+
+    /** 显示用的设备名；没存过就用机型，别让列表里出现空名字。 */
+    var deviceName: String
+        get() {
+            val saved = sp.getString(K_DEV_NAME, "")?.trim() ?: ""
+            if (saved.isNotEmpty()) return saved
+            val model = Build.MODEL?.trim() ?: ""
+            return model.ifEmpty { "这台手机" }
+        }
+        set(v) { sp.edit().putString(K_DEV_NAME, v.trim()).apply() }
+
+    fun paired(): Boolean = deviceId.isNotEmpty() && deviceSecret.isNotEmpty()
+
+    /** 存一次配对结果。这是「配一次、之后不再配」的落点。 */
+    fun saveDevice(id: String, secret: String, name: String) {
+        sp.edit()
+            .putString(K_DEV_ID, id.trim())
+            .putString(K_DEV_SEC, secret.trim())
+            .putString(K_DEV_NAME, name.trim())
+            .apply()
+    }
+
+    /** 忘掉配对（这台设备被撤销、或者要换电脑）。 */
+    fun clearDevice() {
+        sp.edit()
+            .remove(K_DEV_ID)
+            .remove(K_DEV_SEC)
+            .remove(K_DEV_NAME)
+            .apply()
+    }
 }

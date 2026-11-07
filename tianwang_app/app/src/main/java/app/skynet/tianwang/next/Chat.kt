@@ -239,6 +239,9 @@ data class ToolResult(
     val ok: Boolean = false,
     val text: String = "",
     val err: String = "",
+    /** 非空时 MCP 回包会多一条 image 内容（截屏给远端看，不必让远端去拉手机文件）。 */
+    val imageBase64: String = "",
+    val mimeType: String = "image/jpeg",
 )
 
 /** 项目任务进度（来自云侧 /api/tasks）。 */

@@ -1,5 +1,9 @@
 package app.skynet.tianwang.next
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
@@ -27,7 +31,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Check
@@ -36,6 +39,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VolumeOff
@@ -52,19 +56,26 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 聊天页。这块是「照 Operit 抄」抄得最实的一处，抄的是**信息层级**而不是像素：
@@ -91,6 +102,74 @@ fun ChatScreen(
 ) {
     var draft by remember { mutableStateOf("") }
     val list = rememberLazyListState()
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var recording by remember { mutableStateOf(false) }
+    var voiceBusy by remember { mutableStateOf(false) }
+    var voiceErr by remember { mutableStateOf("") }
+
+    suspend fun startVoice() {
+        // 先掐掉 TTS，不然喇叭里的声音会被麦克风收回去，识别成上一句回答。
+        Speech.stop()
+        val r = VoiceInput.start()
+        if (r.isSuccess) {
+            recording = true
+            voiceErr = ""
+        } else {
+            recording = false
+            voiceErr = "录音起不来：${r.exceptionOrNull()?.message ?: "未知原因"}"
+        }
+    }
+
+    suspend fun stopVoice() {
+        recording = false
+        val file = VoiceInput.stop()
+        if (file == null) {
+            voiceErr = "没录到声音，或太短（至少说半秒）"
+            return
+        }
+        voiceBusy = true
+        try {
+            val wav = withContext(Dispatchers.IO) { file.readBytes() }
+            val text = Net.recognize(wav).trim()
+            if (text.isBlank()) voiceErr = "没识别出文字，再说清楚一点"
+            else {
+                draft = text
+                voiceErr = ""
+            }
+        } catch (e: Exception) {
+            voiceErr = "识别失败：${e.message ?: e.javaClass.simpleName}"
+        } finally {
+            voiceBusy = false
+            file.delete()
+        }
+    }
+
+    val micPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            scope.launch { startVoice() }
+        } else {
+            voiceErr = "没有麦克风权限。到系统设置里给「天网 Next」开录音。"
+        }
+    }
+    val onMic: () -> Unit = {
+        when {
+            recording -> scope.launch { stopVoice() }
+            busy || voiceBusy -> Unit
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED -> scope.launch { startVoice() }
+            else -> micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            // 页面切走时直接让录音线程退出；不要在这里做 suspend join。
+            VoiceInput.abort()
+        }
+    }
 
     // 新消息到了就贴底（没有这条，流式输出会推到屏幕外面去）
     LaunchedEffect(msgs.size, msgs.lastOrNull()?.text?.length) {
@@ -148,6 +227,10 @@ fun ChatScreen(
                 if (t.isNotEmpty()) { onSend(t); draft = "" }
             },
             onStop = onStop,
+            recording = recording,
+            voiceBusy = voiceBusy,
+            voiceErr = voiceErr,
+            onVoice = onMic,
         )
     }
 }
@@ -565,6 +648,10 @@ private fun Composer(
     canSend: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    recording: Boolean,
+    voiceBusy: Boolean,
+    voiceErr: String,
+    onVoice: () -> Unit,
 ) {
     val can = draft.isNotBlank() && canSend && !busy
     Column(
@@ -573,13 +660,37 @@ private fun Composer(
             .imePadding(),
     ) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+        if (recording || voiceBusy || voiceErr.isNotBlank()) {
+            Text(
+                when {
+                    recording -> "录音中… 再点麦克风结束"
+                    voiceBusy -> "识别中…"
+                    else -> voiceErr
+                },
+                modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 6.dp),
+                fontSize = 11.sp,
+                color = if (voiceErr.isNotBlank() && !recording && !voiceBusy) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
         Row(
             Modifier.fillMaxWidth().padding(start = 6.dp, end = 8.dp, top = 7.dp, bottom = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            IconButton(onClick = {}) {
-                Icon(Icons.Filled.Add, "附件",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            IconButton(onClick = onVoice,
+                enabled = !voiceBusy && (recording || !busy)) {
+                Icon(
+                    if (recording) Icons.Filled.Stop else Icons.Filled.Mic,
+                    if (recording) "结束录音" else "语音输入",
+                    tint = when {
+                        recording -> StatusColors.fail
+                        voiceBusy -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                        else -> MaterialTheme.colorScheme.primary
+                    },
+                )
             }
             TextField(
                 value = draft,

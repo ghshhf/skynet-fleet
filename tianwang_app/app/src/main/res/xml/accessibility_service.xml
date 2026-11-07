@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    手机自持通道（无障碍）的配置。
+
+    · canRetrieveWindowContent：拿视图树的前提，没有它只能收到事件、读不到控件。
+    · canPerformGestures：控件不响应时按坐标点/滑的兜底。
+    · canTakeScreenshot：Android 11+ 的系统截屏（视觉兜底用）。
+    · flagRetrieveInteractiveWindows + flagIncludeNotImportantViews：
+      多窗口与 Compose/自绘控件更容易被看到；不加时树经常缺一大块。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked|typeViewFocused"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/accessibility_desc"
+    android:notificationTimeout="100" />

@@ -97,6 +97,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.navigation:navigation-compose:2.8.4")
 
+    // 手机入网：出站 WebSocket 连 /pair 中继。手机没有公网入口，只能自己往外连；
+    // 不引 VPN/sshd/adb。OkHttp 的 WebSocket 是这里最薄的一层。
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // 手机端原来一条测试都没有。这里先只上 JVM 单测：不需要真机、

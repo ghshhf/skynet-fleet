@@ -78,6 +78,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         App.bind(this)
         Net.init(applicationContext)
+        // 上次若开着「手机入网」，进程重启后自己接回中继；不要求用户每次手动重连。
+        if (Prefs.mcpEnabled && Prefs.mcpConfigured()) PhoneLinkService.start(this)
         // 出声（总纲第 1 条空白）。默认关，界面上那个喇叭点了才念。
         Speech.init(applicationContext)
         // 云侧连接可由 adb 一次性注入，免得每次装机都要在手机上手动敲一遍：
@@ -313,9 +315,31 @@ private fun App() {
             scope.launch {
                 val started = System.currentTimeMillis()
                 val history = msgs.filter { it.id != replyId }   // 含刚发的 user 消息
-                LocalBackend.chat(model, history, onDelta = { d ->
-                    update(msgs, replyId) { it.copy(text = it.text + d) }
-                }).onSuccess { full ->
+                val steps = mutableStateListOf<ToolCall>()
+                // 通道在线才给本地模型工具协议：没通道时它只会拿到一串「没开」，
+                // 白白烧 token，还会把回答带偏。
+                val run = if (model.tools && PhoneSelf.connected()) {
+                    LocalAgent.run(
+                        profile = model,
+                        history = history,
+                        tools = PhoneMcp.toolList(),
+                        allowActions = Prefs.mcpAllowActions,
+                        execute = { n, a -> PhoneMcp.executeTool(n, a) },
+                        onDelta = { d ->
+                            update(msgs, replyId) { it.copy(text = it.text + d) }
+                        },
+                        onTool = { tc ->
+                            val i = steps.indexOfFirst { it.id == tc.id }
+                            if (i >= 0) steps[i] = tc else steps.add(tc)
+                            update(msgs, replyId) { it.copy(tools = steps.toList()) }
+                        },
+                    )
+                } else {
+                    LocalBackend.chat(model, history, onDelta = { d ->
+                        update(msgs, replyId) { it.copy(text = it.text + d) }
+                    })
+                }
+                run.onSuccess { full ->
                     val st = LlamaNative.lastStats()
                     val cost = System.currentTimeMillis() - started
                     // 念的是"最终落下那句"：full 为空时答案是流式期间攒的 text
