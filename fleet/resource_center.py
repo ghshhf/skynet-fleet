@@ -350,6 +350,19 @@ class ResourceCenter:
         scored.sort(key=lambda x: (-x["score"], x["id"]))
         page = _diverse(scored[cursor:cursor + limit * 2], limit)
         with self._conn() as c:
+            # 一次性取这一页的行为标记，避免每张卡再查三次（手机端一屏 20 张）。
+            ids = [it["id"] for it in page]
+            marks = {}
+            if ids:
+                q = ("SELECT resource_id,action,COUNT(*) n FROM actions WHERE resource_id IN ("
+                     + ",".join("?" * len(ids)) + ") GROUP BY resource_id,action")
+                for a in c.execute(q, ids):
+                    marks.setdefault(a["resource_id"], {})[a["action"]] = a["n"]
+            for it in page:
+                m = marks.get(it["id"], {})
+                it["liked"] = "like" in m
+                it["faved"] = "favorite" in m
+                it["comments"] = m.get("comment", 0)
             for it in page:
                 c.execute(
                     "INSERT INTO exposures(resource_id,session_id,times,clicked,last_at) "
@@ -395,6 +408,9 @@ class ResourceCenter:
             "url": r["canonical_url"], "domain": r["domain"], "kind": r["kind"],
             "quality": r["quality"], "tags": tags, "origins": origins,
             "actions": actions,
+            "liked": any(a["action"] == "like" for a in actions),
+            "faved": any(a["action"] == "favorite" for a in actions),
+            "comments": sum(1 for a in actions if a["action"] == "comment"),
             "published_at": _iso(r["published_at"] or r["created_at"]),
         }}
 

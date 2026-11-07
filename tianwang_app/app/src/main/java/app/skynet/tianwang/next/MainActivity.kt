@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.Assignment
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
@@ -198,7 +199,8 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class Tab(val label: String) {
-    CHAT("对话"), MODELS("模型"), TOOLS("工具箱"), TASKS("任务"), FLEET("编队"), SETTINGS("设置")
+    CHAT("对话"), MODELS("模型"), TOOLS("工具箱"), RES("资源"), TASKS("任务"),
+    FLEET("编队"), SETTINGS("设置")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -418,6 +420,7 @@ private fun App() {
                                     ?.take(20) ?: "新对话"
                                 Tab.MODELS -> "本地 + 云端，一个列表"
                                 Tab.TOOLS -> "电脑侧真实能力"
+                                Tab.RES -> "电脑侧资源流"
                                 Tab.TASKS -> "项目整体进度"
                                 Tab.FLEET -> "我在编队里的位置"
                                 Tab.SETTINGS -> "会改变行为的开关"
@@ -472,6 +475,7 @@ private fun App() {
                                         Tab.CHAT -> Icons.Filled.ChatBubbleOutline
                                         Tab.MODELS -> Icons.Filled.Memory
                                         Tab.TOOLS -> Icons.Filled.Build
+                                        Tab.RES -> Icons.Filled.Explore
                                         Tab.TASKS -> Icons.Filled.Assignment
                                         Tab.FLEET -> Icons.Filled.Devices
                                         Tab.SETTINGS -> Icons.Filled.Settings
@@ -529,6 +533,7 @@ private fun App() {
                         models.addAll(cloud)
                     })
                 Tab.TOOLS -> ToolsScreen()
+                Tab.RES -> ResourcesScreen()
                 Tab.TASKS -> TasksScreen()
                 Tab.FLEET -> FleetScreen()
                 Tab.SETTINGS -> SettingsScreen()

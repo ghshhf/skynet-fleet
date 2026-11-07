@@ -69,8 +69,11 @@ check(rc.act(a["id"], "favorite")["ok"], "收藏落库")
 check(rc.act(a["id"], "comment", "讲得清楚")["ok"], "评论落库")
 det = rc.detail(a["id"])
 check(len(det["item"]["actions"]) == 3, "详情里能看到 3 条行为")
-check(rc.feed("", limit=10, session_id="s2")["items"][0]["id"] == a["id"],
-      "偏好生效：点赞过的 AI 卡排第一")
+f = rc.feed("", limit=10, session_id="s2")
+first = f["items"][0]
+check(first["id"] == a["id"], "偏好生效：点赞过的 AI 卡排第一")
+check(first["liked"] and first["faved"] and first["comments"] == 1,
+      "信息流卡片带回赞/收藏/评论标记")
 
 print("④ 主题筛选 / 搜索 / 分页")
 check(rc.feed("AI", limit=10)["total"] == 1, "主题 AI 只回 1 条")
