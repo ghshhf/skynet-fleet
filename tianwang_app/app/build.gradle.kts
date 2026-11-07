@@ -116,6 +116,15 @@ dependencies {
     // 不引 VPN/sshd/adb。OkHttp 的 WebSocket 是这里最薄的一层。
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // 后台定时爬取：WorkManager 每 30 分钟唤醒一次 ResourceCrawler，合规省电、
+    // 幂等可重复排队，不依赖用户手动下拉刷新。
+    implementation("androidx.work:work-runtime:2.9.1")
+
+    // 资源流内嵌视频播放：直链 mp4/webm/m3u8 用 ExoPlayer 就地播放，不跳浏览器。
+    // （YouTube/B站等页面型视频仍走 ResourceViewer 的 WebView。）
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-ui:1.4.1")
+
     // Shizuku：借一次无线调试授权拿到 shell（uid 2000）身份，补上无障碍够不着的
     // 「装应用 / 改系统设置 / 跨 App shell」。没装 Shizuku 只是降级，不影响装机。
     // 13.1.5 没有 Shizuku.newProcess，正路是自带 AIDL UserService（见 IUserService.aidl）。
