@@ -191,11 +191,32 @@ object PhoneSelf {
         ),
         SelfCap(
             "self.diag", "全通道自检",
-            "一条命令看齐所有开关：无障碍、通知监听、通知/录音权限、电池白名单、云侧配置与配对、MCP 入网、本地模型数量。真机验收先跑这条。",
+            "一条命令看齐所有开关：无障碍、通知监听、通知/录音权限、电池白名单、云侧配置与配对、MCP 入网、Shizuku、本地模型数量。真机验收先跑这条。",
         ),
         SelfCap(
             "self.device.info", "设备档案",
             "厂商型号、Android 版本、ABI、App 包名、是否已做长期设备配对（不暴露 secret）。",
+        ),
+        SelfCap(
+            "self.perm.matrix", "权限矩阵（通道降级）",
+            "逐条列出读界面 / 点击 / 截屏 / 读通知 / shell / 装应用等能力走哪条通道、当前可不可用、缺权时下一步做什么。不重试、不假装成功。",
+        ),
+        SelfCap(
+            "self.shizuku.status", "Shizuku 通道状态",
+            "Shizuku 装没装、服务跑没跑、本 App 授没授权、shell 会话连没连。想用 shell 先跑这条。",
+        ),
+        SelfCap(
+            "self.shizuku.request", "申请 Shizuku 授权",
+            "向 Shizuku 发起授权请求（会弹 Shizuku 自己的确认框）。已授权时不会重复弹。",
+        ),
+        SelfCap(
+            "self.shell.exec", "跨 App shell（uid 2000）",
+            "经 Shizuku 在 shell 身份下执行 `sh -c` 命令，stdout/stderr 合并返回，超时默认 15 秒、输出上限 8KB。没授权时直接报原因。",
+            listOf(
+                CapParam("cmd", "str", "要执行的 shell 命令", true),
+                CapParam("cwd", "str", "工作目录，默认当前目录", false),
+                CapParam("timeout", "int", "超时毫秒，默认 15000，上限 60000", false),
+            ),
         ),
     )
 
@@ -245,6 +266,19 @@ object PhoneSelf {
                     "self.net.status" -> netStatus(App.ctx)
                     "self.device.info" -> deviceInfo(App.ctx)
                     "self.diag" -> diag(App.ctx)
+                    "self.perm.matrix" -> ToolResult(true, text = Perms.format(Perms.snapshot(App.ctx)))
+                    "self.shizuku.status" -> shizukuStatus()
+                    "self.shizuku.request" -> {
+                        val st = ShizukuBridge.status()
+                        if (!st.running) ToolResult(false, err = st.line())
+                        else ToolResult(true, text = ShizukuBridge.requestPermission())
+                    }
+                    // shell 不依赖无障碍，必须放在通道闸门之前。
+                    "self.shell.exec" -> ShizukuBridge.exec(
+                        cmd = strArg(args, "cmd"),
+                        cwd = strArg(args, "cwd"),
+                        timeoutMs = intArg(args, "timeout", 15_000),
+                    )
                     "self.audit" -> audit(args)
                     "self.screen.state" -> screenState(App.ctx)
                     "self.app.list" -> appList(App.ctx, args)
@@ -756,7 +790,27 @@ object PhoneSelf {
             append("MCP 入网：").append(if (Prefs.mcpConfigured()) "已配置" else "未配置")
             append("；开关：").append(if (Prefs.mcpEnabled) "自动连接" else "关闭")
             append("；状态：").append(PhoneMcpLink.status).append('\n')
+            append("Shizuku：").append(ShizukuBridge.status().line()).append('\n')
             append("本地模型：").append(ModelCatalog.local().size).append(" 个 GGUF")
+        }
+        return ToolResult(true, text = txt)
+    }
+
+    private fun shizukuStatus(): ToolResult {
+        val st = ShizukuBridge.status()
+        val txt = buildString {
+            append("Shizuku：").append(st.line()).append('\n')
+            append("已安装：").append(if (st.installed) "是" else "否").append('\n')
+            append("服务在运行：").append(if (st.running) "是" else "否").append('\n')
+            append("本 App 已授权：").append(if (st.authorized) "是" else "否").append('\n')
+            if (st.running) {
+                append("版本：v").append(st.version).append("；shell uid=").append(st.uid).append('\n')
+            }
+            append("shell 会话：")
+            append(if (st.bound) "已连接" else "未连接（首次执行 self.shell.exec 时自动绑定）")
+            if (ShizukuBridge.lastError.isNotBlank()) {
+                append("\n最近错误：").append(ShizukuBridge.lastError)
+            }
         }
         return ToolResult(true, text = txt)
     }

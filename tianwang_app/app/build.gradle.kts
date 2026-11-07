@@ -29,6 +29,9 @@ android {
 
     buildFeatures {
         compose = true
+        // AGP 8 起 AIDL 默认关闭。Shizuku 的 UserService 必须自带 AIDL 接口，
+        // 不打开这个开关，IUserService 根本不会生成。
+        aidl = true
     }
 
     // 沿用老工程那份密钥（tianwang_android/keystore.jks）。
@@ -100,6 +103,12 @@ dependencies {
     // 手机入网：出站 WebSocket 连 /pair 中继。手机没有公网入口，只能自己往外连；
     // 不引 VPN/sshd/adb。OkHttp 的 WebSocket 是这里最薄的一层。
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Shizuku：借一次无线调试授权拿到 shell（uid 2000）身份，补上无障碍够不着的
+    // 「装应用 / 改系统设置 / 跨 App shell」。没装 Shizuku 只是降级，不影响装机。
+    // 13.1.5 没有 Shizuku.newProcess，正路是自带 AIDL UserService（见 IUserService.aidl）。
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 

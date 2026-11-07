@@ -19,3 +19,12 @@
 # 原型阶段先把行号留着，崩溃日志才读得懂（代价是包大一点点）
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
+
+# Shizuku：UserService 由 Shizuku 在它自己的进程里按 ComponentName 反射实例化，
+# R8 看不到这条引用。不保留的话，release 包里会先删掉 ShellService / AIDL，
+# 表现成「debug 能跑、release 一调 shell 就找不到类」。
+-keep class app.skynet.tianwang.next.ShellService { *; }
+-keep class app.skynet.tianwang.next.IUserService { *; }
+-keep class app.skynet.tianwang.next.IUserService$* { *; }
+-keep class rikka.shizuku.** { *; }
+-dontwarn rikka.shizuku.**

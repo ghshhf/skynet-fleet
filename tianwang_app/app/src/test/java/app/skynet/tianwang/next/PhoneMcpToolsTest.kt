@@ -61,6 +61,41 @@ class PhoneMcpToolsTest {
     }
 
     @Test
+    fun permissionAndShizukuToolsAreExposed() {
+        val names = PhoneMcp.toolList().map { it.name }
+        for (n in listOf(
+            "self_perm_matrix", "self_shizuku_status", "self_shizuku_request", "self_shell_exec",
+        )) {
+            assertTrue("缺少工具 $n", n in names)
+        }
+    }
+
+    @Test
+    fun shellAndPermissionRequestAreSideEffects() {
+        val byName = PhoneMcp.toolList().associateBy { it.name }
+        assertTrue(byName.getValue("self_shizuku_request").sideEffect)
+        assertTrue(byName.getValue("self_shell_exec").sideEffect)
+        assertFalse(byName.getValue("self_perm_matrix").sideEffect)
+        assertFalse(byName.getValue("self_shizuku_status").sideEffect)
+    }
+
+    @Test
+    fun readOnlyGateBlocksShellExec() {
+        var called = false
+        val core = McpCore(
+            tools = PhoneMcp.toolList(),
+            actionsAllowed = { false },
+            call = { _, _ -> called = true; ToolResult(true, text = "should-not-run") },
+        )
+        val resp = core.handleLine(
+            """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"self_shell_exec","arguments":{"cmd":"id"}}}"""
+        )
+        val o = JSONObject(resp!!)
+        assertTrue(o.getJSONObject("result").getBoolean("isError"))
+        assertFalse(called)
+    }
+
+    @Test
     fun readOnlyGateBlocksClipboardWrite() {
         var called = false
         val core = McpCore(

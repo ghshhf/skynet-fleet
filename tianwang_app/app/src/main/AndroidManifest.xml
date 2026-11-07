@@ -24,13 +24,19 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
+    <!-- Shizuku：借一次无线调试授权拿到 shell（uid 2000）身份。
+         没装 Shizuku 时这条权限和 provider 都不生效，不影响其它能力。 -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
     <!-- 按包名打开 App 需要「包可见性」。只放开带启动入口的应用，
-         不申请 QUERY_ALL_PACKAGES —— 少一个敏感权限，能力面没少。 -->
+         不申请 QUERY_ALL_PACKAGES —— 少一个敏感权限，能力面没少。
+         Shizuku 管理器要单独列出，否则 Android 11+ 连「装没装」都查不到。 -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <package android:name="moe.shizuku.manager" />
     </queries>
 
     <application
@@ -82,6 +88,17 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- Shizuku 的入口 provider：负责把 Shizuku 的 binder 交给 api 库。
+             authorities 必须带 ${applicationId}.shizuku 后缀，多个 App 才不撞车。
+             ShellService **不在这里声明**——它由 Shizuku 在 shell 进程里反射实例化。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:exported="true"
+            android:enabled="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <activity
             android:name=".MainActivity"

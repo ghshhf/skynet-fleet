@@ -176,12 +176,37 @@ object PhoneMcp {
             schema(emptyMap()),
         ),
         McpTool(
-            "self_diag", "全通道自检：无障碍、通知、权限、电池白名单、云侧、MCP、本地模型。",
+            "self_diag", "全通道自检：无障碍、通知、权限、电池白名单、云侧、MCP、Shizuku、本地模型。",
             schema(emptyMap()),
         ),
         McpTool(
             "self_audit", "最近有副作用动作的审计记录（参数摘要，敏感值隐藏）。",
             schema(mapOf("limit" to prop("integer", "最多返回多少条，默认 20，上限 50")), emptyList()),
+        ),
+        McpTool(
+            "self_perm_matrix", "权限矩阵：每条能力走哪条通道、当前是否可用、缺权时的下一步（只读，不弹授权）。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_shizuku_status", "Shizuku 装没装 / 服务跑没跑 / 本 App 授没授权 / shell 会话状态。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_shizuku_request", "向 Shizuku 申请授权（弹 Shizuku 自己的确认框）；已授权时不重复弹。",
+            schema(emptyMap()),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_shell_exec", "经 Shizuku 在 shell（uid 2000）身份下执行命令；stdout/stderr 合并，输出上限 8KB。",
+            schema(
+                mapOf(
+                    "cmd" to prop("string", "要执行的 shell 命令"),
+                    "cwd" to prop("string", "工作目录，默认当前目录"),
+                    "timeout" to prop("integer", "超时毫秒，默认 15000，上限 60000"),
+                ),
+                listOf("cmd"),
+            ),
+            sideEffect = true,
         ),
     )
 
@@ -229,6 +254,10 @@ object PhoneMcp {
             "self_screen_state" -> "self.screen.state"
             "self_diag" -> "self.diag"
             "self_audit" -> "self.audit"
+            "self_perm_matrix" -> "self.perm.matrix"
+            "self_shizuku_status" -> "self.shizuku.status"
+            "self_shizuku_request" -> "self.shizuku.request"
+            "self_shell_exec" -> "self.shell.exec"
             else -> return ToolResult(false, err = "未知工具：$mcpName")
         }
         val map = LinkedHashMap<String, Any?>()
