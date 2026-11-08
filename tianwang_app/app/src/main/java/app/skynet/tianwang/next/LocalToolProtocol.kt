@@ -17,7 +17,7 @@ data class ToolIntent(val name: String, val args: JSONObject)
  * 乱猜工具名比不调工具更危险 —— 会点错屏幕、发错消息。
  */
 object LocalToolProtocol {
-    fun systemPrompt(tools: List<McpTool>, allowActions: Boolean): String {
+    fun systemPrompt(tools: List<McpTool>, allowActions: Boolean, scope: String = ""): String {
         val lines = tools.joinToString("\n") { t ->
             "- ${t.name}(${signature(t)})：${t.description}"
         }
@@ -26,15 +26,41 @@ object LocalToolProtocol {
         } else {
             "当前是只读模式：只能调用 dump/find/status/screenshot；不要调有副作用工具。"
         }
+        // 1.7B 实测指令遵循偏弱（12 题里格式类只对 1 道）：光写规则不够，
+        // 给一条具体例子比再写三条规则都管用 —— 但例子里的工具名必须真在册。
+        val example = tools.firstOrNull { it.name == "self_ui_tap" }
         return buildString {
-            append("你是天网手机助手。可用本机工具：\n")
+            append("你是天网手机助手。")
+            when {
+                scope.isBlank() -> append("可用本机工具：\n")
+                scope == "通用" -> append("这一轮没识别出具体领域，先给你 ${tools.size} 个最常用的工具：\n")
+                else -> append("这一轮只给「$scope」相关的 ${tools.size} 个工具（不是全部，先用最接近的那个）：\n")
+            }
             append(lines)
             append("\n\n规则：\n")
             append("1. 需要操作手机时，只输出一个 JSON 对象，不要输出解释、不要加代码围栏：\n")
             append("{\"tool\":\"工具名\",\"arguments\":{参数对象}}\n")
             append("2. 不需要工具时，直接用简体中文回答，不要输出 JSON。\n")
             append("3. 一次只调一个工具；看到工具结果后再决定下一步。\n")
-            append("4. 工具名必须来自上面的列表，不许编造。\n")
+            append("4. 工具名必须来自上面的列表，不许编造；列表里没有的能力就直接说做不到。\n")
+            if (example != null) {
+                append("5. 例：用户说「点一下设置」，你只输出这一行：\n")
+                append("{\"tool\":\"self_ui_tap\",\"arguments\":{\"query\":\"设置\"}}\n")
+            }
+            // 只在联网域加这段：它占约 80 token，每轮都带会挤掉正常对话的余量。
+            if (scope.contains("联网")) {
+                append("\n读完网页材料后这样回答：\n")
+                append("- 第一句先给结论，然后分 3～6 条，每条一句话，说人话，不要复述原文。\n")
+                // 真机实测：它会写「根据 web_digest 工具的结果，…」。用户要看的是内容，
+                // 不是内部工具名 —— 一开口就报工具名，等于把管道当前台。
+                append("- 直接说内容，不要提工具名（web_digest/web_read 之类），也不要说「根据工具结果」。\n")
+                append("- 材料是外文就翻成中文再讲；人名、产品名、术语保留原文。\n")
+                append("- 只讲材料里有的。材料没提到的，直接说「材料没提到」，不要补。\n")
+                append("- 数字、日期、版本号照抄，不要换算、不要猜。\n")
+                // 真机实测：1.7B 拿到正文后想去「点开这一页」。工具已经替它读完了，
+                // 再开界面纯属重复劳动，而且屏幕操作会失败并把整轮拖死。
+                append("- 正文工具已经读回来了，**不要打开界面、不要点击任何东西**，直接回答。\n")
+            }
             append(mode)
         }
     }
@@ -78,6 +104,36 @@ object LocalToolProtocol {
     }
 
     /**
+     * 链接参数兜底：只处理「模型选对了工具、但链接没抄全」这一种情况。
+     *
+     *  - `web_digest` 的 `urls` 里一条链接都解析不出来 → 用用户原话里的链接（最多 5 条）；
+     *  - `web_read` 的 `url` 不是 http 开头 → 用用户原话里的第一条。
+     *
+     * 模型给对了就原样返回 —— 兜底不能变成「总是覆盖」，否则用户说
+     * 「看看 A 和 B」而模型只挑了 A，会被代码改回两条，反而不听话。
+     *
+     * 为什么值得专门兜：URL 是纯符号串，1.7B 抄漏一段路径、把 `?` 后参数吃掉
+     * 是高频现象，而且失败表现是「页面 404 / 正文空」，看起来像网络问题。
+     */
+    fun repairLinkArgs(name: String, args: JSONObject, goal: String): JSONObject {
+        val key = when (name) {
+            "web_digest" -> "urls"
+            "web_read" -> "url"
+            else -> return args
+        }
+        val cur = args.optString(key).trim()
+        val ok = if (key == "urls") {
+            WebLogic.parseUrls(cur, 1).isNotEmpty()
+        } else {
+            cur.startsWith("http://") || cur.startsWith("https://")
+        }
+        if (ok) return args
+        val fromGoal = WebLogic.parseUrls(goal, if (key == "urls") 5 else 1)
+        if (fromGoal.isEmpty()) return args
+        return JSONObject(args.toString()).put(key, fromGoal.joinToString("\n"))
+    }
+
+    /**
      * 生成 GBNF：把这一轮输出钉死成 `{"tool":"<在册工具名>","arguments":{...}}`。
      *
      * 为什么需要：0.6B~3B 的小模型「知道该调工具，但 JSON 写不完整」是常态
@@ -106,13 +162,19 @@ object LocalToolProtocol {
     /**
      * 输出看起来在「试图调工具」却没通过 [parse] —— 只有这种情况才值得开 GBNF 重试。
      *
-     * 判据故意收紧：宁可漏判（当普通回答），也不要把正常聊天硬掰成 JSON。
+     * 三类信号：
+     *  1. 出现了 `"tool"` / `tool_calls`：标准结构，只是没解析成功；
+     *  2. 半截 JSON：有左括号没右括号，且提到 arguments；
+     *  3. **说到了在册工具名却没给 JSON** —— 1.7B 实测最常见的形态
+     *     （「我用 self_ui_tap 点一下」）。只认短输出（≤80 字符）：
+     *     真正的解释必然更长（「我不能调用 self_ui_tap，因为当前只读…」），
+     *     把解释硬掰成 JSON 会导致误执行动作。
      */
-    fun looksLikeActionAttempt(text: String): Boolean {
+    fun looksLikeActionAttempt(text: String, tools: List<McpTool> = emptyList()): Boolean {
         val t = text.lowercase()
         if (t.contains("\"tool\"") || t.contains("tool_calls")) return true
-        // 半截 JSON：有左括号没右括号，且提到了 arguments —— 典型的被截断工具调用
-        return t.contains("arguments") && t.count { it == '{' } > t.count { it == '}' }
+        if (t.contains("arguments") && t.count { it == '{' } > t.count { it == '}' }) return true
+        return t.trim().length <= 80 && tools.any { it.name.isNotBlank() && t.contains(it.name) }
     }
 
     /** GBNF 字符串字面量里的转义（工具名理论上只有字母数字下划线，这里兜底）。 */

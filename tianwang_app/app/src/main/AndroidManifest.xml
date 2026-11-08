@@ -90,6 +90,19 @@
             </intent-filter>
         </receiver>
 
+        <!-- 真机验证桥：只在 debug 构建存在（release 里 enabled=false，整条通道消失）。
+             这台手机的 ROM 删了 adb input 的注入权限，屏幕点不了、字打不进，
+             但「工具在真机上跑不跑得通」必须实测 —— 用带 token 的广播调工具/跑一次闭环。
+             token 是首次启动随机生成的，存在应用自己的外部目录，别的 App 读不到。 -->
+        <receiver
+            android:name=".DebugBridge"
+            android:enabled="${debugBridge}"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="app.skynet.tianwang.next.DEBUG" />
+            </intent-filter>
+        </receiver>
+
         <!-- 设备所有者锚点。全新手机可用一条 adb 命令把本 App 设为设备所有者
              （self.owner.provision 会给命令），不需要 root / 解锁 Bootloader。
              只有系统能发 DEVICE_ADMIN_ENABLED，所以 exported=true + 系统签名权限。 -->

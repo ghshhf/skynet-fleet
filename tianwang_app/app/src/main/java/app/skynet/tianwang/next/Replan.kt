@@ -98,6 +98,11 @@ object Replan {
                 "定位没命中。换更短、更稳定的关键词重新 self_ui_find；仍没有就先 self_ui_scroll 再找。不要重复同一个 query。"
             "self_app_launch" ->
                 "包名可能不对。先用 self_app_list 查已安装的包名，再启动；不要反复试同一个包名。"
+            // 联网工具走这里：真机实测 1.7B 会照着页面里的标题**自己拼 URL**，
+            // 拼出来 404，然后反复重试同一个坏链接。必须明确禁止拼地址。
+            "web_read", "web_digest", "web_search" ->
+                "这个链接打不开。不要自己拼 URL —— 只用用户原话里的链接，" +
+                    "或搜索结果里原样出现的链接；需要新链接就先 web_search。"
             else ->
                 "没找到目标。先 self_ui_dump 重新读界面，再换定位方式；不要重复同一个 query。"
         }
@@ -110,17 +115,35 @@ object Replan {
     }
 
     /**
-     * 执行前的硬止损：同一个写操作已经成功过，就不许再来一遍。
+     * 内容型只读：同一个参数读第二遍不会得到任何新东西。
      *
-     * 返回非空 = 拒绝执行。读操作重复（例如连读两次界面）不拦——那可能是刻意等待。
+     * 和 `self_ui_dump` 这类「看当前状态」的工具有本质区别：点完按钮再 dump 一次
+     * 可能真的看到新界面，所以状态观察类不拦；而同一个 URL 再读一次，
+     * 服务器不会因为它被读了两遍就改内容 —— 真机实测 1.7B 会连读 4 次同一页、
+     * 把步数烧光，最后一句答案都没有。
+     */
+    private val CONTENT_READS = setOf(
+        "web_read", "web_search", "web_digest",
+        "self_model_ask", "self_api_ask", "cloud_search",
+    )
+
+    /**
+     * 执行前的硬止损。
+     *
+     * 写操作：同一个动作成功过一次就不许再来（防重复点击/重复发送）。
+     * 内容型只读：同一个参数成功过一次也不许再来 —— 不会有新内容，
+     * 但**不终止整个任务**，由调用方把这句话回灌给模型，逼它用已有结果回答。
      */
     fun blockBefore(steps: List<Step>, name: String, argKey: String, sideEffect: Boolean): String? {
-        if (!sideEffect) return null
         val done = steps.count { it.ok && it.name == name && it.argKey == argKey }
-        return if (done > 0) {
-            "同一个写操作已经成功执行过 $done 次，拒绝重复执行（避免重复点击 / 重复发送）"
-        } else {
-            null
+        if (done == 0) return null
+        return when {
+            sideEffect ->
+                "同一个写操作已经成功执行过 $done 次，拒绝重复执行（避免重复点击 / 重复发送）"
+            name in CONTENT_READS ->
+                "同一个操作已经拿过 $done 次结果，再调不会得到新内容。" +
+                    "请直接用已有结果回答用户，不要再调用工具。"
+            else -> null
         }
     }
 

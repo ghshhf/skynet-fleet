@@ -58,9 +58,12 @@ android {
         debug {
             // 固定签名 ⇒ `adb install -r` 可长期迭代，升级不清数据、不丢模型。
             signingConfig = signingConfigs.getByName("dbg")
+            // 真机验证桥只在 debug 注册；release 里 enabled=false，通道根本不存在。
+            manifestPlaceholders["debugBridge"] = "true"
         }
         release {
             signingConfig = signingConfigs.getByName("rel")
+            manifestPlaceholders["debugBridge"] = "false"
             // 🔴 必须开：material-icons-extended 里有几千个图标，
             // debug 包 55 MB 主要就是它。R8 只留真正引用到的那十几个。
             isMinifyEnabled = true

@@ -53,4 +53,15 @@ class TranslateLogicTest {
         val zh = List(6) { "中文内容占据绝大多数，只有少量 latin 词汇" }
         assertFalse(ArticleTranslator.isEnglish(zh))
     }
+
+    @Test
+    fun arabicTextIsNotEnglish() {
+        // 实测事故：WebView 没带 Accept-Language，example.com 回了阿拉伯语版，
+        // 被判定成「英文」硬走 en→zh 通道，结果整段阿语原样留在材料里。
+        val ar = listOf(
+            "هذا النطاق مُخصص للاستخدام في أمثلة التوثيق دون الحاجة إلى إذن",
+            "هذه ليست خدمة، يُرجى تجنب الاعتماد عليها لأغراض الاختبار والمراقبة",
+        )
+        assertFalse(ArticleTranslator.isEnglish(ar))
+    }
 }

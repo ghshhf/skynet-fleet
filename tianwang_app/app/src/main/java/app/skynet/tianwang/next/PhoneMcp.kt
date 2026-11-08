@@ -496,7 +496,7 @@ object PhoneMcp {
                 listOf("path"),
             ),
         ),
-    )
+    ) + WebTool.tools
 
     private val core = McpCore(
         tools = tools,
@@ -530,6 +530,8 @@ object PhoneMcp {
         val startedAt = System.currentTimeMillis()
         // 网盘能力不走 PhoneSelf 的无障碍分派：它不依赖界面，也不该被无障碍开关挡住。
         if (mcpName.startsWith("cloud_")) return cloudTool(mcpName, args)
+        // 联网同一个道理：能不能上网和「无障碍通没通」是两件事。
+        if (mcpName.startsWith("web_")) return WebTool.run(mcpName, args)
         val selfName = when (mcpName) {
             "self_status" -> "self.status"
             "self_ui_dump" -> "self.ui.dump"

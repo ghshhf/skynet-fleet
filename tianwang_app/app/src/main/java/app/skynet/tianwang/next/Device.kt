@@ -5,6 +5,9 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 /**
  * 设备档案 + 推理参数自适应。
@@ -261,6 +264,16 @@ object Dev {
 object App {
     @Volatile
     private var app: Context? = null
+
+    /**
+     * 应用级协程域：脱离界面与接收器的生命周期，只要进程活着就能跑完。
+     *
+     * 存在的理由：广播接收器里的 `onReceive` 必须立刻返回，用 `goAsync()` 拖长
+     * 也只有约 10 秒 —— 而「本地模型跑一次工具闭环」动辄 30 秒以上。真机实测
+     * 在 `goAsync()` 里跑闭环会触发 **broadcast ANR**，系统直接把进程杀掉，
+     * 一行结果都留不下来。所以长任务一律挂到这里，接收器只负责「收下就走」。
+     */
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun bind(c: Context) { app = c.applicationContext }
 

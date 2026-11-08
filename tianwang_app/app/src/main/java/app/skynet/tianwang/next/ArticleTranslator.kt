@@ -72,6 +72,13 @@ object ArticleTranslator {
         if (s.length < 40) return false
         val latin = s.count { it.isLetter() && it.code < 128 }
         val han = s.count { it.code in 0x4e00..0x9fff }
+        // 🔴 阿拉伯文 / 日文假名 / 韩文不是「英文页面」：通道是 en→zh，
+        //    硬走只会把原文留在结果里（实测混进过整段阿拉伯语）。
+        //    留一点余量（1/4）—— 英文文章里夹几个外来词不该被判成外文。
+        val other = s.count {
+            it.code in 0x0600..0x06FF || it.code in 0x3040..0x30FF || it.code in 0xAC00..0xD7AF
+        }
+        if (other * 4 > latin) return false
         return latin > 40 && han * 5 < latin
     }
 

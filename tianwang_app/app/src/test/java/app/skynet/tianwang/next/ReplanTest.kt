@@ -51,15 +51,36 @@ class ReplanTest {
     }
 
     @Test
+    fun webNotFoundHintForbidsInventingUrls() {
+        // 真机样本：1.7B 照着页面里的标题自己拼了个文章链接 → 404 → 又照着拼。
+        // 联网工具的建议不能沿用「重新 self_ui_dump」那套界面口径。
+        val h = Replan.hint(Replan.Kind.NOT_FOUND, "web_read")
+        assertTrue("必须明确禁止拼链接：$h", h.contains("不要自己拼"))
+        assertTrue("不该给界面操作建议：$h", !h.contains("self_ui_dump"))
+    }
+
+    @Test
     fun duplicateWriteIsBlockedButReadIsNot() {
         val done = listOf(ok("self_ui_tap", "text=设置", side = true))
         assertNotNull("同一个写操作成功过，必须拒绝再执行",
             Replan.blockBefore(done, "self_ui_tap", "text=设置", true))
-        assertNull("读操作重复不拦",
+        assertNull("状态观察类读操作重复不拦（点完再看界面是有意义的）",
             Replan.blockBefore(done, "self_ui_dump", "text=设置", false))
         assertNull("写操作上一次失败，允许换参数再试",
             Replan.blockBefore(listOf(fail("self_ui_tap", "text=设置", "没找到")),
                 "self_ui_tap", "text=设置", true))
+    }
+
+    @Test
+    fun duplicateContentReadIsBlocked() {
+        // 真机实测：1.7B 连续 4 次读同一个 URL，把步数烧光、一句答案都没给。
+        val done = listOf(ok("web_read", "url=https://example.com", side = false))
+        val why = Replan.blockBefore(done, "web_read", "url=https://example.com", false)
+        assertNotNull("同一个网页读第二遍必须拦", why)
+        assertTrue("拦下时要明确要求用已有结果回答：$why", why!!.contains("回答"))
+        // 换一个 URL 是正常的新读取，不能拦
+        assertNull("换了 URL 就该放行",
+            Replan.blockBefore(done, "web_read", "url=https://other.com", false))
     }
 
     @Test

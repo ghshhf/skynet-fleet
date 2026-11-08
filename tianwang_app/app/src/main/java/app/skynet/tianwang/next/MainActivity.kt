@@ -87,6 +87,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         App.bind(this)
         Net.init(applicationContext)
+        // debug 构建才用得到：生成/复用真机验证用的随机 token（release 里无人读它）。
+        runCatching { DebugBridge.ensureToken(this) }
         // 手机端爬虫后台常驻：每 30 分钟自动抓一轮全球资源，不靠用户下拉刷新。
         runCatching { CrawlScheduler.ensure(this) }
         // 电脑上已有凭据按「端点列表」格式一次性交给手机：只落本机，接完即删源件，日志不写内容。
