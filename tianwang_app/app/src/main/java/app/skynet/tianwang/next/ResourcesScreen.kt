@@ -64,6 +64,8 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.text.SimpleDateFormat
 import java.util.Locale
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
 
 /**
  * 资源流：手机自己抓、自己存、自己显示。
@@ -95,6 +97,28 @@ fun ResourcesScreen() {
     var previews by remember { mutableStateOf<Map<String, LinkPreview>>(emptyMap()) }
     var commentFor by remember { mutableStateOf<ResourceCard?>(null) }
     var commentText by remember { mutableStateOf("") }
+
+    // 列表内静音自动预览：默认仅 WiFi，顶部可三档切换（关 / 仅 WiFi / 开）。
+    var autoPlayMode by remember { mutableStateOf(AutoPlayPrefs.mode) }
+    val autoPlayAllowed = autoPlayMode != AutoPlayMode.OFF &&
+        (autoPlayMode == AutoPlayMode.ANY || isOnWifi(ctx)) &&
+        viewer == null && detail == null && lightbox == null && commentFor == null
+    val mutedPlayer = rememberMutedPlayer()
+    val activeVideoId = rememberActiveVideoId(listState, items, autoPlayAllowed)
+
+    // 切换激活卡片时换媒体；没有候选 / 打开阅读器 / 关掉开关就立即暂停。
+    LaunchedEffect(activeVideoId, mutedPlayer, autoPlayAllowed) {
+        val url = items.firstOrNull { it.id == activeVideoId }?.video.orEmpty()
+        if (url.isBlank() || !autoPlayAllowed) {
+            runCatching { mutedPlayer.pause() }
+        } else {
+            runCatching {
+                mutedPlayer.setMediaItem(MediaItem.fromUri(url))
+                mutedPlayer.prepare()
+                mutedPlayer.playWhenReady = true
+            }
+        }
+    }
 
     /** 只从本机库读一页；下拉刷新和首屏共用它，不额外发任何网络请求。 */
     suspend fun fetchPage(reset: Boolean) {
@@ -294,6 +318,14 @@ fun ResourcesScreen() {
             Spacer(Modifier.weight(1f))
             Text("下拉自动刷新", fontSize = 10.5.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+            TextButton(onClick = {
+                val n = AutoPlayMode.next(autoPlayMode)
+                AutoPlayPrefs.mode = n
+                autoPlayMode = n
+            }) {
+                Text("自动预览 ${autoPlayMode.label}", fontSize = 10.5.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             TextButton(onClick = { doSync() }, enabled = !busy && !refreshing) {
                 Text("节点共享", fontSize = 12.sp)
             }
@@ -342,6 +374,8 @@ fun ResourcesScreen() {
                 ) {
                     items(items, key = { it.id }) { c ->
                         ResourceRow(c, preview = previews[c.url],
+                            autoPlayActive = c.id == activeVideoId,
+                            mutedPlayer = mutedPlayer,
                             onOpen = { open(c) },
                             onImage = { lightbox = it },
                             onAct = { a -> act(c, a) },
@@ -427,11 +461,15 @@ fun ResourcesScreen() {
     }
 
     viewer?.let { c ->
-        ResourceViewer(
-            card = c,
-            onClose = { viewer = null },
-            onDetail = { viewer = null; showDetail(c) },
-        )
+        // 网页阅读器固定走浅色：全局深色主题的 #0E1116 会让 WebView 首帧渲染前
+        // 露出近黑背景，看起来就是「点链接黑屏 / 资源加载不出来」。
+        MaterialTheme(colorScheme = LightScheme) {
+            ResourceViewer(
+                card = c,
+                onClose = { viewer = null },
+                onDetail = { viewer = null; showDetail(c) },
+            )
+        }
     }
 
     lightbox?.let { u ->
@@ -469,6 +507,8 @@ fun ResourcesScreen() {
 private fun ResourceRow(
     c: ResourceCard,
     preview: LinkPreview?,
+    autoPlayActive: Boolean,
+    mutedPlayer: ExoPlayer,
     onOpen: () -> Unit,
     onImage: (String) -> Unit,
     onAct: (String) -> Unit,
@@ -513,7 +553,7 @@ private fun ResourceRow(
                         modifier = Modifier.padding(top = 3.dp))
                 }
                 if (c.url.startsWith("http", true)) {
-                    PreviewBlock(preview, c, onOpen, onImage)
+                    PreviewBlock(preview, c, onOpen, onImage, autoPlayActive, mutedPlayer)
                 }
                 if (c.tags.isNotEmpty()) {
                     Text(c.tags.take(4).joinToString("  #") { it }, fontSize = 11.sp,
@@ -565,6 +605,8 @@ private fun PreviewBlock(
     c: ResourceCard,
     onClick: () -> Unit,
     onImage: (String) -> Unit,
+    autoPlayActive: Boolean,
+    mutedPlayer: ExoPlayer,
 ) {
     val shape = RoundedCornerShape(12.dp)
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
@@ -590,7 +632,14 @@ private fun PreviewBlock(
             ) {
                 RemoteImage(url = img, label = site,
                     modifier = Modifier.fillMaxWidth().height(168.dp))
-                if (isVideo) {
+                // 直链视频滚到可视区就静音自动播；只有激活的那条挂播放器，
+                // 其余仍显示封面 + 播放角标，点一下才进全屏有声播放。
+                val canPreview = isVideo && c.video.isNotBlank() && isDirectMedia(c.video)
+                if (canPreview) {
+                    AutoPlaySurface(mutedPlayer, autoPlayActive, c.video,
+                        Modifier.fillMaxWidth().height(168.dp))
+                }
+                if (isVideo && (!canPreview || !autoPlayActive)) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Icon(
                             Icons.Filled.PlayArrow, "播放", tint = Color.White,

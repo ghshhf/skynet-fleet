@@ -50,7 +50,7 @@ private val DarkScheme = darkColorScheme(
     onError = Color.White,
 )
 
-private val LightScheme = lightColorScheme(
+val LightScheme = lightColorScheme(
     primary = Color(0xFF00707C),
     onPrimary = Color.White,
     primaryContainer = Color(0xFFB8ECF2),

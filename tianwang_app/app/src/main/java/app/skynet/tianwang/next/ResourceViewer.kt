@@ -196,6 +196,13 @@ fun ResourceViewer(card: ResourceCard, onClose: () -> Unit, onDetail: () -> Unit
                 }
                 if (progress < 100) {
                     LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
+                    Text(
+                        "正在加载 ${card.domain}… 内容出来前是白底，不是卡住；" +
+                            "若长时间无内容可点右上「浏览器」打开。",
+                        fontSize = 10.5.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp),
+                    )
                 }
                 if (trState.isNotBlank()) {
                     Text(trState, fontSize = 10.5.sp,
@@ -203,12 +210,22 @@ fun ResourceViewer(card: ResourceCard, onClose: () -> Unit, onDetail: () -> Unit
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
                 }
                 if (failed) {
-                    Text(
-                        "页面没加载出来，可点右上「浏览器」打开，卡片内容仍在本机库里。",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                    )
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "这个页面没加载出来（站点慢或被拦），卡片内容仍在本机库里。",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = {
+                            failed = false
+                            progress = 0
+                            runCatching { web?.reload() }
+                        }) { Text("重试", fontSize = 11.sp) }
+                    }
                 }
                 // 直链视频（mp4/webm/m3u8 等）内嵌播放，不跳浏览器；
                 // YouTube/B站等页面型视频交给下面的 WebView，移动网页本身能播。
@@ -232,6 +249,9 @@ fun ResourceViewer(card: ResourceCard, onClose: () -> Unit, onDetail: () -> Unit
                                 mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                                 userAgentString = userAgentString + " TianwangNext/1.0"
                             }
+                            // 默认背景透明会露出深色 window；显式白底，
+                            // 让「首帧未到 / 加载失败」也是白屏 + 提示，而不是黑屏。
+                            setBackgroundColor(android.graphics.Color.WHITE)
                             webChromeClient = object : WebChromeClient() {
                                 override fun onProgressChanged(view: WebView, newProgress: Int) {
                                     progress = newProgress
