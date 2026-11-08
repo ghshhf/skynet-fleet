@@ -234,7 +234,7 @@ private enum class Overlay(val title: String, val sub: String) {
     DEVICE("设备与权限", "无障碍 / 通知 / 手机入网"),
     ABOUT("关于与版本", "版本与后端信息"),
     IMAGE("本机出图", "手机自己跑 diffusion · 提示词出片"),
-    CLOUDDRIVE("网盘聚合", "集中各网盘搜索"),
+    CLOUDDRIVE("网盘聚合", "对等节点 · 集中各网盘"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

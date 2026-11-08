@@ -453,6 +453,49 @@ object PhoneMcp {
             schema(mapOf("enabled" to prop("boolean", "true=开，false=关")), listOf("enabled")),
             sideEffect = true,
         ),
+        // 网盘聚合：本机作为对等节点对外提供能力，别的设备可 self_lan_call / self_peer_call 调用。
+        McpTool(
+            "cloud_nodes", "列出本机保存的网盘节点连接，并自动发现局域网里可达的其它节点。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "cloud_list", "列出某个网盘节点目录下的文件与文件夹（默认第一个连接、根目录）。",
+            schema(
+                mapOf(
+                    "index" to prop("integer", "用第几个连接，从 0 开始，默认 0"),
+                    "host" to prop("string", "或按节点地址指定，可临时用 user/pass 直连"),
+                    "user" to prop("string", "host 直连时的账号"),
+                    "pass" to prop("string", "host 直连时的密码（不回显、不落盘）"),
+                    "path" to prop("string", "目录路径，默认 /"),
+                ),
+            ),
+        ),
+        McpTool(
+            "cloud_search", "在网盘节点里按文件名搜索；节点没建索引时自动遍历目录树。",
+            schema(
+                mapOf(
+                    "query" to prop("string", "文件名关键词"),
+                    "index" to prop("integer", "用第几个连接，默认 0"),
+                    "host" to prop("string", "或按节点地址指定"),
+                    "user" to prop("string", "host 直连时的账号"),
+                    "pass" to prop("string", "host 直连时的密码"),
+                ),
+                listOf("query"),
+            ),
+        ),
+        McpTool(
+            "cloud_file_url", "取网盘里某个文件的下载直链（不下载，只返回地址）。",
+            schema(
+                mapOf(
+                    "path" to prop("string", "文件完整路径"),
+                    "index" to prop("integer", "用第几个连接，默认 0"),
+                    "host" to prop("string", "或按节点地址指定"),
+                    "user" to prop("string", "host 直连时的账号"),
+                    "pass" to prop("string", "host 直连时的密码"),
+                ),
+                listOf("path"),
+            ),
+        ),
     )
 
     private val core = McpCore(
@@ -485,6 +528,8 @@ object PhoneMcp {
     /** 直接执行一次工具（本地模型工具闭环用）；失败不抛异常，统一走 ToolResult。 */
     suspend fun executeTool(mcpName: String, args: JSONObject): ToolResult {
         val startedAt = System.currentTimeMillis()
+        // 网盘能力不走 PhoneSelf 的无障碍分派：它不依赖界面，也不该被无障碍开关挡住。
+        if (mcpName.startsWith("cloud_")) return cloudTool(mcpName, args)
         val selfName = when (mcpName) {
             "self_status" -> "self.status"
             "self_ui_dump" -> "self.ui.dump"
@@ -558,6 +603,71 @@ object PhoneMcp {
             ActionLog.add(mcpName, args, result.ok, result.err, System.currentTimeMillis() - startedAt)
         }
         return result
+    }
+
+    /**
+     * 网盘聚合能力：这台手机作为对等节点，把「我能看到的网盘」开放给编队里其它设备。
+     * 连接地址/凭据只从本机配置读取（或调用方临时直给），不回显密码、不写日志。
+     */
+    private suspend fun cloudTool(name: String, args: JSONObject): ToolResult {
+        val conns = CloudDrivePrefs.load()
+        if (name == "cloud_nodes") {
+            val found = runCatching { CloudDriveNodes.discover() }.getOrDefault(emptyList())
+            return ToolResult(true, text = buildString {
+                append("本机保存的节点连接（${conns.size}）：\n")
+                if (conns.isEmpty()) append("  （暂无，可在工具箱「网盘聚合」里添加）\n")
+                conns.forEachIndexed { i, c ->
+                    append("  [$i] ${c.name} · ${c.type} · ${c.host}\n")
+                }
+                append("可达节点（${found.size}）：\n")
+                if (found.isEmpty()) append("  （没发现，节点地址可手动填）\n")
+                found.forEach { append("  ${it.name} · ${it.host}\n") }
+            })
+        }
+        val host = args.optString("host").orEmpty()
+        val idx = if (args.has("index")) args.optInt("index", 0) else 0
+        val c = if (host.isNotBlank()) {
+            conns.firstOrNull { it.host.trimEnd('/') == host.trimEnd('/') }
+                ?: CloudConn(
+                    type = if (host.contains("webdav", true)) "webdav" else "openlist",
+                    name = host, host = host,
+                    user = args.optString("user"), pass = args.optString("pass"),
+                )
+        } else {
+            conns.getOrNull(idx)
+        } ?: return ToolResult(false, err = "本机没有第 $idx 个节点连接，先添加或传 host")
+        return try {
+            when (name) {
+                "cloud_list" -> {
+                    val p = args.optString("path").ifBlank { "/" }
+                    val list = CloudDriveApi.list(c, p)
+                    ToolResult(true, text = buildString {
+                        append("节点 ${c.name} 目录 $p（${list.size} 项）：\n")
+                        list.forEach {
+                            append(if (it.isDir) "  [目录] " else "  [文件] ")
+                                .append(it.name).append(" · ").append(it.path).append('\n')
+                        }
+                    })
+                }
+                "cloud_search" -> {
+                    val q = args.optString("query")
+                    if (q.isBlank()) return ToolResult(false, err = "缺 query")
+                    val list = CloudDriveApi.search(c, q)
+                    ToolResult(true, text = buildString {
+                        append("节点 ${c.name} 搜「$q」（${list.size} 项）：\n")
+                        list.forEach { append("  ").append(it.path).append('\n') }
+                    })
+                }
+                "cloud_file_url" -> {
+                    val p = args.optString("path")
+                    if (p.isBlank()) return ToolResult(false, err = "缺 path")
+                    ToolResult(true, text = CloudDriveApi.fileUrl(c, p))
+                }
+                else -> ToolResult(false, err = "未知工具：$name")
+            }
+        } catch (t: Throwable) {
+            ToolResult(false, err = t.message ?: t.javaClass.simpleName)
+        }
     }
 
     private fun prop(type: String, desc: String): JSONObject =
