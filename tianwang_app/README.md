@@ -284,7 +284,8 @@ LLAMA_REF=v0.9.0 ./build-llama.sh      # 固定上游版本（默认就是这个
 - 仓库里没有 llama.cpp 源码时，按 `LLAMA_REF` 浅克隆到 `third_party/llama.cpp`；
 - 编之前校验上游 API 与 `llama_jni.cpp` 一致（penalties 签名、`llama_sampler_init_grammar`），
   上游改接口会立刻失败，而不是装到手机上才崩；
-- 产物落 `app/src/main/jniLibs/<abi>/`。**这是构建产物，不进 git**：换机器重跑脚本即可。
+- 产物落 `app/src/main/jniLibs/<abi>/`，**随代码入库**（`.gitignore:96` 有约定：
+  运行时引擎入库备份，CI 构建完整 APK 要用）。所以重编后要一起提交，别只提交 Kotlin 侧改动。
 
 ## 本地模型工具闭环（2026-11-07）
 
