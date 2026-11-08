@@ -5,7 +5,7 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** 一个网盘连接：OpenList 服务地址+账号密码，或 WebDAV 地址+账号密码。 */
+/** 一个对等节点的网盘连接：OpenList 地址+账号密码，或 WebDAV 地址+账号密码。没有主节点。 */
 data class CloudConn(
     val type: String, // "openlist" | "webdav"
     val name: String,
