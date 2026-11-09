@@ -559,6 +559,16 @@ class WsTunnelServer:
             )
             return
 
+        # /tunnel 是出口代理：一旦对公网暴露，没有令牌就等于给全网一个开放代理。
+        # 设了 secret 就必须验 HMAC 令牌（/pair 有自己的帧内令牌，另走一套）。
+        if route != "/pair" and self.secret:
+            if not hmac.compare_digest(pair_token("tunnel", self.secret),
+                                       (q.get("k") or [""])[0]):
+                self.log(f"tunnel 拒绝：令牌缺失或不对 {addr[0]}")
+                conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
+                             b"Connection: close\r\n\r\n")
+                return
+
         key = hdrs.get("sec-websocket-key", "")
         if not key:
             conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
@@ -857,6 +867,22 @@ class WsSock:
         self.pending = b""
         self.closed = False
 
+    def fileno(self):
+        """让 proxy.py 的 select() 能把它和本地 socket 一起监听。
+
+        没有这个方法时 pipe() 的 select 会抛 TypeError 并被静默吞掉，
+        表现为「CONNECT 200 之后立刻断流」。
+        """
+        return self.sock.fileno()
+
+    def settimeout(self, timeout):
+        """隧道建立后转阻塞模式，空闲由上层 select 的 IDLE_TIMEOUT 管。
+
+        握手期的 20s 超时如果留着，keep-alive 空闲超过 20s 就会被
+        socket.timeout 打断，爬虫的会话复用会莫名其妙断掉。
+        """
+        return self.sock.settimeout(timeout)
+
     def sendall(self, data: bytes):
         if self.closed:
             raise ConnectionError("tunnel closed")
@@ -891,13 +917,30 @@ class WsSock:
             pass
 
 
+def _tunnel_auth_path(path: str, query: str = "") -> str:
+    """给 /tunnel 的 URL 补上访问令牌。
+
+    服务端设了 WSRELAY_SECRET 就会验 `?k=`（不验就等于开放代理）；
+    /pair 走的是帧内令牌，这里不动它。
+    """
+    if not path.rstrip("/").endswith("/tunnel"):
+        return path
+    secret = os.environ.get("WSRELAY_SECRET", "")
+    q = urllib.parse.parse_qs(query)
+    if secret and "k" not in q:
+        q["k"] = [pair_token("tunnel", secret)]
+    if not q:
+        return path
+    return path + "?" + urllib.parse.urlencode({k: v[0] for k, v in q.items()})
+
+
 def connect_via_ws(url: str, host: str, port: int, timeout: float = 20.0) -> WsSock:
     """连 `wss://xxx/tunnel`，让它替我们连 host:port，返回可读写的隧道端点。"""
     u = urllib.parse.urlsplit(url)
     tls = u.scheme in ("wss", "https")
     thost = u.hostname
     tport = u.port or (443 if tls else 80)
-    path = u.path or "/"
+    path = _tunnel_auth_path(u.path or "/", u.query)
 
     raw = socket.create_connection((thost, tport), timeout=timeout)
     if tls:
@@ -945,7 +988,7 @@ def _open_ws(url: str, timeout: float = 20.0):
     tls = u.scheme in ("wss", "https")
     thost = u.hostname
     tport = u.port or (443 if tls else 80)
-    path = u.path or "/"
+    path = _tunnel_auth_path(u.path or "/", u.query)
 
     raw = socket.create_connection((thost, tport), timeout=timeout)
     if tls:
@@ -1237,7 +1280,9 @@ def _selftest() -> int:
     print(f"OK (port {srv_port})")
 
     print("[3/5] 经 WS 隧道打 echo …", end=" ")
-    tun = connect_via_ws(f"ws://127.0.0.1:{srv_port}/tunnel", "127.0.0.1", echo_port)
+    tun = connect_via_ws(
+        f"ws://127.0.0.1:{srv_port}/tunnel?k={pair_token('tunnel', selftest_secret)}",
+        "127.0.0.1", echo_port)
     payload = b"skynet-wsrelay-selftest-" + os.urandom(8).hex().encode()
     tun.sendall(payload)
     got = b""

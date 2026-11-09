@@ -30,6 +30,9 @@ import time
 BUFSIZE = 65536
 CONNECT_TIMEOUT = 15
 IDLE_TIMEOUT = 180
+# 晚高峰国际链路丢包会让 TLS 握手触发 1s/2s/4s 指数退避，
+# 20s 不够；后台批量任务对首次建连不敏感，放宽到 45s 换连通率。
+WS_CONNECT_TIMEOUT = 45.0
 
 # 域名 → IP 覆写表。
 # 实测依据（2026-10-31）：github.com 的 DNS 结果 20.205.243.166 被掐（TCP 超时），
@@ -90,7 +93,15 @@ def _dial(host: str, port: int):
     if UPSTREAM_WS:
         try:
             from wsrelay import connect_via_ws
-            return connect_via_ws(UPSTREAM_WS, host, port)
+            up = connect_via_ws(UPSTREAM_WS, host, port, timeout=WS_CONNECT_TIMEOUT)
+            # 握手期的 socket 超时只该用于建连。隧道是长连接，
+            # 空闲由 pipe() 的 select(IDLE_TIMEOUT) 管；留着它会让
+            # 爬虫/下载会话空闲 20s 就被 socket.timeout 打断。
+            try:
+                up.settimeout(None)
+            except Exception:
+                pass
+            return up
         except Exception as e:
             # 隧道挂了就往下回落，不让热点设备整体断网
             print(f"[cloudnode] WS 隧道失败({host}:{port}): {type(e).__name__}: {e}", flush=True)
@@ -150,31 +161,44 @@ class Buf:
 
 
 def pipe(a: socket.socket, b: socket.socket) -> None:
-    """双向转发，任一方向关闭即收尾。"""
-    socks = [a, b]
-    try:
-        while True:
-            r, _, x = select.select(socks, [], socks, IDLE_TIMEOUT)
-            if x or not r:
-                break
-            for s in r:
-                data = s.recv(BUFSIZE)
+    """双向转发：两个阻塞线程各管一个方向，空闲由 socket 超时兜底。
+
+    不能用 select：WS 隧道的 FrameReader 有自己的应用层缓冲，一个 WS 帧
+    可能被一次 recv 全部读进 Python 层，此后底层 TCP 已无可读数据，
+    select 会误判「没数据」而永远不再调用 recv —— 现象是响应收一半
+    就卡死到客户端超时。阻塞 recv 则天然从应用层缓冲里继续取。
+    """
+    def forward(src, dst):
+        try:
+            while True:
+                data = src.recv(BUFSIZE)
                 if not data:
                     return
-                dst = b if s is a else a
                 dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        for s in socks:
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                s.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
+            for s in (a, b):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    for s in (a, b):
+        try:
+            s.settimeout(IDLE_TIMEOUT)
+        except Exception:
+            pass
+    t1 = threading.Thread(target=forward, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=forward, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
 
 def _socks5(conn: socket.socket, head: bytes) -> None:

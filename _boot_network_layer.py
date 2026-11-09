@@ -1,9 +1,10 @@
-r"""天网网络层开机自启（无窗口）。由 HKCU Run 键在登录时调用。
+r"""天网网络层开机自启（无窗口）。由 HKLM Run 键在登录时调用。
 
 组成：
-  1) selfproxy  127.0.0.1:18080 —— 网络层内建出口（直连优先 + 规则分流 + 失败回落）
-  2) gitport    127.0.0.1:7810  —— GitHub 系加速通道（netaccel 子系统）
-日志写 E:\xmanbian\skynet-fleet\_autostart.log。
+  1) selfproxy  127.0.0.1:18080 —— 统一出网层（国内直连 + 国外 Worker 隧道，
+     隧道由 selfproxy 进程内直接建连，不再单独监听 18083）
+  2) gitport    127.0.0.1:7810  —— GitHub 系加速通道（netaccel 子系统，只管 git）
+日志写脚本同目录的 _autostart.log。
 全程 pythonw 运行，不弹窗口。
 """
 import os
