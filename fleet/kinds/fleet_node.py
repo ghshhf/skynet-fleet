@@ -59,6 +59,12 @@ class FleetNode(BaseDevice):
 
     def caps(self):
         caps = list(self.rec.get("capabilities") or [])
+        # P5c 跨设备记忆同步：node_agent._do_memory_sync() 无条件实现
+        # export/import（不依赖控制面密码、也不依赖 relay），但历史 nodes.json
+        # 从没申报过它 ⇒ registry.owners() 一直空、catalog 里成了幽灵能力。
+        # 每台编队节点都该认领，放在条件能力之前，不做 IO。
+        if "fleet.memory.sync" not in caps:
+            caps.append("fleet.memory.sync")
         # 本机若跑着 SkyNet relay，主动申报 skynet.relay 能力，
         # 供 commander 路由 relay_fetch 到本节点。
         try:

@@ -253,14 +253,19 @@ def capability_layers(probe=False):
 
     if reg is not None:
         owned = 0
+        owner_errors = []
         for n in names:
             try:
                 if reg.owners(n):
                     owned += 1
                     domains[n.split(".", 1)[0]]["owned"] += 1
-            except Exception:                               # noqa: BLE001
-                pass
+            except Exception as e:                         # noqa: BLE001
+                # 静默吞掉会让「有主能力」少算，还看不出是降级 —— 记账不撒谎。
+                owner_errors.append({"cap": n, "err": f"{type(e).__name__}: {e}"})
         out["capabilities_owned"] = owned
+        if owner_errors:
+            out["owner_error_count"] = len(owner_errors)
+            out["owner_errors"] = owner_errors[:20]
         try:
             out["devices"] = len(reg.devices())
         except Exception:                                   # noqa: BLE001

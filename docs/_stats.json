@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-08 00:15:00",
+  "generated_at": "2026-11-11 04:46:42",
   "gates_registered": 187,
   "eval_files": 99,
   "orphan_evals": [],
@@ -7,7 +7,7 @@
   "doc_md": 5,
   "app_build": "49",
   "capabilities_declared": 521,
-  "capabilities_owned": 514,
+  "capabilities_owned": 515,
   "capabilities_live": null,
   "capabilities_gated": 238,
   "devices": 71,
@@ -435,7 +435,7 @@
     },
     "fleet": {
       "declared": 1,
-      "owned": 0,
+      "owned": 1,
       "gated": 1
     },
     "device": {
