@@ -28,8 +28,12 @@ import threading
 import time
 
 # ---- 复用 common 帧协议（仓库根目录有一份，保证可 import） ----
+# 本文件在 fleet/ 下，__file__→fleet/→仓库根 只需 1 层 dirname。
+# 原来写了 2 层（..\..\），把仓库的**父目录**塞进 sys.path：一是注入的是个
+# 不含 common.py 的死路径所以没炸，二是父目录一旦出现同名模块就会遮蔽真正的
+# common → 静默引错。与 ctrl_client.py 的同款写法（1 层）对齐。
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_HERE))
+_REPO = os.path.dirname(_HERE)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 import common  # noqa: E402
