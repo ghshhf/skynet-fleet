@@ -468,8 +468,12 @@ def probe_mapping(servers, local_port=0, timeout=2.0, rounds=3):
         behavior = MAP_EIM
         note = ""
     else:
-        behavior = MAP_APDM
-        note = ""
+        # ⚠️ 这里只测了「换目的 IP」这一维（往不同 STUN 服务器发、看端口变不变）。
+        # 换 IP 端口就变 ⇒ 至少 ADM（地址依赖映射）；是否 APDM（换端口也变）
+        # 根本没测，不能过度判成最难打的对称 NAT——那会把诊断报告失真成
+        # 「symmetric」，人也据此误判打洞不可行。按 RFC 5780 语义判 MAP_ADM。
+        behavior = MAP_ADM
+        note = "换目的 IP 时映射端口变化 ⇒ 地址依赖（ADM）；是否端口依赖（APDM）未测"
     deltas = [ports[i + 1] - ports[i] for i in range(len(ports) - 1)]
     return {
         "ok": True, "mapping": behavior, "seen": last,

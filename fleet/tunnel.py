@@ -224,14 +224,21 @@ def _win_firewall_state():
         return None
 
     # netsh 的输出编码跟着系统区域走：中文 Windows 是 GBK，英文是 cp1252。
-    # 这里原来按 gbk → utf-8 → cp1252 顺序试，**顺序是反的**：GBK 的合法区间极宽
-    # （首 0x81-0xFE / 次 0x40-0xFE），任何 UTF-8 中文都能被它「假成功」解出来，
-    # 于是 utf-8 那一步永远走不到，英文系统上照样全是乱码。
     # 统一交给 text 层：严格 UTF-8 优先，解不了才按评分在 gb18030 / utf-16 之间选。
     txt = _fleet_text.decode(out.stdout or b"")
+    return _parse_fw_profiles(txt)
 
+
+def _parse_fw_profiles(txt):
+    """从 `netsh advfirewall show allprofiles state` 输出解析三个配置档开关。
+
+    抽成纯函数是为了能单测：中文 Windows 的「关闭」包含字符「开」，
+    只判「开」子串会把「已关闭」误判成「开启」——这条曾经让防火墙状态整条判反，
+    进而错误建议「先开 pinhole」。否定词优先于肯定词；都不命中保守判 off
+    （off 不触发多余 pinhole 建议，on 才会，所以默认方向要稳）。
+    """
     prof, cur = {}, None
-    for ln in txt.splitlines():
+    for ln in (txt or "").splitlines():
         s = ln.strip()
         low = s.lower()
         if not s:
@@ -243,8 +250,10 @@ def _win_firewall_state():
         elif "public" in low or s.startswith("公用"):
             cur = "public"
         elif cur and (low.startswith("state") or s.startswith("状态")):
-            # 英文 "State  ON" / 中文 "状态  启用"
-            prof[cur] = "on" if ("on" in low or "启用" in s or "开" in s) else "off"
+            neg = ("off" in low or "关闭" in s or "禁用" in s
+                   or "停用" in s or "未启用" in s or "未开启" in s)
+            pos = ("on" in low or "启用" in s or "开启" in s)
+            prof[cur] = "off" if neg else ("on" if pos else "off")
     return prof or None
 
 
@@ -309,14 +318,11 @@ def _win_temporary_ipv6():
     except Exception:
         return set()
 
+    # 与 _win_firewall_state 统一走 text 层解码：严格 UTF-8 优先，解不了再退 gb18030/utf-16。
+    # 之前这里硬编码 ("gbk","utf-8","cp1252") 且 gbk 优先，会把 utf-8 系统上的中文
+    # 假成功解出乱码，与上面 firewall 解析那处是同一类「编码顺序写反」的坑。
     raw = out.stdout or b""
-    txt = ""
-    for enc in ("gbk", "utf-8", "cp1252"):
-        try:
-            txt = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
+    txt = _fleet_text.decode(raw) if raw else ""
 
     tmp = set()
     for ln in txt.splitlines():
@@ -1219,6 +1225,21 @@ def _selftest():
         else:
             fail += 1
             print(f"  ✗ {m}")
+
+    print("【防火墙状态解析：中文「关闭」含「开」字不能误判为开启】")
+    chk(_parse_fw_profiles(
+            "Domain Profile Settings:\nState                           ON\n"
+            "Private Profile Settings:\nState                           OFF\n"
+            "Public Profile Settings:\nState                           ON")
+        == {"domain": "on", "private": "off", "public": "on"},
+        "英文 ON/OFF 三个档解析正确")
+    chk(_parse_fw_profiles(
+            "域配置文件 设置:\n状态                            启用\n"
+            "专用配置文件 设置:\n状态                            关闭\n"
+            "公用配置文件 设置:\n状态                            启用")
+        == {"domain": "on", "private": "off", "public": "on"},
+        "中文 启用/关闭 解析正确（「关闭」含「开」不误判为开启）")
+    chk(_parse_fw_profiles("") is None, "空输出返回 None")
 
     print("【IPv6：能让 NAT 分析整段失效的那一步】")
     chk(ipv6_state(["240e::1"], ["2400::1"]) == "both", "两端都有公网 v6 → both")
