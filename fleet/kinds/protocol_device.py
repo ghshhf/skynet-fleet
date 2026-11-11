@@ -322,7 +322,7 @@ def _headers_from_fp(fp):
 
 # ---------------------------------------------------------------- 能力实现
 
-@_reg("protocol.recon")
+@_reg("re.protocol.recon")
 def _h_recon(cap, args, dev):
     """给一个 URL，回答「怎么进」。只读，不提交任何东西。"""
     url = (args.get("url") or "").strip()
@@ -380,7 +380,7 @@ def _h_recon(cap, args, dev):
     })
 
 
-@_reg("protocol.identity")
+@_reg("re.protocol.identity")
 def _h_identity(cap, args, dev):
     ident = _make_identity(provider=args.get("provider") or "maildrop",
                            locale=args.get("locale") or "zh-CN",
@@ -397,7 +397,7 @@ def _h_identity(cap, args, dev):
     })
 
 
-@_reg("protocol.form")
+@_reg("re.protocol.form")
 def _h_form(cap, args, dev):
     url = (args.get("url") or "").strip()
     if not url:
@@ -416,7 +416,7 @@ def _h_form(cap, args, dev):
                      data={"url": final, "status": st, "forms": forms, "guess": guess})
 
 
-@_reg("protocol.register")
+@_reg("re.protocol.register")
 def _h_register(cap, args, dev):
     """协议注册全流程。每一步都记进 steps，失败停在原地并说清停在哪。"""
     url = (args.get("url") or "").strip()
@@ -519,7 +519,7 @@ def _resp_preview(st, body):
     return {"status": st, "snippet": _text(body)[:200] if body else ""}
 
 
-@_reg("protocol.login")
+@_reg("re.protocol.login")
 def _h_login(cap, args, dev):
     url = (args.get("url") or "").strip()
     if not url:
@@ -551,7 +551,7 @@ def _h_login(cap, args, dev):
     })
 
 
-@_reg("protocol.session")
+@_reg("re.protocol.session")
 def _h_session(cap, args, dev):
     op_name = (args.get("op") or "").strip().lower()
     if op_name not in ("save", "load", "probe", "list"):
@@ -636,15 +636,17 @@ class ProtocolDevice(BaseDevice):
     def caps(self):
         return _CAPS
 
-    def invoke(self, cap, args=None):
+    def invoke(self, cap, args=None, dev=None):
+        # dev 由委派方（Reverse）传入，让结果统一署名 re:bench；不传就自用
+        dev = dev or self
         args = args or {}
         if cap not in _CAPS:
-            return R.unsupported(cap, "protocol 设备没有这个能力", device=self.name, via=self.via)
+            return R.unsupported(cap, "re 设备没有这个能力", device=dev.name, via=dev.via)
         h = _HANDLERS.get(cap)
         if h is None:
             return R.unavailable(cap, "能力已声明，handler 待接入",
-                                 device=self.name, via=self.via)
+                                 device=dev.name, via=dev.via)
         try:
-            return h(cap, args, self)
+            return h(cap, args, dev)
         except Exception as e:
-            return R.error(cap, "handler 执行异常：%s" % e, device=self.name, via=self.via)
+            return R.error(cap, "handler 执行异常：%s" % e, device=dev.name, via=dev.via)

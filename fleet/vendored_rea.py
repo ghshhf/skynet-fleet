@@ -4,6 +4,11 @@
 来源仓库 clone 于 D:/code/rea。每个能力的 check= 探测对应底层引擎（Ghidra/JADX/rizin
 adb/frida...）是否在场；不在则如实下线，不谎报可用。装好引擎并接入 CLI handler 后，
 对应能力自动从「声明」变「实跑」（见 fleet/kinds/rea_device.py）。
+
+命名空间：2026-11 归并——原 rea.* 领域能力并入统一的 re. 命名空间
+（rea.native→re.native / rea.mobile→re.mobile / …）。对外只露这 6 个 re.* 领域能力，
+子动作走 action 参数。内部 ENGINE_OF 仍用 rea.<动作> 做「动作名→引擎」路由，属内部键，
+与对外能力名是两回事，不要混改。
 """
 import os
 import shutil
@@ -262,7 +267,7 @@ ENGINE_OF = {
 # 内部路由不变：ENGINE_OF 仍是「原子名 → 引擎」，rea_device 按 action 反查它。
 # ==========================================================================
 DOMAINS = {
-    'rea.native': (
+    're.native': (
         'compare_managed_members', 'decode_signal_recording',
         'decompile_jeb_item', 'export_environment_bundle',
         'extract_firmware', 'grafana',
@@ -287,7 +292,7 @@ DOMAINS = {
         'notify', 'open',
         'open_jeb_project', 'verify_managed_native_boundaries',
     ),
-    'rea.mobile': (
+    're.mobile': (
         'capture_adb_screen', 'collect_adb_bugreport',
         'decode_android_resources', 'inspect_adb_client',
         'inspect_adb_device', 'inspect_adb_display',
@@ -306,7 +311,7 @@ DOMAINS = {
         'stop_adb_app', 'trace_android_references',
         'uninstall_adb_package',
     ),
-    'rea.web': (
+    're.web': (
         'analyze_javascript_application', 'analyze_web_bundle',
         'capture_browser_scenario', 'capture_electron_scenario',
         'capture_web_screenshot', 'compare_application_versions',
@@ -324,7 +329,7 @@ DOMAINS = {
         'trace_javascript_semantics', 'trace_web_module_imports',
         'trace_web_source_location',
     ),
-    'rea.dynamic': (
+    're.dynamic': (
         'close_frida_session', 'close_gdb_session',
         'close_rizin_debug_session', 'cutter_command',
         'execute_rizin_command', 'frida_session_status',
@@ -336,25 +341,26 @@ DOMAINS = {
         'start_frida_session', 'start_gdb_session',
         'start_rizin_debug_session', 'unload_frida_script',
     ),
-    'rea.appgraph': (
+    're.appgraph': (
         'build_reconstruction_obligation_ledger', 'evaluate_reconstruction_coverage',
         'import_managed_reconstruction', 'project_android_application_graph',
         'project_apple_application_graph', 'project_harmony_application_graph',
         'project_managed_application_graph',
     ),
-    'rea.guidance': (
+    're.guidance': (
         'guided_workflows', 'read_guidance_section',
         'search_guidance',
     ),
 }
 
 #: 原子名 → 所属域。旧调用（直接传 rea.pull_adb_package）靠它一步归位。
-DOMAIN_OF = {"rea." + act: dom
-             for dom, acts in DOMAINS.items() for act in acts}
+# 老调用可能还用 rea.<动作> 写法，保留双前缀兼容（对外能力名已统一为 re.<域>）
+DOMAIN_OF = {p + act: dom
+             for dom, acts in DOMAINS.items() for act in acts for p in ("re.", "rea.")}
 
 REA_CAPABILITIES = [
     Capability(
-        'rea.native',
+        're.native',
         '本地二进制与文件格式静态解析：PE/ELF/Mach-O/WASM/pyc/Go/Rust、固件、PCAP、SQLite、.NET 托管程序集、模型/设备树/信号记录。',
         params=(Param("action", "str", True,
                 '子动作，如 compare_managed_members、decode_signal_recording、decompile_jeb_item'),
@@ -362,10 +368,10 @@ REA_CAPABILITIES = [
                       doc="该子动作的参数，原样透传给引擎")),
         side_effect=False,
         check=_mk_any(['dotnet_ilspy', 'none', 'jeb', 'binwalk', 'flutter', 'ghidra_or_rizin', 'erlang_beam', 'evm_tools', 'go_dump', 'gpu_tools', 'il2cpp_dumper', 'llm', 'tshark', 'python_uncompyle', 'rust_decompiler', 'sqlite3', 'wasm_tools', 'ghidra_rizin', 'adb_apktool']),
-        note="[REA] 46 个子动作；完整清单见 vendored_rea.DOMAINS['rea.native']",
+        note="[REA] 46 个子动作；完整清单见 vendored_rea.DOMAINS['re.native']",
     ),
     Capability(
-        'rea.mobile',
+        're.mobile',
         '移动端逆向：adb 设备/包/文件/日志/截屏、APK 静态分析、签名与资源解码、HarmonyOS 应用。',
         params=(Param("action", "str", True,
                 '子动作，如 capture_adb_screen、collect_adb_bugreport、decode_android_resources'),
@@ -373,10 +379,10 @@ REA_CAPABILITIES = [
                       doc="该子动作的参数，原样透传给引擎")),
         side_effect=True,
         check=_mk_any(['adb', 'apktool', 'adb_apktool', 'apktool_keytool']),
-        note="[REA] 33 个子动作；完整清单见 vendored_rea.DOMAINS['rea.mobile']",
+        note="[REA] 33 个子动作；完整清单见 vendored_rea.DOMAINS['re.mobile']",
     ),
     Capability(
-        'rea.web',
+        're.web',
         'Web / JavaScript 前端逆向：浏览器目标、CDP 观察、web bundle 抓取、源码映射还原、Electron 页面与 fuses。',
         params=(Param("action", "str", True,
                 '子动作，如 analyze_javascript_application、analyze_web_bundle、capture_browser_scenario'),
@@ -384,10 +390,10 @@ REA_CAPABILITIES = [
                       doc="该子动作的参数，原样透传给引擎")),
         side_effect=True,
         check=_mk_any(['node', 'chromium', 'ghidra_rizin', 'none', 'node_chromium', 'node_mitmproxy']),
-        note="[REA] 31 个子动作；完整清单见 vendored_rea.DOMAINS['rea.web']",
+        note="[REA] 31 个子动作；完整清单见 vendored_rea.DOMAINS['re.web']",
     ),
     Capability(
-        'rea.dynamic',
+        're.dynamic',
         '动态调试与插桩：Frida 会话、GDB MI、Rizin/Cutter 调试会话（会附加到进程）。',
         params=(Param("action", "str", True,
                 '子动作，如 close_frida_session、close_gdb_session、close_rizin_debug_session'),
@@ -395,10 +401,10 @@ REA_CAPABILITIES = [
                       doc="该子动作的参数，原样透传给引擎")),
         side_effect=True,
         check=_mk_any(['frida', 'gdb_pwndbg', 'rizin', 'rizin_cutter', 'ghidra_rizin']),
-        note="[REA] 20 个子动作；完整清单见 vendored_rea.DOMAINS['rea.dynamic']",
+        note="[REA] 20 个子动作；完整清单见 vendored_rea.DOMAINS['re.dynamic']",
     ),
     Capability(
-        'rea.appgraph',
+        're.appgraph',
         '应用图投影与重建：Android/Apple/Harmony/托管程序集的应用图、重建义务账本与覆盖率评估。',
         params=(Param("action", "str", True,
                 '子动作，如 build_reconstruction_obligation_ledger、evaluate_reconstruction_coverage、import_managed_reconstruction'),
@@ -406,10 +412,10 @@ REA_CAPABILITIES = [
                       doc="该子动作的参数，原样透传给引擎")),
         side_effect=False,
         check=_mk_any(['ghidra_rizin', 'dotnet_ilspy']),
-        note="[REA] 7 个子动作；完整清单见 vendored_rea.DOMAINS['rea.appgraph']",
+        note="[REA] 7 个子动作；完整清单见 vendored_rea.DOMAINS['re.appgraph']",
     ),
     Capability(
-        'rea.guidance',
+        're.guidance',
         '逆向指引与工作流：检索内置 REA 工作流文档、按小节精确读取。',
         params=(Param("action", "str", True,
                 '子动作，如 guided_workflows、read_guidance_section、search_guidance'),
@@ -417,6 +423,6 @@ REA_CAPABILITIES = [
                       doc="该子动作的参数，原样透传给引擎")),
         side_effect=False,
         check=_mk_any(['ghidra_rizin']),
-        note="[REA] 3 个子动作；完整清单见 vendored_rea.DOMAINS['rea.guidance']",
+        note="[REA] 3 个子动作；完整清单见 vendored_rea.DOMAINS['re.guidance']",
     ),
 ]

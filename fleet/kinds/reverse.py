@@ -10,6 +10,13 @@ from .. import proto_reverse as PR
 from .. import reverse as RV
 from .. import re_llm
 from ..core import BaseDevice, DeviceResult as R
+from ..vendored_rea import DOMAINS as _REA_DOMAINS
+from ..vendored_protocol import PROTOCOL_CAPABILITIES as _PROTO_CAPS_SRC
+from .rea_device import ReaDevice
+from .protocol_device import ProtocolDevice
+
+# 合并进来的能力名（原 rea.* 领域 + 原 protocol.* 协议层），都挂在 re. 命名空间下
+_PROTO_CAPS = tuple(c.name for c in _PROTO_CAPS_SRC)
 
 
 class Reverse(BaseDevice):
@@ -19,6 +26,10 @@ class Reverse(BaseDevice):
     def __init__(self, name="re:bench", **kw):
         super().__init__(name, via="local", **kw)
         self.meta.setdefault("note", "只拆你自己捕获/拥有的数据；LLM 输出标假设")
+        # rea.* 领域能力（原 REA）与 protocol.* 协议层（原第三级）的实现层，
+        # 现在都收编进 Reverse 一个设备，对外统一是 re. 命名空间。
+        self._rea = ReaDevice()
+        self._proto = ProtocolDevice()
 
     def probe(self):
         ok, why = re_llm.available()
@@ -29,10 +40,16 @@ class Reverse(BaseDevice):
 
     def caps(self):
         return ("re.ir", "re.ble", "re.binary", "re.proto",
-                "re.bits", "re.bits_extract", "re.ask")
+                "re.bits", "re.bits_extract", "re.ask") + tuple(_REA_DOMAINS.keys()) + _PROTO_CAPS
 
     def invoke(self, cap, args=None):
         args = args or {}
+        # ---- 合并进来的 rea 领域能力（原 rea.*）----
+        if cap in _REA_DOMAINS:
+            return self._rea.invoke(cap, args, dev=self)
+        # ---- 合并进来的 protocol 协议层能力（原 protocol.*）----
+        if cap in _PROTO_CAPS or cap.startswith("re.protocol."):
+            return self._proto.invoke(cap, args, dev=self)
         if cap == "re.ir":
             cap_data = args.get("capture")
             if cap_data is None:

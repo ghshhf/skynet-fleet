@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""REA 能力设备：承载 rea.* 能力（来源 morluto/rea）。
+"""REA 能力设备（实现层）：承载 re.* 能力（原 rea.*，来源 morluto/rea；已并入 re. 命名空间）。
 
 2026-11-03 归并：原先 140 个引擎原子动作各自成能力（Frida 一个会话拆七项），
 现在 catalog 只露 6 个领域能力（guidance / web / mobile / dynamic / native /
@@ -44,15 +44,17 @@ class ReaDevice(BaseDevice):
         # 只露领域能力（6 个），不再把 140 个原子动作当能力
         return tuple(DOMAINS.keys())
 
-    def invoke(self, cap, args=None):
+    def invoke(self, cap, args=None, dev=None):
+        # dev 由委派方（Reverse）传入，让结果统一署名 re:bench；不传就自用
+        dev = dev or self
         args = dict(args or {})
 
         # 旧原子名 → 归位到域 + 预置 action（老门禁/老调用不用改）
         if cap not in DOMAINS:
             dom = DOMAIN_OF.get(cap)
             if dom is None:
-                return R.unsupported(cap, "rea 设备没有这个能力",
-                                     device=self.name, via=self.via)
+                return R.unsupported(cap, "re 设备没有这个能力",
+                                     device=dev.name, via=dev.via)
             args.setdefault("action", cap[4:])
             cap = dom
 
@@ -60,7 +62,7 @@ class ReaDevice(BaseDevice):
         if not action:
             # 不指定子动作 = 问「这个域有哪些动作」，不猜、不默认跑第一个
             acts = list(DOMAINS[cap])
-            return R.success(cap, self.name, via=self.via, data={
+            return R.success(cap, dev.name, via=dev.via, data={
                 "domain": cap, "actions": acts, "count": len(acts),
                 "hint": "用 action 指定子动作，子动作参数放 args"})
 
@@ -68,13 +70,13 @@ class ReaDevice(BaseDevice):
             return R.unsupported(
                 cap, "%s 没有子动作 %s（该域有 %d 个，先不带 action 调一次拿清单）"
                      % (cap, action, len(DOMAINS[cap])),
-                device=self.name, via=self.via)
+                device=dev.name, via=dev.via)
 
         sub = "rea." + action
         engine = ENGINE_OF.get(sub)
         if engine is None:
             return R.unsupported(sub, "子动作没登记依赖引擎",
-                                 device=self.name, via=self.via)
+                                 device=dev.name, via=dev.via)
 
         h = _HANDLERS.get(engine)
         if h is None:
@@ -82,16 +84,16 @@ class ReaDevice(BaseDevice):
                 cap,
                 "子动作 %s 依赖引擎 %s，该引擎的 handler 尚未接入"
                 "（装好引擎后接 CLI 即可实跑）" % (action, engine),
-                device=self.name, via=self.via)
+                device=dev.name, via=dev.via)
 
         # 子动作参数：顶层散键 + args 子字典（后者优先），action 本身不透传
         payload = {k: v for k, v in args.items() if k not in ("action", "args")}
         payload.update(args.get("args") or {})
         try:
-            return h(self, sub, payload)
+            return h(dev, sub, payload)
         except Exception as e:
             return R.error(cap, "REA 执行失败：%s" % str(e)[:200],
-                           device=self.name, via=self.via)
+                           device=dev.name, via=dev.via)
 
 
 def _h_sqlite3(dev, cap, args):

@@ -9,7 +9,7 @@ import os
 from . import netrunner as NR
 from . import netforce_skynet as NS
 from .core import Capability, Param, Registry
-from .vendored_rea import REA_CAPABILITIES, ENGINE_OF
+from .vendored_rea import REA_CAPABILITIES
 from .vendored_crawler import CRAWLER_CAPABILITIES
 from .vendored_pentest import PENTEST_CAPABILITIES
 from .vendored_llmgw import LLMGW_CAPABILITIES
@@ -49,14 +49,12 @@ from .kinds.wintool import WinTool
 from .kinds.parse import Parse
 from .kinds.code_convert import CodeConvert
 from .kinds.reverse import Reverse
-from .kinds.rea_device import ReaDevice
 from .kinds.crawler_device import CrawlerDevice
 from .kinds.pentest_device import PentestDevice
 from .kinds.llmgw_device import LlmGwDevice
 from .kinds.devfix_device import DevFixDevice
 from .kinds.email_device import EmailDevice
 from .kinds.register_device import RegisterDevice
-from .kinds.protocol_device import ProtocolDevice
 from .kinds.slider_device import SliderDevice
 from .kinds.fp_device import FpDevice
 from .kinds.signup_device import SignupDevice
@@ -2716,7 +2714,6 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(Parse())
     reg.add(CodeConvert())
     reg.add(Reverse())
-    reg.add(ReaDevice())
     reg.add(CrawlerDevice())
     reg.add(PentestDevice())
     reg.add(LlmGwDevice())
@@ -2725,9 +2722,6 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     # 会话层：邮箱解决「拿什么地址」，注册解决「把表单填完过验证码」。两台分开，
     # 谁挂了都不牵连对方——这就是可续。
     reg.add(RegisterDevice())
-    # 协议层：前两级之外不开浏览器的那条腿。造身份→注册/登录→拿会话全走 HTTP，
-    # 是渗透（pentest）+ 逆向（rea）+ 爬虫的汇合点——前三个各自为战，这一层把它们合成一条。
-    reg.add(ProtocolDevice())
     # 滑块：人机验证第一战场。视觉找缺口 + 造像人轨迹 + CDP 逐点拖动。
     # 卡的不是身份也不是会话，是「你像不像人」——零件和别处完全不同，所以单独一族。
     reg.add(SliderDevice())

@@ -185,7 +185,7 @@ DEFAULT_TOOL_LIMIT = 18
 #: `rea.*`（英文长名的逆向套件，Frida/GDB/objdump/Rizin 那一整套）。它们因为描述里
 #: 有「解析」「application」这类字被中文 2-gram 撞上——**语言不通导致的假命中**。
 #: 模型拿到这种表，等于在通用问题上先被塞了十把手术刀。
-HEAVY_PREFIXES = ("rea.", "pentest.", "re.", "rizin.", "tun.", "nat.", "rdv.",
+HEAVY_PREFIXES = ("pentest.", "re.", "rizin.", "tun.", "nat.", "rdv.",
                   "card.", "render.", "mqtt.", "radio.")
 #: 重型域在一张表里最多占几个位子。明确问逆向时它照样能进，只是不挤满。
 HEAVY_QUOTA = 3
@@ -743,7 +743,7 @@ def _selftest():
     assert len(heavy) <= HEAVY_QUOTA, "重型域超配额：%s" % heavy
     # 但**明确问**的时候必须给得出来（限流不是禁用）
     fr = [c.name for c in pick_caps(caps, "用 frida 挂上进程看参数", limit=18)
-          if c.name.startswith("rea.")]
+          if c.name.startswith("re.dynamic")]
     assert fr, "明确问 frida 却一条 rea 工具都没给"
 
     # ---- 中文口语插量词也要能命中（"截个屏" 切不出 "截屏"）----
