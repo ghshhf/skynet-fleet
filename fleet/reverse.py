@@ -72,11 +72,13 @@ def decode_pulses(pairs):
           "histogram", "note"}
     protocol ∈ nec / nec_ext / samsung / sirc / rc5_like / pwm / unknown
     confidence: high=反码校验通过或时序完全吻合规范；low=只是像，别当结论。
+    protocol 为 unknown 时额外给 reason：逐条列出没认出来的判据。
     """
     seq = [int(round(x)) for x in pairs if int(x) > 0]
     if len(seq) < 6:
         return {"ok": False, "err": "脉冲太少（<6 段），拆不了",
-                "protocol": "unknown"}
+                "protocol": "unknown",
+                "reason": "段数 %d < 6，聚类没有统计意义，先多抓几段" % len(seq)}
     hist = _cluster(seq)
     on = [seq[i] for i in range(0, len(seq), 2)]
     off = [seq[i] for i in range(1, len(seq), 2)]
@@ -185,6 +187,29 @@ def decode_pulses(pairs):
                              % (w1, w2, w1 / (w1 + w2) if w1 + w2 else 0))})
     else:
         out["note"] = "只有一种脉宽，判不了协议"
+
+    # ---- 没锁定协议时，给出「为什么没认出来」的线索 ----
+    # 不是猜结论，是把判据逐条摊开：上层据此能分清「真未知协议」和
+    # 「时序对不上已知家族」。用纯计算量，不劳模型。
+    if out["protocol"] == "unknown":
+        hints = []
+        if len(hist) < 2:
+            hints.append("只有单一脉宽 %.0fµs，缺 on/off 两种时长可比对，"
+                         "没有比特结构" % unit)
+        if unit and unit < 200:
+            hints.append("最小脉宽 %.0fµs 远低于红外常见下限（≈350µs），"
+                         "更像噪声或非红外信号" % unit)
+        elif unit > 2000:
+            hints.append("最小脉宽 %.0fµs 高于红外常见上限，"
+                         "时序尺度不像遥控编码" % unit)
+        if not (_near(unit, 560, 0.25) or _near(unit, 600, 0.25)):
+            hints.append("unit %.0fµs 不在 NEC/Samsung(560) 或 SIRC(600) 容差内"
+                         % unit)
+        if not (_near(lead_m, 9000, 0.2) or _near(lead_m, 4500, 0.2)
+                or _near(lead_m, 2400, 0.2)):
+            hints.append("首段 %.0fµs 不匹配已知 lead（9000/4500/2400）" % lead_m)
+        out["reason"] = ("；".join(hints) if hints
+                         else "时序在容差边缘，家族判据（反码/位结构）未通过")
     return out
 
 
