@@ -1,10 +1,10 @@
 {
-  "generated_at": "2026-11-11 04:46:42",
+  "generated_at": "2026-11-11 20:16:03",
   "gates_registered": 187,
   "eval_files": 99,
   "orphan_evals": [],
   "retired_refs": [],
-  "doc_md": 5,
+  "doc_md": 2,
   "app_build": "49",
   "capabilities_declared": 521,
   "capabilities_owned": 515,
