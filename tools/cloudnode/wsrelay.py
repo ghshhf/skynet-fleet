@@ -460,7 +460,6 @@ class _AddrBook:
                 self._d.pop(k, None)
             n += len(extra)
         return n
-        return len(dead)
 
 
 # ---------------------------------------------------------------- 服务端

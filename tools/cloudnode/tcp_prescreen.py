@@ -72,7 +72,9 @@ def main() -> None:
     ap.add_argument("--out", dest="out", default="tools/cloudnode/sub/alive.json")
     ap.add_argument("--timeout", type=float, default=3.0)
     ap.add_argument("--workers", type=int, default=120)
-    ap.add_argument("--keep-quic", action="store_true", default=True)
+    ap.add_argument("--no-keep-quic", dest="keep_quic", action="store_false", default=True,
+                    help="默认保留 QUIC 类（hysteria2/tuic 等，TCP 测不到，交 mihomo 判）；"
+                         "加此开关则把它们从输出里剔除")
     a = ap.parse_args()
 
     txt = io.open(a.inp, encoding="utf-8").read()
@@ -106,7 +108,7 @@ def main() -> None:
 
     quic_names = [{"name": n.get("name"), "type": n.get("type"),
                    "server": n.get("server"), "port": n.get("port"),
-                   "tcp_ms": -1} for n in quic]
+                   "tcp_ms": -1} for n in quic] if a.keep_quic else []
     result = {"generated": int(time.time()), "probe_seconds": dur,
               "tcp_total": len(tcp_nodes), "tcp_alive": len(alive),
               "quic_kept": len(quic_names), "nodes": alive + quic_names}
