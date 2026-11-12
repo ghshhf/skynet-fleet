@@ -89,6 +89,13 @@ def infer_terminal_state(exc, sent):
     if cat == "connection":
         if not sent or "refused" in s or "unreachable" in s or "10061" in s:
             return "failed"          # 连接被拒/不可达：明确没发出去
+        # httpx 把「域名解析失败 / TLS 握手失败」也包成 ConnectError；
+        # 这类错误发生在请求字节发出之前，必须算 failed，不能算 unknown_result
+        # （否则会给一个根本发不出去的请求判「结果未知，别重试」）。
+        if any(k in s for k in ("getaddrinfo", "name or service not known",
+                                "nodename nor servname", "name resolution",
+                                "certificate", "ssl", "tls")):
+            return "failed"
         return "unknown_result"      # 已发且中途断开：可能已抵达
     return "failed"
 

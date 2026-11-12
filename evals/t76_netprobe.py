@@ -86,6 +86,18 @@ tr2.mark_sent()
 tr2.finish_error(RuntimeError("boom"))
 chk(tr2.state == "failed", "finish_error -> failed")
 
+# 终态推断：连接建立前的失败必须算 failed；只有「已发出后断开」才是 unknown_result。
+chk(netprobe.infer_terminal_state(httpx.ConnectError("getaddrinfo failed"), True) == "failed",
+    "DNS 解析失败（ConnectError）-> failed")
+chk(netprobe.infer_terminal_state(
+        httpx.ConnectError("SSL: CERTIFICATE_VERIFY_FAILED"), True) == "failed",
+    "TLS 握手失败（ConnectError）-> failed")
+chk(netprobe.infer_terminal_state(httpx.ConnectError("connection refused"), True) == "failed",
+    "连接被拒 -> failed")
+chk(netprobe.infer_terminal_state(httpx.ConnectError("Connection reset by peer"), True)
+    == "unknown_result",
+    "已连上后中途断开 -> unknown_result（结果未知）")
+
 
 # ---------------------------------------------------------------- 3. 计时（perf_counter）
 print("== 3. 计时 ==")
