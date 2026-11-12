@@ -342,6 +342,13 @@ def build_config(nodes, listen_port=MIXED_PORT, cn=None, tun=False, fakeip=None,
     route_rules = []
     if sniff:
         route_rules.append({"action": "sniff", "timeout": "1s"})
+    # 本机 / 局域网直连必须排在国内规则之前，而且不能只靠国内规则集：
+    # karing ChinaIp 里没有 ::1 / fe80::/fc00::，加载完整规则集后，连自己的
+    # IPv6 设备和回环都会被判进代理（直连自己设备是天网的前提）。
+    route_rules.append({"type": "logical", "mode": "or",
+                        "rules": [{"ip_cidr": PM.LOCAL_DIRECT_CIDR},
+                                  {"domain_suffix": ["localhost", ".local"]}],
+                        "outbound": "direct"})
     if dom_rules or ip_rules:
         cn_sub = []
         if dom_rules:
@@ -849,6 +856,22 @@ def _selftest():
     chk("up_mbps" not in obd2 and "down_mbps" not in obd2, "带宽空值不写字段")
     chk(build_config([n_dirty, n_dirty2])["outbounds"][0]["tag"] == "DIRTY",
         "含脏字段的订阅仍能生成完整配置")
+
+    # 12) 本机/局域网直连规则进 sing-box route，且排在国内规则之前
+    cfg_l = build_config([PM.ProxyNode("N", "ss", "h", 1, {"method": "aes-128-gcm",
+                                                           "password": "p"})])
+    rr = cfg_l["route"]["rules"]
+    local_rule = next((r for r in rr if r.get("type") == "logical"
+                       and any("ip_cidr" in x for x in r.get("rules", []))), None)
+    chk(local_rule is not None and local_rule.get("outbound") == "direct",
+        "route 里有本机/局域网直连规则")
+    chk(local_rule is not None and
+        "::1/128" in local_rule["rules"][0]["ip_cidr"] and
+        "fc00::/7" in local_rule["rules"][0]["ip_cidr"],
+        "直连规则覆盖 IPv6 回环与 ULA（karing ChinaIp 里没有）")
+    idx_local = rr.index(local_rule) if local_rule else 99
+    idx_cn = next((i for i, r in enumerate(rr) if "rule_set" in r), 99)
+    chk(idx_local < idx_cn, "局域网直连规则排在国内规则之前")
 
     print("\n自测结果：", "全部通过 ✓" if not fails else f"{len(fails)} 项失败 ✗")
     return 1 if fails else 0

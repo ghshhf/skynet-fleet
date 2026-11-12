@@ -630,9 +630,9 @@ class RuleSet:
         for rule in (data.get("rules") or []):
             if not isinstance(rule, dict):
                 continue
-            self.domains.update(_as_list(rule.get("domain")))
-            self.domain_suffix.update(_as_list(rule.get("domain_suffix")))
-            self.domain_keyword.update(_as_list(rule.get("domain_keyword")))
+            self.domains.update(x.lower() for x in _as_list(rule.get("domain")))
+            self.domain_suffix.update(x.lower() for x in _as_list(rule.get("domain_suffix")))
+            self.domain_keyword.update(x.lower() for x in _as_list(rule.get("domain_keyword")))
             for c in _as_list(rule.get("ip_cidr")):
                 try:
                     self.ip_cidrs.append(ipaddress.ip_network(c, strict=False))
@@ -640,7 +640,10 @@ class RuleSet:
                     pass
 
     def matches_domain(self, host):
-        host = (host or "").lower().split(":")[0]
+        # rstrip(".")：FQDN 写法 `taobao.com.` 是合法的，不去掉尾点会漏匹配、被送去代理。
+        host = (host or "").strip().lower().split(":")[0].rstrip(".")
+        if not host:
+            return False
         if host in self.domains:
             return True
         for suf in self.domain_suffix:
@@ -751,6 +754,28 @@ def builtin_cn_ruleset():
     return rs
 
 
+# 本机/局域网必须直连：不放在「国内直连」里，因为加载了 karing 完整规则集时
+# 内置那份会被整个替换掉，而 karing 的 ChinaIp 不含 ::1/fe80::/fc00::，IPv6 回环
+# 和局域网会被判去代理 —— 直连自己设备的第一条就可能先绕进代理。
+LOCAL_DIRECT_CIDR = [
+    "127.0.0.0/8", "::1/128",
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+    "fe80::/10", "fc00::/7",
+]
+
+
+def local_direct_ruleset():
+    rs = RuleSet("local-direct")
+    for c in LOCAL_DIRECT_CIDR:
+        try:
+            rs.ip_cidrs.append(ipaddress.ip_network(c, strict=False))
+        except ValueError:
+            pass
+    rs.domains.update({"localhost"})
+    rs.domain_suffix.update({"localhost", "local"})
+    return rs
+
+
 def load_karing_ruleset(dir_path=None):
     """从 karing-ruleset 目录加载完整国内直连规则（ChinaDomain/ChinaIp），覆盖内置精简版。
 
@@ -773,8 +798,9 @@ def load_karing_ruleset(dir_path=None):
 
 
 def default_routetable():
-    """默认路由表：国内直连，其余代理；广告/隐私类可后续挂 block。"""
+    """默认路由表：本机/局域网与国内直连，其余代理；广告/隐私类可后续挂 block。"""
     rt = RouteTable(default="proxy")
+    rt.add_ruleset(local_direct_ruleset(), "direct", "本机/局域网直连")
     cn = load_karing_ruleset() or builtin_cn_ruleset()
     rt.add_ruleset(cn, "direct", "国内直连")
     return rt
@@ -950,6 +976,15 @@ proxies:
     chk(rs_single.domain_suffix == {"google.com"} and len(rs_single.ip_cidrs) == 1
         and rs_single.matches_domain("www.google.com") and rs_single.matches_ip("1.2.3.4"),
         "规则集单值字符串归一（不拆成单字符、不静默丢规则）")
+
+    # 15b) 默认路由：本机/局域网（含 IPv6）必须直连；FQDN 尾点不能漏匹配
+    rt = default_routetable()
+    chk(rt.decision(ip="::1")[0] == "direct", "IPv6 回环直连（原来 ::1 被判去代理）")
+    chk(rt.decision(ip="fe80::1")[0] == "direct", "IPv6 链路本地直连")
+    chk(rt.decision(ip="192.168.1.5")[0] == "direct", "IPv4 局域网直连")
+    chk(rt.decision(host="localhost")[0] == "direct", "localhost 直连")
+    chk(rt.decision(host="taobao.com.")[0] == "direct", "FQDN 尾点仍命中国内直连")
+    chk(rt.decision(host="google.com")[0] == "proxy", "海外站点仍走代理")
 
     # 16) 多行折行的整段 base64 订阅也要能救回（base64 CLI 默认 76 列折行）
     import textwrap
