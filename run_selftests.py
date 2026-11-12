@@ -559,6 +559,8 @@ CASES = [
     ("eval_t_pacing", ["evals/t_pacing.py"], HERE, 120),
     # 批次2（6bb4851 上下文压缩）同样写了没登记 —— t63 又抓到一次。
     ("eval_t_compress", ["evals/t_compress.py"], HERE, 120),
+    # 2026-11-12：agent_phone.solve 的端到端离线门禁（此前 t67 只覆盖滑块页）
+    ("eval_t_solve_offline", ["evals/t_solve_offline.py"], HERE, 120),
     # ---- 下载层门禁：解析层的下游（直链/多源/续传/hash校验/任务接口）----
     # 全离线（本地 Range server），与 t60 同源登记，避免「写了不跑=没写」。
     ("eval_t55_download", ["evals/t55_download.py"], HERE, 120),
