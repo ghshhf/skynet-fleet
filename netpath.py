@@ -167,8 +167,13 @@ def listen(host, port, backlog=32):
     绝不静默抢连接。端口重复是调用方的错，让它响。
 
     端口 0 = 让系统随机分配，配合 getsockname() 取真实端口。
+
+    **显式给了具体 IPv6 地址就只绑它**（`::1`、`2408:...`）。原实现只要 host 里带
+    冒号就一律改绑 `::`，等于「要只开回环 / 只开这块网卡」变成了「全网卡全开」，
+    对 control plane 是实打实的暴露面扩大。
     """
-    want_v6 = (":" in (host or "")) or (host or "") in ("", "*", "0.0.0.0")
+    wild = (host or "") in ("", "*", "0.0.0.0", "::")
+    want_v6 = wild or (":" in (host or ""))
 
     def _prep(s):
         if IS_WIN and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
@@ -176,6 +181,16 @@ def listen(host, port, backlog=32):
         else:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return s
+
+    if want_v6 and not wild and socket.has_ipv6:
+        s = _prep(socket.socket(socket.AF_INET6, socket.SOCK_STREAM))
+        try:
+            s.bind((host, port))
+            s.listen(backlog)
+        except OSError:
+            s.close()
+            raise
+        return s, f"仅 v6（{host}）"
 
     if want_v6 and socket.has_ipv6:
         try:
@@ -188,10 +203,8 @@ def listen(host, port, backlog=32):
             s.bind(("::", port))
             s.listen(backlog)
             return s, "双栈（v4 + v6）"
-        except OSError as e:
-            if host and ":" in host:
-                raise
-            _v6_err = e
+        except OSError:
+            pass              # 没有可用 v6 就退 v4，不让「没 v6」把服务搞挂
     s = _prep(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
     s.bind((host if (host and host not in ("*",)) else "0.0.0.0", port))
     s.listen(backlog)
@@ -334,6 +347,13 @@ def _selftest():
         s6.close()
         assert note6.startswith("双栈"), note6
         assert dual, "绑 :: 后 v4 连不进来：IPV6_V6ONLY 没关掉"
+
+        # ⑥b 显式给具体 v6 地址时只能绑它：原来一律改绑 ::，把回环监听扩成全网卡
+        s1, n1 = listen("::1", 0)
+        bound = s1.getsockname()[0]
+        s1.close()
+        assert bound == "::1", f"要 ::1 却绑到了 {bound}（暴露面扩大）"
+        assert n1.startswith("仅 v6"), n1
 
     # ⑦ 格式化不炸
     assert "公网" in fmt(rows) and "临时" in fmt(rows)
