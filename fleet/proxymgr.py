@@ -21,6 +21,7 @@ import re
 import socket
 import sys
 import time
+from urllib.parse import unquote
 
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
@@ -101,18 +102,30 @@ def _b64decode(s):
     用于「可能是 base64 包裹，也可能就是明文」的场景（节点名 / vmess JSON / 订阅）。
     validate=True 拒绝含 `-`、空格等非 base64 字符的明文；strict UTF-8 拒绝解码出
     乱码的短字符串（如节点名 "test" 恰好是合法 base64 但解码是二进制）。
+
+    两种字母表都试：标准（+/）与 URL-safe（-_，SIP002 的 ss:// userinfo 用它，
+    且常省掉 `=` 填充）。只认标准字母表会把 `ss://YWVz..._w0rd@host` 静默解析成
+    「method=整段乱码、password 为空」的畸形节点。
     """
     s = (s or "").strip()
     if not s:
         return ""
-    try:
-        raw = base64.b64decode(s + "=" * (-len(s) % 4), validate=True)
-    except Exception:
-        return ""
-    try:
-        return raw.decode("utf-8", "strict")
-    except UnicodeDecodeError:
-        return ""
+    for altchars in (None, b"-_"):
+        try:
+            raw = base64.b64decode(s + "=" * (-len(s) % 4),
+                                   altchars=altchars, validate=True)
+        except Exception:
+            continue
+        try:
+            text = raw.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            continue
+        # 解码出控制字节说明原串其实是明文：如节点名 "HK" 恰好是合法 base64，
+        # 解出来是 0x1c —— 不能把这种「看着像 base64 的短名字」改写成乱码。
+        if any(ord(ch) < 32 and ch not in "\t\n\r" for ch in text):
+            continue
+        return text
+    return ""
 
 
 def _try_yaml():
@@ -208,6 +221,31 @@ def _mini_node(d, source):
                      int(d.get("port", 0) or 0), d, source)
 
 
+_HOST_PORT = re.compile(
+    r"^(?P<host>\[[0-9A-Fa-f:.]+\]|[^:/?#]+):(?P<port>\d+)")
+
+
+def _link_name(uri, fallback):
+    """取链接 `#fragment` 里的节点名：先 percent-decode，再尝试 base64 解名。
+
+    订阅里的中文名/emoji 名基本都是 URL 编码的（`#%E9%A6%99%E6%B8%AF`），
+    不解码就会把 `%E9%A6%99...` 原样当成节点名。
+    """
+    name = unquote(uri.split("#", 1)[1]) if "#" in uri else ""
+    name = name.strip()
+    if not name:
+        return fallback
+    return _b64decode(name) or name
+
+
+def _host_port(hostpart):
+    """`host:port` / `[::1]:port` → (host, port)；不合法返回 (None, 0)。"""
+    m = _HOST_PORT.match(hostpart)
+    if not m:
+        return None, 0
+    return m.group("host").strip("[]"), int(m.group("port"))
+
+
 def _parse_vless_trojan(uri, proto):
     """vless:// / trojan:// / socks:// / http:// 这类 `scheme://user@host:port?query#name`"""
     m = re.match(r"^(?P<scheme>\w+)://(?P<auth>[^@]*)@(?P<host>[^:/?#]+):(?P<port>\d+)", uri)
@@ -221,16 +259,22 @@ def _parse_vless_trojan(uri, proto):
     for kv in query.split("&"):
         if "=" in kv:
             k, v = kv.split("=", 1)
-            extra[k] = v
+            extra[k] = unquote(v)   # 参数是 URL 编码的（path=%2Fws → /ws）
     if proto == "vless" and auth:
-        extra.setdefault("uuid", auth)
+        extra.setdefault("uuid", unquote(auth))
     elif proto == "trojan" and auth:
-        extra.setdefault("password", auth)
-    elif proto in ("socks", "http") and auth and ":" in auth:
-        u, p = auth.split(":", 1)
-        extra["username"], extra["password"] = u, p
-    name = uri.split("#", 1)[1] if "#" in uri else f"{proto}-{m.group('host')}"
-    return ProxyNode(_b64decode(name) or name, proto, m.group("host"),
+        extra.setdefault("password", unquote(auth))
+    elif proto in ("socks", "http") and auth:
+        cred = unquote(auth)
+        if ":" not in cred:
+            cred = _b64decode(cred) or cred   # socks://base64(user:pass)@ 也常见
+        if ":" in cred:
+            u, p = cred.split(":", 1)
+            extra["username"], extra["password"] = u, p
+        elif cred:
+            extra["username"] = cred
+    name = _link_name(uri, f"{proto}-{m.group('host')}")
+    return ProxyNode(name, proto, m.group("host"),
                      int(m.group("port")), extra, "v2ray-link")
 
 
@@ -244,40 +288,47 @@ def _parse_hysteria2(uri):
     m = re.match(r"^(?P<scheme>hysteria2|hy2)://(?P<password>[^@/?#]+)@(?P<host>[^:/?#]+):(?P<port>\d+)", uri)
     if not m:
         return None
-    extra = {"password": m.group("password")}
+    extra = {"password": unquote(m.group("password"))}
     query = uri.split("?", 1)[1].split("#")[0] if "?" in uri else ""
     for kv in query.split("&"):
         if "=" not in kv:
             continue
         k, v = kv.split("=", 1)
-        extra[k] = v
+        extra[k] = unquote(v)
     # 归一：sni→servername、insecure→skip-cert-verify、obfs-password→obfs 密码
     if extra.get("sni"):
         extra.setdefault("servername", extra["sni"])
     if extra.get("insecure") in ("1", "true", "True"):
         extra["skip-cert-verify"] = True
-    name = uri.split("#", 1)[1] if "#" in uri else f"hy2-{m.group('host')}"
-    return ProxyNode(_b64decode(name) or name, "hysteria2", m.group("host"),
+    name = _link_name(uri, f"hy2-{m.group('host')}")
+    return ProxyNode(name, "hysteria2", m.group("host"),
                      int(m.group("port")), extra, "v2ray-link")
 
 
 def parse_v2ray_links(text, source="v2ray"):
-    """逐行解析 vmess:// vless:// trojan:// ss:// hysteria2:// socks:// http:// 链接。"""
+    """逐行解析 vmess:// vless:// trojan:// ss:// hysteria2:// socks:// http:// 链接。
+
+    单行畸形只丢这一行：一条坏链接（比如 port 写成 `abc` 的 vmess）不能把整份
+    订阅的其余节点一起带崩——订阅是外部数据，容错边界必须画在「行」上。
+    """
     nodes = []
     for raw in text.splitlines():
         u = raw.strip()
         if not u or "://" not in u:
             continue
         scheme = u.split("://", 1)[0].lower()
-        if scheme == "vmess":
-            n = _parse_vmess(u)
-        elif scheme in ("vless", "trojan", "socks", "socks5", "http", "https"):
-            n = _parse_vless_trojan(u, _PROTO_MAP.get(scheme, scheme))
-        elif scheme in ("ss", "shadowsocks"):
-            n = _parse_ss(u)
-        elif scheme in ("hysteria2", "hy2"):
-            n = _parse_hysteria2(u)
-        else:
+        try:
+            if scheme == "vmess":
+                n = _parse_vmess(u)
+            elif scheme in ("vless", "trojan", "socks", "socks5", "http", "https"):
+                n = _parse_vless_trojan(u, _PROTO_MAP.get(scheme, scheme))
+            elif scheme in ("ss", "shadowsocks"):
+                n = _parse_ss(u)
+            elif scheme in ("hysteria2", "hy2"):
+                n = _parse_hysteria2(u)
+            else:
+                continue
+        except Exception:
             continue
         if n:
             n.source = source
@@ -296,6 +347,8 @@ def _parse_vmess(uri):
         d = json.loads(j)
     except Exception:
         return None
+    if not isinstance(d, dict):
+        return None
     name = d.get("ps") or d.get("remark") or "vmess"
     extra = {"uuid": d.get("id"), "alterId": d.get("aid", 0),
              "security": d.get("scy", "auto"), "network": d.get("net", "tcp")}
@@ -309,25 +362,38 @@ def _parse_vmess(uri):
         extra["path"] = d["path"]
     if d.get("alpn"):
         extra["alpn"] = d["alpn"]
-    return ProxyNode(name, "vmess", d.get("add", ""), int(d.get("port", 0) or 0),
-                     extra, "v2ray-link")
+    try:
+        port = int(d.get("port", 0) or 0)
+    except (TypeError, ValueError):
+        port = 0   # 外部订阅里 port 写成字符串/空值都见过，丢掉端口好过整份订阅解析崩
+    return ProxyNode(name, "vmess", d.get("add", ""), port, extra, "v2ray-link")
 
 
 def _parse_ss(uri):
-    """ss:// 两种：① base64(method:password)@host:port#name ② ss://method:password@host:port#name"""
-    body = uri.split("://", 1)[1].split("#")[0]
-    name = uri.split("#", 1)[1] if "#" in uri else "ss"
+    """ss:// 三种形态：
+    ① SIP002：ss://base64url(method:password)@host:port/?plugin=...#name
+    ② 明文：ss://method:password@host:port#name
+    ③ 旧式整段 base64：ss://base64(method:password@host:port)#name
+
+    ③ 是老机场至今仍在发的格式，原来只认 ①②，这类订阅会被整条丢掉。
+    """
+    body = uri.split("://", 1)[1].split("#")[0].split("?", 1)[0].rstrip("/")
+    name = _link_name(uri, "ss")
     if "@" in body:
-        left, host = body.rsplit("@", 1)
-        cred = _b64decode(left) or left
-        m = re.match(r"^(?P<host>[^:/?#]+):(?P<port>\d+)", host)
-        if not m:
+        left, hostpart = body.rsplit("@", 1)
+        cred = _b64decode(left) or unquote(left)
+    else:
+        dec = _b64decode(body) or _b64decode(unquote(body))
+        if not dec or "@" not in dec:
             return None
-        method, _, password = cred.partition(":")
-        extra = {"method": method, "password": password}
-        return ProxyNode(_b64decode(name) or name, "shadowsocks",
-                         m.group("host"), int(m.group("port")), extra, "v2ray-link")
-    return None
+        cred, _, hostpart = dec.rpartition("@")
+    host, port = _host_port(hostpart)
+    if not host or ":" not in (cred or ""):
+        return None
+    method, _, password = cred.partition(":")
+    return ProxyNode(name, "shadowsocks", host, port,
+                     {"method": method.strip(), "password": password},
+                     "v2ray-link")
 
 
 def parse_singbox_json(obj_or_text, source="sing-box"):
@@ -385,9 +451,11 @@ def _try_full_b64(raw):
     """尝试把整段当 base64 解码（很多订阅是 base64 包裹的自定义格式）。
 
     只接受「解码后像文本」的结果，避免把恰好能 base64 解的二进制误判。
+    先剥掉所有空白：`base64` 命令行默认按 76 列折行，多行包裹的订阅
+    （机场后台导出常见）原来因为 `"\\n" in s` 直接被拒，救不回来。
     """
-    s = (raw or "").strip()
-    if not s or "\n" in s:
+    s = re.sub(r"\s+", "", raw or "")
+    if not s:
         return None
     try:
         d = base64.b64decode(s + "=" * (-len(s) % 4))
@@ -467,22 +535,41 @@ def probe_node(node, timeout=3.0):
     这是「节点可达性 + 基础延迟」探针（Karing 测的是 outbound 端到端延迟，
     但天网克制场景下先测 TCP 连通性，足够支撑选优与多机出口健康度判断）。
     ok=True 可达；ok=False 不可达（latency_ms=-1）。
+
+    地址族交给 getaddrinfo 决定：原来写死 AF_INET，IPv6 节点（`::1` / 2408:…）
+    一律 gaierror 判死，而天网跨网络直连恰恰吃就是 IPv6 这条资源——活的 v6 节点
+    被永久标成不可达，pick_best 永远跳过它。多个地址按顺序试，总耗时不超过 timeout。
     """
     t0 = time.monotonic()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
     try:
-        sock.connect((node.server, node.port))
+        infos = socket.getaddrinfo(node.server, node.port, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError, ValueError):
+        infos = []
+    ok = False
+    for fam, typ, proto, _canon, sa in infos:
+        remain = timeout - (time.monotonic() - t0)
+        if remain <= 0:
+            break
+        sock = socket.socket(fam, typ, proto)
+        sock.settimeout(remain)
+        try:
+            sock.connect(sa)
+            ok = True
+        except (OSError, socket.timeout):
+            ok = False
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        if ok:
+            break
+    if ok:
         node.latency_ms = round((time.monotonic() - t0) * 1000, 1)
         node.ok = True
-    except (OSError, socket.timeout):
+    else:
         node.latency_ms = -1
         node.ok = False
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
     return node
 
 
@@ -494,6 +581,22 @@ def probe_all(nodes, timeout=3.0, max_workers=16):
 
 
 # ───────────────────────── 规则集 + 路由 ─────────────────────────
+
+def _as_list(v):
+    """规则字段归一成列表：sing-box rule-set 允许 `"domain_suffix": "x.com"` 单值写法。
+
+    不归一的话 `set.update("x.com")` 会把字符串拆成单个字符进集合——规则静默失效，
+    而且往域名后缀集合里塞进一堆单字符垃圾。
+    """
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    try:
+        return list(v)
+    except TypeError:
+        return []
+
 
 class RuleSet:
     """sing-box rule-set source 格式规则集：{version,rules:[{domain,domain_suffix,domain_keyword,ip_cidr,geoip,geosite}]}"""
@@ -509,10 +612,12 @@ class RuleSet:
 
     def load(self, data):
         for rule in (data.get("rules") or []):
-            self.domains.update(rule.get("domain", []))
-            self.domain_suffix.update(rule.get("domain_suffix", []))
-            self.domain_keyword.update(rule.get("domain_keyword", []))
-            for c in rule.get("ip_cidr", []):
+            if not isinstance(rule, dict):
+                continue
+            self.domains.update(_as_list(rule.get("domain")))
+            self.domain_suffix.update(_as_list(rule.get("domain_suffix")))
+            self.domain_keyword.update(_as_list(rule.get("domain_keyword")))
+            for c in _as_list(rule.get("ip_cidr")):
                 try:
                     self.ip_cidrs.append(ipaddress.ip_network(c, strict=False))
                 except ValueError:
@@ -786,6 +891,63 @@ proxies:
     chk(_b64decode("JP-ss") == "", "短明文名不误判 base64")
     _cn_b64 = base64.b64encode("香港".encode()).decode()
     chk(_b64decode(_cn_b64) == "香港", "合法 base64 中文名正确解码")
+    chk(_b64decode("HK") == "", "两位合法 base64 的明文名不被解成控制字符")
+
+    # 12) ss 三种写法：SIP002 / 明文 / 旧式整段 base64
+    legacy_ss = "ss://" + base64.b64encode(
+        b"aes-256-gcm:secret@1.2.3.4:8388").decode() + "#%E8%80%81%E5%BC%8F"
+    ln = parse_v2ray_links(legacy_ss)
+    chk(len(ln) == 1 and ln[0].extra == {"method": "aes-256-gcm", "password": "secret"}
+        and ln[0].name == "老式", f"旧式整段 base64 的 ss:// 能解出节点（实际 {ln}）")
+    _u = base64.urlsafe_b64encode(b"aes-128-gcm:pa?ss/w0rd").decode().rstrip("=")
+    sn = parse_v2ray_links("ss://%s@[2001:db8::1]:8388#v6" % _u)
+    chk(len(sn) == 1 and sn[0].extra.get("password") == "pa?ss/w0rd"
+        and sn[0].server == "2001:db8::1", f"SIP002 base64url + IPv6 字面量（实际 {sn}）")
+
+    # 13) 链接里的 percent 编码要还原（名字与参数）
+    pn = parse_v2ray_links(
+        "vless://uuid-1@sg.example.com:443?type=ws&path=%2Fws#%E9%A6%99%E6%B8%AF")
+    chk(pn and pn[0].name == "香港" and pn[0].extra.get("path") == "/ws",
+        f"#name 与 query 参数 percent-decode（实际 {pn[0].name!r}/{pn[0].extra.get('path')!r}）")
+
+    # 14) 一行畸形不拖垮整份订阅（坏节点留 port=0，proxycore 生成配置时自会过滤）
+    bad_vmess = "vmess://" + base64.b64encode(
+        b'{"add":"x.com","port":"abc","id":"u"}').decode()
+    mix = parse_v2ray_links(bad_vmess + "\n" + "trojan://p@ok.example.com:443#ok")
+    chk(len(mix) == 2 and mix[0].port == 0 and mix[1].name == "ok",
+        "vmess port 非数字不抛异常，后续链接照常解析")
+
+    # 15) 规则集允许单值写法（sing-box rule-set 的 "domain_suffix": "x.com"）
+    rs_single = RuleSet("t")
+    rs_single.load({"rules": [{"domain_suffix": "google.com",
+                               "domain": ["a.com"], "ip_cidr": "1.2.3.0/24"}]})
+    chk(rs_single.domain_suffix == {"google.com"} and len(rs_single.ip_cidrs) == 1
+        and rs_single.matches_domain("www.google.com") and rs_single.matches_ip("1.2.3.4"),
+        "规则集单值字符串归一（不拆成单字符、不静默丢规则）")
+
+    # 16) 多行折行的整段 base64 订阅也要能救回（base64 CLI 默认 76 列折行）
+    import textwrap
+    wrapped_multi = "\n".join(textwrap.wrap(
+        base64.b64encode((vless + "\n" + trojan).encode()).decode(), 76))
+    da4 = deep_analyze(wrapped_multi)
+    chk(da4["method"] == "reversed" and len(da4.get("nodes") or []) == 2,
+        f"多行 base64 包裹订阅深解救回 2 个节点（实际 {len(da4.get('nodes') or [])}）")
+
+    # 17) IPv6 节点测速不能一律判死（起一个本地 v6 监听实测）
+    v6srv, v6chk = None, "本机没有可用 IPv6 回环，跳过"
+    try:
+        v6srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        v6srv.bind(("::1", 0))
+        v6srv.listen(1)
+        v6n = ProxyNode("v6-live", "vmess", "::1", v6srv.getsockname()[1])
+        probe_node(v6n, timeout=1.0)
+        v6chk = None
+        chk(v6n.ok is True, "活的 IPv6 节点测速为可达（原来 AF_INET 写死判死）")
+    except OSError:
+        print("  · 跳过 IPv6 回环测速：" + v6chk)
+    finally:
+        if v6srv:
+            v6srv.close()
 
     print("\n自测结果：", "全部通过 ✓" if not fails else f"{len(fails)} 项失败 ✗")
     return 1 if fails else 0
