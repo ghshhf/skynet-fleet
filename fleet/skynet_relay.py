@@ -33,6 +33,10 @@ RELAY_STATE_PATH = os.path.join(
 # 回环地址：只有它能免 token（本机 / 经 adb reverse 进来的手机在本进程眼里就是回环）。
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
+#: 单条请求行的上限。没有它，客户端只要一直发不带 \n 的字节，`buf` 就会无限涨，
+#: relay 绑在 0.0.0.0 时这就是一条局域网内存耗尽路径。1 MiB 对一行 JSON 足够宽裕。
+MAX_LINE = 1024 * 1024
+
 
 def is_loopback(host):
     """host 是否是回环（含 127.0.0.0/8）。"""
@@ -215,6 +219,13 @@ class SkyNetRelay:
                 if not chunk:
                     break
                 buf += chunk
+                if len(buf) > MAX_LINE and b"\n" not in buf:
+                    # 迟迟等不到换行就说明要么协议不对、要么在灌内存。回一句就断，
+                    # 不能让一条连接把进程撑爆。
+                    conn.sendall(json.dumps(
+                        {"type": "error", "error": "request line too long (> %d bytes)"
+                         % MAX_LINE}).encode("utf-8") + b"\n")
+                    break
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     line = line.strip()
