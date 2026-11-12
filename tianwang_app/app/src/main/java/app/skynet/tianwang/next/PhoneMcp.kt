@@ -188,6 +188,32 @@ object PhoneMcp {
             schema(emptyMap()),
         ),
         McpTool(
+            "self_mcp_servers", "外部 MCP 服务器列表：名称/地址/启用/工具数/最近错误（只读）。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_mcp_add", "添加一个外部 MCP 服务器（Streamable HTTP），成功后立刻拉取工具列表。",
+            schema(
+                mapOf(
+                    "name" to prop("string", "服务名，工具前缀会用它，建议短英文"),
+                    "url" to prop("string", "MCP 端点，如 http://192.168.1.10:8765/mcp"),
+                    "token" to prop("string", "可选 Bearer token，不填则不带 Authorization"),
+                ),
+                listOf("name", "url"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_mcp_remove", "移除一个外部 MCP 服务器及其工具。",
+            schema(mapOf("name" to prop("string", "服务名")), listOf("name")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_mcp_refresh", "重新拉取外部 MCP 的工具列表（name 为空=刷新全部）。",
+            schema(mapOf("name" to prop("string", "服务名，留空刷新全部")), emptyList()),
+            sideEffect = true,
+        ),
+        McpTool(
             "self_shizuku_status", "Shizuku 装没装 / 服务跑没跑 / 本 App 授没授权 / shell 会话状态。",
             schema(emptyMap()),
         ),
@@ -499,7 +525,7 @@ object PhoneMcp {
     ) + WebTool.tools
 
     private val core = McpCore(
-        tools = tools,
+        tools = { toolList() },
         actionsAllowed = { Prefs.mcpAllowActions },
         call = { name, args -> runBlocking { executeTool(name, args) } },
     )
@@ -513,21 +539,38 @@ object PhoneMcp {
      * 否则同一个项目里会同时存在「控制方」和「执行方」两套标准。
      */
     private val lanCore = McpCore(
-        tools = tools,
+        tools = { toolList() },
         actionsAllowed = { true },
         call = { name, args -> runBlocking { executeTool(name, args) } },
     )
 
     fun handleLanLine(line: String): String? = lanCore.handleLine(line)
 
-    fun toolCount(): Int = tools.size
+    fun toolCount(): Int = toolList().size
 
-    /** 本机工具表。MCP 入网和本地模型的工具协议共用同一份，避免两边名字漂移。 */
-    fun toolList(): List<McpTool> = tools
+    /**
+     * 本机工具表 = 静态能力 + 外部 MCP 联邦出来的工具。
+     * MCP 入网、LAN 和本地模型工具协议共用同一份，避免三边名字漂移。
+     */
+    fun toolList(): List<McpTool> = tools + McpServers.cachedTools()
 
     /** 直接执行一次工具（本地模型工具闭环用）；失败不抛异常，统一走 ToolResult。 */
     suspend fun executeTool(mcpName: String, args: JSONObject): ToolResult {
         val startedAt = System.currentTimeMillis()
+        // 外部 MCP 联邦工具：名字形如 mcp__<server>__<tool>，原样转给对应服务。
+        if (mcpName.startsWith("mcp__")) {
+            return audited(mcpName, args, startedAt, McpServers.call(mcpName, args))
+        }
+        // 外部 MCP 管理面：控制面可以远程给手机挂新能力。
+        when (mcpName) {
+            "self_mcp_servers" -> return ToolResult(true, text = McpServers.describe())
+            "self_mcp_add" -> return audited(mcpName, args, startedAt,
+                McpServers.add(args.optString("name"), args.optString("url"), args.optString("token")))
+            "self_mcp_remove" -> return audited(mcpName, args, startedAt,
+                McpServers.remove(args.optString("name")))
+            "self_mcp_refresh" -> return audited(mcpName, args, startedAt,
+                ToolResult(true, text = McpServers.refresh(args.optString("name").takeIf { it.isNotBlank() })))
+        }
         // 网盘能力不走 PhoneSelf 的无障碍分派：它不依赖界面，也不该被无障碍开关挡住。
         if (mcpName.startsWith("cloud_")) return cloudTool(mcpName, args)
         // 联网同一个道理：能不能上网和「无障碍通没通」是两件事。
@@ -601,10 +644,16 @@ object PhoneMcp {
         if (mcpName == "self_ui_screenshot") map["inline"] = true
         val result = runBlocking { PhoneSelf.run(selfName, map) }
         // 有副作用的工具才进审计；读界面/读电量这种不刷屏。
-        if (tools.firstOrNull { it.name == mcpName }?.sideEffect == true) {
+        if (toolList().firstOrNull { it.name == mcpName }?.sideEffect == true) {
             ActionLog.add(mcpName, args, result.ok, result.err, System.currentTimeMillis() - startedAt)
         }
         return result
+    }
+
+    /** 外部工具与管理面不进 PhoneSelf 分派，审计要在这里补一刀。 */
+    private fun audited(name: String, args: JSONObject, startedAt: Long, r: ToolResult): ToolResult {
+        ActionLog.add(name, args, r.ok, r.err, System.currentTimeMillis() - startedAt)
+        return r
     }
 
     /**

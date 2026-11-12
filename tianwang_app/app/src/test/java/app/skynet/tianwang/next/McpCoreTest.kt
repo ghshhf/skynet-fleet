@@ -16,10 +16,12 @@ class McpCoreTest {
         .put("properties", JSONObject())
 
     private fun core(allowActions: Boolean = false): McpCore = McpCore(
-        tools = listOf(
-            McpTool("self_status", "看状态", schema()),
-            McpTool("self_ui_tap", "点控件", schema(), sideEffect = true),
-        ),
+        tools = {
+            listOf(
+                McpTool("self_status", "看状态", schema()),
+                McpTool("self_ui_tap", "点控件", schema(), sideEffect = true),
+            )
+        },
         actionsAllowed = { allowActions },
         call = { name, args ->
             calls += name to args
@@ -87,7 +89,7 @@ class McpCoreTest {
     @Test
     fun imageResultCarriesImageAndText() {
         val core = McpCore(
-            tools = listOf(McpTool("self_ui_screenshot", "截屏", schema())),
+            tools = { listOf(McpTool("self_ui_screenshot", "截屏", schema())) },
             actionsAllowed = { false },
             call = { _, _ -> ToolResult(true, text = "/sdcard/shot.png", imageBase64 = "aGVsbG8=", mimeType = "image/jpeg") },
         )
@@ -132,6 +134,22 @@ class McpCoreTest {
                 .put("arguments", JSONObject().put("query", "搜索")))
         assertNull(core(allowActions = true).handleLine(note.toString()))
         assertTrue(calls.isEmpty())
+    }
+
+    @Test
+    fun toolsListSeesToolsAddedAfterConstruction() {
+        val extra = mutableListOf<McpTool>()
+        val core = McpCore(
+            tools = { listOf(McpTool("self_status", "看状态", schema())) + extra },
+            actionsAllowed = { false },
+            call = { _, _ -> ToolResult(true, text = "ok") },
+        )
+        fun listed(): Int = JSONObject(core.handleLine(req(20, "tools/list").toString())!!)
+            .getJSONObject("result").getJSONArray("tools").length()
+
+        assertEquals(1, listed())
+        extra += McpTool("mcp__pc__search", "外部搜索", schema(), sideEffect = true)
+        assertEquals(2, listed())
     }
 
     @Test

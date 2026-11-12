@@ -31,7 +31,8 @@ data class McpTool(
 }
 
 class McpCore(
-    private val tools: List<McpTool>,
+    /** 每次现取：外部 MCP 的工具是运行时长出来的，不能在构造成员时绑死。 */
+    private val tools: () -> List<McpTool>,
     private val actionsAllowed: () -> Boolean,
     private val call: (String, JSONObject) -> ToolResult,
     private val serverName: String = "phone-self",
@@ -88,7 +89,7 @@ class McpCore(
 
             "tools/list" -> {
                 val arr = JSONArray()
-                tools.forEach { arr.put(it.describe()) }
+                tools().forEach { arr.put(it.describe()) }
                 ok(id, JSONObject().put("tools", arr))
             }
 
@@ -120,7 +121,7 @@ class McpCore(
     }
 
     private fun invoke(name: String, args: JSONObject): JSONObject {
-        val tool = tools.firstOrNull { it.name == name }
+        val tool = tools().firstOrNull { it.name == name }
             ?: return toolResult("未知工具：$name（先 tools/list 看可用工具）", true)
         if (tool.sideEffect && !actionsAllowed()) {
             return toolResult(

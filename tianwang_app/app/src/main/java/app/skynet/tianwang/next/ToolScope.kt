@@ -147,6 +147,15 @@ object ToolScope {
             listOf("cloud_"),
             listOf("cloud_nodes", "cloud_list", "cloud_search", "cloud_file_url"),
         ),
+        EXT(
+            "外部工具",
+            listOf(
+                "mcp", "外部工具", "外部服务", "外部能力", "插件", "扩展", "挂载",
+                "外部 mcp", "外部mcp", "mcp server", "mcp服务器",
+            ),
+            listOf("self_mcp_", "mcp__"),
+            listOf("self_mcp_servers", "self_mcp_refresh"),
+        ),
         NOTIFY(
             "通知与剪贴板",
             listOf(

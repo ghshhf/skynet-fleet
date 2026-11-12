@@ -87,6 +87,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         App.bind(this)
         Net.init(applicationContext)
+        // 外部 MCP 联邦：只读本机配置，不在主线程联网。
+        McpServers.init(applicationContext)
         // debug 构建才用得到：生成/复用真机验证用的随机 token（release 里无人读它）。
         runCatching { DebugBridge.ensureToken(this) }
         // 手机端爬虫后台常驻：每 30 分钟自动抓一轮全球资源，不靠用户下拉刷新。

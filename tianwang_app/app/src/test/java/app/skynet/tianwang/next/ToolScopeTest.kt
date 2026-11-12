@@ -16,7 +16,7 @@ import org.junit.Test
  */
 class ToolScopeTest {
 
-    /** 真实工具名（与 PhoneMcp 的 63 个一一对应）。 */
+    /** 真实工具名（与 PhoneMcp 的 67 个一一对应）。 */
     private val names = listOf(
         "self_status", "self_ui_dump", "self_ui_find", "self_ui_tap", "self_ui_tap_at",
         "self_ui_swipe", "self_ui_text", "self_ui_scroll", "self_ui_key", "self_ui_wait",
@@ -26,7 +26,8 @@ class ToolScopeTest {
         "self_device_info", "self_screen_state", "self_diag", "self_audit", "self_perm_matrix",
         "self_shizuku_status", "self_shizuku_request", "self_shell_exec", "self_owner_status",
         "self_owner_provision", "self_owner_grant_perm", "self_owner_restriction",
-        "self_owner_reboot", "self_lan_status", "self_lan_start", "self_lan_stop",
+        "self_owner_reboot", "self_mcp_servers", "self_mcp_add", "self_mcp_remove",
+        "self_mcp_refresh", "self_lan_status", "self_lan_start", "self_lan_stop",
         "self_lan_call", "self_lan_speed", "self_peer_add", "self_peer_remove", "self_peer_list",
         "self_peer_probe", "self_peer_pick", "self_peer_call", "self_agent_goal",
         "self_peer_goal", "self_model_ask", "self_api_ask", "self_peer_pool", "self_dns_resolve",
@@ -43,7 +44,7 @@ class ToolScopeTest {
 
     @Test
     fun everyToolHasDomain() {
-        assertEquals(63, names.size)
+        assertEquals(67, names.size)
         for (n in names) {
             assertTrue("工具 $n 没有归属域，那一域的目标永远拿不到它", ToolScope.domainLabel(n).isNotBlank())
         }
@@ -54,6 +55,14 @@ class ToolScopeTest {
         val got = pickedNames("帮我点一下设置里的关于手机")
         assertTrue("应给到 self_ui_tap，实际：$got", "self_ui_tap" in got)
         assertTrue("不该出现网盘工具，实际：$got", got.none { it.startsWith("cloud_") })
+        assertTrue(got.size <= ToolScope.DEFAULT_LIMIT)
+    }
+
+    @Test
+    fun mcpGoalPicksExternalTools() {
+        val withExt = table() + McpTool("mcp__pc__search", "外部搜索", JSONObject(), sideEffect = true)
+        val got = ToolScope.pick("用 mcp 查一下这台电脑", withExt).tools.map { it.name }
+        assertTrue("说 mcp 却没给外部工具，实际：$got", "mcp__pc__search" in got)
         assertTrue(got.size <= ToolScope.DEFAULT_LIMIT)
     }
 

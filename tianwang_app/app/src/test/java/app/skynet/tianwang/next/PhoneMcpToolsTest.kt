@@ -1,4 +1,4 @@
-package app.skynet.tianwang.next
+﻿package app.skynet.tianwang.next
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -115,7 +115,7 @@ class PhoneMcpToolsTest {
     fun readOnlyGateBlocksShellExec() {
         var called = false
         val core = McpCore(
-            tools = PhoneMcp.toolList(),
+            tools = { PhoneMcp.toolList() },
             actionsAllowed = { false },
             call = { _, _ -> called = true; ToolResult(true, text = "should-not-run") },
         )
@@ -131,7 +131,7 @@ class PhoneMcpToolsTest {
     fun readOnlyGateBlocksClipboardWrite() {
         var called = false
         val core = McpCore(
-            tools = PhoneMcp.toolList(),
+            tools = { PhoneMcp.toolList() },
             actionsAllowed = { false },
             call = { _, _ -> called = true; ToolResult(true, text = "should-not-run") },
         )
@@ -147,7 +147,7 @@ class PhoneMcpToolsTest {
     fun readOnlyGateBlocksLanCall() {
         var called = false
         val core = McpCore(
-            tools = PhoneMcp.toolList(),
+            tools = { PhoneMcp.toolList() },
             actionsAllowed = { false },
             call = { _, _ -> called = true; ToolResult(true, text = "should-not-run") },
         )
@@ -163,7 +163,7 @@ class PhoneMcpToolsTest {
     fun readOnlyGateDoesNotBlockReads() {
         var called = false
         val core = McpCore(
-            tools = PhoneMcp.toolList(),
+            tools = { PhoneMcp.toolList() },
             actionsAllowed = { false },
             call = { _, _ -> called = true; ToolResult(true, text = "ok") },
         )
