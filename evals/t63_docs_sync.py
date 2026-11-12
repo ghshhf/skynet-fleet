@@ -69,7 +69,23 @@ def _read(path):
 
 
 # 正文路径引用：`evals/t60_parse.py` / `tools/gen_stats.py` / `fleet/net.py`
-_PATH_RE = re.compile(r"`((?:evals|tools|fleet|docs)/[A-Za-z0-9_./\-]+\.(?:py|md|json))`")
+# 2026-11-12：放宽到中文文件名与更多扩展名。旧正则只认「反引号 + ASCII」，
+# 总纲里一条已删的中文计划书路径因此漏网了整整 10 天。
+_PATH_RE = re.compile(
+    r"`((?:evals|tools|fleet|docs|tianwang_app|tianwang_android)/[^`\n*?<>]+?\.(?:py|md|json|pptx|txt|html|kts|gradle))`")
+# 裸路径（不在反引号里）：docs/xxx.md、tianwang_android/version.txt。
+# 只认这几个文件树根，避免把普通英文句子当路径。
+_BARE_PATH_RE = re.compile(
+    r"(?<![`\w/\\])((?:docs|tianwang_app|tianwang_android)/"
+    r"[A-Za-z0-9_\u4e00-\u9fff./\-]+?\.(?:py|md|json|pptx|txt|html|kts|gradle))")
+_FENCE_RE = re.compile(r"```.*?```", re.S)
+
+
+def _blank_fences(text):
+    """把围栏代码块换成等量空行：行号不变，但代码示例里的路径不参与存在性校验。"""
+    return _FENCE_RE.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+
+
 # 累加绝对值：能力表 151 → 160（也认 -> 和 全角 →）
 # 正则故意只认「能力表」这个前缀：这是本项目历史上的固定写法，抓它零误报。
 # 想把口子放宽到「能力数 / 能力 N 个」就会误伤"举反例"的段落，得不偿失。
@@ -107,16 +123,17 @@ def main():
     seen = set()
     for path in _docs():
         rel = os.path.relpath(path, ROOT).replace("\\", "/")
-        text = _read(path)
-        for m in _PATH_RE.finditer(text):
-            target = m.group(1)
-            if target in seen:
-                continue
-            seen.add(target)
-            full = os.path.join(ROOT, target.replace("/", os.sep))
-            if not os.path.exists(full):
-                line = text[:m.start()].count("\n") + 1
-                FAIL.append("%s:%d 引用了不存在的文件 `%s`" % (rel, line, target))
+        text = _blank_fences(_read(path))
+        for regex in (_PATH_RE, _BARE_PATH_RE):
+            for m in regex.finditer(text):
+                target = m.group(1)
+                if target in seen:
+                    continue
+                seen.add(target)
+                full = os.path.join(ROOT, target.replace("/", os.sep))
+                if not os.path.exists(full):
+                    line = text[:m.start()].count("\n") + 1
+                    FAIL.append("%s:%d 引用了不存在的文件 `%s`" % (rel, line, target))
 
     # ---------- ④ 游离门禁必须为 0 ----------
     orph = st.get("orphan_evals") or []
