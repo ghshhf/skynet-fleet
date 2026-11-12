@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -193,7 +194,18 @@ class Job:
         self.proc = subprocess.Popen(self.cmd, **kw)
         if self.minutes:
             self._deadline = time.time() + self.minutes * 60
+            # 限时必须独立于输出：`lines()` 是阻塞读 stdout，子进程若一直不出声
+            # （网络卡死、死锁），到点判断永远轮不到 —— 加个看门狗到点直接杀。
+            threading.Thread(target=self._watchdog, daemon=True).start()
         return self
+
+    def _watchdog(self):
+        while not self._stopped:
+            left = self._deadline - time.time()
+            if left <= 0:
+                self.stop()
+                return
+            time.sleep(min(left, 0.5))
 
     # ---------------- 读 ----------------
 
