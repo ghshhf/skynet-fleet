@@ -79,6 +79,12 @@ def main():
             ("phone.fs.list", {}, "fs.list"),
             ("phone.llm.chat", {"prompt": "hi"}, "llm.chat"),
             ("phone.termux.camera", {}, "termux.camera"),
+            # agent 已实现、catalog 侧却接不到的能力（只读，手机上直接可用）
+            ("phone.sys.info", {}, "sys.info"),
+            ("phone.sandbox.info", {}, "sandbox.info"),
+            ("phone.llm.models", {}, "llm.models"),
+            ("phone.termux.wifi.scan", {}, "termux.wifi.scan"),
+            ("phone.termux.info", {}, "termux.info"),
         ]
         for cap, args, local in cases:
             r = node.invoke(cap, args)

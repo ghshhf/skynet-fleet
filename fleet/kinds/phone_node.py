@@ -111,6 +111,9 @@ _AGENT_CAPS = (
     "phone.fs.write",        # ← agent: fs.write
     "phone.fs.list",         # ← agent: fs.list
     "phone.llm.chat",       # ← agent: llm.chat
+    "phone.sys.info",       # ← agent: sys.info（agent 版本 / 平台 / 能力清单）
+    "phone.sandbox.info",   # ← agent: sandbox.info（沙箱根 / 内核 / 磁盘）
+    "phone.llm.models",     # ← agent: llm.models（手机上可用的权重）
     "phone.termux.camera",
     "phone.termux.sensor",
     "phone.termux.battery",
@@ -121,11 +124,13 @@ _AGENT_CAPS = (
     "phone.termux.tts",
     "phone.termux.torch",
     "phone.termux.wifi",
+    "phone.termux.wifi.scan",
     "phone.termux.location",
     "phone.termux.vibrate",
     "phone.termux.brightness",
     "phone.termux.volume",
     "phone.termux.ir",
+    "phone.termux.info",
 )
 
 CAPS = ("phone.node.status", "memory.pack.list", "memory.pack.render",
@@ -229,7 +234,7 @@ class PhoneNode(BaseDevice):
     def _agent_invoke(self, cap, args):
         """catalog 的 phone.* 执行能力 → 手机 agent 本地协议名，转发并折结果。
 
-        映射：catalog 名 → agent 本地 cap（termux.* 同名透传）。
+        映射：catalog 名 → agent 本地 cap（去掉 phone. 前缀；少数改名单独列）。
         短信/通话不在此（无 SIM）。不加 denied/确认：完全权限，结果客观上报。
         """
         local = {
@@ -238,10 +243,7 @@ class PhoneNode(BaseDevice):
             "phone.fs.write": "fs.write",
             "phone.fs.list": "fs.list",
             "phone.llm.chat": "llm.chat",
-        }.get(cap, cap)
-        # agent 本地协议名不带 phone. 前缀：phone.termux.camera → termux.camera
-        if local.startswith("phone.termux."):
-            local = local[len("phone."):]
+        }.get(cap) or cap.removeprefix("phone.")
         out = _agent_post(local, args)
         if out.get("ok") is True:
             return R.success(cap, self.name, data=out, via=self.via)
