@@ -346,7 +346,7 @@ def _wait_text(serial, want, timeout=8.0):
     return {"ok": False, "changed": False, "err": f"{timeout}s 内界面上没等到「{want}」"}
 
 
-def do(serial, act):
+def _do_raw(serial, act):
     """执行一个动作。白名单之外的一律拒绝，模型碰不到 shell/文件/网络。"""
     a = str(act.get("action", "")).strip().lower()
     if a not in ACTIONS:
@@ -386,6 +386,24 @@ def do(serial, act):
     r = A.launch(serial, pkg)
     return {"ok": bool(r["ok"]), "changed": True,
             "err": "" if r["ok"] else str(r.get("out", ""))[:120]}
+
+
+def do(serial, act, prev_fp=None):
+    """执行动作，并把 changed 统一改成「界面是否真的变化」。
+
+    旧实现各分支把 changed 写成「adb 命令返回 ok」——solve 的守卫和 commander 的
+    tap 反馈都因此把「点了没反应」当成「界面变了」。这里在动作后重读屏幕比指纹；
+    调用方若已有动作前指纹（solve），传进来可省一次读屏。
+    """
+    if prev_fp is None:
+        fg, items, _v, _e = screen_brief(serial)
+        prev_fp = screen_fingerprint(fg, items) if items else None
+    r = _do_raw(serial, act)
+    if not r.get("ok"):
+        r["changed"] = False
+    elif prev_fp is not None:
+        r["changed"], _ = _screen_changed(serial, prev_fp)
+    return r
 
 
 def solve(serial, task, model="", max_steps=14, verbose=True):
@@ -464,11 +482,9 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
             break
         # 对外节奏：动作打到设备前先按间隔等（防风控烧钱）
         pacing_out.wait_before()
-        r = do(serial, act)
+        r = do(serial, act, fp)
         ok = bool(r.get("ok"))
-        # 界面是否变化必须重新读屏判定；r["changed"] 是旧口径（命令返回成功），
-        # 会把「点了没反应」也算成有变化，导致守卫的无效果阶梯失效。
-        changed, _fp_after = _screen_changed(serial, fp)
+        changed = bool(r.get("changed"))
         feedback = ("成功" if ok else "失败：" + str(r.get("err", ""))[:80]) + \
                    ("，界面已变化" if changed else "，界面没变化（这一下可能没点到）")
         if r.get("note"):
