@@ -210,22 +210,30 @@ class Job:
     # ---------------- 读 ----------------
 
     def lines(self):
-        """逐行吐出子进程输出；到点/被停/自然结束都停。"""
+        """逐行吐出子进程输出；到点/被停/自然结束都停。
+
+        必须包 try/finally：消费方中途放弃（回调抛异常、只看几行就 break、
+        生成器被 close）时，`for` 循环后面的 stop() 永远不会执行——没有 deadline
+        的作业（corpus/diffuse/papers 都不传 minutes）就会在后台一直跑，
+        面板关了它还在爬。收尾动作只能放在 finally 里。
+        """
         if self.proc is None:
             return
-        for raw in self.proc.stdout:
-            line = (raw or "").rstrip("\r\n")
-            if not line.strip():
-                continue
-            self.lines_seen += 1
-            self._absorb(line)
-            yield line
-            if self._stopped:
-                break
-            if self._deadline and time.time() >= self._deadline:
-                self.stop()
-                break
-        self.stop()
+        try:
+            for raw in self.proc.stdout:
+                line = (raw or "").rstrip("\r\n")
+                if not line.strip():
+                    continue
+                self.lines_seen += 1
+                self._absorb(line)
+                yield line
+                if self._stopped:
+                    break
+                if self._deadline and time.time() >= self._deadline:
+                    self.stop()
+                    break
+        finally:
+            self.stop()
 
     def _absorb(self, line):
         """从一行里认领进度与命中——解析不出来就当没看见，不硬猜。"""
