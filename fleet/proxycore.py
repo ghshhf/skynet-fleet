@@ -149,6 +149,15 @@ def _transport(extra):
     return t
 
 
+def _int_or_none(v):
+    """外部订阅里的数值字段（alterId / upmbps …）留空是常事：`alterId: ""` 直接 int()
+    会抛 ValueError，把整份配置生成带崩。转不了就当没给，交给 sing-box 用默认值。"""
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def node_to_singbox(node):
     """把 proxymgr.ProxyNode（Clash 风格 extra）翻译成 sing-box outbound JSON。"""
     ex = node.extra or {}
@@ -158,8 +167,8 @@ def node_to_singbox(node):
     if p == "vmess":
         if ex.get("uuid"):
             ob["uuid"] = ex["uuid"]
-        if "alterId" in ex:
-            ob["alter_id"] = int(ex["alterId"])
+        if "alterId" in ex and _int_or_none(ex.get("alterId")) is not None:
+            ob["alter_id"] = _int_or_none(ex.get("alterId"))
         if ex.get("cipher"):
             ob["security"] = ex["cipher"]
         tls = _tls(ex)
@@ -204,10 +213,11 @@ def node_to_singbox(node):
         if ex.get("password"):
             ob["password"] = ex["password"]
         # 带宽（upmbps/downmbps，缺省不限）
-        if ex.get("upmbps"):
-            ob["up_mbps"] = int(ex["upmbps"])
-        if ex.get("downmbps"):
-            ob["down_mbps"] = int(ex["downmbps"])
+        up, down = _int_or_none(ex.get("upmbps")), _int_or_none(ex.get("downmbps"))
+        if up:
+            ob["up_mbps"] = up
+        if down:
+            ob["down_mbps"] = down
         # 混淆：obfs=salamander + obfs-password
         if ex.get("obfs") or ex.get("obfs-password"):
             ob["obfs"] = {"type": ex.get("obfs") or "salamander",
@@ -780,6 +790,18 @@ def _selftest():
     chk(any(r.get("action") == "sniff" for r in cfg_t["route"]["rules"]), "sniff 规则动作")
     chk(any(r.get("type") == "logical" for r in cfg_t["route"]["rules"]), "逻辑规则")
     chk(not any(s["type"] == "fakeip" for s in cfg["dns"]["servers"]), "常规模式无 fakeip")
+
+    # 11) 外部订阅的脏数值字段：alterId/upmbps 留空不能把配置生成带崩
+    n_dirty = PM.ProxyNode("DIRTY", "vmess", "d.example.com", 443,
+                           {"uuid": "u", "alterId": ""})
+    obd = node_to_singbox(n_dirty)
+    chk("alter_id" not in obd, "alterId 空串不写 alter_id（也不抛 ValueError）")
+    n_dirty2 = PM.ProxyNode("DIRTY2", "hysteria2", "d.example.com", 443,
+                            {"password": "p", "upmbps": "", "downmbps": None})
+    obd2 = node_to_singbox(n_dirty2)
+    chk("up_mbps" not in obd2 and "down_mbps" not in obd2, "带宽空值不写字段")
+    chk(build_config([n_dirty, n_dirty2])["outbounds"][0]["tag"] == "DIRTY",
+        "含脏字段的订阅仍能生成完整配置")
 
     print("\n自测结果：", "全部通过 ✓" if not fails else f"{len(fails)} 项失败 ✗")
     return 1 if fails else 0

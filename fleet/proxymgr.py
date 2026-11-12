@@ -48,6 +48,19 @@ if not os.path.isdir(_KARING_RULESET_DIR):
     )
 
 
+def _coerce_port(v):
+    """端口归一：外部订阅里 `port:` 留空、写成字符串、甚至写成 `"443 "` 都见过。
+
+    直接 int() 会抛 ValueError，而这发生在**解析过程中**——只要一条坏节点，
+    整份订阅都解析不出来。解析层不该被单条脏数据炸掉，统一按 0 处理，后续
+    生成配置时 `not server_port` 会把这条自然滤掉。
+    """
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
 class ProxyNode:
     """归一后的代理节点（sing-box outbound 风格）。
 
@@ -59,7 +72,7 @@ class ProxyNode:
         self.name = name
         self.proto = proto            # 归一后的类型（见 _PROTO_MAP）
         self.server = server
-        self.port = int(port)
+        self.port = _coerce_port(port)
         self.extra = extra or {}
         self.source = source          # 来自哪个订阅（多源归一时区分）
         self.latency_ms = None       # 测速结果（None=未测 / -1=不可达）
@@ -154,7 +167,10 @@ def parse_clash_yaml(text, source="clash"):
         for p in data["proxies"]:
             if not isinstance(p, dict):
                 continue
-            nodes.append(_clash_item_to_node(p, source))
+            try:
+                nodes.append(_clash_item_to_node(p, source))
+            except Exception:
+                continue   # 单条脏节点不连坐整份订阅
     else:
         nodes = _mini_clash(text, source)
     return nodes
@@ -218,7 +234,7 @@ def _mini_node(d, source):
     proto = _PROTO_MAP.get((d.get("type") or "").lower(),
                            (d.get("type") or "unknown").lower())
     return ProxyNode(d.get("name", ""), proto, d.get("server", ""),
-                     int(d.get("port", 0) or 0), d, source)
+                     d.get("port", 0) or 0, d, source)
 
 
 _HOST_PORT = re.compile(
@@ -916,6 +932,16 @@ proxies:
     mix = parse_v2ray_links(bad_vmess + "\n" + "trojan://p@ok.example.com:443#ok")
     chk(len(mix) == 2 and mix[0].port == 0 and mix[1].name == "ok",
         "vmess port 非数字不抛异常，后续链接照常解析")
+
+    # 14b) Clash YAML 里 port 留空/写成空串，只废这一条，不能整份订阅解析失败
+    clash_dirty = ("proxies:\n"
+                   "  - name: good\n    type: ss\n    server: b.example.com\n"
+                   "    port: 8388\n    cipher: aes-256-gcm\n    password: p\n"
+                   "  - name: bad\n    type: ss\n    server: c.example.com\n"
+                   "    port: \"\"\n    cipher: aes-256-gcm\n    password: p\n")
+    cd = parse_subscription(clash_dirty, fmt="clash")
+    chk(len(cd) == 2 and cd[0].port == 8388 and cd[1].port == 0,
+        f"Clash 空端口节点不抛 ValueError（实际 {[n.port for n in cd]}）")
 
     # 15) 规则集允许单值写法（sing-box rule-set 的 "domain_suffix": "x.com"）
     rs_single = RuleSet("t")
