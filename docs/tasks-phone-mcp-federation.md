@@ -31,5 +31,5 @@
 ## T4 收尾
 - [x] `gradlew.bat :app:testDebugUnitTest --tests "app.skynet.tianwang.next.*"`（BUILD SUCCESSFUL）。
 - [x] `git diff --check`；`python tools\check_catalog.py`（PASS）。
-- [ ] 单条 commit：`feat(phone): 接入外部 MCP 服务器，工具面从封闭变可扩展`。
-- [ ] 汇报：改了什么、证据、commit、剩余风险与下一步（本地 MCP 进程 / 插件运行时 / 按调用批准）。
+- [x] 单条 commit：`feat(phone): 接入外部 MCP 服务器，工具面从封闭变可扩展`（3806eac）。
+- [x] 汇报：改了什么、证据、commit、剩余风险与下一步（本地 MCP 进程 / 插件运行时 / 按调用批准）。
