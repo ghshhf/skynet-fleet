@@ -396,6 +396,25 @@ def find_exe():
     return p if os.path.isfile(p) else None
 
 
+def _extract_zip(zip_path, dest):
+    """用标准库解压。Windows 原生没有 unzip，靠外部命令会让「一键 deploy」直接卡死。"""
+    try:
+        import zipfile
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(dest)
+        return True, None
+    except Exception as e:                              # noqa: BLE001
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def _find_file_under(root, name):
+    """在目录树里找第一个同名文件（发行包通常带一层版本目录）。"""
+    for dirpath, _dirs, files in os.walk(root):
+        if name in files:
+            return os.path.join(dirpath, name)
+    return None
+
+
 def download_singbox(version=SB_VERSION, retries=3):
     """下载 sing-box Windows amd64 二进制到 vendor/sing-box（curl 可续传）。"""
     os.makedirs(SB_DIR, exist_ok=True)
@@ -409,13 +428,21 @@ def download_singbox(version=SB_VERSION, retries=3):
         return False, f"curl 调用失败：{e}"
     if rc != 0 or not os.path.isfile(zip_path):
         return False, f"下载失败（rc={rc}），URL：{url}"
-    try:
-        rc2 = subprocess.call(["unzip", "-o", "-q", zip_path], cwd=SB_DIR, timeout=120)
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, f"解压失败：{e}"
-    if rc2 != 0:
-        return False, "解压失败"
+    ok, err = _extract_zip(zip_path, SB_DIR)
+    if not ok:
+        return False, f"解压失败：{err}"
     exe = find_exe()
+    if not exe:
+        # 官方包是 sing-box-<ver>-windows-amd64/sing-box.exe，不会直接躺在 SB_DIR 下。
+        # 旧实现用 unzip 解完就 find_exe()，永远找不到 —— 下载成功也部署不了。
+        found = _find_file_under(SB_DIR, SB_EXE)
+        if found:
+            import shutil
+            try:
+                shutil.move(found, os.path.join(SB_DIR, SB_EXE))
+            except OSError as e:
+                return False, f"已解压但搬移 sing-box.exe 失败：{e}"
+            exe = find_exe()
     if not exe:
         return False, "解压后未找到 sing-box.exe"
     return True, f"已就位 {exe}"
@@ -445,12 +472,13 @@ def download_wintun(version="0.14.1"):
         return False, f"curl 调用失败：{e}"
     if rc != 0 or not os.path.isfile(zip_path):
         return False, f"下载失败（rc={rc}），URL：{url}"
-    try:
-        subprocess.call(["unzip", "-o", "-q", zip_path], cwd=SB_DIR, timeout=120)
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, f"解压失败：{e}"
+    ok, err = _extract_zip(zip_path, SB_DIR)
+    if not ok:
+        return False, f"解压失败：{err}"
     import shutil
     dll = os.path.join(SB_DIR, "wintun", "bin", "amd64", "wintun.dll")
+    if not os.path.isfile(dll):
+        dll = _find_file_under(os.path.join(SB_DIR, "wintun"), "wintun.dll") or dll
     if os.path.isfile(dll):
         shutil.copy(dll, os.path.join(SB_DIR, "wintun.dll"))
         return True, f"wintun.dll 已就位（{os.path.join(SB_DIR, 'wintun.dll')}）"
