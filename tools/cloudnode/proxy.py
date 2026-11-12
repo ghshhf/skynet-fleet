@@ -173,20 +173,19 @@ def pipe(a: socket.socket, b: socket.socket) -> None:
             while True:
                 data = src.recv(BUFSIZE)
                 if not data:
-                    return
+                    break
                 dst.sendall(data)
         except Exception:
             pass
         finally:
-            for s in (a, b):
-                try:
-                    s.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                try:
-                    s.close()
-                except Exception:
-                    pass
+            # 半关闭：一侧 EOF 只关「对端的写」，另一方向继续把剩余响应送回来。
+            # 旧写法在任一方向 EOF 就 SHUT_RDWR 掉两个 socket，客户端只要先
+            # shutdown(WR) 再等响应（SMTP、部分 HTTP/1.0 客户端），响应就被
+            # 直接腰斩成「连接已重置」。
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
 
     for s in (a, b):
         try:
@@ -199,6 +198,11 @@ def pipe(a: socket.socket, b: socket.socket) -> None:
     t2.start()
     t1.join()
     t2.join()
+    for s in (a, b):
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def _socks5(conn: socket.socket, head: bytes) -> None:
