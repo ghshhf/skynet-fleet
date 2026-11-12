@@ -65,12 +65,15 @@ class FleetNode(BaseDevice):
         # 每台编队节点都该认领，放在条件能力之前，不做 IO。
         if "fleet.memory.sync" not in caps:
             caps.append("fleet.memory.sync")
-        # 本机若跑着 SkyNet relay，主动申报 skynet.relay 能力，
-        # 供 commander 路由 relay_fetch 到本节点。
+        # 本机若跑着 SkyNet relay，主动申报 relay 取数能力，
+        # 供 commander 路由 relay_fetch 到本节点。fetch 与 relay 同一前置条件，
+        # 否则「有 relay 却不能代取」会让 catalog 里留下一条实现但无主的幽灵能力。
         try:
             relay = get_relay()
-            if relay.running and "skynet.relay" not in caps:
-                caps.append("skynet.relay")
+            if relay.running:
+                for c in ("skynet.relay", "skynet.relay.fetch"):
+                    if c not in caps:
+                        caps.append(c)
         except Exception:
             pass
         # D1 真代发（总纲 P1-9）：控制面已有对外协议（common.CLIENT*），
