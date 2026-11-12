@@ -137,4 +137,10 @@ class CloudDriveApiTest {
         assertFalse(CloudDriveApi.isAuthError("HTTP 500 @/api/fs/list"))
         assertFalse(CloudDriveApi.isAuthError("please add a storage"))
     }
+
+    @Test
+    fun `WebDAV 下载带 Basic 认证头`() {
+        val conn = CloudConn("webdav", "家里 NAS", "http://192.168.1.9/dav", "user", "pass")
+        assertEquals("Basic dXNlcjpwYXNz", CloudDriveApi.basicAuth(conn))
+    }
 }

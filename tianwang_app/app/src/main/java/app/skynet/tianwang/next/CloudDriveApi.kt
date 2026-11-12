@@ -325,4 +325,13 @@ object CloudDriveApi {
             m.contains("unauthorized") || m.contains("登录已过期") ||
             m.contains("token is invalid") || m.contains("invalid token")
     }
+
+    /**
+     * WebDAV 直链的 Basic 认证头。
+     *
+     * WebDAV 的文件 URL 本身不带凭据，缺 Authorization 一律 401。App 内 OkHttp 请求
+     * 会加，但 DownloadManager（以及外部播放器）拿不到我们的 client，必须显式塞头，
+     * 否则「下载到手机」只会存下一个 401 错误页。
+     */
+    internal fun basicAuth(conn: CloudConn): String = Credentials.basic(conn.user, conn.pass)
 }

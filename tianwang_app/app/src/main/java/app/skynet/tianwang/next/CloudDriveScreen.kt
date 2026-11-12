@@ -163,6 +163,7 @@ fun CloudDriveScreen(onBack: () -> Unit) {
 
     fun download() {
         val f = fileAction ?: return
+        val c = conns.getOrNull(sel)
         if (fileLink.isBlank()) return
         runCatching {
             val dm = App.ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -171,6 +172,10 @@ fun CloudDriveScreen(onBack: () -> Unit) {
                 .setDescription("天网 · 网盘聚合")
                 .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                 .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, f.name)
+            // WebDAV 直链要 Basic 认证：DownloadManager 不走我们的 OkHttp，缺头就是 401
+            if (c?.type == "webdav") {
+                req.addRequestHeader("Authorization", CloudDriveApi.basicAuth(c))
+            }
             dm.enqueue(req)
             Toast.makeText(App.ctx, "已开始下载：${f.name}", Toast.LENGTH_SHORT).show()
             fileAction = null
