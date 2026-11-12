@@ -491,10 +491,18 @@ def pac_script():
     return "\n".join(lines) + "\n"
 
 
-def _reg_proxy(on, pac_path=None):
-    """Windows 系统代理开关（注册表 HKCU）。on=True 用 PAC（pac_path 必须给）；False 全关。"""
+def _reg_proxy(on, pac_path=None, dry_run=False):
+    """Windows 系统代理开关（注册表 HKCU）。on=True 用 PAC（pac_path 必须给）；False 全关。
+
+    dry_run=True 时只走完「该写什么」的判断，**不碰注册表** —— 自测必须用这条，
+    否则跑一次 `--selftest` 就会把主人正开着的系统代理关掉。
+    """
     if not IS_WIN:
         return False, "非 Windows：请用浏览器/系统设置把代理指向 PAC 或 7810"
+    if dry_run:
+        if on and pac_path:
+            return True, "（dry-run）系统代理将指向 PAC：%s" % pac_path
+        return True, "（dry-run）系统代理将关闭并清掉 ProxyServer 残留"
     try:
         import winreg
     except ImportError:
@@ -572,8 +580,10 @@ def _selftest():
     exe = find_exe()
     if exe:
         assert os.path.isfile(exe), exe
-    # ⑤ 系统代理关路径不炸
-    ok, msg = system_proxy(False)
+    # ⑤ 系统代理关路径不炸 —— **必须 dry_run**：自测不许改注册表。
+    # 旧写法直接调 system_proxy(False)，等于每跑一次门禁就把主人开着的系统代理关掉，
+    # 与「改系统代理是显式动作」的纪律正相反。
+    ok, msg = _reg_proxy(False, dry_run=True)
     assert isinstance(ok, bool), (ok, msg)
     # ⑥ CI 产物通道：dist 必须在候选里，否则 ci-fetch 下完了也用不上（静默失效）
     assert os.path.normpath(os.path.join(CI_DIST_DIR, "gitport-github.exe")) in [
