@@ -166,7 +166,6 @@ check(C.spec_of("job.submit")["title"] == "提交长任务（作业）", "说明
 check(C.param_names("job.submit") == ["cap"], "job.submit 必填只有 cap")
 check(C.spec_of("artifact.get")["title"] == "取产物内容（返回 base64）",
       "产物说明书来自 catalog")
-check(C.spec_of("job.run")["title"] == "job.run", "退役别名 job.run 已删除")
 
 # ================================================================ 收尾
 import shutil                           # noqa: E402

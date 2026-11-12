@@ -33,6 +33,7 @@
 import ast
 import json
 import os
+import re
 import sys
 import datetime
 
@@ -151,6 +152,20 @@ def retired_refs():
         retired["host.input." + a] = "host.input 归并"
     for cap in _REA:
         retired.setdefault(cap, "rea 折叠")
+    # 2026-11-12 capabilities.ALIASES 整表退役：旧别名不再翻译，任何残留引用都该改名。
+    # 这里登记旧名 -> 现在的真名，扫到即红（t54），别让「查得到旧说明书」再活过来。
+    for _old, _now in (
+        ("ctx.read", "ctx"), ("ctx.write", "ctx"), ("compute.run", "compute"),
+        ("persona.tick", "persona"), ("perceive.report", "perceive"),
+        ("image.gen.run", "image.gen"), ("video.gen.run", "video.gen"),
+        ("video.story.run", "video.story"), ("fleet.memory.sync.run", "fleet.memory.sync"),
+        ("job.run", "job.submit"), ("art.put", "artifact.put"),
+        ("art.get", "artifact.get"), ("art.list", "artifact.list"),
+        ("mem.list", "memory.pack.list"), ("mem.render", "memory.pack.render"),
+        ("mem.diff", "memory.pack.diff"), ("mem.sync", "memory.pack.sync"),
+        ("phone.status", "phone.node.status"), ("phone.ask", "phone.llm.ask"),
+    ):
+        retired.setdefault(_old, "改名为 " + _now)
     retired = {k: v for k, v in retired.items() if k not in alive}
 
     # 这些文件里出现旧名是故意的：兼容层 / 内部路由表 / 声明处
@@ -165,6 +180,9 @@ def retired_refs():
     exts = (".py", ".json", ".yaml", ".yml")
 
     hits = []
+    # 用词边界而不是子串：`batch_start.get(...)` 里也含 "art.get"，子串会误报。
+    pats = [(old, re.compile(r"(?<![\w.])" + re.escape(old) + r"(?![\w])"))
+            for old in retired]
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for fn in filenames:
@@ -178,8 +196,8 @@ def retired_refs():
                 src = open(p, encoding="utf-8", errors="ignore").read()
             except OSError:
                 continue
-            for old in retired:
-                if old in src:
+            for old, pat in pats:
+                if pat.search(src):
                     hits.append({"file": rel, "cap": old,
                                  "now": retired[old]})
                     break

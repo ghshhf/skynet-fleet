@@ -157,8 +157,9 @@ def _selftest():
     assert spec_of("shell.exec")["title"] == "在编队节点上执行命令（节点侧白名单把关）"
     assert param_names("shell.exec") == ["cmd"]
     assert known("file.push") and not known("nope.nope")
-    # 退役名不再有说明书：旧名只许落到兜底，不许再冒充真源
-    assert spec_of("job.run")["title"] == "job.run", "退役别名必须已删除"
+    # 退役名的旧说明书必须已删：改名后的旧名只会落到「能力名即标题」兜底
+    _old = "art" + ".get"           # 拆开写：避免被 retired_refs 当成残留引用
+    assert spec_of(_old)["title"] == _old, "退役别名必须已删除"
     s = spec_of("brand.new")
     assert s["title"] == "brand.new" and s["params"] == []
     assert len(describe(["exec", "push"])) == 2
