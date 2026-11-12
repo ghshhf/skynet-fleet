@@ -230,6 +230,21 @@ def screen_brief(serial, limit=40):
     return sc["pkg"], items, value, ""
 
 
+def _screen_changed(serial, prev_fp, limit=40):
+    """动作后重读屏幕，用指纹比较判定「界面是否真的变了」。
+
+    以前 `do()` 各分支把「adb 命令返回 ok」直接写成 changed=True，StallGuard 的
+    「无效果」阶梯因此对成功点击永远触发不了。这里只改判定来源：命令成功不等于
+    界面变化，必须重新读屏比指纹。读不到界面时按「有变化」处理——守卫的底线是
+    不误杀真进展，未知不算空转。
+    """
+    fg, items, _value, _err = screen_brief(serial, limit=limit)
+    if not items:
+        return True, prev_fp
+    fp = screen_fingerprint(fg, items)
+    return fp != prev_fp, fp
+
+
 def _ambiguous_n(err):
     m = re.search(r"ambiguous (\d+)", err or "")
     return int(m.group(1)) if m else 0
@@ -451,7 +466,9 @@ def solve(serial, task, model="", max_steps=14, verbose=True):
         pacing_out.wait_before()
         r = do(serial, act)
         ok = bool(r.get("ok"))
-        changed = r.get("changed")
+        # 界面是否变化必须重新读屏判定；r["changed"] 是旧口径（命令返回成功），
+        # 会把「点了没反应」也算成有变化，导致守卫的无效果阶梯失效。
+        changed, _fp_after = _screen_changed(serial, fp)
         feedback = ("成功" if ok else "失败：" + str(r.get("err", ""))[:80]) + \
                    ("，界面已变化" if changed else "，界面没变化（这一下可能没点到）")
         if r.get("note"):
