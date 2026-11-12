@@ -102,18 +102,14 @@ print("  [--] 已声明但暂无设备认领：%d 项%s" % (
     len(unowned), "（%s…）" % "、".join(unowned[:3]) if unowned else ""))
 
 
-# ⑤ 旧说明书（capabilities.SPECS）与 catalog 不许继续漂移。
-# 现状（2026-11-12）：19 条别名指向 catalog 已不存在的退役名，只许减不许增；
-# 参数漂移已在 spec_of 改为 catalog 优先后归零，任何新增参数漂移立刻红。
-# 退役名单的物理清理属于后续单独一步，不在这里顺手删。
+# ⑤ 旧说明书（capabilities.SPECS）只许留节点协议动词。
+# 退役名与被 catalog 接管的条目一律删除：两处都写 = 两个真源，早晚静默漂移。
+# 这三条是硬门禁（不是「只减不增」的棘轮）：存量已清零，新增即红。
 import capabilities as SPEC
 
-SPEC_ALIAS_DRIFT = 19
-SPEC_PARAM_DRIFT = 0
 name_set = set(names)
-
-bad_alias = [k for k in SPEC.ALIASES if k not in name_set]
-bad_value = [v for v in set(SPEC.ALIASES.values()) if v not in SPEC.SPECS]
+shadowed = sorted(set(SPEC.SPECS) & name_set)
+stray = sorted(k for k in SPEC.SPECS if "." in k and k not in name_set)
 param_drift = []
 for name in sorted(name_set):
     got = SPEC.spec_of(name)
@@ -122,16 +118,12 @@ for name in sorted(name_set):
     if want != have:
         param_drift.append((name, sorted(want - have), sorted(have - want)))
 
-check(not bad_value,
-      "旧说明书别名都指向存在的 SPECS（坏的：%s）" % (bad_value[:4] or "无"))
-check(len(bad_alias) <= SPEC_ALIAS_DRIFT,
-      "旧说明书别名漂移只减不增（存量 %d / 上限 %d，示例：%s）"
-      % (len(bad_alias), SPEC_ALIAS_DRIFT, bad_alias[:4] or "无"))
-check(len(param_drift) <= SPEC_PARAM_DRIFT,
-      "旧说明书参数漂移只减不增（存量 %d / 上限 %d，示例：%s）"
-      % (len(param_drift), SPEC_PARAM_DRIFT, param_drift[:2] or "无"))
-print("  [--] 旧说明书存量漂移：别名 %d 条、参数 %d 组（只许减不许增）"
-      % (len(bad_alias), len(param_drift)))
+check(not shadowed,
+      "旧说明书不复制 catalog 条目（重复：%s）" % (shadowed[:4] or "无"))
+check(not stray,
+      "点号能力只登记在 catalog（游离：%s）" % (stray[:4] or "无"))
+check(not param_drift,
+      "能力参数只有 catalog 一个真源（漂移：%s）" % (param_drift[:2] or "无"))
 
 
 print("契约校验:", "PASS" if not FAIL else "FAIL (%d 项)" % len(FAIL))

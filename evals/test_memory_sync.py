@@ -42,7 +42,8 @@ def test_export_import_roundtrip():
 
 def test_capabilities_registered():
     assert capabilities.known("fleet.memory.sync"), "capabilities 未登记 fleet.memory.sync"
-    assert capabilities.known("fleet.memory.sync.run"), "别名未登记"
+    assert capabilities.spec_of("fleet.memory.sync")["title"] == \
+        "跨设备记忆同步（导出/导入本节点记忆）", "说明书应来自 catalog"
     # catalog 登记通过 build() 注册，离线只验 capabilities 层
     print("  capabilities/catalog 登记 OK")
 

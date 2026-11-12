@@ -703,12 +703,13 @@ def _selftest():
     st = reg.stats()
     assert st["devices"] == 2 and st["online"] == 1 and st["caps"] == 5, st
 
-    # ⑮ 没声明参数的能力，自动从根目录 capabilities 基线继承
+    # ⑮ 没声明参数的能力，自动从能力说明书继承（catalog 优先，协议动词兜底）
     if CAPSPEC is not None:
         reg6 = Registry(path="", ttl=0)
         reg6.register(Capability("shell.exec", "在节点上执行命令", side_effect=True))
         c = reg6.capability("shell.exec")
-        assert [p.name for p in c.params] == ["cmd"] and c.params[0].required, c
+        assert [p.name for p in c.params] == ["node", "cmd", "timeout"], c
+        assert [p.name for p in c.params if p.required] == ["cmd"], c
         # 显式声明永远压过继承（catalog 是唯一真相）
         reg6.register(Capability("file.pull", "取文件", params=(Param("node", "str"),)))
         assert [p.name for p in reg6.capability("file.pull").params] == ["node"]

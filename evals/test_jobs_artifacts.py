@@ -164,8 +164,9 @@ import capabilities as C                # noqa: E402
 
 check(C.spec_of("job.submit")["title"] == "提交长任务（作业）", "说明书标题正确")
 check(C.param_names("job.submit") == ["cap"], "job.submit 必填只有 cap")
-check(C.spec_of("job.run")["title"] == "提交长任务（作业）", "别名 job.run 可用")
-check(C.spec_of("art.get")["title"] == "取产物", "别名 art.get 可用")
+check(C.spec_of("artifact.get")["title"] == "取产物内容（返回 base64）",
+      "产物说明书来自 catalog")
+check(C.spec_of("job.run")["title"] == "job.run", "退役别名 job.run 已删除")
 
 # ================================================================ 收尾
 import shutil                           # noqa: E402

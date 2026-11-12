@@ -53,7 +53,8 @@ check(node is not None and node.kind == "phone_node" and node.via == "http",
 print("② 端点不通时如实报（不假装在线）")
 ok, why = node.probe() if node else (None, "")
 check(ok is False, "probe 返回 False")
-check("不通" in why and "adb forward" in why, "原因里带「不通」和怎么通（adb forward）")
+check("不通" in why and ("llama-server" in why or "agent" in why),
+      "原因里带「不通」和怎么通（起 llama-server / fleet-node agent）")
 
 r = node.invoke("phone.llm.ask", {"ask": "在吗"}) if node else None
 check(r is not None and r.code in ("unavailable", "error"),
@@ -102,8 +103,10 @@ check({"memory_pack_sync", "phone_llm_ask"} <= tun, "--unsafe 才导出")
 
 import capabilities as C                               # noqa: E402
 
-check(C.spec_of("phone.llm.ask")["title"] == "用手机上的人格回答", "说明书标题正确")
-check(C.spec_of("mem.sync")["title"] == "增量下发人格包到手机", "别名 mem.sync 可用")
+check(C.spec_of("phone.llm.ask")["title"] == "用指定人格包 + 手机上的权重回答一句话",
+      "说明书标题来自 catalog")
+check(C.spec_of("memory.pack.sync")["title"] == "把人格包增量下发到手机",
+      "人格包同步说明书来自 catalog")
 check(C.param_names("phone.llm.ask")[0] == "ask", "phone.llm.ask 首个必填是 ask")
 
 import shutil                                          # noqa: E402
