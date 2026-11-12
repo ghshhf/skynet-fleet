@@ -20,6 +20,8 @@ _ENGINE_MODS = {
     "playwright": (["playwright"], "playwright + chromium（无头渲染）"),
     "crawlee": (["crawlee"], "crawlee（Apify 爬虫框架）"),
     "scrapy": (["scrapy"], "Scrapy（备选爬虫框架）"),
+    # 纯标准库实现的 handler 不该被第三方引擎绑架：check 恒真。
+    "stdlib": ([], "标准库（无第三方依赖）"),
 }
 
 
@@ -70,11 +72,14 @@ ENGINE_OF = {
     "crawl.extract_article": "trafilatura",
     "crawl.discover_links": "bs4",
     "crawl.crawl_site": "crawlee",
-    "crawl.scrape_structured": "crawlee",
+    # scrape_structured 的 handler 走 httpx + bs4（XPath 兜底才用 lxml），并不 import crawlee。
+    # 声明成 crawlee 会让「装了 bs4 就能用」的能力在没装 crawlee 的机器上被误判为离线。
+    "crawl.scrape_structured": "bs4",
     "crawl.anti_block": "crawlee",
     "crawl.proxy_rotate": "crawlee",
     "crawl.session_manage": "crawlee",
-    "crawl.export_dataset": "crawlee",
+    # export_dataset 只用了 json/csv 两个标准库，不依赖任何第三方引擎。
+    "crawl.export_dataset": "stdlib",
     "crawl.robots_sitemap": "httpx",
     "crawl.autoscale": "crawlee",
     "crawl.diagnose": "httpx",
@@ -111,7 +116,8 @@ CRAWLER_CAPABILITIES = [
     Capability("crawl.scrape_structured", "按 CSS/XPath selector 或字段 schema 抽取结构化数据",
                params=(Param("url", "str", True, "目标 URL"),
                        Param("selectors", "dict", doc="字段名->selector 映射")),
-               side_effect=False, check=_mk("crawlee"), note="[CRAWL] 依赖 crawlee"),
+               side_effect=False, check=_mk("bs4"),
+               note="[CRAWL] 依赖 bs4 + httpx；XPath 兜底需 lxml（可选）"),
     Capability("crawl.anti_block", "反检测抓取：代理轮换 + 会话池 + 浏览器 stealth 指纹，绕过 bot 防护",
                params=(Param("url", "str", True, "目标 URL"),
                        Param("proxy", "str", doc="代理地址，如 http://ip:port")),
@@ -125,7 +131,7 @@ CRAWLER_CAPABILITIES = [
     Capability("crawl.export_dataset", "把爬取结果落 Dataset 并导出 JSON/CSV",
                params=(Param("data", "list", True, "待导出记录"),
                        Param("fmt", "str", doc="json/csv，默认 json")),
-               side_effect=False, check=_mk("crawlee"), note="[CRAWL] 依赖 crawlee"),
+               side_effect=False, check=_mk("stdlib"), note="[CRAWL] 纯标准库（json/csv），无第三方依赖"),
     Capability("crawl.robots_sitemap", "读取并解析 robots.txt / sitemap.xml，判断可抓取范围",
                params=(Param("url", "str", True, "站点根或 robots/sitemap URL")),
                side_effect=False, check=_mk("httpx"), note="[CRAWL] 依赖 httpx"),
