@@ -308,15 +308,15 @@ def corpus_out(tag="blhx") -> dict:
     if not f.is_file():
         return {"tag": tag, "lines": 0, "samples": []}
     rows = []
+    n = 0
     with open(f, encoding="utf-8") as fh:
-        for i, ln in enumerate(fh):
-            if i >= 6:
-                break
-            try:
-                rows.append(json.loads(ln))
-            except Exception:
-                pass
-    n = sum(1 for _ in open(f, encoding="utf-8"))
+        for ln in fh:
+            n += 1
+            if len(rows) < 6:
+                try:
+                    rows.append(json.loads(ln))
+                except Exception:
+                    pass
     return {"tag": tag, "lines": n, "samples": rows}
 
 
