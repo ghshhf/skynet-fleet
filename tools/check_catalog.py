@@ -103,27 +103,24 @@ print("  [--] 已声明但暂无设备认领：%d 项%s" % (
 
 
 # ⑤ 旧说明书（capabilities.SPECS）与 catalog 不许继续漂移。
-# 现状（2026-11-12 盘点）：23 条别名里 19 条指向 catalog 已不存在的名字；
-# 2 组说明书参数 catalog 不认。这里做棘轮——只许减不许增，新增漂移立刻红。
-# 存量清理属于「退役旧说明书」那一步，需主人点头，不在这里顺手删。
+# 现状（2026-11-12）：19 条别名指向 catalog 已不存在的退役名，只许减不许增；
+# 参数漂移已在 spec_of 改为 catalog 优先后归零，任何新增参数漂移立刻红。
+# 退役名单的物理清理属于后续单独一步，不在这里顺手删。
 import capabilities as SPEC
 
 SPEC_ALIAS_DRIFT = 19
-SPEC_PARAM_DRIFT = 2
+SPEC_PARAM_DRIFT = 0
 name_set = set(names)
 
 bad_alias = [k for k in SPEC.ALIASES if k not in name_set]
 bad_value = [v for v in set(SPEC.ALIASES.values()) if v not in SPEC.SPECS]
 param_drift = []
-for old, s in SPEC.SPECS.items():
-    targets = [n for n, o in SPEC.ALIASES.items() if o == old and n in name_set]
-    if old in name_set:
-        targets.append(old)
-    want = set(p.get("name") for p in s.get("params", []))
-    for n in targets:
-        have = set(p.name for p in reg.capability(n).params)
-        if want - have:
-            param_drift.append((old, n, sorted(want - have)))
+for name in sorted(name_set):
+    got = SPEC.spec_of(name)
+    want = set(p.get("name") for p in got.get("params", []))
+    have = set(p.name for p in reg.capability(name).params)
+    if want != have:
+        param_drift.append((name, sorted(want - have), sorted(have - want)))
 
 check(not bad_value,
       "旧说明书别名都指向存在的 SPECS（坏的：%s）" % (bad_value[:4] or "无"))

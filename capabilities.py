@@ -337,8 +337,35 @@ ALIASES = {
 TYPES = {"base64": "str", "str": "str", "int": "int", "bool": "bool", "json": "json"}
 
 
+_CATALOG_VIEW = None
+
+
+def _catalog_view():
+    """catalog 的能力名 -> 说明书视图。
+
+    懒加载：capabilities 是基线文件，必须能不依赖设备层单独 import；
+    catalog 才是能力的唯一真源，旧 SPECS/ALIASES 只给已退役的名字兜底。
+    """
+    global _CATALOG_VIEW
+    if _CATALOG_VIEW is None:
+        try:
+            from fleet.catalog import CAPABILITIES
+            _CATALOG_VIEW = {c.name: c.as_dict() for c in CAPABILITIES}
+        except Exception:
+            _CATALOG_VIEW = {}
+    return _CATALOG_VIEW
+
+
 def spec_of(cap):
-    """取能力说明书；未登记的能力自动兜底，保证「可发现」。"""
+    """取能力说明书；catalog 优先，旧表兜底，保证「可发现」。"""
+    live = _catalog_view().get(cap)
+    if live:
+        return {"title": live["title"],
+                "desc": live.get("note", ""),
+                "params": live.get("params", []),
+                "side_effect": live.get("side_effect", False),
+                "destructive": live.get("destructive", False),
+                "approval": live.get("approval", "auto")}
     s = SPECS.get(cap)
     if s:
         return s
@@ -378,8 +405,8 @@ def known(cap):
 
 def _selftest():
     assert spec_of("exec")["title"] == "执行命令"
-    # 新名要能翻译到旧基线
-    assert spec_of("shell.exec")["title"] == "执行命令"
+    # 新名以 catalog 为准（catalog 是唯一真源，旧 SPECS 只给退役名兜底）
+    assert spec_of("shell.exec")["title"] == "在编队节点上执行命令（节点侧白名单把关）"
     assert param_names("shell.exec") == ["cmd"]
     assert known("file.push") and not known("nope.nope")
     # 未登记的能力不许抛异常，且要有兜底说明书（可发现性 > 精确性）
