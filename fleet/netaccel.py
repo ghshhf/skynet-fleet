@@ -491,39 +491,133 @@ def pac_script():
     return "\n".join(lines) + "\n"
 
 
+_PROXY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+_PROXY_VALUES = ("ProxyEnable", "ProxyServer", "AutoConfigURL")
+#: 开代理前的原设置备份。`off` 要「恢复」而不是「清空」——见 _reg_proxy 注释。
+_PROXY_BACKUP = os.path.join(os.path.expanduser("~"), ".fleet", "system_proxy_backup.json")
+
+
+def read_proxy_reg(key=None):
+    """读系统代理三项值 → dict（缺的键给 None）；非 Windows/读不到返回 None。"""
+    if not IS_WIN:
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key or _PROXY_KEY,
+                            0, winreg.KEY_READ) as k:
+            out = {}
+            for name in _PROXY_VALUES:
+                try:
+                    out[name] = winreg.QueryValueEx(k, name)[0]
+                except OSError:
+                    out[name] = None
+            return out
+    except OSError:
+        return None
+
+
+def _write_proxy_reg(k, values):
+    """按值的类型写回（int→REG_DWORD / str→REG_SZ / None→删掉该值）。"""
+    import winreg
+    for name, v in values.items():
+        try:
+            if v is None:
+                winreg.DeleteValue(k, name)
+            elif isinstance(v, int):
+                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, v)
+            else:
+                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, str(v))
+        except OSError:
+            pass      # 原本就不存在的键，删不掉属正常
+
+
+def backup_proxy_reg(path=None, key=None):
+    """把「当前」系统代理设置存一份备份；已有备份不覆盖。
+
+    不覆盖很关键：第二次 `system-proxy on` 看到的已经是我们的设置，
+    拿它当原件存下来，`off` 就会把主人原本的代理配置「恢复」成一个死端口。
+    """
+    p = path or _PROXY_BACKUP
+    if os.path.isfile(p):
+        return True
+    cur = read_proxy_reg(key)
+    if cur is None:
+        return False
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False)
+        return True
+    except OSError:
+        return False
+
+
+def restore_proxy_reg(path=None, key=None):
+    """有备份就原样写回并删除备份；返回是否真的恢复了。"""
+    p = path or _PROXY_BACKUP
+    if not os.path.isfile(p) or not IS_WIN:
+        return False
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(saved, dict):
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key or _PROXY_KEY,
+                            0, winreg.KEY_SET_VALUE) as k:
+            _write_proxy_reg(k, {n: saved.get(n) for n in _PROXY_VALUES})
+    except OSError:
+        return False
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+    return True
+
+
 def _reg_proxy(on, pac_path=None, dry_run=False):
-    """Windows 系统代理开关（注册表 HKCU）。on=True 用 PAC（pac_path 必须给）；False 全关。
+    """Windows 系统代理开关（注册表 HKCU）。on=True 用 PAC（pac_path 必须给）；False 恢复原设置。
 
     dry_run=True 时只走完「该写什么」的判断，**不碰注册表** —— 自测必须用这条，
     否则跑一次 `--selftest` 就会把主人正开着的系统代理关掉。
+
+    off 的语义是**恢复**，不是清空：开之前把 ProxyEnable/ProxyServer/AutoConfigURL
+    三项存成备份，off 时原样写回。旧实现直接把 ProxyServer 清成空串——主人原本
+    指着 127.0.0.1:7890 的代理配置被永久抹掉，这正是 2026-11-02 那次事故的同一片雷区。
+    没有备份可恢复时只关 ProxyEnable（Windows 与 urllib.getproxies_registry
+    都会在 enable=0 时忽略 ProxyServer，不需要毁掉用户的值）。
     """
     if not IS_WIN:
         return False, "非 Windows：请用浏览器/系统设置把代理指向 PAC 或 7810"
     if dry_run:
         if on and pac_path:
-            return True, "（dry-run）系统代理将指向 PAC：%s" % pac_path
-        return True, "（dry-run）系统代理将关闭并清掉 ProxyServer 残留"
+            return True, "（dry-run）系统代理将指向 PAC（并备份原设置）：%s" % pac_path
+        return True, "（dry-run）系统代理将恢复开启前的设置"
     try:
         import winreg
     except ImportError:
         return False, "无 winreg 模块"
-    key = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as k:
-            if on and pac_path:
+        if on and pac_path:
+            has_backup = backup_proxy_reg()
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PROXY_KEY,
+                                0, winreg.KEY_SET_VALUE) as k:
                 winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
                 winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, pac_path)
                 winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, "")
-                return True, f"系统代理已指向 PAC：{pac_path}"
-            else:
-                winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-                winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, "")
-                # ProxyServer 必须一起清空（2026-11-02 事故）：
-                # Python 的 urllib.request.getproxies() 只看 ProxyServer 键「存不存在」，
-                # 不看 ProxyEnable。只关 enable 不清这个值，等于给所有 urllib 请求
-                # 埋一颗地雷 —— 代理进程一停，全站请求 10061 目标计算机积极拒绝。
-                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, "")
-                return True, "系统代理已关闭（并清掉 ProxyServer 残留）"
+            return True, ("系统代理已指向 PAC：%s" % pac_path
+                          + ("（原设置已备份，off 时原样恢复）" if has_backup else ""))
+        if restore_proxy_reg():
+            cur = read_proxy_reg() or {}
+            return True, ("系统代理已恢复为开启前的设置（ProxyEnable=%s, ProxyServer=%r）"
+                          % (cur.get("ProxyEnable"), cur.get("ProxyServer") or ""))
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PROXY_KEY,
+                            0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+        return True, "系统代理已关闭（没有备份可恢复，只关开关，保留原有 ProxyServer）"
     except OSError as e:
         return False, f"注册表写入失败（可能需要管理员）：{e}"
 
@@ -585,11 +679,45 @@ def _selftest():
     # 与「改系统代理是显式动作」的纪律正相反。
     ok, msg = _reg_proxy(False, dry_run=True)
     assert isinstance(ok, bool), (ok, msg)
+
+    # ⑤b 备份/恢复闭环 —— 打在临时注册表键上，绝不碰真实 Internet Settings。
+    # 旧实现 off 会把 ProxyServer 清空，主人的 127.0.0.1:7890 被永久抹掉。
+    if IS_WIN:
+        import tempfile
+        import winreg
+        global _PROXY_KEY, _PROXY_BACKUP
+        tkey = r"Software\fleet-selftest-proxy\Internet Settings"
+        tbak = os.path.join(tempfile.gettempdir(), "fleet_proxy_backup_selftest.json")
+        old_key, old_bak = _PROXY_KEY, _PROXY_BACKUP
+        try:
+            _PROXY_KEY, _PROXY_BACKUP = tkey, tbak
+            if os.path.exists(tbak):
+                os.remove(tbak)
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, tkey, 0,
+                                    winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, "127.0.0.1:7890")
+                winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, "")
+            assert _reg_proxy(True, pac_path="C:\\tmp\\x.pac")[0]
+            assert read_proxy_reg()["ProxyServer"] == "", "on 没接管"
+            assert _reg_proxy(False)[0]
+            back = read_proxy_reg()
+            assert back["ProxyEnable"] == 1 and back["ProxyServer"] == "127.0.0.1:7890", \
+                f"off 没恢复原设置：{back}"
+            assert not os.path.exists(tbak), "恢复后备份没清掉"
+        finally:
+            _PROXY_KEY, _PROXY_BACKUP = old_key, old_bak
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, tkey)
+            except OSError:
+                pass
+            if os.path.exists(tbak):
+                os.remove(tbak)
     # ⑥ CI 产物通道：dist 必须在候选里，否则 ci-fetch 下完了也用不上（静默失效）
     assert os.path.normpath(os.path.join(CI_DIST_DIR, "gitport-github.exe")) in [
         os.path.normpath(c) for c in _EXE_CANDIDATES
     ], "ci-fetch 的落地目录不在 find_exe 候选里"
-    print(f"netaccel 自检：6 项全过（受管域名 {len(doms)} 个，exe={exe or '未编译'}）")
+    print(f"netaccel 自检：全部通过（受管域名 {len(doms)} 个，exe={exe or '未编译'}）")
 
 
 def _cmd_status(_args):

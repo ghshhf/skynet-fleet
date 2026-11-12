@@ -589,26 +589,40 @@ def _refresh_system_proxy():
 
 
 def system_proxy(on, port=MIXED_PORT):
-    """Windows 系统代理开关（全局指向 sing-box mixed 入站）。返回 (ok, 说明)。"""
+    """Windows 系统代理开关（全局指向 sing-box mixed 入站）。返回 (ok, 说明)。
+
+    off 走「恢复」而不是「清空」：开之前把三项原值备份，关时原样写回。
+    旧实现 off 直接 `ProxyServer=""`，会把主人自己指着 127.0.0.1:7890 的
+    代理配置永久抹掉；没有备份可恢复时才只关 ProxyEnable（enable=0 时
+    Windows 与 urllib 都忽略 ProxyServer，不需要毁值）。
+    """
     if not IS_WIN:
         return False, "非 Windows：请手动把系统代理指向 " + PROXY_SERVER
     try:
         import winreg
     except ImportError:
         return False, "无 winreg 模块"
-    key = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    from . import netaccel as _NA
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as k:
-            if on:
+        if on:
+            has_backup = _NA.backup_proxy_reg()
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _NA._PROXY_KEY,
+                                0, winreg.KEY_SET_VALUE) as k:
                 winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
                 winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ,
                                   f"127.0.0.1:{port}")
                 winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, "")
-            else:
-                winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, "")
+            _refresh_system_proxy()
+            return True, ("系统代理已指向 " + PROXY_SERVER
+                          + ("（原设置已备份，off 时原样恢复）" if has_backup else ""))
+        if _NA.restore_proxy_reg():
+            _refresh_system_proxy()
+            return True, "系统代理已恢复为开启前的设置"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _NA._PROXY_KEY,
+                            0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 0)
         _refresh_system_proxy()
-        return True, ("系统代理已指向 " + PROXY_SERVER) if on else "系统代理已关闭"
+        return True, "系统代理已关闭（没有备份可恢复，只关开关，保留原有 ProxyServer）"
     except OSError as e:
         return False, f"注册表写入失败：{e}"
 
