@@ -86,10 +86,19 @@ object CloudDriveNodes {
             .build()
         client.newCall(req).execute().use { r ->
             if (!r.isSuccessful) return@use false
-            val body = r.body?.string().orEmpty()
-            val o = runCatching { org.json.JSONObject(body) }.getOrNull() ?: return@use false
-            o.optInt("code", 200) == 200
+            looksLikeOpenList(r.body?.string().orEmpty())
         }
+    }.getOrDefault(false)
+
+    /**
+     * OpenList 公开设置接口的应答必须**显式** `code=200` 才算节点。
+     *
+     * 旧实现用 `optInt("code", 200)`：任何返回 JSON 对象、又没有 code 字段的服务
+     * （路由器、别的 Web 服务）都会被当成「可达节点」，发现列表里全是假阳性。
+     */
+    internal fun looksLikeOpenList(body: String): Boolean = runCatching {
+        val o = org.json.JSONObject(body)
+        o.has("code") && o.optInt("code") == 200
     }.getOrDefault(false)
 
     /** 节点管理页：各网盘账号在这台节点上登录/扫码/输验证码，手机内嵌 WebView 打开即可。 */
