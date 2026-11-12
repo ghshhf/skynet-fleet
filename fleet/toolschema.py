@@ -743,8 +743,11 @@ def _selftest():
     assert len(heavy) <= HEAVY_QUOTA, "重型域超配额：%s" % heavy
     # 但**明确问**的时候必须给得出来（限流不是禁用）
     fr = [c.name for c in pick_caps(caps, "用 frida 挂上进程看参数", limit=18)
-          if c.name.startswith("re.dynamic")]
-    assert fr, "明确问 frida 却一条 rea 工具都没给"
+          if c.name.startswith("re.")]
+    assert fr, "明确问逆向却一条 re 只读工具都没给"
+    # re.dynamic 会附加到进程，是副作用能力：默认工具表（只读）本来就不该给，
+    # 与「明确问」无关——安全边界优先于相关性。要用它走 include_unsafe。
+    assert "re.dynamic" not in fr, "副作用能力不许混进默认只读工具表"
 
     # ---- 中文口语插量词也要能命中（"截个屏" 切不出 "截屏"）----
     shot = {c.name for c in pick_caps(caps, "帮我截个屏看看", limit=18)}
