@@ -13,8 +13,10 @@ import sys
 import threading
 import time
 
-SKYNET = r"E:\xmanbian\skynet-fleet"
-NETFORCE = r"E:\xmanbian\netforce"
+# 位置从脚本自身推导，不写死盘符：换机器/换盘只改目录摆法，不改代码。
+SKYNET = os.path.dirname(os.path.abspath(__file__))
+NETFORCE = os.environ.get("NETFORCE_HOME") or os.path.join(
+    os.path.dirname(SKYNET), "netforce")
 LOG = os.path.join(SKYNET, "_autostart.log")
 SELFPROXY_PORT = 18080
 

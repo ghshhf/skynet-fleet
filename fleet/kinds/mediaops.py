@@ -208,10 +208,15 @@ class MediaOps(BaseDevice):
         try:
             self._ffmpeg_path = shutil.which("ffmpeg")
             self._ffprobe_path = shutil.which("ffprobe")
-            if os.name == "nt":
-                search = r"G:\dev\ffmpeg\bin"
-                self._ffmpeg_path = self._ffmpeg_path or shutil.which("ffmpeg", path=search)
-                self._ffprobe_path = self._ffprobe_path or shutil.which("ffprobe", path=search)
+            if os.name == "nt" and not (self._ffmpeg_path and self._ffprobe_path):
+                # 已知安装点靠 locate 枚举盘符，不把 G:\ 之类写进代码。
+                try:
+                    from .. import locate as _locate
+                    hints = ("dev/ffmpeg/bin", "tools/ffmpeg/bin")
+                    self._ffmpeg_path = self._ffmpeg_path or _locate.exe("ffmpeg", hints=hints)
+                    self._ffprobe_path = self._ffprobe_path or _locate.exe("ffprobe", hints=hints)
+                except Exception:
+                    pass
             if not self._ffmpeg_path:
                 raise _MediaError("找不到 ffmpeg，请将本机 ffmpeg 的 bin 目录加入 PATH")
             self._run([self._ffmpeg_path, "-hide_banner", "-loglevel", "error",
@@ -687,8 +692,10 @@ def _selftest():
         check(diagnostic.split("字符：", 1)[1] == ("x" * 1000 + "结尾")[-400:],
               "stderr 仅保留最后 400 字符")
         # 模拟找不到程序只替换定位函数，不触碰系统 PATH 或安装状态。
+        # 除了 PATH（shutil.which），还要堵住 locate 在已知安装点上的兜底查找。
         from unittest.mock import patch
-        with patch.object(shutil, "which", return_value=None):
+        with patch.object(shutil, "which", return_value=None), \
+                patch("fleet.locate.exe", return_value=""):
             missing = MediaOps()
             available, reason = missing.probe()
             check(not available and "找不到 ffmpeg" in reason, "缺少程序的中文原因")

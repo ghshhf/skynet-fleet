@@ -31,6 +31,7 @@
 import io
 import os
 import re
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +51,7 @@ def check(cond, msg):
 _SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", "tmp", "build", "build-sd",
     "dist", "out", "shots", ".gradle", ".venv", "venv", "cards", "audio_out",
+    ".cxx",
     # cargo 的编译产物目录，**不入 Git**（`git ls-files vendor/gitport-accel/target`
     # 是空的）。里面 .fingerprint/*.json 记的是「上次编译时 clang 在哪」，
     # 天然是绝对路径 —— 拿它当「代码里写死了盘符」来判是误报。
@@ -91,11 +93,32 @@ _ALLOW = {
 }
 
 
+def _git_files():
+    """Git 眼里的「代码」：已跟踪 + 未忽略的新文件。
+
+    构建产物/运行时数据/vendored 目录在 .gitignore 里，它们天然带本机路径
+    （compile_commands.json、drive_mounts.json、sing-box 配置），拿它们判
+    「代码写死盘符」是误报。git 不可用时返回 None，退回全盘扫描 + _SKIP_DIRS。
+    """
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=ROOT, capture_output=True, check=True).stdout
+    except Exception:
+        return None
+    return {p.replace("\\", "/") for p in out.decode("utf-8", "replace").split("\0") if p}
+
+
 def _scan():
     """返回 [(相对路径, 行号, 字面量)]。整行注释跳过——那是讲道理用的反例。"""
     found = []
+    tracked = _git_files()
     for dirpath, dirnames, filenames in os.walk(ROOT):
-        dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
+        # build-*（Android/NDK 构建目录）里全是编译中间物，里面的
+        # compile_commands.json 天然带本机绝对路径，不是「代码写死盘符」。
+        dirnames[:] = [d for d in dirnames
+                       if d.lower() not in _SKIP_DIRS
+                       and not d.lower().startswith("build")]
         # 点开头的隐藏文件是本机产物/缓存（如 tools/.gate_map.json），不是源码，
         # 里面存的本机绝对路径是正常的——它们不入 Git，也不代表「代码里写死了路径」
         filenames = [f for f in filenames if not f.startswith(".")]
@@ -106,6 +129,8 @@ def _scan():
             if os.path.splitext(fn)[1].lower() not in _EXTS:
                 continue
             rel = fn if rel_dir == "." else rel_dir + "/" + fn
+            if tracked is not None and rel not in tracked:
+                continue
             if _ALLOW.get(rel) == "*":
                 continue
             try:

@@ -40,6 +40,7 @@ import tempfile
 import time
 
 from ..core import BaseDevice, DeviceResult as R
+from .. import locate as _locate
 
 #: Windows 下不给子进程开控制台窗口（硬约束：后台脚本不许弹黑框）
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -100,10 +101,16 @@ def _tool_dirs():
     if _TOOLDIRS_CACHE is not None:
         return _TOOLDIRS_CACHE
     dirs = []
-    for p in (os.environ.get("FLEET_TOOLBIN"),
-              r"G:\dev\ffmpeg\bin", r"D:\tools\ffmpeg\bin", r"C:\ffmpeg\bin"):
-        if p:
-            dirs.append(p)
+    if os.environ.get("FLEET_TOOLBIN"):
+        dirs.append(os.environ["FLEET_TOOLBIN"])
+    # 盘符不写死：hints 只写「相对怎么摆」，根目录运行时枚举（fleet.locate）。
+    for cand in _locate._hint_candidates(
+            "ffmpeg.exe",
+            ("dev/ffmpeg/bin", "tools/ffmpeg/bin", "ffmpeg/bin"),
+            _locate.roots()):
+        d = os.path.dirname(cand)
+        if os.path.isdir(d):
+            dirs.append(d)
     for env in ("USERPROFILE", "LOCALAPPDATA", "ProgramData"):
         base = os.environ.get(env)
         if not base:
