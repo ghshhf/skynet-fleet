@@ -1264,7 +1264,13 @@ def _selftest() -> int:
 
     print("[2/5] 起隧道服务端 …", end=" ")
     selftest_secret = "wsrelay-selftest"
-    srv = WsTunnelServer(0, verbose=False, secret=selftest_secret)
+    # 自测的地址簿必须落在临时目录：默认路径是 ./addrbook.json（部署环境的真实地址簿），
+    # 跑一次自测就会把 selftest-fp 这类假设备写进生产数据里。
+    import tempfile
+    _selftest_addr = os.path.join(tempfile.mkdtemp(prefix="wsrelay-selftest-"),
+                                  "addrbook.json")
+    srv = WsTunnelServer(0, verbose=False, secret=selftest_secret,
+                         addr_path=_selftest_addr)
     box = {}
     t = threading.Thread(
         target=srv.serve_forever, kwargs={"ready_cb": lambda p: box.update(port=p)}, daemon=True
