@@ -262,12 +262,23 @@ def _h_scrape_structured(cap, args, dev):
         except Exception:
             nodes = []
         if not nodes:
+            # XPath 兜底：bs4 的 `.xpath` 在没有 XPath 引擎时是 None（不是方法），
+            # 直接 `soup.xpath(sel)` 只会抛 TypeError 被吞掉，兜底等于永远不生效。
+            # 真正能用的是 lxml.html：`fromstring(html).xpath(sel)`。
             try:
-                sx = bs4.BeautifulSoup(html, "lxml")
-                nodes = sx.xpath(sel)
+                import lxml.html as _lxml_html
+                nodes = _lxml_html.fromstring(html).xpath(sel)
             except Exception:
                 nodes = []
-        fields[name] = [n.get_text(strip=True) for n in nodes[:50]]
+        vals = []
+        for n in nodes[:50]:
+            if isinstance(n, str):                       # XPath 命中文本节点
+                vals.append(n.strip())
+            elif hasattr(n, "get_text"):                 # bs4 Tag
+                vals.append(n.get_text(strip=True))
+            else:                                        # lxml 元素
+                vals.append((n.text_content() or "").strip())
+        fields[name] = vals
     return R.success(cap, dev.name, via=dev.via,
                      data={"url": url, "fields": fields, "engine": "bs4/css+xpath"})
 
