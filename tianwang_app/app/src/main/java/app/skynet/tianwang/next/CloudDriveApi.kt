@@ -10,6 +10,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
 import java.net.URLDecoder
+import java.net.URLEncoder
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -47,24 +48,17 @@ object CloudDriveApi {
             webdavPropfind(conn, "/")
             "WebDAV 连接正常"
         } else {
-            val o = post(conn, "/api/auth/login",
-                JSONObject().apply { put("username", conn.user); put("password", conn.pass) })
-            val t = o.optJSONObject("data")?.optString("token").orEmpty()
-            if (t.isBlank()) {
-                throw Exception("登录失败：${o.optString("message").ifBlank { "无 token" }}")
-            }
-            olTokens[conn.host] = t
+            login(conn)
             "OpenList 连接正常"
         }
     }
 
     suspend fun list(conn: CloudConn, path: String): List<FileItem> = withContext(Dispatchers.IO) {
         if (conn.type == "webdav") return@withContext webdavList(conn, path)
-        val token = ensureToken(conn)
-        val o = post(conn, "/api/fs/list",
+        val o = postAuthed(conn, "/api/fs/list",
             JSONObject().apply {
                 put("path", path); put("password", ""); put("page", 1); put("per_page", 200)
-            }, token)
+            })
         o.optJSONObject("data")?.optJSONArray("content")?.let { parseItems(it, path) }
             ?: emptyList()
     }
@@ -76,32 +70,30 @@ object CloudDriveApi {
     suspend fun search(conn: CloudConn, kw: String): List<FileItem> = withContext(Dispatchers.IO) {
         if (conn.type == "webdav") throw Exception("WebDAV 不支持搜索，请用 OpenList 连接")
         if (kw.isBlank()) return@withContext emptyList()
-        val token = ensureToken(conn)
         val remote = runCatching {
-            post(conn, "/api/fs/search",
+            postAuthed(conn, "/api/fs/search",
                 JSONObject().apply {
                     put("parent", "/"); put("keywords", kw); put("scope", 0)
                     put("page", 1); put("per_page", 200)
-                }, token)
+                })
         }.getOrNull()
         val arr = remote?.optJSONObject("data")?.optJSONArray("content")
         if (arr != null && arr.length() > 0) return@withContext parseItems(arr, "/", fromSearch = true)
-        walkForName(conn, token, kw)
+        walkForName(conn, kw)
     }
 
     /** 取文件直链（/api/fs/get 的 raw_url），并把服务端生成的 host 换成手机能连上的 host。 */
     suspend fun fileUrl(conn: CloudConn, path: String): String = withContext(Dispatchers.IO) {
         if (conn.type == "webdav") return@withContext joinWebdav(conn.host, path)
-        val token = ensureToken(conn)
-        val o = post(conn, "/api/fs/get",
-            JSONObject().apply { put("path", path); put("password", "") }, token)
+        val o = postAuthed(conn, "/api/fs/get",
+            JSONObject().apply { put("path", path); put("password", "") })
         val raw = o.optJSONObject("data")?.optString("raw_url").orEmpty()
         if (raw.isBlank()) throw Exception("没拿到文件直链")
         rebaseHost(conn.host, raw)
     }
 
     /** 服务端索引不可用时的回退：广度优先遍历目录树，按文件名过滤。 */
-    private fun walkForName(conn: CloudConn, token: String, kw: String): List<FileItem> {
+    private fun walkForName(conn: CloudConn, kw: String): List<FileItem> {
         val out = ArrayList<FileItem>()
         val seen = HashSet<String>()
         val queue = ArrayDeque<Pair<String, Int>>()
@@ -112,10 +104,10 @@ object CloudDriveApi {
             if (!seen.add(dir)) continue
             visited++
             val arr = runCatching {
-                post(conn, "/api/fs/list",
+                postAuthed(conn, "/api/fs/list",
                     JSONObject().apply {
                         put("path", dir); put("password", ""); put("page", 1); put("per_page", 200)
-                    }, token).optJSONObject("data")?.optJSONArray("content")
+                    }).optJSONObject("data")?.optJSONArray("content")
             }.getOrNull() ?: continue
             for (f in parseItems(arr, dir)) {
                 if (f.name.contains(kw, ignoreCase = true)) out.add(f)
@@ -152,10 +144,36 @@ object CloudDriveApi {
         return out.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase(Locale.ROOT) }))
     }
 
-    private suspend fun ensureToken(conn: CloudConn): String {
-        olTokens[conn.host]?.let { return it }
-        probe(conn)
-        return olTokens[conn.host].orEmpty()
+    private fun ensureToken(conn: CloudConn): String =
+        olTokens[conn.host] ?: login(conn)
+
+    /** OpenList 登录并缓存 token（失败如实抛，不缓存空串冒充已登录）。 */
+    private fun login(conn: CloudConn): String {
+        val o = post(conn, "/api/auth/login",
+            JSONObject().apply { put("username", conn.user); put("password", conn.pass) })
+        val t = o.optJSONObject("data")?.optString("token").orEmpty()
+        if (t.isBlank()) {
+            throw Exception("登录失败：${o.optString("message").ifBlank { "无 token" }}")
+        }
+        olTokens[conn.host] = t
+        return t
+    }
+
+    /**
+     * 带 token 的业务请求：token 过期（OpenList 重启 / 服务端回收）时丢掉缓存重新登录一次。
+     *
+     * 旧实现只把错误翻译成「登录已过期，正在重新登录」，但**没有任何代码真的重登**，
+     * 于是界面上一直显示这句话、所有操作都失败，只能杀 App 重来。
+     */
+    private fun postAuthed(conn: CloudConn, path: String, body: JSONObject): JSONObject {
+        val token = ensureToken(conn)
+        return try {
+            post(conn, path, body, token)
+        } catch (e: Exception) {
+            if (!isAuthError(e.message.orEmpty())) throw e
+            olTokens.remove(conn.host)
+            post(conn, path, body, login(conn))
+        }
     }
 
     // ---------------------------------------------------------------- OpenList HTTP
@@ -218,28 +236,93 @@ object CloudDriveApi {
 
     private fun webdavList(conn: CloudConn, path: String): List<FileItem> {
         val text = webdavPropfind(conn, path)
-        val base = joinWebdav(conn.host, path).removeSuffix("/")
-        val out = ArrayList<FileItem>()
-        for (m in Regex("<D:response>(.*?)</D:response>", RegexOption.DOT_MATCHES_ALL).findAll(text)) {
-            val block = m.groupValues[1]
-            val href = Regex("<D:href>(.*?)</D:href>", RegexOption.DOT_MATCHES_ALL)
-                .find(block)?.groupValues?.get(1)?.let { decode(it) } ?: continue
-            if (href == base || href == "$base/") continue // 跳过自身
-            val name = href.removeSuffix("/").substringAfterLast("/")
-            if (name.isBlank()) continue
-            val isDir = Regex("<D:collection>").containsMatchIn(block)
-            val len = Regex("<D:getcontentlength>(\\d+)</D:getcontentlength>")
-                .find(block)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-            out.add(FileItem(name = name, path = href, isDir = isDir, size = len))
-        }
-        return out.sortedWith(compareBy({ !it.isDir }, { it.name.lowercase(Locale.ROOT) }))
+        return parseWebdavXml(text, path)
     }
 
-    private fun joinWebdav(host: String, path: String): String {
+    /**
+     * 解析 PROPFIND 的 multistatus 报文。
+     *
+     * 踩过的四个坑（都会表现成「WebDAV 连接正常，但目录是空的」）：
+     *  1) 命名空间前缀大小写不统一：Nextcloud/ownCloud/sabre 用小写 `<d:response>`，
+     *     Apache/x-net 用大写 `<D:response>`，还有不带前缀的默认命名空间；
+     *  2) href 可能是绝对 URL（反代 / 不同 host），直接拼连接地址会拼出垃圾；
+     *  3) href 是 URL 编码的，但**路径里的 `+` 是字面加号**，URLDecoder 会解成空格；
+     *  4) 自身条目用连接地址去比，中文/空格目录名永远比不中，会被当成子项列出来。
+     *
+     * path 统一存**解码后的路径**（OpenList 也是逻辑路径），显示与后续拼接都一致。
+     */
+    internal fun parseWebdavXml(text: String, currentPath: String): List<FileItem> {
+        val cur = normDavPath(currentPath)
+        val out = ArrayList<FileItem>()
+        for (m in RE_RESPONSE.findAll(text)) {
+            val block = m.groupValues[1]
+            val rawHref = RE_HREF.find(block)?.groupValues?.get(1) ?: continue
+            val path = davHrefPath(rawHref)
+            if (path.isEmpty()) continue
+            val norm = normDavPath(path)
+            if (norm == cur) continue // 跳过自身
+            val name = norm.substringAfterLast('/')
+            if (name.isBlank()) continue
+            val isDir = path.endsWith("/") || RE_COLLECTION.containsMatchIn(block)
+            val len = RE_LEN.find(block)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+            out.add(FileItem(name = name, path = norm, isDir = isDir, size = len))
+        }
+        return out.distinctBy { it.path }
+            .sortedWith(compareBy({ !it.isDir }, { it.name.lowercase(Locale.ROOT) }))
+    }
+
+    /** href → 解码后的绝对路径；绝对 URL 只取 path，`?`/`#` 之后是查询与片段。 */
+    internal fun davHrefPath(href: String): String {
+        var s = unescapeXml(href.trim())
+        if (s.startsWith("http://", true) || s.startsWith("https://", true)) {
+            s = s.replaceFirst(Regex("^[A-Za-z][A-Za-z0-9+.-]*://[^/]*"), "")
+            if (!s.startsWith("/")) s = "/$s"
+        }
+        s = s.substringBefore('#').substringBefore('?')
+        // 先保护字面 `+`（路径里的加号不是空格），再按 UTF-8 解百分号
+        return runCatching { URLDecoder.decode(s.replace("+", "%2B"), "UTF-8") }.getOrDefault(s)
+    }
+
+    private fun unescapeXml(s: String): String {
+        if (!s.contains('&')) return s
+        return s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
+            .replace("&apos;", "'").replace("&amp;", "&")
+    }
+
+    private fun normDavPath(p: String): String {
+        val t = p.trim().replace(Regex("/{2,}"), "/")
+        if (t.isEmpty() || t == "/") return "/"
+        val full = if (t.startsWith("/")) t else "/$t"
+        return full.trimEnd('/').ifEmpty { "/" }
+    }
+
+    private val RE_RESPONSE = Regex(
+        "<(?:[A-Za-z0-9_.-]+:)?response\\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?response>",
+        RegexOption.DOT_MATCHES_ALL,
+    )
+    private val RE_HREF = Regex(
+        "<(?:[A-Za-z0-9_.-]+:)?href\\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?href>",
+        RegexOption.DOT_MATCHES_ALL,
+    )
+    private val RE_LEN = Regex(
+        "<(?:[A-Za-z0-9_.-]+:)?getcontentlength\\b[^>]*>(\\d+)</(?:[A-Za-z0-9_.-]+:)?getcontentlength>",
+    )
+    private val RE_COLLECTION = Regex("<(?:[A-Za-z0-9_.-]+:)?collection\\b")
+
+    /** 拼 WebDAV URL：路径段按 URL 编码，文件名里的空格/`#`/`?` 不会变成片段或查询。 */
+    internal fun joinWebdav(host: String, path: String): String {
         val h = host.trimEnd('/')
         val p = if (path.startsWith("/")) path else "/$path"
-        return h + p
+        return h + p.split("/").joinToString("/") {
+            URLEncoder.encode(it, "UTF-8").replace("+", "%20")
+        }
     }
 
-    private fun decode(s: String): String = runCatching { URLDecoder.decode(s, "UTF-8") }.getOrDefault(s)
+    /** token 失效的几种表现（HTTP 401 或 OpenList 业务码里的登录提示）。 */
+    internal fun isAuthError(msg: String): Boolean {
+        val m = msg.lowercase(Locale.ROOT)
+        return m.contains("http 401") || m.contains("login please") ||
+            m.contains("unauthorized") || m.contains("登录已过期") ||
+            m.contains("token is invalid") || m.contains("invalid token")
+    }
 }
