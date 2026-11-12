@@ -58,10 +58,13 @@ def main():
     cf = None
     if args.cloudflared:
         try:
+            # 不能接 PIPE 又不读：cloudflared 的日志几十 KB 就能把管道塞满，
+            # 之后它会阻塞在写日志上、隧道直接卡死，而公网地址也永远看不到。
+            # 控制台入口直接继承输出，日志与 https 地址都落在当前终端/服务日志里。
             cf = subprocess.Popen(
                 ["cloudflared", "tunnel", "--url", "http://localhost:%d" % port],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            print("[relay] cloudflared 隧道启动中……（公网 https 地址会打印在它的输出里）")
+                stdout=sys.stdout, stderr=sys.stderr)
+            print("[relay] cloudflared 隧道启动中……（公网 https 地址会打印在下面）")
         except FileNotFoundError:
             print("[relay] 没装 cloudflared。手动跑：")
             print("        cloudflared tunnel --url http://localhost:%d" % port)
