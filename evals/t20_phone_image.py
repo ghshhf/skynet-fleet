@@ -167,6 +167,11 @@ def base_env(work):
     # 因为 Git Bash / 真机 Termux 都只认 /data/... 这种正斜杠路径。
     wp = posix(work)
     e = dict(os.environ)
+    if os.path.isfile(BASH_EXE):
+        # 用绝对路径的 MSYS2/Git bash 时，它的 usr/bin 不在 PATH 里：
+        # mkdir/chmod 这些 coreutils 会 command not found，worker 直接 rc=2。
+        # 这里把 bash 自己的 bin 目录补到 PATH 最前面（真机 Termux 不走这条分支）。
+        e["PATH"] = os.path.dirname(BASH_EXE) + os.pathsep + e.get("PATH", "")
     e["FLEET_IMG_WORKDIR"] = wp + "/work"
     e["FLEET_IMG_OUT_DIR"] = wp + "/out"
     e["FLEET_IMG_LOG_DIR"] = wp + "/log"

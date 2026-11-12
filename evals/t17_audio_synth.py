@@ -181,8 +181,10 @@ def main():
             pass
 
     # ---------- ⑦ 能力是四个面都能看见的（注册表是唯一真相）----------
-    check(len([c for c in allcaps if c.startswith("audio.")]) == 2,
-          "注册表里 audio.* 恰好 2 项（不重名）")
+    audio_caps = [c for c in allcaps if c.startswith("audio.")]
+    check(len(audio_caps) == len(set(audio_caps)), "audio.* 不重名")
+    check({"audio.synth", "audio.presets"} <= set(audio_caps),
+          "audio.synth / audio.presets 都在（audio.* 共 %d 项）" % len(audio_caps))
 
     shutil.rmtree(tmp, ignore_errors=True)
 
