@@ -154,6 +154,23 @@ def main():
           "半步圆满定义守门：真实直连层通 ⇒ achieved=True（不要求 7891 起）",
           "direct_egress.ok=True 但 half_ban.achieved 不是 True（定义被改窄了）")
 
+    # ---- 5c. 「系统代理开着」≠「内核接管」
+    # 这台机器的 7890 常是 karing。只按 ProxyEnable/self_alive 判内核层，会在
+    # 7891 起着、系统代理却指着 7890 时把「自有内核层」判成达成 —— 谎报半步圆满。
+    real_pts, real_alive_fn = PC.proxy_points_to_us, net.is_proxy_alive
+    try:
+        PC.proxy_points_to_us = lambda *a, **kw: (
+            False, "ProxyServer=127.0.0.1:7890 不是内核入站 127.0.0.1:7891")
+        net.is_proxy_alive = lambda *a, **kw: True      # 假装 7891 也在听
+        r_pts = reg.call("net.status", args={})
+        c5 = (r_pts.data or {}).get("core", {})
+        hb5 = (r_pts.data or {}).get("half_ban", {}).get("paths", {}).get("core_layer", {})
+        check(c5.get("system_proxy_to_us") is False and hb5.get("ok") is False,
+              "系统代理指向 7890 时不判内核层（7891 在听也不算接管）",
+              "7891 在听 + 系统代理指向 7890，却被判成「自有内核层达成」（谎报半步圆满）")
+    finally:
+        PC.proxy_points_to_us, net.is_proxy_alive = real_pts, real_alive_fn
+
     # ---- 6. net.route：两栏分离
     rr = reg.call("net.route", args={"host": "github.com"})
     check(rr.ok, "net.route(github.com) 调用成功",

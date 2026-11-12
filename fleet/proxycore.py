@@ -642,6 +642,39 @@ def proxy_state():
         return None
 
 
+def proxy_points_to_us(port=MIXED_PORT):
+    """系统代理是否真的指向**我们**的 mixed 入站（默认 7891）。
+
+    返回 (bool|None, 说明)。`proxy_state()` 只能回答「有没有代理开着」，
+    而本机开着的 7890 很可能是 karing/其它工具。把「有代理开着」当成
+    「内核已接管」会直接把「半步圆满·自有内核层」判成达成 —— 那是谎报。
+    """
+    if not IS_WIN:
+        return None, "非 Windows，无法判断"
+    target = "127.0.0.1:%d" % port
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                            0, winreg.KEY_READ) as k:
+            def _get(name):
+                try:
+                    return str(winreg.QueryValueEx(k, name)[0] or "")
+                except OSError:
+                    return ""
+            server = _get("ProxyServer").strip().lower()
+            pac = _get("AutoConfigURL").strip()
+            if server in (target, "localhost:%d" % port):
+                return True, "ProxyServer=%s（内核入站）" % target
+            if pac:
+                return False, "AutoConfigURL=%s 不是内核入站 %s" % (pac, target)
+            if not server:
+                return False, "系统没设代理"
+            return False, "ProxyServer=%s 不是内核入站 %s" % (server, target)
+    except OSError as e:
+        return None, "读注册表失败：%s" % e
+
+
 # ------------------------------------------------------------------ 一键部署
 
 def deploy(raw, fmt=None, listen_port=MIXED_PORT, start_core=True, enable_proxy=True,

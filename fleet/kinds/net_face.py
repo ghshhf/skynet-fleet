@@ -192,11 +192,15 @@ class NetFace(BaseDevice):
         # running 直接沿用上面那次 7891 探活，不再调 proxycore.is_running()：
         # 两者探的是同一个端口，而 is_running 写死 1.5s 超时——死口要白等 1.5 秒。
         core = {"ok": False, "err": "proxycore 不可用"}
+        sys_to_us, sys_to_us_why = None, "proxycore 不可用"
         try:
             from .. import proxycore as PC
 
             exe = PC.find_exe()
             nodes, nodes_why = _count_nodes(PC.CONFIG_PATH)
+            # 「系统代理开着」不等于「内核接管」：这台机器上开着的 7890 常是 karing。
+            # 半步圆满的内核层判据必须看系统代理是否真的指着我们的 7891。
+            sys_to_us, sys_to_us_why = PC.proxy_points_to_us()
             core = {
                 "ok": True,
                 "installed": bool(exe),
@@ -207,6 +211,8 @@ class NetFace(BaseDevice):
                                   % PC.MIXED_ADDR,
                 "mixed": PC.MIXED_ADDR,
                 "system_proxy_on": PC.proxy_state(),
+                "system_proxy_to_us": sys_to_us,
+                "system_proxy_to_us_why": sys_to_us_why,
                 "config_path": PC.CONFIG_PATH,
                 "config_exists": os.path.isfile(PC.CONFIG_PATH),
                 "config_nodes": nodes,
@@ -292,14 +298,17 @@ class NetFace(BaseDevice):
         installed = core.get("installed")
         sys_on = core.get("system_proxy_on")
         tun = core.get("tun")
-        core_layer = bool(self_alive and installed and (sys_on or tun))
+        # 内核层 = 7891 起着 + 内核在 + **系统代理真的指向我们(或 tun 接管)**。
+        # 只看 sys_on 会把 karing 的 7890 也算成「内核已接管」——谎报半步圆满。
+        core_layer = bool(self_alive and installed and (sys_to_us or tun))
         direct_layer = bool(direct_ok)
         missing = []
         if not core_layer and not direct_layer:
             if not installed:
                 missing.append("sing-box 没下载（download_singbox 从 GitHub 拉内核大文件，本身要出网）")
-            elif self_alive and not (sys_on or tun):
-                missing.append("内核装了也起了，但系统代理/tun 没接管（deploy 的 enable_proxy=True）")
+            elif self_alive and not (sys_to_us or tun):
+                missing.append("内核装了也起了，但系统代理/tun 没接管"
+                               "（当前系统代理：%s；deploy 要 enable_proxy=True）" % sys_to_us_why)
             if not direct_ok:
                 missing.append("清代理后真实直连 GitHub 不通（半步圆满的真实直连层未达成）")
         data["half_ban"] = {
@@ -309,8 +318,11 @@ class NetFace(BaseDevice):
             "paths": {
                 "direct_layer": {"ok": direct_layer, "detail": direct_detail},
                 "core_layer": {"ok": core_layer,
-                               "detail": ("7891 起 + %s 接管" % ("系统代理" if sys_on else "tun")
-                                          if core_layer else "7891 未起或未接管")},
+                               "detail": ("7891 起 + %s 接管" % ("系统代理" if sys_to_us else "tun")
+                                          if core_layer else
+                                          ("7891 起了但系统代理没指向它（%s）" % sys_to_us_why
+                                           if (self_alive and installed) else
+                                           "7891 未起或未接管（%s）" % sys_to_us_why))},
             },
             "missing": missing or None,
             "egress_verified": ("端到端验证通过（probe 实发出网）"
@@ -328,13 +340,13 @@ class NetFace(BaseDevice):
         ② 自有内核层（7891 起 + 接管）。只陈述事实，不给「建议怎么做」。
         """
         installed = core.get("installed")
-        sys_on = core.get("system_proxy_on")
         tun = core.get("tun")
         # 头条①：真实直连层达成（此刻 karing 关掉后天网正在跑的状态）
         if direct_ok:
             return "半步圆满达成（真实直连层）：关掉 karing 后 GitHub/pypi/raw 真实直连通，不靠任何代理"
-        # 头条②：自有内核层达成
-        if self_alive and installed and (sys_on or tun):
+        # 头条②：自有内核层达成（系统代理必须真的指向 7891，karing 的 7890 不算）
+        sys_to_us = core.get("system_proxy_to_us")
+        if self_alive and installed and (sys_to_us or tun):
             return "半步圆满达成（自有内核层）：7891 起、系统代理/tun 接管，不靠 karing"
         # 7891 在听但不是天网内核
         if self_alive and not installed:
@@ -348,8 +360,9 @@ class NetFace(BaseDevice):
             return ("半步圆满未达成：内核装了但没起（proxy.deploy 拉起 7891），且清代理真实直连也不通"
                     if not direct_ok else
                     "半步圆满差自有内核层：真实直连已通，但 7891 没起")
-        if not (sys_on or tun):
-            return "半步圆满差最后一步：7891 起了但系统代理/tun 没接管（deploy 的 enable_proxy=True）"
+        if not (sys_to_us or tun):
+            return ("半步圆满差最后一步：7891 起了但系统代理没指向它（%s；deploy 用 enable_proxy=True）"
+                    % core.get("system_proxy_to_us_why"))
         return ("出向：半步圆满未达成，靠 karing 拐杖顶着" if sys_alive
                 else "出向：半步圆满未达成，只剩直连")
 
