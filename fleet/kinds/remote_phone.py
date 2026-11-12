@@ -81,6 +81,9 @@ class RelayNode(BaseDevice):
     kind = "relay"
     via = "local"
 
+    #: 中继在跑、且编队里有中继节点时才申报；静态统计看不见。
+    RUNTIME_CAPS = ("relay.status",)
+
     def __init__(self, name="relay:home", via="local"):
         super().__init__(name, via=via)
         self._caps = ("relay.status",)

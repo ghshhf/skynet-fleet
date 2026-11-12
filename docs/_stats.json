@@ -1,11 +1,41 @@
 {
-  "generated_at": "2026-11-12 20:39:35",
-  "gates_registered": 187,
-  "eval_files": 99,
+  "generated_at": "2026-11-12 21:01:57",
+  "gates_registered": 188,
+  "eval_files": 100,
   "orphan_evals": [],
   "retired_refs": [],
   "doc_md": 2,
   "app_build": "49",
+  "runtime_declared": [
+    {
+      "cap": "fleet.memory.sync",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "skynet.relay",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "skynet.relay.fetch",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "shell.exec",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "file.push",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "file.pull",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "relay.status",
+      "by": "remote_phone"
+    }
+  ],
   "capabilities_declared": 521,
   "capabilities_owned": 515,
   "capabilities_live": null,
@@ -434,5 +464,31 @@
       "gated": 0
     }
   },
-  "declared_error": ""
+  "declared_error": "",
+  "runtime_declared_unowned": [
+    {
+      "cap": "skynet.relay",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "skynet.relay.fetch",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "shell.exec",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "file.push",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "file.pull",
+      "by": "fleet_node"
+    },
+    {
+      "cap": "relay.status",
+      "by": "remote_phone"
+    }
+  ]
 }

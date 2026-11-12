@@ -271,16 +271,21 @@ def capability_layers(probe=False):
 
     if reg is not None:
         owned = 0
+        owned_names = set()
         owner_errors = []
         for n in names:
             try:
                 if reg.owners(n):
                     owned += 1
+                    owned_names.add(n)
                     domains[n.split(".", 1)[0]]["owned"] += 1
             except Exception as e:                         # noqa: BLE001
                 # 静默吞掉会让「有主能力」少算，还看不出是降级 —— 记账不撒谎。
                 owner_errors.append({"cap": n, "err": f"{type(e).__name__}: {e}"})
         out["capabilities_owned"] = owned
+        # 「声明 → 有主」的缺口里，有多少是运行时条件申报（不是空壳）
+        rt, _rt_err = runtime_declared()
+        out["runtime_declared_unowned"] = [r for r in rt if r["cap"] not in owned_names]
         if owner_errors:
             out["owner_error_count"] = len(owner_errors)
             out["owner_errors"] = owner_errors[:20]
@@ -329,7 +334,27 @@ def app_build():
     return "?"
 
 
+def runtime_declared():
+    """有实现、但只在运行时条件满足时才申报的能力（静态有主统计看不见）。
+
+    名单的真源是各设备类的 `RUNTIME_CAPS` 常量；本函数只汇总，不手抄——
+    否则这里会变成第二本必然过期的账。返回 (行列表, 错误原因)。
+    """
+    sys.path.insert(0, ROOT)
+    try:
+        from fleet.kinds.fleet_node import FleetNode
+        from fleet.kinds.remote_phone import RelayNode
+    except Exception as e:                                  # noqa: BLE001
+        return [], f"{type(e).__name__}: {e}"
+    rows = []
+    for cls, owner in ((FleetNode, "fleet_node"), (RelayNode, "remote_phone")):
+        for n in getattr(cls, "RUNTIME_CAPS", ()):
+            rows.append({"cap": n, "by": owner})
+    return rows, ""
+
+
 def collect(probe=False):
+    rt, rt_err = runtime_declared()
     st = {
         "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "gates_registered": gate_count(),
@@ -338,7 +363,10 @@ def collect(probe=False):
         "retired_refs": retired_refs(),
         "doc_md": doc_count(),
         "app_build": app_build(),
+        "runtime_declared": rt,
     }
+    if rt_err:
+        st["runtime_declared_error"] = rt_err
     st.update(capability_layers(probe=probe))
     return st
 
@@ -373,6 +401,9 @@ def render_block(st):
     lines += ["", "| 缺口 | 条 | 含义 |", "|---|---|---|"]
     if isinstance(dec, int) and isinstance(own, int):
         lines.append(f"| 声明 → 有主 | **{dec - own}** | 挂了名字但没有设备认领，调必失败 |")
+        rt = st.get("runtime_declared_unowned") or []
+        if rt:
+            lines.append(f"| 其中运行时条件申报 | **{len(rt)}** | 有实现，等条件满足才申报（不是空壳） |")
     else:
         lines.append("| 声明 → 有主 | — | 注册表没建起来，这一格不给数 |")
     if isinstance(own, int) and isinstance(gat, int):

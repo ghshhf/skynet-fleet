@@ -38,6 +38,11 @@ class FleetNode(BaseDevice):
     kind = "fleet_node"
     via = "control"
 
+    #: 只在运行时条件申报的能力——静态 `catalog.build()` 的「有主」统计看不见它们。
+    #: 真源放在这里，`tools/gen_stats.py` 只汇总，不另抄一份名单。
+    RUNTIME_CAPS = ("fleet.memory.sync", "skynet.relay", "skynet.relay.fetch",
+                    "shell.exec", "file.push", "file.pull")
+
     def __init__(self, name, rec=None, **kw):
         super().__init__(name if name.startswith("node:") else f"node:{name}",
                          via="control", **kw)
