@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-11 20:16:03",
+  "generated_at": "2026-11-12 20:06:54",
   "gates_registered": 187,
   "eval_files": 99,
   "orphan_evals": [],
@@ -10,13 +10,18 @@
   "capabilities_owned": 515,
   "capabilities_live": null,
   "capabilities_gated": 238,
-  "devices": 71,
+  "devices": 69,
   "devices_live": null,
   "domains": {
     "phone": {
       "declared": 25,
       "owned": 25,
       "gated": 8
+    },
+    "re": {
+      "declared": 19,
+      "owned": 19,
+      "gated": 7
     },
     "web": {
       "declared": 15,
@@ -153,11 +158,6 @@
       "owned": 7,
       "gated": 0
     },
-    "re": {
-      "declared": 7,
-      "owned": 7,
-      "gated": 3
-    },
     "paper": {
       "declared": 7,
       "owned": 7,
@@ -192,16 +192,6 @@
       "declared": 6,
       "owned": 6,
       "gated": 3
-    },
-    "rea": {
-      "declared": 6,
-      "owned": 6,
-      "gated": 0
-    },
-    "protocol": {
-      "declared": 6,
-      "owned": 6,
-      "gated": 4
     },
     "signup": {
       "declared": 6,

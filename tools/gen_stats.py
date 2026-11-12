@@ -347,7 +347,7 @@ def render_block(st):
         f"| eval 文件 | **{n(st.get('eval_files'))}** 份 | `evals/*.py` |",
         f"| 游离门禁 | **{len(st.get('orphan_evals') or [])}** 份 | 写了但没登记，等于没写 |",
         f"| 文档 | **{n(st.get('doc_md'))}** 份 | `docs/*.md` |",
-        f"| App build | **{n(st.get('app_build'))}** | `tianwang_android/version.txt` |",
+        f"| App build | **{n(st.get('app_build'))}** | `tianwang_android/version.txt`（第二代版本看 `tianwang_app/app/build.gradle.kts`） |",
     ]
     # 两个缺口也由脚本算——它们是「该去解释的东西」，不是让人记住的数字
     dec, own, gat = (st.get("capabilities_declared"), st.get("capabilities_owned"),
