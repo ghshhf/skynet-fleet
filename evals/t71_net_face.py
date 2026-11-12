@@ -201,28 +201,25 @@ def main():
 
     # ---- 9. 显影面：界面只许从能力取数
     # 防的是「面板自己再算一份」——那就会出现两份真相，主人对着哪份判断都可能错。
-    tui_path = os.path.join(HERE, "fleet", "tui.py")
-    with io.open(tui_path, "r", encoding="utf-8") as f:
-        tui_src = f.read()
-    check('call("net.status"' in tui_src,
-          "TUI 网络页从 net.status 取数",
-          "TUI 里没有 call(\"net.status\") —— 网络页要么没接，要么自己算了一份")
-    seg = tui_src.split("def _paint_net", 1)
-    if len(seg) == 2:
-        body = seg[1].split("\n    def ", 1)[0]
-        leaked = [w for w in ("is_proxy_alive", "proxycore", "socket.",
-                              "resolve_proxy") if w in body]
-        check(not leaked, "TUI 的 _paint_net 只画不算（没有直接探口/探模块）",
-              "TUI 的 _paint_net 里直接调了 %r —— 界面自己算一份就出现两份真相"
-              % (leaked,))
-    else:
-        check(False, "TUI 有 _paint_net", "TUI 里没有 _paint_net，网络页没接上")
-
+    # 终端 TUI 已在 17d9cb5 移除（只留命令行），显影面统一收敛到 GUI 服务端。
     srv_path = os.path.join(HERE, "fleet", "gui", "server.py")
     with io.open(srv_path, "r", encoding="utf-8") as f:
         srv_src = f.read()
     check('"/api/net"' in srv_src, "GUI 服务端有 /api/net 端点",
           "GUI 服务端没有 /api/net —— 图形面板看不见网络层")
+    seg = srv_src.split("def _net_panel", 1)
+    if len(seg) == 2:
+        body = seg[1].split("\n    def ", 1)[0]
+        check('call("net.status"' in body,
+              "面板网络页从 net.status 取数",
+              "面板里没有 call(\"net.status\") —— 网络页要么没接，要么自己算了一份")
+        leaked = [w for w in ("is_proxy_alive", "proxycore", "socket.",
+                              "resolve_proxy") if w in body]
+        check(not leaked, "面板 _net_panel 只画不算（没有直接探口/探模块）",
+              "面板 _net_panel 里直接调了 %r —— 界面自己算一份就出现两份真相"
+              % (leaked,))
+    else:
+        check(False, "面板有 _net_panel", "GUI 服务端没有 _net_panel，网络页没接上")
 
     # 端点逻辑不只是「写了」，要真跑一次（不起服务、不占端口）
     try:
