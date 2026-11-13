@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-14 05:36:02",
+  "generated_at": "2026-11-14 05:52:16",
   "gates_registered": 188,
   "eval_files": 100,
   "orphan_evals": [],
@@ -37,10 +37,10 @@
     }
   ],
   "capabilities_declared": 528,
-  "capabilities_owned": 522,
+  "capabilities_owned": 521,
   "capabilities_live": null,
   "capabilities_gated": 246,
-  "devices": 69,
+  "devices": 66,
   "devices_live": null,
   "domains": {
     "phone": {
@@ -455,7 +455,7 @@
     },
     "fleet": {
       "declared": 1,
-      "owned": 1,
+      "owned": 0,
       "gated": 1
     },
     "device": {
@@ -466,6 +466,10 @@
   },
   "declared_error": "",
   "runtime_declared_unowned": [
+    {
+      "cap": "fleet.memory.sync",
+      "by": "fleet_node"
+    },
     {
       "cap": "skynet.relay",
       "by": "fleet_node"

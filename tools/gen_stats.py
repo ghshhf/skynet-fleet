@@ -223,7 +223,10 @@ def _load_registry(probe=False):
     sys.path.insert(0, ROOT)
     try:
         from fleet import catalog
-        reg = catalog.build()
+        # 只数代码里声明的设备。运行时节点账本（编队里临时登记的对端）是本机
+        # 状态、不是代码事实：掺进来会让同一份 _stats.json 在开发机算出 69 台、
+        # 干净的 CI runner 算出 66 台，t54/t63 就永远在两台机器上互相判对方漂移。
+        reg = catalog.build(with_nodes=False)
         return reg, ""
     except Exception as e:                                  # noqa: BLE001
         return None, f"{type(e).__name__}: {e}"
