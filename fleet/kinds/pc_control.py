@@ -25,6 +25,7 @@ macOS/Linux **明确不支持**：本实现只用 Win32（user32）与 PowerShel
 等价出口。此时 probe() 直接说「只实现了 Windows」，invoke() 回 unsupported + 原因，
 不许静默返回空。
 """
+import base64
 import ctypes
 import json
 import os
@@ -64,11 +65,13 @@ CAPS = (
     "pcctl.gesture",
     "pcctl.screen",
     "pcctl.clipboard.write",
+    "pcctl.file.read",
+    "pcctl.file.write",
     "pcctl.proc.kill",
 )
 
 READ_CAPS = ("pcctl.screenshot", "pcctl.windows", "pcctl.clipboard.read",
-             "pcctl.proc.list", "pcctl.sysinfo")
+             "pcctl.proc.list", "pcctl.sysinfo", "pcctl.file.read")
 
 #: 旧名 → (新名, 预置参数)。只为兼容，不再出现在 caps() 里。
 ALIASES = {
@@ -1255,6 +1258,81 @@ class PcControl(BaseDevice):
         return R.success("pcctl.clipboard.write", self.name, via=self.via, side_effect=True,
                          data={"chars": len(text), "risk": RISK_MEDIUM, "reversible": True,
                                "reversible_note": "可逆：再写回原内容即可"})
+
+    # ---------------- 文件（LAN 裸传，base64 内联） ----------------
+
+    def _do_file_read(self, args):
+        """读这台电脑上的一个文件，把内容以 base64 内联回包。
+
+        为什么是「裸读 + base64」而不是复用 file.push：file.push 是编队节点之间、
+        带节点注册的较重型通道；LAN 直连控制要的是「一句话把某个文件拿回来」，
+        对端（手机或另一台电脑）拿到 base64 自己落盘即可，不依赖节点体系。
+        上限 50MB，避免把大文件塞进回包把信道撑爆。
+        """
+        path = str(args.get("path") or "").strip()
+        if not path:
+            return R.error("pcctl.file.read", "缺 path：要读哪个文件的绝对路径",
+                           device=self.name, via=self.via)
+        p = os.path.abspath(path)
+        if not os.path.isfile(p):
+            return R.error("pcctl.file.read", "文件不存在：%s" % p,
+                           device=self.name, via=self.via)
+        max_bytes = int(args.get("max_bytes") or 50 * 1024 * 1024)
+        size = os.path.getsize(p)
+        if size > max_bytes:
+            return R.error("pcctl.file.read", "文件 %d 字节超过上限 %d" % (size, max_bytes),
+                           device=self.name, via=self.via)
+        try:
+            with open(p, "rb") as f:
+                data = base64.b64encode(f.read()).decode("ascii")
+        except Exception as e:
+            return R.error("pcctl.file.read", "%s: %s" % (type(e).__name__, e),
+                           device=self.name, via=self.via)
+        return R.success("pcctl.file.read", self.name, via=self.via, data={
+            "path": p, "name": os.path.basename(p), "bytes": size, "data": data,
+            "risk": RISK_LOW, "reversible": True,
+            "note": "文件内容已以 base64 内联；可能含密钥/隐私，别往外发。" + INJECT_DEFENSE,
+        })
+
+    def _do_file_write(self, args):
+        """把一段 base64 写到这台电脑的文件（父目录自动建）。
+
+        和 read 配对：对端把本地文件读成 base64 调这条，就完成了「手机把文件推到电脑」。
+        不自动覆盖（已存在要先确认），解码后上限 60MB；写文件是 side_effect + ask 档，
+        闸门没开一律 denied（fail-closed）。
+        """
+        path = str(args.get("path") or "").strip()
+        data = args.get("data") or ""
+        if not path:
+            return R.error("pcctl.file.write", "缺 path", device=self.name, via=self.via)
+        if not data:
+            return R.error("pcctl.file.write", "缺 data（base64）", device=self.name, via=self.via)
+        p = os.path.abspath(path)
+        if os.path.exists(p) and not bool(args.get("overwrite")):
+            return R.error("pcctl.file.write", "已存在且不覆盖：%s（要覆盖传 overwrite=true）" % p,
+                           device=self.name, via=self.via)
+        try:
+            raw = base64.b64decode(data)
+        except Exception as e:
+            return R.error("pcctl.file.write", "base64 解码失败：%s" % e,
+                           device=self.name, via=self.via)
+        max_bytes = int(args.get("max_bytes") or 60 * 1024 * 1024)
+        if len(raw) > max_bytes:
+            return R.error("pcctl.file.write", "解码后 %d 字节超过上限 %d" % (len(raw), max_bytes),
+                           device=self.name, via=self.via)
+        try:
+            parent = os.path.dirname(p)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(raw)
+        except Exception as e:
+            return R.error("pcctl.file.write", "%s: %s" % (type(e).__name__, e),
+                           device=self.name, via=self.via)
+        return R.success("pcctl.file.write", self.name, via=self.via, side_effect=True, data={
+            "path": p, "bytes": len(raw), "risk": RISK_MEDIUM, "reversible": True,
+            "note": "已写入 %d 字节到 %s；可逆（删掉即可）。" % (len(raw), p),
+        })
 
     def _do_proc_kill(self, args):
         pid = args.get("pid")

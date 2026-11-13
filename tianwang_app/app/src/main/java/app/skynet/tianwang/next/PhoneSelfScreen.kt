@@ -145,7 +145,8 @@ fun PhoneSelfPane() {
                 Text(
                     if (linkConnected) {
                         "控制面已配对，后台能力可供调用；" +
-                            if (Prefs.mcpAllowActions) "当前允许操作。" else "当前只读。"
+                            if (SafeMode.on()) "安全模式已开启，所有写操作被拒。"
+                            else if (Prefs.mcpAllowActions) "当前允许操作。" else "当前只读。"
                     } else {
                         "手机只主动往外连中继，不开端口、不走 adb。"
                     },

@@ -31,7 +31,7 @@ private val Green = Color(0xFF57C08A)        // 成功
 private val TextMain = Color(0xFFE6EDF3)
 private val TextDim = Color(0xFF8B98A5)
 
-private val DarkScheme = darkColorScheme(
+val DarkScheme = darkColorScheme(
     primary = Cyan,
     onPrimary = Color(0xFF00201F),
     primaryContainer = CyanDim,
@@ -90,9 +90,11 @@ private val AppTypography = Typography(
 
 @Composable
 fun TianwangTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
-    // 原型阶段：默认走深色（见上），跟随系统只在系统为亮色时切浅色。
+    // 主题色与深浅都由「外观」页决定；这里只负责把系统亮暗当成一个输入，
+    // 用户在设置里选了「始终深/浅」就覆盖它，不再写死跟随系统。
+    val useDark = Appearance.useDark(dark)
     MaterialTheme(
-        colorScheme = if (dark) DarkScheme else LightScheme,
+        colorScheme = Appearance.scheme(useDark),
         typography = AppTypography,
         content = content,
     )

@@ -311,8 +311,44 @@ object Prefs {
     private const val K_DEV_ID = "device_id"
     private const val K_DEV_SEC = "device_secret"
     private const val K_DEV_NAME = "device_name"
+    private const val K_ONBOARD_DONE = "onboarding_done"
+    private const val K_SAFE_MODE = "safe_mode"
+    private const val K_SAFE_STOPPED_AT = "safe_stopped_at"
+    private const val K_ACCENT = "appearance_accent"
+    private const val K_DARK_MODE = "appearance_dark_mode"
 
     private val sp get() = App.ctx.getSharedPreferences(SP, Context.MODE_PRIVATE)
+
+    /**
+     * 首次引导走没走完。点「跳过」也算走完 —— 引导不能变成每次启动都拦人的门。
+     * 想再看一遍：抽屉里「首次引导」入口。
+     */
+    var onboardingDone: Boolean
+        get() = sp.getBoolean(K_ONBOARD_DONE, false)
+        set(v) { sp.edit().putBoolean(K_ONBOARD_DONE, v).apply() }
+
+    /**
+     * 安全模式：一键把「别人能操作这台手机」的所有入口关在门外。
+     * 与 mcpAllowActions 分开 —— 后者是平时那档权限，前者是应急总闸，关掉后不自动恢复。
+     */
+    var safeMode: Boolean
+        get() = sp.getBoolean(K_SAFE_MODE, false)
+        set(v) { sp.edit().putBoolean(K_SAFE_MODE, v).apply() }
+
+    /** 上一次按「立即停止」的时间，界面上给人看，证明真的停过而不是只改了个开关。 */
+    var safeStoppedAt: Long
+        get() = sp.getLong(K_SAFE_STOPPED_AT, 0L)
+        set(v) { sp.edit().putLong(K_SAFE_STOPPED_AT, v).apply() }
+
+    /** 主题色 key，见 Appearance.Accent。 */
+    var accentKey: String
+        get() = sp.getString(K_ACCENT, "cyan") ?: "cyan"
+        set(v) { sp.edit().putString(K_ACCENT, v).apply() }
+
+    /** 0 跟随系统 / 1 强制深色 / 2 强制浅色。 */
+    var darkMode: Int
+        get() = sp.getInt(K_DARK_MODE, 0)
+        set(v) { sp.edit().putInt(K_DARK_MODE, v.coerceIn(0, 2)).apply() }
 
     var mode: InferenceMode
         get() = InferenceMode.of(sp.getString(K_MODE, InferenceMode.AUTO.key))

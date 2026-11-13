@@ -39,6 +39,10 @@ import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalDrawerSheet
@@ -57,6 +61,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -119,6 +128,12 @@ class MainActivity : ComponentActivity() {
         Log.i("TianwangModels", "扫描到 ${found.size} 个 GGUF")
         found.forEach { Log.i("TianwangModels", "${it.label} ${it.sizeMb}MB ${it.target}") }
         enableEdgeToEdge()
+        // 别的 App 分享文字/链接过来：先接住，再让首页直接落在收件箱。
+        // 只存本机、不自动发给模型；收件箱页里由人决定复制/转发/删除。
+        if (ShareIntake.absorb(intent)) {
+            intent?.putExtra("tw_inbox", true)
+            Log.i("TianwangShare", "已收下一条外部分享")
+        }
         // 出声自检：HyperOS 把 `adb shell input` 封了（INJECT_EVENTS），
         // 点不了界面上那个喇叭，所以给一条命令让 App 自己开开关 + 念一句。
         //   adb shell am start -n app.skynet.tianwang.next/.MainActivity --ez speaktest true
@@ -239,11 +254,36 @@ private enum class Overlay(val title: String, val sub: String) {
     ABOUT("关于与版本", "版本与后端信息"),
     IMAGE("本机出图", "手机自己跑 diffusion · 提示词出片"),
     CLOUDDRIVE("网盘聚合", "对等节点 · 集中各网盘"),
+    ONBOARD("首次引导", "再看一遍这台手机的能力就绪清单"),
+    SAFE("安全模式", "一键停止全部远控"),
+    DIAG("诊断与导出", "脱敏状态包 · 可复制可分享"),
+    REPLAY("对话回放", "只读重看 / 导出历史对话"),
+    INBOX("分享收件箱", "别的 App 送来的文字与链接"),
+    CAPS("全部能力", "这台手机挂着的每一个工具"),
+    APPEARANCE("外观", "六套主题色 · 深浅模式"),
+    PERMS("权限矩阵", "每条能力走哪条通道 · 缺什么"),
+    HELP("使用指南", "离线可查的常见问答"),
+    SEARCH("全局搜索", "一次查会话/资源/工具"),
+    BACKUP("备份与恢复", "本地数据打包带走"),
+    EVENTS("事件中心", "本机动作审计"),
+    PEERS("双机互联", "局域网直连 + 集群名册"),
+    NOTIFS("通知中心", "最近通知 · 自我监控"),
+    REMOTE("远程控制台", "局域网直连控制对端"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun App() {
+    // 从别的 App 分享进来时不拦引导：人家是来放东西的，不是来听讲解的。
+    val launchInbox = (androidx.compose.ui.platform.LocalContext.current
+        as? android.app.Activity)?.intent?.getBooleanExtra("tw_inbox", false) == true
+    // 首次装完先讲清楚这台手机现在能用哪些能力，而不是把 64 个工具直接甩给人。
+    // 跳过 / 走完都会写 Prefs.onboardingDone，不会每次启动都拦。
+    var showOnboarding by remember { mutableStateOf(!Prefs.onboardingDone && !launchInbox) }
+    if (showOnboarding) {
+        OnboardingScreen(onDone = { showOnboarding = false })
+        return@App
+    }
     var tab by remember { mutableStateOf(Tab.CHAT) }
     // 一条命令直达二级页 / 自动自检：HyperOS 拦了 adb input（INJECT_EVENTS），
     // 点不了屏，所以留 intent 入口给机主和验收用，跟已有的 speaktest 一个路子。
@@ -260,7 +300,15 @@ private fun App() {
     //   adb shell am start -n app.skynet.tianwang.next/.MainActivity --ez tw_drawer true
     val launchDrawer = launchIntent?.getBooleanExtra("tw_drawer", false) == true
     // 二级页 + 全局左侧抽屉。overlay 非空时顶栏变返回箭头，底栏保持不变。
-    var overlay by remember { mutableStateOf<Overlay?>(if (launchImage) Overlay.IMAGE else null) }
+    var overlay by remember {
+        mutableStateOf<Overlay?>(
+            when {
+                launchImage -> Overlay.IMAGE
+                launchInbox -> Overlay.INBOX
+                else -> null
+            }
+        )
+    }
     val drawerState = rememberDrawerState(if (launchDrawer) DrawerValue.Open else DrawerValue.Closed)
     // 默认选「这台手机真跑得动」的那个：1.7B 是普适甜点——本机（K70E/天玑8300）
     // 实测 9.8 tok/s，4B 只有 2.9 tok/s（首字 4.2s），明显卡手。
@@ -346,7 +394,12 @@ private fun App() {
     val msgs = remember { mutableStateListOf<ChatMsg>() }
     // 🔴 历史从磁盘读（2026-10-26）：以前这里是 Demo.sessions = emptyList()，
     //    于是「会话」抽屉永远空、杀进程就全丢。现在落盘，重开还在。
-    val sessions = remember { mutableStateListOf<Session>().apply { addAll(SessionStore.load()) } }
+    val sessions = remember {
+        mutableStateListOf<Session>().apply {
+            addAll(SessionStore.load().sortedWith(
+                compareByDescending<Session> { it.pinned }.thenByDescending { it.at }))
+        }
+    }
     var currentSessionId by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
 
@@ -372,11 +425,54 @@ private fun App() {
         )
         val i = sessions.indexOfFirst { it.id == sid }
         if (i >= 0) sessions[i] = s else sessions.add(0, s)
-        // 最近说话的排最前 —— 抽屉里第一眼就是刚才那段
-        val ordered = sessions.sortedByDescending { it.at }
+        // 最近说话的排最前 —— 抽屉里第一眼就是刚才那段；置顶的永远压在最上
+        val ordered = sessions.sortedWith(
+            compareByDescending<Session> { it.pinned }.thenByDescending { it.at })
         sessions.clear()
         sessions.addAll(ordered)
         SessionStore.save(ordered)
+    }
+
+    /** 删除一条会话：落盘 + 内存同步；若正在看这条，回到空对话。 */
+    fun deleteSession(s: Session) {
+        SessionStore.delete(s.id)
+        val i = sessions.indexOfFirst { it.id == s.id }
+        if (i >= 0) sessions.removeAt(i)
+        if (currentSessionId == s.id) { currentSessionId = null; msgs.clear() }
+    }
+
+    /** 置顶 / 取消置顶：落盘 + 内存重排（置顶压最上）。 */
+    fun pinSession(s: Session, pinned: Boolean) {
+        SessionStore.setPinned(s.id, pinned)
+        val i = sessions.indexOfFirst { it.id == s.id }
+        if (i >= 0) sessions[i] = s.copy(pinned = pinned)
+        val ordered = sessions.sortedWith(
+            compareByDescending<Session> { it.pinned }.thenByDescending { it.at })
+        sessions.clear(); sessions.addAll(ordered)
+    }
+
+    var renameTarget by remember { mutableStateOf<Session?>(null) }
+    var renameText by remember { mutableStateOf("") }
+    fun requestRename(s: Session) { renameText = s.title; renameTarget = s }
+
+    var deleteTarget by remember { mutableStateOf<Session?>(null) }
+
+    var capsQuery by remember { mutableStateOf("") }
+
+    /** 打开一条会话：先保住当前，再把选中的装进来并切到对话页。抽屉和全局搜索共用。 */
+    fun pickSession(s: Session) {
+        persist()
+        msgs.clear()
+        msgs.addAll(s.msgs)
+        currentSessionId = s.id
+        s.modelId.takeIf { it.isNotBlank() }?.let { mid ->
+            models.firstOrNull { it.id == mid }?.let {
+                current = it
+                Prefs.lastModelId = it.id
+            }
+        }
+        tab = Tab.CHAT
+        scope.launch { drawerState.close() }
     }
 
     fun send(text: String) {
@@ -399,7 +495,7 @@ private fun App() {
                         profile = model,
                         history = history,
                         tools = PhoneMcp.toolList(),
-                        allowActions = Prefs.mcpAllowActions,
+                        allowActions = SafeMode.allowsActions(),
                         execute = { n, a -> PhoneMcp.executeTool(n, a) },
                         onDelta = { d ->
                             update(msgs, replyId) { it.copy(text = it.text + d) }
@@ -515,21 +611,7 @@ private fun App() {
                 AppDrawer(
                     sessions = sessions,
                     currentSessionId = currentSessionId,
-                    onSelect = { s ->
-                        // 点历史 = 先保住当前这段，再把那段装进来；抽屉当场收起。
-                        persist()
-                        msgs.clear()
-                        msgs.addAll(s.msgs)
-                        currentSessionId = s.id
-                        s.modelId.takeIf { it.isNotBlank() }?.let { mid ->
-                            models.firstOrNull { it.id == mid }?.let {
-                                current = it
-                                Prefs.lastModelId = it.id
-                            }
-                        }
-                        tab = Tab.CHAT
-                        scope.launch { drawerState.close() }
-                    },
+                    onSelect = { pickSession(it) },
                     onNewChat = {
                         scope.launch { drawerState.close() }
                         overlay = null
@@ -542,6 +624,9 @@ private fun App() {
                         scope.launch { drawerState.close() }
                         overlay = ov
                     },
+                    onDelete = { deleteTarget = it },
+                    onRename = { s, _ -> requestRename(s) },
+                    onPin = { s, p -> pinSession(s, p) },
                 )
             }
         },
@@ -587,6 +672,10 @@ private fun App() {
                     }
                 },
                 actions = {
+                    IconButton(onClick = { overlay = Overlay.SEARCH }) {
+                        Icon(Icons.Filled.Search, "全局搜索",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     if (tab == Tab.CHAT && overlay == null) {
                         IconButton(onClick = {
                             // 新对话 = 先把当前这段存好再清空。
@@ -598,6 +687,14 @@ private fun App() {
                             Icon(Icons.Filled.Add, "新会话",
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
+                    }
+                    // 安全模式常驻顶栏：开了就变红，任何时候一眼看得到/一按能停。
+                    IconButton(onClick = { overlay = Overlay.SAFE }) {
+                        Icon(
+                            Icons.Filled.Security, "安全模式",
+                            tint = if (SafeMode.on()) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -713,8 +810,71 @@ private fun App() {
                     autoPrompt = launchPrompt,
                 )
                 Overlay.CLOUDDRIVE -> CloudDriveScreen(onBack = { overlay = null })
+                Overlay.ONBOARD -> OnboardingScreen(onDone = { overlay = null })
+                Overlay.SAFE -> SafeModeScreen()
+                Overlay.DIAG -> DiagnosticsScreen()
+                Overlay.REPLAY -> ReplayHostScreen()
+                Overlay.INBOX -> InboxScreen()
+                Overlay.CAPS -> CapabilityCatalogScreen(capsQuery)
+                Overlay.APPEARANCE -> AppearanceScreen()
+                Overlay.PERMS -> PermissionMatrixScreen()
+                Overlay.HELP -> HelpScreen()
+                Overlay.SEARCH -> GlobalSearchScreen(
+                    sessions = sessions,
+                    onPickSession = { s -> overlay = null; pickSession(s) },
+                    onOpenCaps = { q -> capsQuery = q; overlay = Overlay.CAPS },
+                )
+                Overlay.BACKUP -> BackupScreen()
+                Overlay.EVENTS -> EventCenterScreen()
+                Overlay.PEERS -> PeersScreen()
+                Overlay.NOTIFS -> NotificationsScreen()
+                Overlay.REMOTE -> RemoteConsoleScreen(onBack = { overlay = null })
             }
         }
+    }
+    if (renameTarget != null) {
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("重命名会话") },
+            text = {
+                TextField(
+                    value = renameText,
+                    onValueChange = { renameText = it },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val s = renameTarget!!
+                    val t = renameText.trim().take(48)
+                    if (t.isNotEmpty()) {
+                        SessionStore.rename(s.id, t)
+                        val i = sessions.indexOfFirst { it.id == s.id }
+                        if (i >= 0) sessions[i] = s.copy(title = t)
+                    }
+                    renameTarget = null
+                }) { Text("确定") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) { Text("取消") }
+            },
+        )
+    }
+    if (deleteTarget != null) {
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("删除会话") },
+            text = { Text("「${deleteTarget!!.title}」删了就找不回来（本地数据，没有云端回收站）。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleteSession(deleteTarget!!); deleteTarget = null
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("取消") }
+            },
+        )
     }
     }
 }
@@ -734,6 +894,9 @@ private fun AppDrawer(
     onSelect: (Session) -> Unit,
     onNewChat: () -> Unit,
     onOpen: (Overlay) -> Unit,
+    onDelete: (Session) -> Unit,
+    onRename: (Session, String) -> Unit,
+    onPin: (Session, Boolean) -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
     Column(
@@ -811,24 +974,53 @@ private fun AppDrawer(
                     } else {
                         val s = row.session!!
                         val active = s.id == currentSessionId
-                        NavigationDrawerItem(
-                            label = {
-                                Text(s.title, fontSize = 13.sp, maxLines = 1,
-                                    color = if (active) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.onSurface)
-                            },
-                            selected = active,
-                            onClick = { onSelect(s) },
-                            icon = {
-                                Icon(Icons.Filled.ChatBubbleOutline, null,
-                                    modifier = Modifier.size(18.dp))
-                            },
-                            badge = {
-                                if (active) Text("当前", fontSize = 10.sp,
-                                    color = MaterialTheme.colorScheme.primary)
-                            },
-                            modifier = Modifier.padding(bottom = 2.dp),
-                        )
+                        Box {
+                            NavigationDrawerItem(
+                                label = {
+                                    Text(s.title, fontSize = 13.sp, maxLines = 1,
+                                        color = if (active) MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.onSurface)
+                                },
+                                selected = active,
+                                onClick = { onSelect(s) },
+                                icon = {
+                                    Icon(Icons.Filled.ChatBubbleOutline, null,
+                                        modifier = Modifier.size(18.dp))
+                                },
+                                badge = {
+                                    if (active) Text("当前", fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.primary)
+                                    else if (s.pinned) Text("置顶", fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                },
+                                modifier = Modifier.padding(bottom = 2.dp),
+                            )
+                            Row(
+                                Modifier.align(androidx.compose.ui.Alignment.TopEnd)
+                                    .padding(top = 4.dp, end = 4.dp),
+                            ) {
+                                var open by remember { mutableStateOf(false) }
+                                IconButton(onClick = { open = true }) {
+                                    Icon(Icons.Filled.MoreVert, "更多",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp))
+                                }
+                                DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                                    DropdownMenuItem(
+                                        text = { Text(if (s.pinned) "取消置顶" else "置顶") },
+                                        onClick = { open = false; onPin(s, !s.pinned) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("重命名") },
+                                        onClick = { open = false; onRename(s, s.title) },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("删除", color = MaterialTheme.colorScheme.error) },
+                                        onClick = { open = false; onDelete(s) },
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -841,6 +1033,24 @@ private fun AppDrawer(
             item { DrawerItem(Icons.Filled.Devices, "编队节点", "我在编队里的位置") { onOpen(Overlay.FLEET) } }
             item { DrawerGroup("设备") }
             item { DrawerItem(Icons.Filled.PhoneAndroid, "设备与权限", "授权与入网") { onOpen(Overlay.DEVICE) } }
+            item { DrawerItem(Icons.Filled.Notifications, "通知中心", "最近通知 · 自我监控") { onOpen(Overlay.NOTIFS) } }
+            item { DrawerGroup("安全与数据") }
+            item { DrawerItem(Icons.Filled.Security, "安全模式", "一键停掉全部远控") { onOpen(Overlay.SAFE) } }
+            item { DrawerItem(Icons.Filled.Assignment, "诊断与导出", "脱敏状态包") { onOpen(Overlay.DIAG) } }
+            item { DrawerItem(Icons.Filled.Bookmark, "对话回放", "只读重看 / 导出") { onOpen(Overlay.REPLAY) } }
+            item { DrawerItem(Icons.Filled.Assignment, "分享收件箱", "别处送来的文字与链接") { onOpen(Overlay.INBOX) } }
+            item { DrawerItem(Icons.Filled.Build, "全部能力", "这台手机挂着的工具") { onOpen(Overlay.CAPS) } }
+            item { DrawerItem(Icons.Filled.Label, "外观", "主题色与深浅模式") { onOpen(Overlay.APPEARANCE) } }
+            item { DrawerItem(Icons.Filled.Devices, "权限矩阵", "通道与缺权明细") { onOpen(Overlay.PERMS) } }
+            item { DrawerItem(Icons.Filled.Settings, "使用指南", "离线常见问答") { onOpen(Overlay.HELP) } }
+            item { DrawerGroup("查找与数据") }
+            item { DrawerItem(Icons.Filled.Search, "全局搜索", "会话/资源/工具") { onOpen(Overlay.SEARCH) } }
+            item { DrawerItem(Icons.Filled.Settings, "备份与恢复", "本地数据打包带走") { onOpen(Overlay.BACKUP) } }
+            item { DrawerItem(Icons.Filled.Assignment, "事件中心", "本机动作审计") { onOpen(Overlay.EVENTS) } }
+            item { DrawerGroup("对等网络") }
+            item { DrawerItem(Icons.Filled.PhoneAndroid, "双机互联", "直连服务 + 集群名册") { onOpen(Overlay.PEERS) } }
+            item { DrawerItem(Icons.Filled.Devices, "远程控制台", "直连控制手机/电脑") { onOpen(Overlay.REMOTE) } }
+            item { DrawerItem(Icons.Filled.PhoneAndroid, "首次引导", "再看能力就绪清单") { onOpen(Overlay.ONBOARD) } }
             item { Spacer(Modifier.height(16.dp)) }
         }
     }

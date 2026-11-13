@@ -183,6 +183,9 @@ object LanHub {
 
     fun peers(): List<PeerBook.Peer> = PeerBook.decode(Prefs.fleetPeers)
 
+    /** mDNS 发现但未入册的邻近设备（手机 / 电脑）。用于远程控制台「一键加入」。 */
+    fun discovered(): List<LanDiscovery.Peer> = discovery?.peerList() ?: emptyList()
+
     private fun savePeers(list: List<PeerBook.Peer>) {
         Prefs.fleetPeers = PeerBook.encode(list)
     }
@@ -285,7 +288,7 @@ object LanHub {
         val sb = StringBuilder()
         sb.append("按 suitability 排序（").append(tool)
         if (meta.sideEffect) {
-            if (!Prefs.mcpAllowActions) {
+            if (!SafeMode.allowsActions()) {
                 return ToolResult(
                     false,
                     err = "本机（控制方）没开动作权限，写操作派不出去。整个项目只有这一档：" +
@@ -315,7 +318,7 @@ object LanHub {
         val all = peers()
         if (all.isEmpty()) return ToolResult(false, err = "集群名册为空，先 self.peer.add")
         // 整个项目只有一档权限：控制方允许写操作，才把写操作派出去。
-        if (meta.sideEffect && !Prefs.mcpAllowActions) {
+        if (meta.sideEffect && !SafeMode.allowsActions()) {
             return ToolResult(
                 false,
                 err = "本机（控制方）没开动作权限，写操作派不出去。整个项目只有这一档：" +

@@ -42,6 +42,7 @@ object SessionStore {
                         modelId = o.optString("modelId", ""),
                         at = o.optLong("at", 0L),
                         msgs = readMsgs(o.optJSONArray("msgs")),
+                        pinned = o.optBoolean("pinned", false),
                     )
                 )
             }
@@ -59,6 +60,7 @@ object SessionStore {
                         .put("title", s.title)
                         .put("modelId", s.modelId)
                         .put("at", s.at)
+                        .put("pinned", s.pinned)
                         .put("msgs", writeMsgs(s.msgs))
                 )
             }
@@ -71,6 +73,21 @@ object SessionStore {
                 tmp.delete()
             }
         }
+    }
+
+    /** 删除一条会话（按 id）。 */
+    fun delete(id: String) { save(load().filter { it.id != id }) }
+
+    /** 重命名一条会话，空名 / 超长会被忽略或截断。 */
+    fun rename(id: String, title: String) {
+        val t = title.trim().take(48)
+        if (t.isEmpty()) return
+        save(load().map { if (it.id == id) it.copy(title = t) else it })
+    }
+
+    /** 置顶 / 取消置顶：置顶的排在最前，不被新会话挤下去。 */
+    fun setPinned(id: String, pinned: Boolean) {
+        save(load().map { if (it.id == id) it.copy(pinned = pinned) else it })
     }
 
     private fun writeMsgs(msgs: List<ChatMsg>): JSONArray {

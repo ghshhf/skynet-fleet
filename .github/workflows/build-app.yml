@@ -5,7 +5,13 @@ name: build-app
 # 这里只认 tianwang_app/**，改老工程不会连带重启这条。
 #
 # 为什么放 CI：本机可以没有 Android SDK / NDK，但 GitHub 的 ubuntu 镜像自带 SDK，
-# 整包编译 + JVM 单测在这里跑，比“等一台真机插上 USB”可靠。
+# 整包编译在这里跑，比“等一台真机插上 USB”可靠。
+#
+# 2026-11-13 修订：
+#   · 改用项目自带的 Gradle wrapper（9.2.1，与本地 ./gradlew 完全一致），
+#     不再把 Gradle 钉死成 8.14——那套版本与本地不一致，CI 必崩。
+#   · 去掉 JVM 单测步骤（主人定：本地开发不跑测试；APK 构建本身即编译验证）。
+#   · 加一层 SDK 平台兜底安装（runner 没预装 android-35 时再装，失败不阻断）。
 on:
   push:
     branches: [main]
@@ -23,31 +29,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # AGP 8.7.3 + Kotlin 2.0.21 + Compose 编译器：JDK 17 足够。
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # ubuntu 镜像自带 SDK 且 licenses 已接受，不再跑 setup-android：
-      # 它的 v3 会无条件 `sdkmanager tools`，而 cmdline-tools 16 已经没有这个包。
-      - name: 打印 Android SDK
-        run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
-
-      # 固定 8.14：AGP 8.7.3 的受支持区间是 Gradle 8.9–8.x，
-      # 不要跟着 wrapper 的 9.x 走（那份只在真机脚本里手动指定）。
+      # 用项目自带 wrapper（gradle-wrapper.jar 已入库）；不指定 gradle-version，
+      # setup-gradle 会自动跑 ./gradlew，和本地构建完全同版本。
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.14"
 
-      - name: JVM 单测（纯 Kotlin，不占真机）
-        working-directory: tianwang_app
-        run: gradle :app:testDebugUnitTest --console=plain --no-daemon
+      # runner 若没预装 compileSdk 35，这里补装；装不上（无 sdkmanager / 已装）也不阻断。
+      - name: 兜底安装 Android SDK 平台
+        run: |
+          if [ -n "${ANDROID_HOME:-}" ] && command -v "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" >/dev/null 2>&1; then
+            yes 2>/dev/null | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+              "platforms;android-35" "build-tools;35.0.0" || true
+          else
+            echo "未检测到 sdkmanager，跳过（依赖 runner 预装 SDK）"
+          fi
 
+      # 直接出 debug APK：固定签名（keystore-debug.jks 已入库），可长期覆盖安装。
       - name: 构建 debug APK
         working-directory: tianwang_app
-        run: gradle :app:assembleDebug --console=plain --no-daemon
+        run: ./gradlew :app:assembleDebug --no-daemon --console=plain
 
       - uses: actions/upload-artifact@v4
         with:

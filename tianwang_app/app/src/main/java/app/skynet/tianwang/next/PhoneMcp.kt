@@ -151,6 +151,19 @@ object PhoneMcp {
             sideEffect = true,
         ),
         McpTool(
+            "self_file_read", "读本机交换目录里的文件（base64 内联），目录 = 私有外部目录/lanfiles。",
+            schema(mapOf("path" to prop("string", "文件名，落在 lanfiles 目录下"))),
+        ),
+        McpTool(
+            "self_file_write", "把一段 base64 写到本机交换目录（文件名落在 lanfiles 下）。",
+            schema(mapOf(
+                "path" to prop("string", "文件名"),
+                "data" to prop("string", "base64 文件内容"),
+                "overwrite" to prop("boolean", "已存在时是否覆盖，默认 false"),
+            ), listOf("path", "data")),
+            sideEffect = true,
+        ),
+        McpTool(
             "self_battery_status", "电量、充电、省电模式、是否在电池优化白名单。",
             schema(emptyMap()),
         ),
@@ -526,7 +539,7 @@ object PhoneMcp {
 
     private val core = McpCore(
         tools = { toolList() },
-        actionsAllowed = { Prefs.mcpAllowActions },
+        actionsAllowed = { SafeMode.allowsActions() },
         call = { name, args -> runBlocking { executeTool(name, args) } },
     )
 
@@ -535,12 +548,13 @@ object PhoneMcp {
 
     /**
      * 局域网直连的权限标准：**口令即授权**。
-     * 执行方只判断「自己有没有这个工具」，不叠加本机只读开关；
+     * 执行方只判断「自己有没有这个工具」，不叠加平时的只读开关；
      * 否则同一个项目里会同时存在「控制方」和「执行方」两套标准。
+     * 唯一例外是安全模式总闸 —— 那是本机主人按下的应急停止，不是第二套权限体系。
      */
     private val lanCore = McpCore(
         tools = { toolList() },
-        actionsAllowed = { true },
+        actionsAllowed = { SafeMode.allowsLanActions() },
         call = { name, args -> runBlocking { executeTool(name, args) } },
     )
 
@@ -594,6 +608,8 @@ object PhoneMcp {
             "self_notif_clear" -> "self.notif.clear"
             "self_clipboard_get" -> "self.clipboard.get"
             "self_clipboard_set" -> "self.clipboard.set"
+            "self_file_read" -> "self.file.read"
+            "self_file_write" -> "self.file.write"
             "self_battery_status" -> "self.battery.status"
             "self_audio_volume" -> "self.audio.volume"
             "self_audio_set_volume" -> "self.audio.set_volume"

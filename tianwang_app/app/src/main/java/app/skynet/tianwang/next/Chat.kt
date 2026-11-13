@@ -43,6 +43,8 @@ data class Session(
     val modelId: String = "",
     val at: Long = System.currentTimeMillis(),
     val tokens: Int = 0,
+    /** 置顶：常驻历史列表最前，不被后续会话挤下去。 */
+    val pinned: Boolean = false,
 )
 
 /** 天网节点（手机端要能看见自己在编队里的位置，这是上游两家都没有的东西）。 */

@@ -164,6 +164,19 @@ object PhoneSelf {
             listOf(CapParam("text", "str", "要写入的文字", true)),
         ),
         SelfCap(
+            "self.file.read", "读交换文件",
+            "读本机「交换目录」（私有外部目录/lanfiles）里的文件，内容以 base64 回包。" +
+            "这是手机↔电脑 LAN 裸传的落地处：另一端把文件读成 base64 调这条，就完成了「推到手机」。",
+            listOf(CapParam("path", "str", "文件名，落在 lanfiles 目录下", true)),
+        ),
+        SelfCap(
+            "self.file.write", "写交换文件",
+            "把一段 base64 写到本机交换目录（lanfiles 下）。用于另一端「从手机拉文件」时手机这边落盘。",
+            listOf(CapParam("path", "str", "文件名", true),
+                   CapParam("data", "str", "base64 文件内容", true),
+                   CapParam("overwrite", "bool", "已存在时是否覆盖，默认 false")),
+        ),
+        SelfCap(
             "self.battery.status", "电量与保活状态",
             "电量、是否充电、是否已在电池优化白名单里 —— 长任务被厂商杀后台时先看这条。",
         ),
@@ -418,6 +431,8 @@ object PhoneSelf {
                     }
                     "self.clipboard.get" -> clipboardGet(App.ctx)
                     "self.clipboard.set" -> clipboardSet(App.ctx, args)
+                    "self.file.read" -> fileRead(App.ctx, args)
+                    "self.file.write" -> fileWrite(App.ctx, args)
                     "self.battery.status" -> batteryStatus(App.ctx)
                     "self.audio.volume" -> volumeRead(App.ctx)
                     "self.audio.set_volume" -> volumeSet(App.ctx, args)
@@ -921,6 +936,56 @@ object PhoneSelf {
             ?: return ToolResult(false, err = "系统没有剪贴板服务")
         cm.setPrimaryClip(ClipData.newPlainText("天网", text))
         return ToolResult(true, text = "已写入剪贴板 ${text.length} 个字")
+    }
+
+    /**
+     * 交换目录：手机↔电脑 LAN 裸传的落地处。放在 App 私有外部目录，不需要任何
+     * 额外存储权限（scoped storage 下只有这里能自由读写），别的 App 也读不到。
+     */
+    private fun lanDir(ctx: Context): File {
+        return File(ctx.getExternalFilesDir(null), "lanfiles").apply { mkdirs() }
+    }
+
+    private fun fileRead(ctx: Context, args: Map<String, Any?>): ToolResult {
+        val name = strArg(args, "path").trim()
+        if (name.isEmpty() || name.contains("/") || name.contains("\\")) {
+            return ToolResult(false, err = "path 只能是文件名，不能带路径分隔符（落在 lanfiles 目录下）")
+        }
+        val f = File(lanDir(ctx), name)
+        if (!f.isFile) return ToolResult(false, err = "交换目录里没有这个文件：$name")
+        val maxBytes = intArg(args, "max_bytes", 15 * 1024 * 1024)
+        val size = f.length()
+        if (size > maxBytes) {
+            return ToolResult(false, err = "文件 $size 字节超过上限 $maxBytes（用 max_bytes 放大）")
+        }
+        val b64 = runCatching {
+            Base64.encodeToString(f.readBytes(), Base64.DEFAULT)
+        }.getOrElse { return ToolResult(false, err = "读文件失败：${it.message}") }
+        // base64 直接进 text；对端（另一台手机或电脑）拿到后自己解码落盘。
+        // bytes 大小也透过文字长度可估，方便远端决定是否写
+        return ToolResult(true, text = b64)
+    }
+
+    private fun fileWrite(ctx: Context, args: Map<String, Any?>): ToolResult {
+        val name = strArg(args, "path").trim()
+        if (name.isEmpty() || name.contains("/") || name.contains("\\")) {
+            return ToolResult(false, err = "path 只能是文件名，不能带路径分隔符（落在 lanfiles 目录下）")
+        }
+        val data = strArg(args, "data")
+        if (data.isEmpty()) return ToolResult(false, err = "data 不能为空（base64 文件内容）")
+        val f = File(lanDir(ctx), name)
+        if (f.exists() && !flagArg(args, "overwrite")) {
+            return ToolResult(false, err = "已存在且不覆盖：$name（要覆盖传 overwrite=true）")
+        }
+        val raw = runCatching { Base64.decode(data, Base64.DEFAULT) }
+            .getOrElse { return ToolResult(false, err = "base64 解码失败：${it.message}") }
+        val maxBytes = intArg(args, "max_bytes", 20 * 1024 * 1024)
+        if (raw.size > maxBytes) {
+            return ToolResult(false, err = "解码后 ${raw.size} 字节超过上限 $maxBytes")
+        }
+        runCatching { f.writeBytes(raw) }
+            .onFailure { return ToolResult(false, err = "写文件失败：${it.message}") }
+        return ToolResult(true, text = "已写入 $name（${raw.size} 字节）")
     }
 
     private fun batteryStatus(ctx: Context): ToolResult {
