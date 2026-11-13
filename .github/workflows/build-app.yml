@@ -12,6 +12,10 @@ name: build-app
 #     不再把 Gradle 钉死成 8.14——那套版本与本地不一致，CI 必崩。
 #   · 去掉 JVM 单测步骤（主人定：本地开发不跑测试；APK 构建本身即编译验证）。
 #   · 加一层 SDK 平台兜底安装（runner 没预装 android-35 时再装，失败不阻断）。
+# 2026-11-14 修红：
+#   · 上一版 ./gradlew 报 "Permission denied"（exit 126）：Windows 生成的 gradlew
+#     在 git 里是 100644，Linux 检出后没有 x 位。已把索引改成 100755，
+#     构建步骤里再加一道 chmod 兜底，避免任何机器检出后权限再丢。
 on:
   push:
     branches: [main]
@@ -39,6 +43,12 @@ jobs:
       # setup-gradle 会自动跑 ./gradlew，和本地构建完全同版本。
       - uses: gradle/actions/setup-gradle@v4
 
+      # 沿用上一版跑绿时的自检：镜像换了（ubuntu-26.04）也能一眼看清 SDK 在哪、装了哪些平台。
+      - name: 打印 Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+
       # runner 若没预装 compileSdk 35，这里补装；装不上（无 sdkmanager / 已装）也不阻断。
       - name: 兜底安装 Android SDK 平台
         run: |
@@ -52,7 +62,9 @@ jobs:
       # 直接出 debug APK：固定签名（keystore-debug.jks 已入库），可长期覆盖安装。
       - name: 构建 debug APK
         working-directory: tianwang_app
-        run: ./gradlew :app:assembleDebug --no-daemon --console=plain
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --console=plain
 
       - uses: actions/upload-artifact@v4
         with:
