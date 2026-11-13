@@ -17,5 +17,7 @@ doit>=0.37
 # pypdf 7.x 改过 compress / 水印相关 API，CI 装到 7.1.0 时这两项直接失败。
 pypdf==6.21.4
 
-# t80 office_ops：缺 python-docx 时 wordops 判「本机不可用」直接红
+# t80 office_ops：wordops 的模板填充走 docxtpl（Jinja2 + python-docx），
+# 缺任一个都会判「本机不可用」直接红
 python-docx==1.2.0
+docxtpl==0.20.2
