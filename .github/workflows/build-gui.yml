@@ -54,6 +54,15 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-ci.txt
 
+      # ffmpeg/ffprobe 是媒体门禁的硬依赖（mediaops / audioops / videogen 都要
+      # 在 PATH 里真找到两个可执行程序）。runner 没预装，缺了就是三项红。
+      # imageio-ffmpeg 只有 ffmpeg、没有 ffprobe，顶不上，这里装完整的一套。
+      - name: 装 ffmpeg/ffprobe
+        shell: bash
+        run: |
+          choco install ffmpeg -y --no-progress --limit-output
+          echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
+
       # 两条活线门禁（eval_t31 对比度 / eval_t32 死链）要有真浏览器才跑得起来。
       # 不装的话它们会 skip —— skip 不算通过，等于这两条在 CI 上是空的。
       # Windows runner 不支持 --with-deps（那是 Linux 装系统库用的），直接装 chromium。

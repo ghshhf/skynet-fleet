@@ -382,7 +382,7 @@ def _selftest():
             probe = subprocess.run(
                 [ffprobe, "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=nb_frames,width,height", "-of", "json", str(mp4)],
-                capture_output=True, text=True)
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
             check(probe.returncode == 0 and '"nb_frames"' in probe.stdout,
                   "真生成：ffprobe 能读出帧")
             r_again = dev.invoke("video.gen", {"prompt": "海浪", "out": str(out),

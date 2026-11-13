@@ -698,7 +698,9 @@ def _selftest():
                 winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
                 winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, "127.0.0.1:7890")
                 winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, "")
-            assert _reg_proxy(True, pac_path="C:\\tmp\\x.pac")[0]
+            # 只验「传了 pac 路径」这个形状，路径本身不落盘；用系统临时目录，
+            # 不把任何盘符写死在代码里（t45 门禁守的就是这条）。
+            assert _reg_proxy(True, pac_path=os.path.join(tempfile.gettempdir(), "x.pac"))[0]
             assert read_proxy_reg()["ProxyServer"] == "", "on 没接管"
             assert _reg_proxy(False)[0]
             back = read_proxy_reg()

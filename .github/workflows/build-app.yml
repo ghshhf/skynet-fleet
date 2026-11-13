@@ -74,6 +74,10 @@ jobs:
 
       # Actions 的 artifact 在手机浏览器里基本下不动；挂到固定 tag 的 Release，
       # 手机打开 https://github.com/ghshhf/skynet-fleet/releases/tag/apk-latest 就能直装。
+      #
+      # 必须是正式 Release，不能标 --prerelease：预发布不计入 /releases/latest，
+      # 仓库首页会一直显示「还没发布第一个包」，手机/脚本按 latest 取包也 404。
+      # 已存在的那份也补一次 edit，防止哪次被手工改回预发布后再也回不来。
       - name: 发布到「最新 APK」Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,9 +85,9 @@ jobs:
           APK=tianwang_app/app/build/outputs/apk/debug/app-debug.apk
           if gh release view apk-latest >/dev/null 2>&1; then
             gh release upload apk-latest "$APK" --clobber
+            gh release edit apk-latest --prerelease=false
           else
             gh release create apk-latest "$APK" \
               --title "天网 APK（最新）" \
-              --notes "由 build-app 自动更新；提交 ${GITHUB_SHA}。手机可直接下载安装。" \
-              --prerelease
+              --notes "由 build-app 自动更新；提交 ${GITHUB_SHA}。手机可直接下载安装。"
           fi

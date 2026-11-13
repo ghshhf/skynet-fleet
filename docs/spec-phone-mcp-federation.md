@@ -16,7 +16,7 @@
   - 远程传输：`mcp_runtime/plugins/MCPStreamableHttp.rs`（POST + 增量响应 + 超时/取消）；
   - 本地服务：`mcp_runtime/MCPLocalServer.rs`、`MCPStarter.rs`；
   - 工具命名 `serverName:toolName`（`MCPToolExecutor.rs:338-350`），调用前要求服务已激活。
-- 权限四层：App 沙箱 → Host 授权 → `AiPermissionMode`（ReadOnly/WorkspaceWrite/Full）→ 用户按调用批准（`docs/permission-access-architecture.md`）。
+- 权限四层：App 沙箱 → Host 授权 → `AiPermissionMode`（ReadOnly/WorkspaceWrite/Full）→ 用户按调用批准（对应 Operit2 参考仓库里的 `permission-access-architecture.md`，本仓未收录）。
 
 结论：Operit2 的差异不是「无障碍做得更好」，而是 **工具面是开放的、可扩展的**。天网手机端目前恰好相反：60 多个工具写死在一个 Kotlin 列表里，只能被外部调用，不能自己长出能力。这条差距比再补几个点屏动作更接近「我想要的」。
 

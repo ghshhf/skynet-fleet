@@ -12,3 +12,6 @@ markitdown[pdf,docx,pptx,xlsx]>=0.1
 
 # flow.* 调度层依赖 doit（dict_to_task / TaskLoader2 / DoitMain），fleet_flowops 门禁实测导入
 doit>=0.37
+
+# t80 office_ops 门禁：缺 pypdf 会判「pdfops 在本机不可用」直接红（不是只测纯函数）
+pypdf>=5.0

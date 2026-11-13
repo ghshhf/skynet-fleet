@@ -476,7 +476,11 @@ try:
               "cap 名字是字符串（前端拿去当 key 用）")
         check(any(x.get("side_effect") for x in c["caps"]), "清单里标得出副作用能力")
 
-    st, d, err = http_json(f"{BASE}/api/devices", token=TOKEN)
+    # /api/devices 会逐台 probe 全部设备：markitdown 等重依赖首次 import 单台就要
+    # 十几秒，冷启动整表实测 15s~70s。10s 是「接口没响应」的判据，不该把「慢」
+    # 判成「坏」——之前 CI 上这条红的是 TimeoutError，服务端随后写响应才撞出
+    # ConnectionAbortedError，两者同源。契约断言（200 + 字段完整）一条没松。
+    st, d, err = http_json(f"{BASE}/api/devices", token=TOKEN, timeout=90)
     check(st == 200, f"GET /api/devices 200（实际 {st} {err}）")
     if d:
         check(isinstance(d.get("devices"), list) and d["devices"], "devices 是非空列表")

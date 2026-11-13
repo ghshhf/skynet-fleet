@@ -46,10 +46,11 @@ from fleet.catalog import build                # noqa: E402
 from fleet.core import result as R             # noqa: E402
 
 READ_CAPS = ("pcctl.screenshot", "pcctl.windows", "pcctl.clipboard.read",
-             "pcctl.proc.list", "pcctl.sysinfo", "pcctl.screen")
+             "pcctl.proc.list", "pcctl.sysinfo", "pcctl.screen",
+             "pcctl.file.read")
 ACT_CAPS = ("pcctl.app.launch", "pcctl.window", "pcctl.mouse",
             "pcctl.input", "pcctl.clipboard.write", "pcctl.proc.kill",
-            "pcctl.gesture")
+            "pcctl.gesture", "pcctl.file.write")
 #: 第三档（2026-10-28）：**看，但看的东西会出本机**。
 #: 为什么不并进 READ_CAPS：它确实不改这台机器，但截图要送视觉模型 →
 #: 屏幕内容离开本地。并进只读档就等于把「外发」登记成了「只读」，
@@ -290,7 +291,10 @@ ACTION_FOR = {"pcctl.window": "activate", "pcctl.mouse": "click", "pcctl.input":
 for name in ACT_CAPS:
     CALLS.clear()
     args = {"target": "notepad.exe", "hwnd": 1001, "x": 10, "y": 20,
-            "keys": "ctrl+c", "text": "你好", "pid": 4321}
+            "keys": "ctrl+c", "text": "你好", "pid": 4321,
+            # LAN 文件互传用的两项：给齐参数才能证明「被拒时也没真写盘」
+            "path": os.path.join(_tmp, "file_write_selftest.bin"),
+            "data": "aGVsbG8="}
     if name in ACTION_FOR:
         args["action"] = ACTION_FOR[name]
     r = reg.call(name, args=args)
@@ -312,7 +316,11 @@ for name in ACT_CAPS:
     args = {"target": "notepad.exe", "hwnd": 1001, "x": 10, "y": 20,
             "keys": "ctrl+c", "text": "你好", "pid": 4321,
             # gesture 要的是动作序列；给一步纯等待，既能验证放行后真跑，又不碰任何东西
-            "steps": [{"do": "wait", "ms": 5}]}
+            "steps": [{"do": "wait", "ms": 5}],
+            # file.write 放行后只写进本门禁自己的临时目录（末尾会清掉），
+            # 不碰用户任何真实文件
+            "path": os.path.join(_tmp, "file_write_selftest.bin"),
+            "data": "aGVsbG8="}
     if name in ACTION_FOR:
         args["action"] = ACTION_FOR[name]
     r = reg.call(name, args=args, gate=gate_yes)
