@@ -269,6 +269,85 @@ private enum class Overlay(val title: String, val sub: String) {
     PEERS("双机互联", "局域网直连 + 集群名册"),
     NOTIFS("通知中心", "最近通知 · 自我监控"),
     REMOTE("远程控制台", "局域网直连控制对端"),
+
+    // ---- 对照 DSH Go 成批补齐的产品模块（详见 FeatureHub）----
+    HUB("能力工作台", "按板块索引全部新增模块"),
+    PETS("桌宠", "形象 / 四态台词 / 悬浮开关"),
+    TERMINAL("终端", "手机 shell 命令 + 历史"),
+    SLASH("斜杠命令", "/ 命令面板 + 自定义"),
+    MSGACTIONS("消息快捷操作", "长按消息能做什么"),
+    GOALTODO("目标与待办", "本轮目标 + 待办勾选"),
+    SHARECARD("分享卡", "结论做成纯文本卡片"),
+    ACCOUNT("账户与本机", "身份卡 + 本机名"),
+    CHANGELOG("更新日志", "这一版加了什么"),
+    USAGE("用量与状态", "工具数 / 名册 / 直连快照"),
+    LANG("语言", "中文 / English / 跟随系统"),
+    COL_BOTS("Bot 与智能体", "名字 / 人设 / 模型 / 启停"),
+    COL_ROOMS("群聊房间", "多 Bot 协作的房间"),
+    COL_TEAM("Agent 团队", "席位 / 职责 / 上级"),
+    COL_PLUGINS("插件与工具卡", "已装 / 可用的原生工具卡"),
+    COL_SKILLS("技能与预设", "Agent 预设 / 斜杠命令"),
+    COL_SCHEDULES("日程与定时任务", "cron + 动作登记"),
+    COL_JOBS("作业队列", "长任务登记与状态"),
+    COL_FORUM("社区论坛", "本地发帖 / 看帖"),
+    COL_CHARACTERS("酒馆 · 角色卡", "角色名 / 设定 / 开场白"),
+    COL_LOREBOOKS("酒馆 · 世界书", "关键词触发的背景设定"),
+    COL_REGEX("酒馆 · 正则脚本", "文本替换规则"),
+    COL_QUICK_REPLIES("快捷回复", "常用话术一键插入"),
+    COL_RULES("应用规则", "手机操控 allow/ask/deny"),
+    COL_LINKS("分享链接", "托管链接登记"),
+    COL_WORKSPACES("工作区", "目录登记与用途"),
+    SET_INTERFACE("界面与交互", "流式 / 代码块 / 过程折叠"),
+    SET_PRIVACY("隐私与分享", "统计 / 打码 / 读取权限"),
+    SET_NOTIFY("通知设置", "完成 / 确认 / 失败提醒"),
+    SET_VOICE("语音设置", "输入 / 朗读 / 本地优先"),
+    SET_MEDIA("媒体设置", "预览 / 保存 / 压缩"),
+    SET_PERF("性能", "低占用 / 预取 / GPU 回退"),
+    SET_REPLY("回复偏好", "思考 / 语言 / 引用"),
+    SET_SAFE("安全附加", "只读 / 停止监视 / 三档确认"),
+    SET_WEB("网页模式", "本机网页版 + 外链守卫"),
+
+    // ---- 第二批：会话/内容集合 + 独立动作页 ----
+    COL_FOLDERS("会话文件夹", "会话归类"),
+    COL_BOOKMARKS("书签", "长对话里的位置标记"),
+    COL_BRANCHES("对话分支", "从某条消息分叉"),
+    COL_PRESETS("回复预设", "提示词/参数组合"),
+    COL_PERSONAS("人格面具", "说话风格切换"),
+    COL_PROVIDERS("模型提供方", "API 地址登记（不存密钥）"),
+    COL_SUBSCRIPTIONS("订阅与用量", "套餐与额度"),
+    COL_REPORTS("检查报告", "审查结论与建议"),
+    COL_RUNS("运行记录", "长跑输入与结果"),
+    SHARECODE("分享码", "配置编解码"),
+    NETDETAIL("网络详情", "地址 / 直连 / DDNS"),
+    ACCESSWALK("权限引导", "通道与缺权明细"),
+    VERIFY("验证", "口令自检"),
+    TERMKEYS("终端快捷命令", "常用命令一键填"),
+    CREDITS("许可与致谢", "开源组件清单"),
+    UPDATE("更新", "版本与本次变更"),
+
+    // ---- 第三批：内容呈现 + 交互工具 ----
+    RENDER("富文本渲染预览", "代码块/表格/数学/diff 分类"),
+    TRAJECTORY("过程轨迹", "动作序列逐步看"),
+    ARTIFACT("产物", "链接与报告聚合"),
+    DICE("骰子", "真随机数 + 历史"),
+    STORYBOOK("故事书", "逐页翻看"),
+    FORUMCOMPOSE("论坛 · 发帖与搜索", "写帖 + 过滤"),
+    SETSEARCH("设置搜索", "一次搜遍开关与模块"),
+    QUICKPANEL("快捷面板", "下拉快捷项定制"),
+
+    // ---- 第四批：手机内置代码运行时（自包含 Linux，不依赖 Termux）----
+    WORKBENCH("代码工作台", "写代码 · 跑脚本 · 看输出"),
+    MINIAPP("小应用工坊", "HTML/JS 本机预览与导出"),
+    TASKAGENT("自主任务", "手机自己跑完一组动作"),
+    WORKSPACE("工作区文件", "本地代码与产物管理"),
+    RUNTIME("Linux 运行时", "Alpine 用户态 / PRoot 状态"),
+    CODEHISTORY("运行历史", "代码与命令回执"),
+
+    // ---- 第五批：IDE 层（编辑器 / 终端 / 工具链 / 脚手架）----
+    CODEEDITOR("代码编辑器", "行号着色 · 查找替换 · 多文件"),
+    SETERMINAL("会话终端", "命令历史 · 快捷命令 · 连续会话"),
+    TOOLCHAIN("工具链自检", "逐条查可用命令 · apk 安装"),
+    SCAFFOLD("项目脚手架", "一键生成一组真文件"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -829,6 +908,11 @@ private fun App() {
                 Overlay.PEERS -> PeersScreen()
                 Overlay.NOTIFS -> NotificationsScreen()
                 Overlay.REMOTE -> RemoteConsoleScreen(onBack = { overlay = null })
+                // 成批补齐的模块集中在一个路由里，避免 MainActivity 里再铺 35 个分支。
+                // 传枚举名字符串：Overlay 是本文件 private，独立路由文件用它做 when 分发即可。
+                else -> FeatureOverlayRoute(ov?.name.orEmpty()) { key ->
+                    Overlay.entries.firstOrNull { it.name == key }?.let { overlay = it }
+                }
             }
         }
     }
@@ -1047,6 +1131,21 @@ private fun AppDrawer(
             item { DrawerItem(Icons.Filled.Search, "全局搜索", "会话/资源/工具") { onOpen(Overlay.SEARCH) } }
             item { DrawerItem(Icons.Filled.Settings, "备份与恢复", "本地数据打包带走") { onOpen(Overlay.BACKUP) } }
             item { DrawerItem(Icons.Filled.Assignment, "事件中心", "本机动作审计") { onOpen(Overlay.EVENTS) } }
+            item { DrawerGroup("代码与运行时（手机自己跑）") }
+            item { DrawerItem(Icons.Filled.Build, "代码工作台", "写代码 · 跑脚本 · 看输出") { onOpen(Overlay.WORKBENCH) } }
+            item { DrawerItem(Icons.Filled.Build, "小应用工坊", "手机里编写并运行小应用") { onOpen(Overlay.MINIAPP) } }
+            item { DrawerItem(Icons.Filled.Assignment, "自主任务", "自己跑完一组动作 + 轨迹") { onOpen(Overlay.TASKAGENT) } }
+            item { DrawerItem(Icons.Filled.Settings, "Linux 运行时", "Alpine 用户态 / PRoot 状态") { onOpen(Overlay.RUNTIME) } }
+            item { DrawerItem(Icons.Filled.Build, "代码编辑器", "行号着色 / 查找替换") { onOpen(Overlay.CODEEDITOR) } }
+            item { DrawerItem(Icons.Filled.Build, "会话终端", "连续命令 + 历史") { onOpen(Overlay.SETERMINAL) } }
+            item { DrawerItem(Icons.Filled.Assignment, "工具链 / 脚手架", "环境自检 · 一键建项目") { onOpen(Overlay.TOOLCHAIN) } }
+            item { DrawerGroup("能力工作台（对照 DSH Go 补齐）") }
+            item { DrawerItem(Icons.Filled.Explore, "全部新模块", "${FeatureHub.count} 个 · 按板块索引") { onOpen(Overlay.HUB) } }
+            item { DrawerItem(Icons.Filled.Person, "桌宠", "形象 / 台词 / 悬浮") { onOpen(Overlay.PETS) } }
+            item { DrawerItem(Icons.Filled.Build, "终端", "手机 shell 命令") { onOpen(Overlay.TERMINAL) } }
+            item { DrawerItem(Icons.Filled.Devices, "Bot / 团队 / 插件", "智能体与协作") { onOpen(Overlay.COL_BOTS) } }
+            item { DrawerItem(Icons.Filled.Person, "酒馆 · 角色", "角色卡 / 世界书") { onOpen(Overlay.COL_CHARACTERS) } }
+            item { DrawerItem(Icons.Filled.Assignment, "日程 / 作业", "任务登记") { onOpen(Overlay.COL_SCHEDULES) } }
             item { DrawerGroup("对等网络") }
             item { DrawerItem(Icons.Filled.PhoneAndroid, "双机互联", "直连服务 + 集群名册") { onOpen(Overlay.PEERS) } }
             item { DrawerItem(Icons.Filled.Devices, "远程控制台", "直连控制手机/电脑") { onOpen(Overlay.REMOTE) } }

@@ -164,6 +164,55 @@ object PhoneMcp {
             sideEffect = true,
         ),
         McpTool(
+            "self_code_runtime", "读手机内置 Linux 运行时状态（引擎、rootfs、proot、工作区占用）。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_code_files", "列出手机代码工作区里的文件。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_code_read", "读手机代码工作区里某个文件的文本。",
+            schema(mapOf("name" to prop("string", "文件名")), listOf("name")),
+        ),
+        McpTool(
+            "self_code_write", "把一段代码写进手机代码工作区（不执行）。",
+            schema(mapOf(
+                "name" to prop("string", "文件名"),
+                "code" to prop("string", "代码内容"),
+                "lang" to prop("string", "sh / py / js / html，默认 sh"),
+            ), listOf("name", "code")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_code_run", "在手机上跑一段代码：shell 开箱可用，Python/Node 需 Linux 用户态。",
+            schema(mapOf(
+                "code" to prop("string", "代码内容"),
+                "lang" to prop("string", "sh / py / js / html，默认 sh"),
+                "name" to prop("string", "保存的文件名，可省"),
+                "args" to prop("string", "附在命令后的参数"),
+                "timeout_ms" to prop("integer", "超时毫秒，默认 15000"),
+            ), listOf("code")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_code_command", "在手机上执行一条原始 shell 命令（工作区为当前目录）。",
+            schema(mapOf(
+                "command" to prop("string", "要执行的命令"),
+                "timeout_ms" to prop("integer", "超时毫秒，默认 15000"),
+            ), listOf("command")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_code_task", "让手机自己跑一组预设步骤（体检/清单/搭骨架/生成网页/清理）。",
+            schema(mapOf("key" to prop("string", "probe/manifest/scaffold/page/cleanup"))),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_code_history", "读手机最近 20 条代码运行记录。",
+            schema(emptyMap()),
+        ),
+        McpTool(
             "self_battery_status", "电量、充电、省电模式、是否在电池优化白名单。",
             schema(emptyMap()),
         ),
@@ -589,6 +638,9 @@ object PhoneMcp {
         if (mcpName.startsWith("cloud_")) return cloudTool(mcpName, args)
         // 联网同一个道理：能不能上网和「无障碍通没通」是两件事。
         if (mcpName.startsWith("web_")) return WebTool.run(mcpName, args)
+        // 代码运行时：与界面无关，不走 PhoneSelf 的无障碍分派；
+        // 局域网对端（电脑 / 另一台手机）可直接让这台手机写代码、跑脚本、跑任务。
+        if (mcpName.startsWith("self_code_")) return CodeMcp.run(mcpName, args)
         val selfName = when (mcpName) {
             "self_status" -> "self.status"
             "self_ui_dump" -> "self.ui.dump"

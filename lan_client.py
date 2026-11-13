@@ -105,7 +105,7 @@ def call(target, token, tool, args=None, timeout=30.0):
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": tool, "arguments": args or {}},
         }
-        _write_line(s, json.dumps(req, ensure_ascii=False))
+        _write_line(s, json.dumps(req, ensure_ascii=True))
         line = _read_line(s)
         if not line:
             raise RuntimeError("对端没回包（连接被关）")
@@ -164,7 +164,7 @@ def main():
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": args.tool, "arguments": argobj},
         }
-        _write_line(s, json.dumps(req, ensure_ascii=False))
+        _write_line(s, json.dumps(req, ensure_ascii=True))
         line = _read_line(s)
         if not line:
             print("对端没回包（连接被关）", file=sys.stderr)
