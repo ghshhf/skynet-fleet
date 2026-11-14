@@ -6,11 +6,14 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -52,11 +55,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
@@ -100,6 +106,101 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
 
     // 控制表单
     var argStr by remember { mutableStateOf("{}") }
+
+    // ---- 手机遥控：看屏 → 直接在图上点/划/打字 ----
+    var live by remember { mutableStateOf(false) }
+    var liveImg by remember { mutableStateOf<ImageBitmap?>(null) }
+    var liveErr by remember { mutableStateOf("") }
+    var actErr by remember { mutableStateOf("") }
+    var liveNote by remember { mutableStateOf("") }
+    var liveBusy by remember { mutableStateOf(false) }
+    var scrW by remember { mutableStateOf(0) }
+    var scrH by remember { mutableStateOf(0) }
+    var typed by remember { mutableStateOf("") }
+
+    fun callPeer(p: PeerBook.Peer, tool: String, args: JSONObject, timeoutMs: Int = 30_000): LanClient.Reply =
+        LanClient.call(LanProto.Target(p.host, p.port), p.token, LanProto.toolRequest(tool, args), timeoutMs)
+
+    /** 拉一帧对端屏幕；不知道对端分辨率时先问一次 self_status。 */
+    fun pullScreen(p: PeerBook.Peer) {
+        if (liveBusy) return
+        liveBusy = true
+        val knownW = scrW
+        val knownH = scrH
+        scope.launch(Dispatchers.IO) {
+            var w = knownW
+            var h = knownH
+            if (w <= 0 || h <= 0) {
+                val st = callPeer(p, "self_status", JSONObject(), 10_000)
+                if (!st.ok) {
+                    withContext(Dispatchers.Main) {
+                        liveBusy = false
+                        liveErr = "读对端状态失败：${st.err}"
+                    }
+                    return@launch
+                }
+                val size = RemoteScreen.parseScreenSize(st.text)
+                if (size != null) {
+                    w = size.first
+                    h = size.second
+                }
+            }
+            val shot = callPeer(p, "self_ui_screenshot", JSONObject().put("max", 1080), 20_000)
+            val (txt, img) = if (shot.ok) parseReply(shot.text) else (null to null)
+            withContext(Dispatchers.Main) {
+                liveBusy = false
+                if (img != null) {
+                    liveImg = img
+                    liveErr = ""
+                    liveNote = txt.orEmpty().lineSequence().firstOrNull().orEmpty()
+                    if (w > 0 && h > 0) { scrW = w; scrH = h }
+                } else {
+                    liveErr = if (!shot.ok) shot.err.ifBlank { "截图失败" }
+                    else "对端回包拿不到图片：${txt.orEmpty().take(120)}"
+                }
+            }
+        }
+    }
+
+    /** 做一次遥控动作，稍等对端渲染后再拉一帧，让人马上看到结果。 */
+    fun remoteAct(p: PeerBook.Peer, tool: String, args: JSONObject) {
+        scope.launch(Dispatchers.IO) {
+            val r = callPeer(p, tool, args, 20_000)
+            withContext(Dispatchers.Main) {
+                actErr = if (r.ok) "" else "${tool} 失败：${r.err}"
+                if (r.ok) {
+                    delay(260)
+                    pullScreen(p)
+                }
+            }
+        }
+    }
+
+    fun remoteTap(p: PeerBook.Peer, px: Float, py: Float, viewW: Float, viewH: Float, img: ImageBitmap) {
+        val pt = RemoteScreen.mapToScreen(px, py, viewW, viewH, img.width, img.height, scrW, scrH)
+        if (pt == null) {
+            liveErr = "还没拿到对端屏幕分辨率（点「刷新」重试），这次点击没发出去"
+            return
+        }
+        remoteAct(p, "self_ui_tap_at", JSONObject().put("x", pt.first).put("y", pt.second))
+    }
+
+    fun remoteSwipe(
+        p: PeerBook.Peer, sx: Float, sy: Float, ex: Float, ey: Float,
+        viewW: Float, viewH: Float, img: ImageBitmap,
+    ) {
+        val a = RemoteScreen.mapToScreen(sx, sy, viewW, viewH, img.width, img.height, scrW, scrH)
+        val b = RemoteScreen.mapToScreen(ex, ey, viewW, viewH, img.width, img.height, scrW, scrH)
+        if (a == null || b == null) {
+            liveErr = "还没拿到对端屏幕分辨率（点「刷新」重试），这次滑动没发出去"
+            return
+        }
+        remoteAct(
+            p, "self_ui_swipe",
+            JSONObject().put("x1", a.first).put("y1", a.second)
+                .put("x2", b.first).put("y2", b.second).put("duration", 320),
+        )
+    }
 
     fun reload() {
         peers = LanHub.peers()
@@ -188,6 +289,114 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
         LanHub.peerRemove(mapOf("name" to name))
         reload()
         if (selected?.name == name) { selected = null; meta = null }
+    }
+
+    // ---- 全屏遥控：整页只放对端画面，点哪点哪 ----
+    val peer = selected
+    if (live && peer != null) {
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { live = false }) {
+                    Icon(Icons.Filled.ArrowBack, "退出遥控")
+                }
+                Column(Modifier.weight(1f)) {
+                    Text("遥控 ${peer.name}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface)
+                    Text(
+                        when {
+                            actErr.isNotBlank() -> actErr
+                            liveBusy -> "拉屏中…"
+                            liveErr.isNotBlank() -> liveErr
+                            liveNote.isNotBlank() -> liveNote
+                            else -> "点图即点屏 · 拖动即滑动"
+                        },
+                        fontSize = 10.5.sp, maxLines = 2,
+                        color = if (actErr.isNotBlank() || liveErr.isNotBlank())
+                            MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = { pullScreen(peer) }, enabled = !liveBusy) { Text("刷新") }
+            }
+            Spacer(Modifier.height(6.dp))
+            Box(
+                Modifier.fillMaxWidth().weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                val img = liveImg
+                if (img == null) {
+                    Text(if (liveBusy) "正在取对端画面…" else "还没有画面，点右上「刷新」",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    Image(
+                        img, "对端屏幕",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(peer.name, img, scrW, scrH) {
+                                detectTapGestures { off ->
+                                    remoteTap(peer, off.x, off.y,
+                                        size.width.toFloat(), size.height.toFloat(), img)
+                                }
+                            }
+                            .pointerInput(peer.name, img, scrW, scrH) {
+                                var sx = 0f; var sy = 0f
+                                var lx = 0f; var ly = 0f
+                                var moved = false
+                                detectDragGestures(
+                                    onDragStart = { o ->
+                                        sx = o.x; sy = o.y; lx = o.x; ly = o.y; moved = false
+                                    },
+                                    onDrag = { ch, d ->
+                                        ch.consume(); lx += d.x; ly += d.y; moved = true
+                                    },
+                                    onDragEnd = {
+                                        if (moved) {
+                                            remoteSwipe(peer, sx, sy, lx, ly,
+                                                size.width.toFloat(), size.height.toFloat(), img)
+                                        }
+                                    },
+                                )
+                            },
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                RemoteKey("返回") { remoteAct(peer, "self_ui_key", JSONObject().put("key", "back")) }
+                RemoteKey("桌面") { remoteAct(peer, "self_ui_key", JSONObject().put("key", "home")) }
+                RemoteKey("任务") { remoteAct(peer, "self_ui_key", JSONObject().put("key", "recents")) }
+                RemoteKey("通知") { remoteAct(peer, "self_ui_key", JSONObject().put("key", "notifications")) }
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    typed, { typed = it }, singleLine = true,
+                    modifier = Modifier.weight(1f), textStyle = TextStyle(fontSize = 12.sp),
+                    placeholder = { Text("打进对端当前输入框", fontSize = 11.sp) },
+                )
+                Spacer(Modifier.width(6.dp))
+                TextButton(
+                    onClick = {
+                        val t = typed.trim()
+                        if (t.isNotEmpty()) {
+                            remoteAct(peer, "self_ui_text", JSONObject().put("text", t))
+                            typed = ""
+                        }
+                    },
+                    enabled = !liveBusy,
+                ) {
+                    Icon(Icons.Filled.Send, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("发送")
+                }
+            }
+        }
+        return
     }
 
     Column(
@@ -363,107 +572,61 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
                 Text("工具表（$toolCount）", fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface)
                 val isPhone = (0 until toolCount).any { toolsArr?.optString(it) == "self_ui_screenshot" }
-                // 手机对端：快捷控制
+                // 手机对端：进全屏遥控 —— 看对端画面，直接在图上点/划/打字
                 if (isPhone) {
                     Spacer(Modifier.height(6.dp))
                     Row {
-                        QuickControlButton("截图", Icons.Filled.Photo) { doCall(p, "self_ui_screenshot", "{}") }
+                        QuickControlButton("遥控这台手机", Icons.Filled.TouchApp) {
+                            liveImg = null
+                            liveErr = ""
+                            actErr = ""
+                            liveNote = ""
+                            live = true
+                            pullScreen(p)
+                        }
                         Spacer(Modifier.width(6.dp))
-                        QuickControlButton("回桌面", Icons.Filled.TouchApp) { doCall(p, "self_ui_key", JSONObject().put("key","home").toString()) }
-                        Spacer(Modifier.width(6.dp))
-                        QuickControlButton("返回", Icons.Filled.ArrowBack) { doCall(p, "self_ui_key", JSONObject().put("key","back").toString()) }
-                    }
-Spacer(Modifier.height(6.dp))
-                // 电脑端信息/窗口（由对端即 PC 侧 pcctl.* 返回）
-                if (isPhone) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { doCall(p, "pcctl.sysinfo", "{}") }) { "系统信息" }
-                        Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { doCall(p, "pcctl.windows", "{}") }) { "窗口列表" }
-                    }
-                    Spacer(Modifier.height(6.dp))
-                }
-                Text("按坐标点（x,y）：", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    var xy by remember { mutableStateOf("500,800") }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(xy, { xy = it }, singleLine = true,
-                            modifier = Modifier.weight(1f), textStyle = TextStyle(fontSize = 12.sp))
-                        Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = {
-                            val parts = xy.split(",").map { it.trim().toIntOrNull() ?: 0 }
-                            if (parts.size >= 2) doCall(p, "self_ui_tap_at",
-                                JSONObject().put("x", parts[0]).put("y", parts[1]).toString())
-                        }) {
-                            Icon(Icons.Filled.TouchApp, null, Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp)); Text("点")
+                        QuickControlButton("截一张", Icons.Filled.Photo) {
+                            doCall(p, "self_ui_screenshot", "{}")
                         }
                     }
                     Spacer(Modifier.height(6.dp))
-                    Text("滑动（x1,y1 -> x2,y2）：", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    var sw by remember { mutableStateOf("500,800,500,300") }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(sw, { sw = it }, singleLine = true,
-                            modifier = Modifier.weight(1f), textStyle = TextStyle(fontSize = 12.sp))
-                        Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = {
-                            val a = sw.split(",").map { it.trim().toIntOrNull() ?: 0 }
-                            if (a.size >= 4) doCall(p, "self_ui_swipe",
-                                JSONObject().put("x1", a[0]).put("y1", a[1])
-                                    .put("x2", a[2]).put("y2", a[3]).toString())
-                        }) {
-                            Icon(Icons.Filled.Send, null, Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp)); Text("滑")
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                }
-                // 鼠标键盘远程控制（由对端即 PC 侧 pcctl.* 返回）
-                if (isPhone) {
+                    Text("遥控页里：点图 = 点对端屏幕，拖动 = 滑动，底部可打字。",
+                        fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(6.dp))
+                } else {
+                    // 电脑端：由对端 pcctl.* 提供
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { doCall(p, "pcctl.mouse", """{"action":"move","x":0,"y":0}""") }) { "鼠标移动" }
+                        TextButton(onClick = { doCall(p, "pcctl.sysinfo", "{}") }) { Text("系统信息") }
                         Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { doCall(p, "pcctl.mouse", """{"action":"click"}""") }) { "鼠标点击" }
-                        Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { doCall(p, "pcctl.mouse", """{"action":"drag","from":[0,0],"to":[100,100]}""") }) { "鼠标拖拽" }
+                        TextButton(onClick = { doCall(p, "pcctl.windows", "{}") }) { Text("窗口列表") }
                     }
                     Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { doCall(p, "pcctl.input", """{"action":"key","keys":"ctrl+c"}""") }) { "键盘复制" }
+                        TextButton(onClick = { doCall(p, "pcctl.mouse", """{"action":"move","x":0,"y":0}""") }) { Text("鼠标移动") }
                         Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { doCall(p, "pcctl.input", """{"action":"key","keys":"ctrl+v"}""") }) { "键盘粘贴" }
+                        TextButton(onClick = { doCall(p, "pcctl.mouse", """{"action":"click"}""") }) { Text("鼠标点击") }
                         Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { doCall(p, "pcctl.input", """{"action":"key","keys":"enter"}""") }) { "键盘回车" }
+                        TextButton(onClick = { doCall(p, "pcctl.mouse", """{"action":"drag","from":[0,0],"to":[100,100]}""") }) { Text("鼠标拖拽") }
                     }
                     Spacer(Modifier.height(6.dp))
-                }
-                // 进程管理（由对端即 PC 侧 pcctl.proc.* 返回）
-                if (isPhone) {
-                    Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { doCall(p, "pcctl.proc.list", "{}") }) { "进程列表" }
+                        TextButton(onClick = { doCall(p, "pcctl.input", """{"action":"key","keys":"ctrl+c"}""") }) { Text("键盘复制") }
                         Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { doCall(p, "pcctl.proc.kill", """{"pid":0}""") }) { "结束进程" }
+                        TextButton(onClick = { doCall(p, "pcctl.input", """{"action":"key","keys":"ctrl+v"}""") }) { Text("键盘粘贴") }
+                        Spacer(Modifier.width(6.dp))
+                        TextButton(onClick = { doCall(p, "pcctl.input", """{"action":"key","keys":"enter"}""") }) { Text("键盘回车") }
                     }
                     Spacer(Modifier.height(6.dp))
-                }
-                // 剪贴板同步（由对端即 PC 侧 pcctl.clipboard.* 返回）
-                if (isPhone) {
-                    Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { doCall(p, "pcctl.clipboard.read", "{}") }) { "读剪贴板" }
+                        TextButton(onClick = { doCall(p, "pcctl.proc.list", "{}") }) { Text("进程列表") }
                         Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { doCall(p, "pcctl.clipboard.write", """{"text":""}""") }) { "写剪贴板" }
+                        TextButton(onClick = { doCall(p, "pcctl.proc.kill", """{"pid":0}""") }) { Text("结束进程") }
                     }
                     Spacer(Modifier.height(6.dp))
-                }
-                // 探测对端状态（由 LanHub.peerProbe 返回，刷新电量/工具表/在线标记）
-                if (isPhone) {
-                    Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { probePeer(p) }) { "探测对端" }
+                        TextButton(onClick = { doCall(p, "pcctl.clipboard.read", "{}") }) { Text("读剪贴板") }
                         Spacer(Modifier.width(6.dp))
-                        TextButton(onClick = { reload() }) { "刷新名册" }
+                        TextButton(onClick = { doCall(p, "pcctl.clipboard.write", """{"text":""}""") }) { Text("写剪贴板") }
                     }
                     Spacer(Modifier.height(6.dp))
                 }
@@ -619,6 +782,59 @@ private fun QuickControlButton(label: String, icon: androidx.compose.ui.graphics
             Spacer(Modifier.width(4.dp))
             Text(label, fontSize = 11.5.sp, color = MaterialTheme.colorScheme.primary)
         }
+    }
+}
+
+@Composable
+private fun RemoteKey(label: String, onClick: () -> Unit) {
+    Surface(
+        tonalElevation = 1.dp,
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.clickable { onClick() },
+    ) {
+        Text(label, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
+    }
+}
+
+/**
+ * 遥控屏的纯计算部分：屏幕尺寸解析 + 图上坐标换算。
+ *
+ * 放在一起是为了能在 JVM 单测里直接验：图片按 Fit 缩放后四周会有留白，
+ * 点在留白上不算，落在图上才换算成对端的物理像素。
+ */
+internal object RemoteScreen {
+    /** 从 self_status 的回包文字里取「屏幕：1080×2400」。 */
+    fun parseScreenSize(statusText: String): Pair<Int, Int>? {
+        val m = Regex("屏幕\\s*[:：]\\s*(\\d+)\\s*[×x]\\s*(\\d+)").find(statusText) ?: return null
+        val w = m.groupValues[1].toIntOrNull() ?: return null
+        val h = m.groupValues[2].toIntOrNull() ?: return null
+        return if (w > 0 && h > 0) w to h else null
+    }
+
+    /**
+     * 把控件上的点击点（px,py）换算成对端屏幕像素。
+     * 图片按 Fit 显示：缩放到恰好塞进 viewW×viewH 并居中，留白处返回 null。
+     */
+    fun mapToScreen(
+        px: Float, py: Float,
+        viewW: Float, viewH: Float,
+        imgW: Int, imgH: Int,
+        screenW: Int, screenH: Int,
+    ): Pair<Int, Int>? {
+        if (viewW <= 0f || viewH <= 0f) return null
+        if (imgW <= 0 || imgH <= 0 || screenW <= 0 || screenH <= 0) return null
+        val scale = minOf(viewW / imgW, viewH / imgH)
+        val drawnW = imgW * scale
+        val drawnH = imgH * scale
+        val dx = (viewW - drawnW) / 2f
+        val dy = (viewH - drawnH) / 2f
+        if (px < dx || py < dy || px > dx + drawnW || py > dy + drawnH) return null
+        val u = ((px - dx) / drawnW).coerceIn(0f, 1f)
+        val v = ((py - dy) / drawnH).coerceIn(0f, 1f)
+        val x = (u * screenW).toInt().coerceIn(0, screenW - 1)
+        val y = (v * screenH).toInt().coerceIn(0, screenH - 1)
+        return x to y
     }
 }
 
