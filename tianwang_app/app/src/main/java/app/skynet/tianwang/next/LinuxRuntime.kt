@@ -67,6 +67,10 @@ object LinuxRuntime {
     private const val K_VER = "linux.rootfs.version"
     private const val K_CMDS = "linux.cmds"
     private const val K_CMDS_AT = "linux.cmds.at"
+    /** 探测累计次数，便于判断环境是否被反复重探。 */
+    private const val K_CMDS_CC = "linux.cmds.count"
+    /** 最后一次探测时间戳（毫秒）。 */
+    private const val K_CMDS_LAST = "linux.cmds.last"
 
     /** 当前选用的 rootfs 版本（可被用户/远端配置覆盖）。 */
     fun version(): String = KB.str(K_VER, DEFAULT_VERSION).ifBlank { DEFAULT_VERSION }
@@ -145,7 +149,7 @@ object LinuxRuntime {
         val cnt = runCatching { KB.str(K_CMDS_CC, "0").toInt() }.getOrDefault(0)
         val last = runCatching { KB.str(K_CMDS_LAST, "0").toLong() }.getOrDefault(0L)
         // 若距离上次探测超过了 5 分钟，则重新探测；否则沿用缓存
-        if (cached.isNotBlank() && cnt >= 0 && System.currentTimeMillis() - last < 300_000) {
+        if (cached.isNotBlank() && System.currentTimeMillis() - last < 300_000) {
             return cached.split(',').mapNotNull { it.split('=').takeIf { it.size == 2 } }
                 .associate { it[0] to (it[1] == "1") }
         }
@@ -161,7 +165,10 @@ object LinuxRuntime {
         val newEntries = map.map { "${it.key}=${if (it.value) 1 else 0}" }.joinToString(",")
         KB.setStr(K_CMDS, newEntries)
         KB.setStr(K_CMDS_CC, (cnt + 1).toString())
-        KB.setStr(K_CMDS_LAST, System.currentTimeMillis().toString())
+        val now = System.currentTimeMillis().toString()
+        KB.setStr(K_CMDS_LAST, now)
+        // 旧键同步写入，避免历史读取方拿到空值。
+        KB.setStr(K_CMDS_AT, now)
         return map
     }
 
