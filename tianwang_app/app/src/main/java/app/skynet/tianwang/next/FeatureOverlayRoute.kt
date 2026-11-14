@@ -104,6 +104,12 @@ fun FeatureOverlayRoute(name: String, onOpen: (String) -> Unit) {
         "APPLIST" -> AppListScreen()
         "CMDFAV" -> CommandFavScreen()
 
+        // 第九批：手机实体工具（存储 / 属性 / 传感器 / 电池）
+        "STORAGE" -> StorageAnalysisScreen()
+        "PROPS" -> DevicePropsScreen()
+        "SENSORS" -> SensorScreen()
+        "BATTERY" -> BatteryScreen()
+
         // 未知名字不白屏：退回工作台目录，人还能从这再点进去。
         else -> FeatureHubScreen(onOpen)
     }

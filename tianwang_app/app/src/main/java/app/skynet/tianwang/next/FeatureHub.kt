@@ -123,6 +123,10 @@ object FeatureHub {
             HubEntry("本机日志", "logcat 抓取 / 过滤 / 保存", "LOGCAT"),
             HubEntry("应用列表", "已装第三方应用 · 点一下复制包名", "APPLIST"),
             HubEntry("命令收藏", "常用 shell 命令本机存储 · 一键执行", "CMDFAV"),
+            HubEntry("存储分析", "目录体积 / 文件数 · 清本应用缓存", "STORAGE"),
+            HubEntry("本机属性", "getprop 构建 / 运行环境 / 网络", "PROPS"),
+            HubEntry("传感器清单", "机身传感器类型 / 供应商 / 量程", "SENSORS"),
+            HubEntry("电量与电池", "电量 / 健康 / 温度 / 电压", "BATTERY"),
         )),
     )
 

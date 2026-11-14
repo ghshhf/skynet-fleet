@@ -362,6 +362,12 @@ private enum class Overlay(val title: String, val sub: String) {
     // ---- 第八批：手机实体工具（应用管理 / 命令收藏）----
     APPLIST("应用列表", "已装第三方应用 · 点一下复制包名"),
     CMDFAV("命令收藏", "常用 shell 命令本机存储 · 一键执行"),
+
+    // ---- 第九批：手机实体工具（存储 / 属性 / 传感器 / 电池）----
+    STORAGE("存储分析", "目录体积 / 文件数 · 清本应用缓存"),
+    PROPS("本机属性", "getprop 构建 / 运行环境 / 网络"),
+    SENSORS("传感器清单", "机身传感器类型 / 供应商 / 量程"),
+    BATTERY("电量与电池", "电量 / 健康 / 温度 / 电压"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
