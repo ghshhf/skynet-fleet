@@ -165,8 +165,16 @@ fun RuntimeSetupScreen() {
             Text(s.note, fontSize = 11.sp, lineHeight = 16.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(6.dp))
+            FeatureKV("架构", if (s.archSupported) s.arch else "${s.arch}（不支持）")
             FeatureKV("Alpine rootfs", if (s.rootfsReady) "已就绪" else "未安装")
-            FeatureKV("PRoot 二进制", if (s.prootReady) "有" else "无")
+            FeatureKV("PRoot", "${if (s.prootReady) "有 · " else "无 · "}${s.prootSource}")
+            FeatureKV("镜像源", s.mirror)
+            FeatureKV("可用空间", "${s.spaceFreeBytes / 1024 / 1024} MB")
+            val py = s.available["python3"]; val nd = s.available["node"]
+            FeatureKV("python3",
+                if (s.engine == "alpine-proot") (if (py == true) "已装" else "需 apk add") else "仅完整发行版")
+            FeatureKV("node",
+                if (s.engine == "alpine-proot") (if (nd == true) "已装" else "需 apk add") else "仅完整发行版")
             FeatureKV("下载包", "${s.archiveBytes / 1024} KB")
             FeatureKV("用户态", "${s.rootfsBytes / 1024} KB")
             FeatureKV("工作区", "${s.workspaceBytes / 1024} KB")
@@ -176,14 +184,16 @@ fun RuntimeSetupScreen() {
         Spacer(Modifier.height(10.dp))
         FeatureSection("安装 / 升级 Linux 用户态")
         FeatureCard {
-            Text("来源：Alpine 官方 CDN（arm64 minirootfs，约 3.8 MB）", fontSize = 11.sp,
+            Text("来源：Alpine 官方 CDN，自动按本机架构选镜像（${if (s.archSupported) s.arch else "不支持"}）" +
+                "，清华 / 阿里云镜像兜底（约 3.8 MB）。", fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurface)
             Spacer(Modifier.height(3.dp))
-            Text(LinuxRuntime.ROOTFS_URL, fontSize = 9.5.sp,
+            Text(s.rootfsUrl, fontSize = 9.5.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(3.dp))
-            Text("校验：下载官方 .sha256 交叉核对，不通过就不解压。", fontSize = 10.5.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("自适应：装之前先看剩余空间，架构不支持或空间不足会直接拒；" +
+                "校验取官方 .sha256 交叉核对，不通过就不解压，离线取不到校验值也拒装。",
+                fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(4.dp))
             if (progress.isNotBlank()) {
                 Text(progress, fontSize = 10.5.sp, color = MaterialTheme.colorScheme.primary)

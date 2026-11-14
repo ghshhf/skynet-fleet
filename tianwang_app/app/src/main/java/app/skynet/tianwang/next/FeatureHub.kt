@@ -114,6 +114,10 @@ object FeatureHub {
             HubEntry("更新日志", "这一版加了什么", "CHANGELOG"),
             HubEntry("用量与状态", "工具数 / 名册 / 直连快照", "USAGE"),
         )),
+        HubGroup("手机实体工具", listOf(
+            HubEntry("系统体检", "CPU/内存/电池/存储/屏幕", "SYSINFO"),
+            HubEntry("文件管理器", "浏览 / 查看 / 删除 / 复制路径", "FILEMAN"),
+        )),
     )
 
     val count: Int get() = groups.sumOf { it.entries.size }

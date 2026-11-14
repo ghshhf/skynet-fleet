@@ -204,11 +204,13 @@ object CodeEngine {
         if (lang == Lang.HTML) {
             return RunOutcome("preview", "网页小应用请在「小应用工坊」里预览；这里不执行 HTML。", false, 0L)
         }
-        if (lang.needsLinux && LinuxRuntime.prootBinary() == null) {
+        if (lang.needsLinux && (LinuxRuntime.prootBinary() == null || !LinuxRuntime.rootfsReady())) {
+            val why = if (!LinuxRuntime.rootfsReady()) "Alpine 用户态未安装" else "缺少 proot 二进制"
             return RunOutcome(
                 "android-sh",
-                "这条需要完整 Linux 用户态（${lang.label}）。当前没有 proot 二进制，" +
-                    "手机默认跑 Android 自带 shell；请先装 Alpine 用户提供 proot，或改用 Shell 脚本。",
+                "这条需要完整 Linux 用户态（${lang.label}）。当前：$why；" +
+                    "请在「代码工作台 → Linux 运行时」安装用户态并准备 proot，或改用 Shell 脚本。" +
+                    "（即使进了 Alpine，python3 / node 也需联网 apk add，默认不含。）",
                 false, 0L,
             )
         }

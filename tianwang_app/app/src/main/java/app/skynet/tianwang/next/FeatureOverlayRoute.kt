@@ -90,6 +90,10 @@ fun FeatureOverlayRoute(name: String, onOpen: (String) -> Unit) {
         "TOOLCHAIN" -> ToolchainScreen(onOpen)
         "SCAFFOLD" -> ScaffoldScreen(onOpen)
 
+        // 第六批：手机实体工具
+        "SYSINFO" -> SysInfoScreen()
+        "FILEMAN" -> FileManagerScreen()
+
         // 未知名字不白屏：退回工作台目录，人还能从这再点进去。
         else -> FeatureHubScreen(onOpen)
     }

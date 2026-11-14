@@ -348,6 +348,10 @@ private enum class Overlay(val title: String, val sub: String) {
     SETERMINAL("会话终端", "命令历史 · 快捷命令 · 连续会话"),
     TOOLCHAIN("工具链自检", "逐条查可用命令 · apk 安装"),
     SCAFFOLD("项目脚手架", "一键生成一组真文件"),
+
+    // ---- 第六批：手机实体工具（系统自检 + 存储浏览）----
+    SYSINFO("系统体检", "CPU/内存/电池/存储/屏幕"),
+    FILEMAN("文件管理器", "浏览 / 查看 / 删除 / 复制路径"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
