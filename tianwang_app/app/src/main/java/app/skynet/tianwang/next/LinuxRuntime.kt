@@ -67,6 +67,11 @@ object LinuxRuntime {
     private const val K_VER = "linux.rootfs.version"
     private const val K_CMDS = "linux.cmds"
     private const val K_CMDS_AT = "linux.cmds.at"
+    private const val K_CMDS_CC = "linux.cmds.cc"     // 探测计数
+    private const val K_CMDS_LAST = "linux.cmds.last"  // 最后探测时间戳
+    private const val K_PROBE_SUCC = "linux.probe.succ" // 探测成功计数
+    private const val K_PROBE_FAIL = "linux.probe.fail" // 探测失败计数
+    private const val K_PROBE_FRESH = "linux.probe.fresh" // 是否显式刷新
 
     /** 当前选用的 rootfs 版本（可被用户/远端配置覆盖）。 */
     fun version(): String = KB.str(K_VER, DEFAULT_VERSION).ifBlank { DEFAULT_VERSION }
@@ -97,14 +102,39 @@ object LinuxRuntime {
     private fun rootfsShaUrl(arch: String, ver: String, mirror: String): String =
         rootfsUrl(arch, ver, mirror) + ".sha256"
 
-    enum class ProotSource { APK, IMPORTED, NONE }
+    enum class ProotSource { APK, IMPORTED, NONE, DISCOVERED }
 
-    /** proot 来源：APK 内置 nativeLibraryDir 的 libproot.so / 用户导入到 runtime/bin / 无。 */
+    /** 探测已下载的 rootfs 目录中是否存在 proot binary（子目录 bin/ 与 lib/）。 */
+    private fun discoverProotInDir(dir: File): Boolean {
+        if (!dir.isDirectory) return false
+        // 检查 bin/ 目录
+        val binDir = File(dir, "bin")
+        if (binDir.isDirectory) {
+            val prootInBin = binDir.listFiles()?.firstOrNull { it.name.startsWith("proot") && it.canExecute() }
+            if (prootInBin != null) return true
+        }
+        // 检查 lib/ 目录（部分打包方式会放 lib/）
+        val libDir = File(dir, "lib")
+        if (libDir.isDirectory) {
+            val prootInLib = libDir.listFiles()?.firstOrNull { it.name.startsWith("proot") && it.canExecute() }
+            if (prootInLib != null) return true
+        }
+        // 检查最顶层（有的压包直接把二进制放根目录）
+        if (dir.canExecute() && !dir.name.startsWith(".")) {
+            if (dir.listFiles()?.any { it.name.startsWith("proot") && it.canExecute() } == true) return true
+        }
+        return false
+    }
+
+    /** proot 来源：APK 内置 / 用户导入 / 已下载 rootfs 中自动发现 / 无。 */
     fun prootSource(): ProotSource {
         val apk = File(App.ctx.applicationInfo.nativeLibraryDir, "libproot.so")
         if (apk.isFile && apk.canExecute()) return ProotSource.APK
         val imported = File(runtimeDir(), "bin/proot")
         if (imported.isFile && imported.canExecute()) return ProotSource.IMPORTED
+        // 尝试从已下载的 minirootfs 中发现
+        val rootfsDir = rootfsDir()
+        if (rootfsDir.isDirectory && discoverProotInDir(rootfsDir)) return ProotSource.DISCOVERED
         return ProotSource.NONE
     }
 
@@ -137,13 +167,23 @@ object LinuxRuntime {
         val sha: String,
         val installedAt: Long,
         val note: String,
-    )
+        /** 最后一次探测的时间戳（Unix 毫秒） */
+        val lastProbeAt: Long,
+        /** 探测成功计数（命令至少有一条可用） */
+        val probeSuccessCount: Int,
+        /** 探测失败计数（上一次探测中没有任何命令可用） */
+        val probeFailCount: Int,
+    }
 
-    /** 探测 android 层可用命令（带缓存，60s 过期），不执行完整发行版内的探测以免拖慢。 */
+    /** 探测 android 层可用命令（计数 + 显式刷新），不执行完整发行版内的探测以免拖慢。 */
     private fun probeAndroidCommands(): Map<String, Boolean> {
         val cached = KB.str(K_CMDS, "")
-        val at = runCatching { KB.str(K_CMDS_AT, "0").toLong() }.getOrDefault(0L)
-        if (cached.isNotBlank() && System.currentTimeMillis() - at < 60_000) {
+        val cnt = runCatching { KB.str(K_CMDS_CC, "0").toInt() }.getOrDefault(0)
+        val last = runCatching { KB.str(K_CMDS_LAST, "0").toLong() }.getOrDefault(0L)
+        // 若本轮已显式刷新或距离上次探测超过了阈值（可配），则重新探测
+        val shouldRefresh = KB.str(K_PROBE_FRESH, "0").toBoolean()
+        if (!shouldRefresh && cached.isNotBlank() && cnt > 0 && System.currentTimeMillis() - last < 300_000) {
+            // 缓存有效：返回已有的，并累加计数（防止同一轮多次调用导致计数异常）
             return cached.split(',').mapNotNull { it.split('=').takeIf { it.size == 2 } }
                 .associate { it[0] to (it[1] == "1") }
         }
@@ -155,9 +195,21 @@ object LinuxRuntime {
             val p = line.trim().split('=')
             if (p.size == 2) map[p[0]] = p[1] == "1"
         }
-        KB.setStr(K_CMDS, map.map { "${it.key}=${if (it.value) 1 else 0}" }.joinToString(","))
-        KB.setStr(K_CMDS_AT, System.currentTimeMillis().toString())
+        // 写入缓存：键值对、本轮计数 +1、最后探测时间、探测成功/失败计数
+        val newEntries = map.map { "${it.key}=${if (it.value) 1 else 0}" }.joinToString(",")
+        KB.setStr(K_CMDS, newEntries)
+        KB.setStr(K_CMDS_CC, (cnt + 1).toString())
+        KB.setStr(K_CMDS_LAST, System.currentTimeMillis().toString())
+        // 若本次探测有至少有一条命令可用，记为成功；否则记为失败
+        val hasAny = map.values.any { it }
+        KB.setStr(K_PROBE_SUCC, if (hasAny) (runCatching { KB.str(K_PROBE_SUCC, "0").toInt() + 1 }.getOrDefault(0) else runCatching { KB.str(K_PROBE_SUCC, "0").toInt() })
+        KB.setStr(K_PROBE_FAIL, if (!hasAny) (runCatching { KB.str(K_PROBE_FAIL, "0").toInt() + 1 }.getOrDefault(0) else runCatching { KB.str(K_PROBE_FAIL, "0").toInt() })
         return map
+    }
+
+    /** 显式刷新命令探测缓存（由 AI 或手动调用，始终重新探测）。 */
+    fun refreshProbe(): Map<String, Boolean> = probeAndroidCommands(forceRefresh = true).also {
+        KB.setStr(K_PROBE_FRESH, "1")
     }
 
     fun status(): Status {
@@ -170,6 +222,10 @@ object LinuxRuntime {
         val note = buildNote(archSupported, rootfs, proot, linux, cmds)
         val mirror = MIRRORS.first()
         val url = rootfsUrl(arch ?: "aarch64", version(), mirror)
+        // 探测相关状态
+        val lastProbe = runCatching { KB.str(K_CMDS_LAST, "0").toLong() }.getOrDefault(0L)
+        val succCnt = runCatching { KB.str(K_PROBE_SUCC, "0").toInt() }.getOrDefault(0)
+        val failCnt = runCatching { KB.str(K_PROBE_FAIL, "0").toInt() }.getOrDefault(0)
         return Status(
             engine = if (linux) "alpine-proot" else "android-sh",
             engineLabel = if (linux) "Alpine Linux（PRoot）" else "Android Linux shell",
@@ -192,6 +248,9 @@ object LinuxRuntime {
             sha = KB.str(K_SHA, ""),
             installedAt = runCatching { KB.str(K_AT, "0").toLong() }.getOrDefault(0L),
             note = note,
+            lastProbeAt = lastProbe,
+            probeSuccessCount = succCnt,
+            probeFailCount = failCnt,
         )
     }
 
