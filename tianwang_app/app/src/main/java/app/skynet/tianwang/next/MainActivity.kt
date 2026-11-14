@@ -368,6 +368,12 @@ private enum class Overlay(val title: String, val sub: String) {
     PROPS("本机属性", "getprop 构建 / 运行环境 / 网络"),
     SENSORS("传感器清单", "机身传感器类型 / 供应商 / 量程"),
     BATTERY("电量与电池", "电量 / 健康 / 温度 / 电压"),
+
+    // ---- 第十批：手机实体工具（流量 / 磁盘 / 字体 / 权限）----
+    TRAFFIC("网络流量", "/proc/net/dev 各接口收发"),
+    DISK("磁盘与挂载", "df -h 各分区用量"),
+    FONTS("字体清单", "/system/fonts 字体文件"),
+    PERMS("应用权限自查", "本应用危险权限授予状态"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

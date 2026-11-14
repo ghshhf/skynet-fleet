@@ -127,6 +127,10 @@ object FeatureHub {
             HubEntry("本机属性", "getprop 构建 / 运行环境 / 网络", "PROPS"),
             HubEntry("传感器清单", "机身传感器类型 / 供应商 / 量程", "SENSORS"),
             HubEntry("电量与电池", "电量 / 健康 / 温度 / 电压", "BATTERY"),
+            HubEntry("网络流量", "/proc/net/dev 各接口收发", "TRAFFIC"),
+            HubEntry("磁盘与挂载", "df -h 各分区用量", "DISK"),
+            HubEntry("字体清单", "/system/fonts 字体文件", "FONTS"),
+            HubEntry("应用权限自查", "本应用危险权限授予状态", "PERMS"),
         )),
     )
 
