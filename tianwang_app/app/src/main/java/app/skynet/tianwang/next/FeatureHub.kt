@@ -114,19 +114,25 @@ object FeatureHub {
             HubEntry("更新日志", "这一版加了什么", "CHANGELOG"),
             HubEntry("用量与状态", "工具数 / 名册 / 直连快照", "USAGE"),
         )),
-        HubGroup("手机实体工具", listOf(
-            HubEntry("系统体检", "CPU/内存/电池/存储/屏幕", "SYSINFO"),
+        // 人日常真会点的那几个。其余模块一律归到下面的「AI 用」，不占人的注意力。
+        HubGroup("人真正常用", listOf(
+            HubEntry("会话终端", "长驻 shell · 能跑长任务 · 边跑边看", "TTYSESSION"),
             HubEntry("文件管理器", "浏览 / 查看 / 删除 / 复制路径", "FILEMAN"),
+            HubEntry("剪贴板", "读取 / 写入 / 本地历史", "CLIPBOARD"),
+            HubEntry("电量与电池", "电量 / 健康 / 温度 / 电压", "BATTERY"),
+            HubEntry("全部能力", "人用 / AI 用一眼分清 · 可按用途筛", "CAPS"),
+        )),
+        // 这些是给 AI 或脚本调的。留着是为了能手动验一下，不是让你日常点。
+        HubGroup("AI 用 · 手机实体工具（一般不用手点）", listOf(
+            HubEntry("系统体检", "CPU/内存/电池/存储/屏幕", "SYSINFO"),
             HubEntry("网络诊断", "连通性 / 网关 / DNS / 接口", "NETDIAG"),
             HubEntry("进程查看", "运行中进程 · 按内存排序 · 结束", "PROC"),
-            HubEntry("剪贴板", "读取 / 写入 / 本地历史", "CLIPBOARD"),
             HubEntry("本机日志", "logcat 抓取 / 过滤 / 保存", "LOGCAT"),
             HubEntry("应用列表", "已装第三方应用 · 点一下复制包名", "APPLIST"),
             HubEntry("命令收藏", "常用 shell 命令本机存储 · 一键执行", "CMDFAV"),
             HubEntry("存储分析", "目录体积 / 文件数 · 清本应用缓存", "STORAGE"),
             HubEntry("本机属性", "getprop 构建 / 运行环境 / 网络", "PROPS"),
             HubEntry("传感器清单", "机身传感器类型 / 供应商 / 量程", "SENSORS"),
-            HubEntry("电量与电池", "电量 / 健康 / 温度 / 电压", "BATTERY"),
             HubEntry("网络流量", "/proc/net/dev 各接口收发", "TRAFFIC"),
             HubEntry("磁盘与挂载", "df -h 各分区用量", "DISK"),
             HubEntry("字体清单", "/system/fonts 字体文件", "FONTS"),

@@ -213,6 +213,49 @@ object PhoneMcp {
             schema(emptyMap()),
         ),
         McpTool(
+            "self_tty_list", "列出长驻 shell 会话：后端、是否在跑、累计输出、当前目录。",
+            schema(emptyMap()),
+        ),
+        McpTool(
+            "self_tty_open", "开一个长驻 shell 会话（stdin 可写、输出流式、不截断到 8KB）。",
+            schema(mapOf(
+                "cwd" to prop("string", "工作目录，空则用应用私有目录"),
+                "pty" to prop("boolean", "要真 tty 就传 true；系统没有 script 会如实回落管道模式"),
+            )),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_tty_write", "往会话写一段输入（默认补回车）。发 \\u0003 可当中断前台命令，不必杀会话。",
+            schema(mapOf(
+                "id" to prop("string", "会话 id，如 s1"),
+                "text" to prop("string", "要写入的内容"),
+                "enter" to prop("boolean", "是否补回车，默认 true"),
+            ), listOf("id", "text")),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_tty_read", "取会话增量输出；since 传上一轮的 cursor，只回新内容。",
+            schema(mapOf(
+                "id" to prop("string", "会话 id"),
+                "since" to prop("integer", "上一轮返回的 cursor，首次传 0"),
+                "max_chars" to prop("integer", "本次最多回多少字，默认 8000，上限 32000"),
+            ), listOf("id")),
+        ),
+        McpTool(
+            "self_tty_close", "关会话：先 TERM，1 秒不退才强杀。不传 id 则关全部。",
+            schema(mapOf("id" to prop("string", "会话 id，留空关全部"))),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_tty_run", "一条命令跑完就取走输出（开→写→边等边收→关），省来往四趟。",
+            schema(mapOf(
+                "command" to prop("string", "要执行的命令"),
+                "cwd" to prop("string", "工作目录"),
+                "wait_ms" to prop("integer", "最多等多久，默认 4000"),
+            ), listOf("command")),
+            sideEffect = true,
+        ),
+        McpTool(
             "self_battery_status", "电量、充电、省电模式、是否在电池优化白名单。",
             schema(emptyMap()),
         ),
@@ -641,6 +684,9 @@ object PhoneMcp {
         // 代码运行时：与界面无关，不走 PhoneSelf 的无障碍分派；
         // 局域网对端（电脑 / 另一台手机）可直接让这台手机写代码、跑脚本、跑任务。
         if (mcpName.startsWith("self_code_")) return CodeMcp.run(mcpName, args)
+        // 会话层：同样跟界面无关。stdin 可写、输出流式、长驻，
+        // 是 apk add / 编译 / 长任务能在手机上真跑起来的前提。
+        if (mcpName.startsWith("self_tty_")) return TtyMcp.run(mcpName, args)
         val selfName = when (mcpName) {
             "self_status" -> "self.status"
             "self_ui_dump" -> "self.ui.dump"

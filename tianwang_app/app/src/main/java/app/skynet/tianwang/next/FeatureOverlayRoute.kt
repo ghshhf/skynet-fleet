@@ -116,6 +116,12 @@ fun FeatureOverlayRoute(name: String, onOpen: (String) -> Unit) {
         "FONTS" -> FontScreen()
         "SELFPERMS" -> SelfPermsScreen()
 
+        // 能力目录：人用 / AI 用一眼分清，工具能直接跑，界面入口点了就进。
+        "CAPS" -> CapabilityCatalogScreen(onOpen = onOpen)
+
+        // 会话层：长驻 shell。人和 AI 共用同一个会话，不是又一个只看一眼的仪表。
+        "TTYSESSION" -> TtyScreen()
+
         // 未知名字不白屏：退回工作台目录，人还能从这再点进去。
         else -> FeatureHubScreen(onOpen)
     }

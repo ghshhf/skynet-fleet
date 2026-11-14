@@ -242,7 +242,20 @@ private enum class Tab(val label: String) {
  * 底栏只放 4 个「每天要用」的，其余一律点一下再进 —— 这是国内外大厂的
  * 共同做法，也是 Material 官方 3–5 个顶级入口的上限。
  */
-internal enum class Overlay(val title: String, val sub: String) {
+/**
+ * 这个入口到底是谁在用。
+ *
+ * 之前 119 个屏一视同仁铺开，人会以为每个都要自己点 —— 实际上真正由人日常用的
+ * 只有少数几个，其余是给 AI / 脚本调的。分开标注之后：界面只强调人用的，
+ * 剩下的写成「AI 用」，不占人的注意力，但也不删。
+ */
+enum class OverlayUse(val label: String, val hint: String) {
+    HUMAN("人用", "人日常真的会点的"),
+    BOTH("人 / AI", "两边都会用的"),
+    AI("AI 用", "由 AI 或脚本调，人不必手点"),
+}
+
+internal enum class Overlay(val title: String, val sub: String, val use: OverlayUse = OverlayUse.BOTH) {
     MODELS("模型与网关", "本地 GGUF + 云端网关"),
     TASKS("任务进度", "项目整体进度"),
     FLEET("编队节点", "我在编队里的位置"),
@@ -354,26 +367,29 @@ internal enum class Overlay(val title: String, val sub: String) {
     FILEMAN("文件管理器", "浏览 / 查看 / 删除 / 复制路径"),
 
     // ---- 第七批：手机实体工具（网络 / 进程 / 剪贴板 / 日志）----
-    NETDIAG("网络诊断", "连通性 / 网关 / DNS / 接口"),
-    PROC("进程查看", "运行中进程 · 按内存排序 · 结束"),
-    CLIPBOARD("剪贴板", "读取 / 写入 / 本地历史"),
-    LOGCAT("本机日志", "logcat 抓取 / 过滤 / 保存"),
+    NETDIAG("网络诊断", "连通性 / 网关 / DNS / 接口", OverlayUse.AI),
+    PROC("进程查看", "运行中进程 · 按内存排序 · 结束", OverlayUse.AI),
+    CLIPBOARD("剪贴板", "读取 / 写入 / 本地历史", OverlayUse.HUMAN),
+    LOGCAT("本机日志", "logcat 抓取 / 过滤 / 保存", OverlayUse.AI),
 
     // ---- 第八批：手机实体工具（应用管理 / 命令收藏）----
-    APPLIST("应用列表", "已装第三方应用 · 点一下复制包名"),
-    CMDFAV("命令收藏", "常用 shell 命令本机存储 · 一键执行"),
+    APPLIST("应用列表", "已装第三方应用 · 点一下复制包名", OverlayUse.AI),
+    CMDFAV("命令收藏", "常用 shell 命令本机存储 · 一键执行", OverlayUse.AI),
 
     // ---- 第九批：手机实体工具（存储 / 属性 / 传感器 / 电池）----
-    STORAGE("存储分析", "目录体积 / 文件数 · 清本应用缓存"),
-    PROPS("本机属性", "getprop 构建 / 运行环境 / 网络"),
-    SENSORS("传感器清单", "机身传感器类型 / 供应商 / 量程"),
-    BATTERY("电量与电池", "电量 / 健康 / 温度 / 电压"),
+    STORAGE("存储分析", "目录体积 / 文件数 · 清本应用缓存", OverlayUse.AI),
+    PROPS("本机属性", "getprop 构建 / 运行环境 / 网络", OverlayUse.AI),
+    SENSORS("传感器清单", "机身传感器类型 / 供应商 / 量程", OverlayUse.AI),
+    BATTERY("电量与电池", "电量 / 健康 / 温度 / 电压", OverlayUse.BOTH),
 
     // ---- 第十批：手机实体工具（流量 / 磁盘 / 字体 / 权限）----
-    TRAFFIC("网络流量", "/proc/net/dev 各接口收发"),
-    DISK("磁盘与挂载", "df -h 各分区用量"),
-    FONTS("字体清单", "/system/fonts 字体文件"),
-    SELFPERMS("应用权限自查", "本应用危险权限授予状态"),
+    TRAFFIC("网络流量", "/proc/net/dev 各接口收发", OverlayUse.AI),
+    DISK("磁盘与挂载", "df -h 各分区用量", OverlayUse.AI),
+    FONTS("字体清单", "/system/fonts 字体文件", OverlayUse.AI),
+    SELFPERMS("应用权限自查", "本应用危险权限授予状态", OverlayUse.AI),
+
+    // ---- 会话层：手机第一次能「开着会话持续干活」（人机共用同一个会话）----
+    TTYSESSION("会话终端", "长驻 shell · stdin 可写 · 输出流式不截断", OverlayUse.BOTH),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

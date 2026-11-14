@@ -70,6 +70,7 @@ object CapabilityCatalog {
 
     /** 顺序即页面顺序。未归到任何前缀的进「其它」。 */
     private val RULES = listOf(
+        Triple("self_tty_", "会话层", "长驻 shell / 流式输出 / 可中断"),
         Triple("self_ui_", "界面操作", "读屏 / 点击 / 输入 / 截图"),
         Triple("self_app_", "应用与系统", "启动 / 列表 / 打开链接"),
         Triple("self_notif_", "通知", "读最近通知"),
@@ -110,6 +111,8 @@ object CapabilityCatalog {
         val toolName: String? = null,
         val overlay: String? = null,
         val schema: JSONObject? = null,
+        /** 谁在用。工具一律归 AI —— 人不必手点；界面入口按 [Overlay.use] 如实标。 */
+        val use: OverlayUse = OverlayUse.AI,
     ) {
         val runnable: Boolean get() = toolName != null
     }
@@ -176,11 +179,20 @@ object CapabilityCatalog {
                     desc = sub,
                     domain = UI_DOMAIN,
                     overlay = name,
+                    use = Overlay.values().firstOrNull { it.name == name }?.use ?: OverlayUse.BOTH,
                 )
             )
         }
         return out
     }
+
+    /** 按「谁在用」筛。传 null 表示全部。 */
+    fun filterUse(list: List<CapEntry>, use: OverlayUse?): List<CapEntry> =
+        if (use == null) list else list.filter { it.use == use }
+
+    /** 人用 / AI 用各有多少，用于说明文字，别让人以为 119 个都得自己点。 */
+    fun useCounts(list: List<CapEntry>): Map<OverlayUse, Int> =
+        list.groupingBy { it.use }.eachCount()
 
     fun searchEntries(list: List<CapEntry>, q: String): List<CapEntry> {
         val s = q.trim().lowercase()
@@ -249,21 +261,25 @@ fun CapabilityCatalogScreen(
     }
 
     var q by remember { mutableStateOf(initialQuery) }
+    var useFilter by remember { mutableStateOf<OverlayUse?>(null) }
     var opened by remember { mutableStateOf("") }
     var result by remember { mutableStateOf<Pair<String, ToolResult>?>(null) }
     var busy by remember { mutableStateOf("") }
 
-    val matched = CapabilityCatalog.searchEntries(allEntries, q)
+    val searched = CapabilityCatalog.searchEntries(allEntries, q)
+    val matched = CapabilityCatalog.filterUse(searched, useFilter)
     val groups = CapabilityCatalog.groupEntries(matched)
     val toolCount = allEntries.count { it.runnable }
-    val sideCount = allEntries.count { it.sideEffect }
+    val counts = CapabilityCatalog.useCounts(allEntries)
+    val humanCount = counts[OverlayUse.HUMAN] ?: 0
+    val aiCount = counts[OverlayUse.AI] ?: 0
 
     Column(Modifier.fillMaxSize().padding(14.dp)) {
         Text("全部能力", fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface)
         Text(
-            "$toolCount 个工具能直接跑，${allEntries.size - toolCount} 个界面入口点了就进；" +
-                "其中 $sideCount 个会改状态（默认被闸门挡着）。名单现取，不另写一份。",
+            "$toolCount 个工具能直接跑（都归 AI 用，人不必手点）；界面入口里人常用的只有 $humanCount 个，" +
+                "另有 $aiCount 个是 AI 用的诊断/采集屏。名单现取，不另写一份。",
             fontSize = 11.sp, lineHeight = 16.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -284,7 +300,9 @@ fun CapabilityCatalogScreen(
                 inner()
             },
         )
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(8.dp))
+        UseFilterRow(active = useFilter, counts = counts) { useFilter = it }
+        Spacer(Modifier.height(8.dp))
         Text("命中 ${matched.size} 个 · ${groups.size} 个域", fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(6.dp))
@@ -356,6 +374,41 @@ fun CapabilityCatalogScreen(
     }
 }
 
+/** 「谁在用」筛选：全部 / 人用 / 人AI / AI 用。默认全部，但把数量摊开，人一眼知道哪些不必自己点。 */
+@Composable
+private fun UseFilterRow(
+    active: OverlayUse?,
+    counts: Map<OverlayUse, Int>,
+    onPick: (OverlayUse?) -> Unit,
+) {
+    val all = counts.values.sum()
+    val items: List<Pair<OverlayUse?, String>> = listOf(
+        null to "全部 $all",
+        OverlayUse.HUMAN to "人用 ${counts[OverlayUse.HUMAN] ?: 0}",
+        OverlayUse.BOTH to "人/AI ${counts[OverlayUse.BOTH] ?: 0}",
+        OverlayUse.AI to "AI 用 ${counts[OverlayUse.AI] ?: 0}",
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+        for ((use, label) in items) {
+            val on = active == use
+            Text(
+                label,
+                fontSize = 10.5.sp,
+                color = if (on) MaterialTheme.colorScheme.surface
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(
+                        if (on) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.surfaceVariant
+                    )
+                    .clickable { onPick(use) }
+                    .padding(horizontal = 9.dp, vertical = 5.dp),
+            )
+        }
+    }
+}
+
 @Composable
 private fun CapEntryRow(
     e: CapabilityCatalog.CapEntry,
@@ -384,7 +437,8 @@ private fun CapEntryRow(
             if (e.sideEffect) {
                 Text("会改状态", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
             } else if (!e.runnable) {
-                Text("界面", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(e.use.label, fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         Spacer(Modifier.height(3.dp))
