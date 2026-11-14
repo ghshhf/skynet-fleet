@@ -28,8 +28,8 @@
 | 有主能力 | **521** | 至少一台设备声明支持它 |
 | 有门禁能力 | **246** | `evals/` 里有真跑过的证据 |
 | 设备种类实例 | **66** | 注册表里的设备对象数（非型号数） |
-| 门禁登记 | **188** 条 | `run_selftests.py` 的 `CASES` |
-| eval 文件 | **100** 份 | `evals/*.py` |
+| 门禁登记 | **189** 条 | `run_selftests.py` 的 `CASES` |
+| eval 文件 | **101** 份 | `evals/*.py` |
 | 游离门禁 | **0** 份 | 写了但没登记，等于没写 |
 | 文档 | **4** 份 | `docs/*.md` |
 | App build | **49** | `tianwang_android/version.txt`（第二代版本看 `tianwang_app/app/build.gradle.kts`） |

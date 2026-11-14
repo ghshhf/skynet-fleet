@@ -344,9 +344,12 @@ def _maybe_mdns(port: int, token: str):
         if not addrs:
             addrs = [socket.inet_aton("127.0.0.1")]
         zc = Zeroconf()
+        # 实例名带 pid：服务名写死会导致第二个实例注册失败（NonUniqueNameException），
+        # 而失败是静默的（只是没广播），排查时以为是网络问题。手机端认的是 TXT 里的
+        # id/name，不看实例名，所以这里可以放心用 pid 区分。
         info = ServiceInfo(
             SERVICE_TYPE,
-            "skynet-pc._skynet._tcp.local.",
+            "skynet-pc-%d._skynet._tcp.local." % os.getpid(),
             addresses=addrs,
             port=port,
             properties={"id": pid, "name": name, "v": "1"},
