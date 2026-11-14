@@ -1999,6 +1999,8 @@
         if (view === "phone") {
           showView("phone", "遥控手机");
           loadPhoneRemote();
+          // 回来接着看：离开时只是停了连播，连接还在。
+          if (PHONE.connected) { phoneStream(true); }
           return;
         }
         if (view === "chat") {
