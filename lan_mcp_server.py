@@ -240,6 +240,14 @@ class LanMcpServer:
         try:
             self.server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Windows 上 AF_INET6 默认 IPV6_V6ONLY=1：绑了 :: 之后 v4 一律连不进来，
+            # 手机用 192.168.x.x 会直接连不上（手机端主路还是 v4 兜底）。
+            # 和 netpath.listen() 同一条规矩：要双栈就必须显式关掉。
+            if hasattr(socket, "IPV6_V6ONLY"):
+                try:
+                    self.server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except OSError:
+                    pass  # 某些系统上该选项只读，绑上了仍可用 v6
             self.server.bind(("::", self.port))
         except Exception:
             try:
@@ -276,34 +284,75 @@ class LanMcpServer:
             self.server = None
 
 
+def _pc_identity() -> tuple[str, str]:
+    """稳定的电脑标识 + 显示名。身份取 ~/.fleet/lan_identity.json 的指纹前 12 位。"""
+    pid = ""
+    try:
+        with open(os.path.expanduser("~/.fleet/lan_identity.json"), encoding="utf-8") as f:
+            pid = (json.load(f).get("fingerprint") or "")[:12]
+    except Exception:
+        pid = ""
+    if not pid:
+        pid = "pc-" + (socket.gethostname() or "unknown")[:8]
+    name = "天网主机（%s）" % (socket.gethostname() or "PC")
+    return pid, name
+
+
 def _maybe_mdns(port: int, token: str):
+    """广播 _skynet._tcp.，让手机端 LanDiscovery 自动看到这台电脑。
+
+    🔴 两条硬规矩：
+    1) **不广播口令**。手机端 LanDiscovery 的注释写得很清楚：把口令塞进 TXT 等于
+       在同一 Wi-Fi 里公开，谁都能连。这里只播 id / name / v，和手机端同一套字段。
+    2) **不依赖 netifaces**（Windows 上要编译，装不上是常态）。地址直接用项目自己的
+       netpath 层取——它已经处理了「跳过 127 / 跳过临时地址」。
+    """
     try:
         from zeroconf import Zeroconf, ServiceInfo
     except Exception:
         print("[lan-mcp] 未装 zeroconf，跳过 mDNS 广播（手机仍可手动添加 host:port:token）", flush=True)
         return None
     try:
+        pid, name = _pc_identity()
+        addrs = []
+        # 先探出「默认路由走的那张网卡」的地址，再只保留同一 /24 的地址。
+        # 理由：本机还挂着 172.25.208.1 这类虚拟网卡（WSL/VMware），
+        # 一起广播出去手机会先试它、连不上才回落，等于白等一轮超时。
+        primary = ""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("223.5.5.5", 53))
+            primary = s.getsockname()[0]
+            s.close()
+        except Exception:
+            primary = ""
+        try:
+            import netpath
+            for r in netpath.addresses():
+                if r.get("family") != 4 or r.get("temp"):
+                    continue
+                ip = r["addr"]
+                if ip.startswith("127."):
+                    continue
+                if primary and ip.rsplit(".", 1)[0] != primary.rsplit(".", 1)[0]:
+                    continue
+                addrs.append(socket.inet_aton(ip))
+        except Exception:
+            addrs = []
+        if not addrs and primary:
+            addrs = [socket.inet_aton(primary)]
+        if not addrs:
+            addrs = [socket.inet_aton("127.0.0.1")]
         zc = Zeroconf()
         info = ServiceInfo(
             SERVICE_TYPE,
             "skynet-pc._skynet._tcp.local.",
-            addresses=[socket.inet_aton("0.0.0.0")] if False else None,
+            addresses=addrs,
             port=port,
-            properties={"token": token[:8], "role": "pc"},
+            properties={"id": pid, "name": name, "v": "1"},
         )
-        # zeroconf 需要真实地址；用本机 IPv4 列表注册
-        import netifaces  # 可能也没装
-        addrs = []
-        for iface in netifaces.interfaces():
-            for a in netifaces.ifaddresses(iface).get(netifaces.AF_INET, []):
-                ip = a["addr"]
-                if ip != "127.0.0.1":
-                    addrs.append(socket.inet_aton(ip))
-        if not addrs:
-            addrs = [socket.inet_aton("127.0.0.1")]
-        info.addresses = addrs
         zc.register_service(info)
-        print(f"[lan-mcp] mDNS 已广播 {SERVICE_TYPE} 端口 {port}", flush=True)
+        print(f"[lan-mcp] mDNS 已广播 {SERVICE_TYPE} 端口 {port}（不含口令）", flush=True)
         return zc
     except Exception as e:
         print(f"[lan-mcp] mDNS 广播失败（不影响直连）：{e}", flush=True)
