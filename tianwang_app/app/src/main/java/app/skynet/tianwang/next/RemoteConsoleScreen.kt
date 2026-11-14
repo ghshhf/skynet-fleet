@@ -45,6 +45,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -112,11 +113,14 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
     var liveImg by remember { mutableStateOf<ImageBitmap?>(null) }
     var liveErr by remember { mutableStateOf("") }
     var actErr by remember { mutableStateOf("") }
-    var liveNote by remember { mutableStateOf("") }
     var liveBusy by remember { mutableStateOf(false) }
     var scrW by remember { mutableStateOf(0) }
     var scrH by remember { mutableStateOf(0) }
     var typed by remember { mutableStateOf("") }
+    // 连播：1.2 秒一帧，点按后不用再手点刷新；同一时间只允许一帧在飞。
+    var autoOn by remember { mutableStateOf(true) }
+    var liveMs by remember { mutableStateOf(0) }
+    var failStreak by remember { mutableStateOf(0) }
 
     fun callPeer(p: PeerBook.Peer, tool: String, args: JSONObject, timeoutMs: Int = 30_000): LanClient.Reply =
         LanClient.call(LanProto.Target(p.host, p.port), p.token, LanProto.toolRequest(tool, args), timeoutMs)
@@ -127,6 +131,7 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
         liveBusy = true
         val knownW = scrW
         val knownH = scrH
+        val t0 = System.currentTimeMillis()
         scope.launch(Dispatchers.IO) {
             var w = knownW
             var h = knownH
@@ -152,11 +157,18 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
                 if (img != null) {
                     liveImg = img
                     liveErr = ""
-                    liveNote = txt.orEmpty().lineSequence().firstOrNull().orEmpty()
+                    liveMs = (System.currentTimeMillis() - t0).toInt()
+                    failStreak = 0
                     if (w > 0 && h > 0) { scrW = w; scrH = h }
                 } else {
                     liveErr = if (!shot.ok) shot.err.ifBlank { "截图失败" }
                     else "对端回包拿不到图片：${txt.orEmpty().take(120)}"
+                    // 连播时对端掉线就别一直锤：连续三次失败自动停下，人能看到原因。
+                    failStreak += 1
+                    if (failStreak >= 3) {
+                        autoOn = false
+                        liveErr = "连续 3 次取帧失败，已停连播：$liveErr"
+                    }
                 }
             }
         }
@@ -176,13 +188,19 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
         }
     }
 
-    fun remoteTap(p: PeerBook.Peer, px: Float, py: Float, viewW: Float, viewH: Float, img: ImageBitmap) {
+    fun remoteTap(
+        p: PeerBook.Peer, px: Float, py: Float,
+        viewW: Float, viewH: Float, img: ImageBitmap,
+        long: Boolean = false,
+    ) {
         val pt = RemoteScreen.mapToScreen(px, py, viewW, viewH, img.width, img.height, scrW, scrH)
         if (pt == null) {
             liveErr = "还没拿到对端屏幕分辨率（点「刷新」重试），这次点击没发出去"
             return
         }
-        remoteAct(p, "self_ui_tap_at", JSONObject().put("x", pt.first).put("y", pt.second))
+        val args = JSONObject().put("x", pt.first).put("y", pt.second)
+        if (long) args.put("long", true)
+        remoteAct(p, "self_ui_tap_at", args)
     }
 
     fun remoteSwipe(
@@ -294,6 +312,13 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
     // ---- 全屏遥控：整页只放对端画面，点哪点哪 ----
     val peer = selected
     if (live && peer != null) {
+        // 连播：一帧一帧地拉，但同一时间只允许一帧在飞（pullScreen 自己有闸）。
+        LaunchedEffect(peer.name, autoOn) {
+            while (autoOn) {
+                delay(1200)
+                pullScreen(peer)
+            }
+        }
         Column(
             Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(10.dp),
         ) {
@@ -309,14 +334,20 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
                             actErr.isNotBlank() -> actErr
                             liveBusy -> "拉屏中…"
                             liveErr.isNotBlank() -> liveErr
-                            liveNote.isNotBlank() -> liveNote
-                            else -> "点图即点屏 · 拖动即滑动"
+                            else -> buildString {
+                                append(if (autoOn) "连播 1.2s" else "单帧")
+                                if (liveMs > 0) append(" · 上一帧 ${liveMs}ms")
+                                append(" · 点一下=点屏，长按=长按，拖动=滑动")
+                            }
                         },
                         fontSize = 10.5.sp, maxLines = 2,
                         color = if (actErr.isNotBlank() || liveErr.isNotBlank())
                             MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+                TextButton(onClick = { autoOn = !autoOn }) {
+                    Text(if (autoOn) "暂停" else "连播")
                 }
                 TextButton(onClick = { pullScreen(peer) }, enabled = !liveBusy) { Text("刷新") }
             }
@@ -338,10 +369,16 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
                         modifier = Modifier
                             .fillMaxSize()
                             .pointerInput(peer.name, img, scrW, scrH) {
-                                detectTapGestures { off ->
-                                    remoteTap(peer, off.x, off.y,
-                                        size.width.toFloat(), size.height.toFloat(), img)
-                                }
+                                detectTapGestures(
+                                    onLongPress = { off ->
+                                        remoteTap(peer, off.x, off.y,
+                                            size.width.toFloat(), size.height.toFloat(), img, long = true)
+                                    },
+                                    onTap = { off ->
+                                        remoteTap(peer, off.x, off.y,
+                                            size.width.toFloat(), size.height.toFloat(), img)
+                                    },
+                                )
                             }
                             .pointerInput(peer.name, img, scrW, scrH) {
                                 var sx = 0f; var sy = 0f
@@ -580,7 +617,8 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
                             liveImg = null
                             liveErr = ""
                             actErr = ""
-                            liveNote = ""
+                            failStreak = 0
+                            autoOn = true
                             live = true
                             pullScreen(p)
                         }
@@ -590,7 +628,7 @@ fun RemoteConsoleScreen(onBack: () -> Unit) {
                         }
                     }
                     Spacer(Modifier.height(6.dp))
-                    Text("遥控页里：点图 = 点对端屏幕，拖动 = 滑动，底部可打字。",
+                    Text("遥控页里：连播自动换帧；点一下 = 点对端屏幕，长按 = 长按，拖动 = 滑动。",
                         fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(6.dp))
                 } else {
