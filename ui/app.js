@@ -3107,7 +3107,6 @@
     if (rf) {
       rf.addEventListener("click", function () {
         if (!PHONE.connected) { phoneStat("还没连上手机", true); return; }
-        if (PHONE.streaming) { phoneShotNow(); return; }
         phoneShotNow();
       });
     }
@@ -3260,6 +3259,14 @@
     PHONE.connected = false;
     PHONE.connecting = false;
     PHONE.fail = 0;
+    // 真把中继那头关掉：只改界面状态会让手机侧白挂一条到电脑的链路。
+    api("/api/phone/mcp", {
+      method: "POST",
+      body: {
+        url: PHONE.cfg.url, room: PHONE.cfg.room, secret: PHONE.cfg.secret,
+        close: true
+      }
+    }).catch(function () { /* 断开失败无处可退：本地状态已经清了 */ });
     var img = $("phoneImg");
     if (img) { img.hidden = true; img.removeAttribute("src"); }
     var hint = $("phoneEmpty");

@@ -931,10 +931,16 @@ class _Handler(BaseHTTPRequestHandler):
 
         只放行 self_* / mcp__*：这一页要的是「看屏 + 点按」，顺手把手机自己的
         管理类工具也开放出去没有好处，出了事还分不清是谁按的。
+
+        `close=true` 是「断开」按钮：把池里那条连接真关掉，而不是只让界面
+        显示成断开、后台还挂着一条到手机的活链路。
         """
         url = str(body.get("url") or "").strip()
         room = str(body.get("room") or "").strip()
         secret = str(body.get("secret") or "").strip()
+        if body.get("close"):
+            _phone_drop(url, room, secret)
+            return self._json({"ok": True, "text": "已断开"})
         tool = str(body.get("tool") or "").strip()
         args = body.get("args") or {}
         if not tool:

@@ -163,7 +163,13 @@ def main():
         check((cfg["url"], cfg["room"], cfg["secret"]) in dropped,
               "调用失败后丢弃这条连接（下一次重建）")
 
-        print("⑤ 结果归一化：resource 文本也算文字")
+        print("⑤ 「断开」要真断：关掉池里的连接，不是只改界面状态")
+        st, d = _post(port, "/api/phone/mcp", dict(cfg, close=True), tok)
+        check(st == 200 and d.get("ok") is True, "close=true → 200")
+        check(dropped.count((cfg["url"], cfg["room"], cfg["secret"])) >= 2,
+              "close 也走丢弃连接（池里那条被真关掉）")
+
+        print("⑥ 结果归一化：resource 文本也算文字")
         p = GS._mcp_result_payload({"content": [
             {"type": "resource", "resource": {"text": "资源文本"}}]})
         check(p.get("ok") is True and p.get("text") == "资源文本",
