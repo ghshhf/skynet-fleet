@@ -60,6 +60,74 @@ PERSONA_PATH = os.environ.get(
     "FLEET_PERSONA", os.path.join(ROOT, "persona_state.json"))
 
 
+# ---------------------------------------------------------------- 遥控手机
+#
+# PC 端「遥控手机」页经 /pair 中继调手机自己的 MCP（self_ui_*）。
+# 每帧都重新连一次要重做 WS + initialize，一次就几百毫秒，连播时根本跟不上；
+# 所以按 (url, room, secret) 复用一条已握手的连接。配置换了或者一出错就丢掉
+# 重建——宁可多握一次手，也不要把一条半死的连接继续用下去。
+_PHONE_CLIENTS = {}
+_PHONE_CLIENTS_LK = threading.Lock()
+_PHONE_CLIENTS_MAX = 2
+_PHONE_TOOL_PREFIXES = ("self_", "mcp__")
+
+
+def _phone_client(url, room, secret):
+    from ..mcp.pair import PairMCPClient
+    key = (url, room, secret)
+    with _PHONE_CLIENTS_LK:
+        client = _PHONE_CLIENTS.get(key)
+        if client is not None:
+            return client
+        while len(_PHONE_CLIENTS) >= _PHONE_CLIENTS_MAX:
+            _, old = _PHONE_CLIENTS.popitem()
+            try:
+                old.close()
+            except Exception:
+                pass
+        client = PairMCPClient(url, room, secret, name="gui-phone")
+        _PHONE_CLIENTS[key] = client
+        return client
+
+
+def _phone_drop(url, room, secret):
+    with _PHONE_CLIENTS_LK:
+        client = _PHONE_CLIENTS.pop((url, room, secret), None)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _mcp_result_payload(result):
+    """把 MCP 的 result 压成前端要的形状：文字 + 第一张图（base64）。"""
+    content = (result or {}).get("content") or []
+    texts = []
+    image = ""
+    mime = ""
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            text = item.get("text") or ""
+            if text:
+                texts.append(text)
+        elif kind == "image" and not image:
+            image = item.get("data") or ""
+            mime = item.get("mimeType") or "image/jpeg"
+        elif kind == "resource":
+            res = item.get("resource") or {}
+            text = res.get("text") or ""
+            if text:
+                texts.append(text)
+    text = "\n".join(texts)
+    if (result or {}).get("isError"):
+        return {"ok": False, "err": text or "手机端工具返回错误"}
+    return {"ok": True, "text": text, "image": image, "mime": mime}
+
+
 # ------------------------------------------------------------------ 人格
 
 class Persona:
@@ -775,6 +843,16 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(DOCTOR.scan(deep=deep))
         if path == "/api/compute":
             return self._compute_list()
+        if path == "/api/phone/config":
+            # 遥控手机页的默认连接参数：有环境变量就先替用户填上，
+            # 免得每次手抄中继地址 / 房间 / 密钥。前端只把它当**预填建议**，
+            # 用户改过的值存在本机 localStorage 里，优先于这里。
+            return self._json({
+                "ok": True,
+                "url": os.environ.get("SKYNET_RELAY_URL", ""),
+                "room": os.environ.get("SKYNET_PAIR_ROOM", ""),
+                "secret": os.environ.get("SKYNET_PAIR_SECRET", ""),
+            })
         if path == "/api/compute/probe":
             # 探测是网络操作（最长 25s），用 POST。放 GET 里会被浏览器预取/缓存
             # 在背后悄悄发起，白烧额度。
@@ -844,7 +922,37 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_skill_promote(body)
         if path == "/api/skill/rollback":
             return self._post_skill_rollback(body)
+        if path == "/api/phone/mcp":
+            return self._post_phone_mcp(body)
         self._err(404, f"没有这个接口: {path}")
+
+    def _post_phone_mcp(self, body):
+        """PC 遥控页的代理：{url, room, secret, tool, args} → 手机上那个工具。
+
+        只放行 self_* / mcp__*：这一页要的是「看屏 + 点按」，顺手把手机自己的
+        管理类工具也开放出去没有好处，出了事还分不清是谁按的。
+        """
+        url = str(body.get("url") or "").strip()
+        room = str(body.get("room") or "").strip()
+        secret = str(body.get("secret") or "").strip()
+        tool = str(body.get("tool") or "").strip()
+        args = body.get("args") or {}
+        if not tool:
+            return self._err(400, "缺 tool")
+        if not tool.startswith(_PHONE_TOOL_PREFIXES):
+            return self._err(400, f"只允许调 self_* / mcp__* 工具：{tool}")
+        if not isinstance(args, dict):
+            return self._err(400, "args 必须是对象")
+        try:
+            client = _phone_client(url, room, secret)
+            result = client.call_tool(tool, args)
+        except Exception as e:
+            _phone_drop(url, room, secret)
+            return self._err(502, f"手机端调用失败：{e}")
+        payload = _mcp_result_payload(result)
+        if payload.get("ok"):
+            return self._json(payload)
+        return self._json(payload, 502)
 
     # ---------------- 配对 / 受控端点（N+1b） ----------------
     #

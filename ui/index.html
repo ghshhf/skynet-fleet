@@ -48,6 +48,8 @@
         <!-- 算力：谁来算这件事。放这里是因为它跟「用哪个专家」同级 ——
              都是「这个软件靠什么干活」的顶层选择，不是某一页里的细节设置。 -->
         <div class="sb-item" data-view="compute"><span class="ic">⚡</span>算力</div>
+        <!-- 遥控手机：PC 看手机画面、点哪算哪。走已配对的中继，不走 adb。 -->
+        <div class="sb-item" data-view="phone"><span class="ic">▣</span>遥控手机</div>
         <div class="sb-item" data-view="todo"><span class="ic">⏱</span>定时任务</div>
         <div class="sb-item" data-view="lib"><span class="ic">▤</span>资料库</div>
         <div class="sb-item" data-view="more"><span class="ic">⋯</span>更多<span class="tag">灵感</span></div>
@@ -201,6 +203,17 @@
           </div>
           <div class="tabbody" id="computeBody" role="tabpanel"
                aria-label="算力端点与用途路由"></div>
+        </div>
+
+        <!-- 遥控手机：看屏 + 直点（经 /pair 中继调手机端 self_ui_* 工具） -->
+        <div class="view view-phone" id="viewPhone">
+          <div class="tabbar">
+            <span class="tabhead">遥控手机 · 看屏直点</span>
+            <span class="grow"></span>
+            <button class="hbtn" id="phoneRefresh" title="单帧刷新">↻</button>
+          </div>
+          <div class="tabbody" id="phoneBody" role="tabpanel"
+               aria-label="连接已配对手机并遥控"></div>
         </div>
 
         <!-- 助理：无限智能体名册（真读 cards/ 下的角色卡）-->

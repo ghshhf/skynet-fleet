@@ -28,8 +28,8 @@
 | 有主能力 | **521** | 至少一台设备声明支持它 |
 | 有门禁能力 | **246** | `evals/` 里有真跑过的证据 |
 | 设备种类实例 | **66** | 注册表里的设备对象数（非型号数） |
-| 门禁登记 | **186** 条 | `run_selftests.py` 的 `CASES` |
-| eval 文件 | **100** 份 | `evals/*.py` |
+| 门禁登记 | **187** 条 | `run_selftests.py` 的 `CASES` |
+| eval 文件 | **101** 份 | `evals/*.py` |
 | 游离门禁 | **0** 份 | 写了但没登记，等于没写 |
 | 文档 | **4** 份 | `docs/*.md` |
 | App build | **0.1.49-proto** | `tianwang_app/version.properties`（唯一真源） |
@@ -349,7 +349,7 @@
 - **联网层接活 + 取文增强（2026-10-24）**：netforce 采集内核从「README 写着已接、实测全降级」修到真能用——**路径候选制 + marker 判定**（换盘换机不用再指路径，唯一约定 = 两个项目放同一个父目录，判据是 `resource_finder.py` + `skynet/` 子包同时在）；新增 `web.origin` 跳转链穿透与 `web.dns` DoH 污染判据。实测 httpbin 三跳穿透到终点、CDN 站不误报。自测 **73/74**，唯一红的 t8 是本机缺 `polaris-audio-io` 模块（train_15b 整个迁走）——代码现在如实报「缺模块」而不是误报「缺解释器」。
 - **分支合并 + 跨机死路径家族收尾（2026-10-24）**：GitHub 上 11 个分支合并为只剩 `main`——10 个历史分支逐文件验证内容全在 main（相同或演进版，两个中文名文档与 `.gitignore` 均比对过方向），删除前 SHA 全量备份在提交历史中（`git reflog` 可找回）；此后分支政策 = 只留 main，确需分支当天合并当天删。同批修掉最后一拨跨机死路径：adb / Android SDK 候选补 **G 盘 `/g/sdk`**（build-tools 34/35/37 + android-35 + adb 37.0.0 + JDK 21 实测齐全 ⇒ APK 五步构建链在本机完整，不再依赖另一台机器的 D 盘工具链）；两个文件 sys.path 钉死旧仓库名 `D:/code/device-fleet`（一跑就 ModuleNotFoundError）改按 `__file__` 推仓库根。全量 **71/74**：t8 缺模块（环境缺资产）、t23 demo 模板用 `Date.now()` 渲染不确定（老伤待修）、registry 秒级 mtime 排序抖动（连跑 5 次 4 绿 1 红，与改动无关）。
 - **设备层三块新地基**（2026-10-21）：
-  - **Windows 图形版（W1）**：`fleet/gui/server.py` + `fleet/gui/app.py`（pywebview 窗口壳）+ `ui/index.html|app.css|app.js`（纯原生三栏，无 CDN 外链）。三层安全：只绑 `127.0.0.1` + 随机端口（`port=0`）、一次性 token 走 **URL 片段**（片段不随 HTTP 发出 ⇒ 不进服务端日志、不进 Referer）+ `secrets.compare_digest`、一切能力调用走 `registry.call`（前端绕不过闸门）。T 版与命令行**保留**，但不当日常入口。
+  - **Windows 图形版（W1）**：`fleet/gui/server.py` + `fleet/gui/app.py`（pywebview 窗口壳）+ `ui/index.html|app.css|app.js`（纯原生三栏，无 CDN 外链）。三层安全：只绑 `127.0.0.1` + 随机端口（`port=0`）、一次性 token 走 **URL 片段**（片段不随 HTTP 发出 ⇒ 不进服务端日志、不进 Referer）+ `secrets.compare_digest`、一切能力调用走 `registry.call`（前端绕不过闸门）。T 版与命令行**保留**，但不当日常入口。**「遥控手机」页**（2026-11-14）：左栏直接看手机画面、点哪算哪（点击 / 长按 / 拖动 / 键位 / 打字），走已跑通的 `/pair` 中继调手机自己的 `self_ui_*`，**不需要 adb 与数据线**；后端 `POST /api/phone/mcp` 只放行 `self_*` / `mcp__*`，失败即丢弃连接重建，门禁 `eval_phone_gui_remote`。
   - **无线 ADB（`kind=adb_wifi`，14 条能力）**：`fleet/kinds/adb_wifi.py`。只读 3 条 auto 档，动手 11 条全 `approval="ask"` + fail-closed。shell 只读白名单按「首词 + 参数形态」两级判定，**禁 shell 元字符**（管道符也拦）堵组合拳。发现方式默认 **mDNS + 经典 5555**（纯 stdlib），深度扫须显式 opt-in 且带**次数 + 墙钟双硬预算**，到点如实说扫了多少——**不许假装扫完了**。
   - **语音输入（W4）**：`fleet/gui/voice.py` + `voice_runner.py`。STT **跨进程**调 polaris venv 的 whisper（fleet 自带解释器没有 torch）。**语音路径的两段式安全闸判定权在注册表层**：识别文字是**不可信数据不是指令**，破坏性能力一律拒，确认词必须来自另一句话，取消优先于确认，含糊拒。
   - **角色卡人格**：`persona_card.py` 吃 SillyTavern chara_card V1/V2/V3（纯 stdlib 解 PNG tEXt，不引 Pillow），世界书按关键词命中才注入。**卡是第三方数据不是指令来源**——system prompt 外框由本模块拼，只有白名单字段能进。

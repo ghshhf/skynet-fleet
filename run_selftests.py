@@ -566,6 +566,7 @@ CASES = [
     ("eval_model_catalog", ["evals/test_model_catalog.py"], HERE, 60),
     ("eval_phone_node", ["evals/test_phone_node.py"], HERE, 90),
     ("eval_phone_mcp_pair", ["evals/test_phone_mcp_pair.py"], HERE, 120),
+    ("eval_phone_gui_remote", ["evals/test_phone_gui_remote.py"], HERE, 90),
     ("eval_video_gen", ["evals/test_video_gen.py"], HERE, 90),
 ]
 

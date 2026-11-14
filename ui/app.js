@@ -1996,6 +1996,11 @@
           loadCompute();
           return;
         }
+        if (view === "phone") {
+          showView("phone", "遥控手机");
+          loadPhoneRemote();
+          return;
+        }
         if (view === "chat") {
           showView("chat", "设备编队");
           if (act === "new") { newTask(); }
@@ -2758,6 +2763,10 @@
     $("viewCrew").classList.toggle("on", name === "crew");
     if ($("viewCompute")) { $("viewCompute").classList.toggle("on", name === "compute"); }
     if ($("viewVoice")) { $("viewVoice").classList.toggle("on", name === "voice"); }
+    if ($("viewPhone")) { $("viewPhone").classList.toggle("on", name === "phone"); }
+    // 离开遥控页就停连播：没人看的页面不该每秒向手机要一次截图。
+    // 连接本身保留（不动 PHONE.connected），回来接着用。
+    if (name !== "phone") { phoneStream(false); }
     if (title) { $("viewTitle").textContent = title; }
   }
 
@@ -3035,6 +3044,341 @@
       "（配置在 " + (d.conf_path || "?") + "）。只在本机使用，不上传；" +
       "界面只显示末四位，回包从不含完整 key。");
     body.appendChild(foot);
+  }
+
+  /* ------------------------------------------------------------------ 遥控手机
+     主人直接把第二台手机当显示屏用：这边看画面，点哪算哪。
+
+     为什么走 /pair 中继而不是 adb：adb 要数据线、要开调试、换台机器还得重配；
+     配对通道是手机自己出站连中继，电脑只要地址 / 房间 / 密钥。
+
+     三条界面纪律（和算力页同一套）：
+       ① 画面必须是手机真的截出来的：取不到就报错，不拿上一帧假装还活着；
+       ② 坐标**按当前实际渲染尺寸换算**（图片显示尺寸 ≠ 手机分辨率），
+          所以窗口怎么缩放都对得上；
+       ③ 连播只负责刷新画面，绝不替你点 —— 点、键位、打字都是显式动作。
+  */
+  var PHONE = {
+    cfg: { url: "", room: "", secret: "" },
+    scr: { w: 0, h: 0 },
+    connected: false,
+    connecting: false,
+    streaming: false,
+    busy: false,
+    fail: 0,
+    ms: 0,
+    timer: null,
+    built: false,
+    fromStore: false
+  };
+  var PHONE_CFG_KEY = "fleet.phone.cfg";
+
+  function phoneLoadCfg() {
+    try {
+      var raw = localStorage.getItem(PHONE_CFG_KEY);
+      if (!raw) { return false; }
+      var o = JSON.parse(raw);
+      PHONE.cfg.url = o.url || "";
+      PHONE.cfg.room = o.room || "";
+      PHONE.cfg.secret = o.secret || "";
+      return true;
+    } catch (e) { return false; }   // 本地配置坏了就当没有，不拿坏值去连
+  }
+
+  function phoneSaveCfg() {
+    try { localStorage.setItem(PHONE_CFG_KEY, JSON.stringify(PHONE.cfg)); }
+    catch (e) { /* 存不了不影响本次连接，只是下次要重填 */ }
+  }
+
+  function phoneStat(msg, isErr) {
+    var s = $("phoneStat");
+    if (!s) { return; }
+    s.textContent = msg || "";
+    s.classList.toggle("err", !!isErr);
+  }
+
+  function loadPhoneRemote() {
+    var body = $("phoneBody");
+    if (!body || PHONE.built) { return; }
+    PHONE.fromStore = phoneLoadCfg();
+    phoneBuild(body);
+    PHONE.built = true;
+    var rf = $("phoneRefresh");
+    if (rf) {
+      rf.addEventListener("click", function () {
+        if (!PHONE.connected) { phoneStat("还没连上手机", true); return; }
+        if (PHONE.streaming) { phoneShotNow(); return; }
+        phoneShotNow();
+      });
+    }
+  }
+
+  function phoneBuild(body) {
+    body.textContent = "";
+
+    var cfg = el("div", "phone-cfg");
+    var iUrl = document.createElement("input");
+    iUrl.className = "cin"; iUrl.id = "phoneUrl";
+    iUrl.placeholder = "中继地址（wss://主机，路径空着会自动补 /pair）";
+    iUrl.setAttribute("aria-label", "中继地址");
+    iUrl.value = PHONE.cfg.url;
+    var iRoom = document.createElement("input");
+    iRoom.className = "cin"; iRoom.id = "phoneRoom";
+    iRoom.placeholder = "房间号（room）";
+    iRoom.setAttribute("aria-label", "配对房间号");
+    iRoom.value = PHONE.cfg.room;
+    var iSec = document.createElement("input");
+    iSec.className = "cin"; iSec.id = "phoneSecret"; iSec.type = "password";
+    iSec.placeholder = "配对密钥（secret）";
+    iSec.setAttribute("aria-label", "配对密钥");
+    iSec.value = PHONE.cfg.secret;
+    var bConn = el("button", "hbtn go", "连接");
+    bConn.addEventListener("click", phoneConnect);
+    var bDisc = el("button", "hbtn", "断开");
+    bDisc.addEventListener("click", phoneDisconnect);
+    var bAuto = el("button", "hbtn", "连播：关");
+    bAuto.id = "phoneAuto";
+    bAuto.addEventListener("click", function () {
+      if (!PHONE.connected) { phoneStat("先连上手机再开连播", true); return; }
+      phoneStream(!PHONE.streaming);
+    });
+    cfg.appendChild(iUrl);
+    cfg.appendChild(iRoom);
+    cfg.appendChild(iSec);
+    cfg.appendChild(bConn);
+    cfg.appendChild(bDisc);
+    cfg.appendChild(bAuto);
+    body.appendChild(cfg);
+
+    var stat = el("div", "phone-stat", "还没连。填好后点「连接」。");
+    stat.id = "phoneStat";
+    body.appendChild(stat);
+
+    var screen = el("div", "phone-screen");
+    screen.id = "phoneScreen";
+    var hint = el("div", "empty",
+      "连上后这里显示手机当前画面：点一下=点屏幕，按住=长按，拖动=滑动。");
+    hint.id = "phoneEmpty";
+    var img = document.createElement("img");
+    img.id = "phoneImg";
+    img.alt = "手机当前画面";
+    img.hidden = true;
+    screen.appendChild(hint);
+    screen.appendChild(img);
+    body.appendChild(screen);
+    phoneBindGesture(img);
+
+    var row = el("div", "phone-row");
+    [["返回", "back"], ["桌面", "home"], ["任务", "recents"], ["通知", "notifications"]]
+      .forEach(function (k) {
+        var b = el("button", "hbtn", k[0]);
+        b.addEventListener("click", function () { phoneAct("self_ui_key", { key: k[1] }); });
+        row.appendChild(b);
+      });
+    var tInp = document.createElement("input");
+    tInp.className = "cin"; tInp.id = "phoneText";
+    tInp.placeholder = "往手机当前输入框打字…";
+    tInp.setAttribute("aria-label", "发送到手机的文字");
+    tInp.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") { phoneSendText(); }
+    });
+    var bSend = el("button", "hbtn go", "发送文字");
+    bSend.addEventListener("click", phoneSendText);
+    row.appendChild(tInp);
+    row.appendChild(bSend);
+    body.appendChild(row);
+
+    body.appendChild(el("div", "phone-legend",
+      "点击 = 点屏幕 · 按住 ≥0.6 秒 = 长按 · 拖动 = 滑动。" +
+      " 画面来自手机自己的无障碍截图（Android 11+），每帧重新取。"));
+
+    // 没存过本地配置时，用后端读到的环境变量预填一次。
+    // 拿不到不算错：用户自己填也一样能用。
+    api("/api/phone/config").then(function (d) {
+      if (!d || PHONE.fromStore) { return; }
+      if (!iUrl.value && d.url) { iUrl.value = d.url; }
+      if (!iRoom.value && d.room) { iRoom.value = d.room; }
+      if (!iSec.value && d.secret) { iSec.value = d.secret; }
+      if (iUrl.value) { phoneStat("已按中继配置预填，点「连接」即可。"); }
+    }).catch(function () { /* 没有默认值不算错 */ });
+  }
+
+  function phoneCall(tool, args) {
+    return api("/api/phone/mcp", {
+      method: "POST",
+      body: {
+        url: PHONE.cfg.url, room: PHONE.cfg.room, secret: PHONE.cfg.secret,
+        tool: tool, args: args || {}
+      }
+    });
+  }
+
+  function phoneParseScreen(text) {
+    var m = /屏幕\s*[:：]\s*(\d+)\s*[×x]\s*(\d+)/.exec(text || "");
+    if (!m) { return null; }
+    var w = parseInt(m[1], 10), h = parseInt(m[2], 10);
+    if (!w || !h) { return null; }
+    return { w: w, h: h };
+  }
+
+  function phoneConnect() {
+    if (PHONE.connecting) { return; }
+    var url = $("phoneUrl").value.trim();
+    var room = $("phoneRoom").value.trim();
+    var secret = $("phoneSecret").value.trim();
+    if (!url || !room || !secret) {
+      phoneStat("中继地址 / 房间 / 密钥三项都要填（手机「远程控制台」里是同一组）", true);
+      return;
+    }
+    PHONE.cfg = { url: url, room: room, secret: secret };
+    phoneSaveCfg();
+    phoneStream(false);
+    PHONE.connected = false;
+    PHONE.connecting = true;
+    phoneStat("正在连手机（首次要握手，约 1–3 秒）…");
+    phoneCall("self_status", {}).then(function (r) {
+      PHONE.connecting = false;
+      if (!r || !r.ok) { throw new Error((r && r.err) || "手机没回状态"); }
+      var scr = phoneParseScreen(r.text);
+      if (!scr) {
+        throw new Error("读不出屏幕分辨率：" + String(r.text || "").slice(0, 120));
+      }
+      PHONE.scr = scr;
+      PHONE.connected = true;
+      PHONE.fail = 0;
+      phoneStat("已连接 · 屏幕 " + scr.w + "×" + scr.h);
+      phoneStream(true);
+    }).catch(function (e) {
+      PHONE.connecting = false;
+      PHONE.connected = false;
+      phoneStat("连接失败：" + (e.message || e), true);
+    });
+  }
+
+  function phoneDisconnect() {
+    phoneStream(false);
+    PHONE.connected = false;
+    PHONE.connecting = false;
+    PHONE.fail = 0;
+    var img = $("phoneImg");
+    if (img) { img.hidden = true; img.removeAttribute("src"); }
+    var hint = $("phoneEmpty");
+    if (hint) { hint.hidden = false; }
+    phoneStat("已断开");
+  }
+
+  function phoneShotNow() {
+    if (!PHONE.connected || PHONE.busy) { return; }
+    PHONE.busy = true;
+    var t0 = Date.now();
+    phoneCall("self_ui_screenshot", { max: 1080 }).then(function (r) {
+      PHONE.busy = false;
+      if (!r || !r.ok) { throw new Error((r && r.err) || "手机没给画面"); }
+      if (!r.image) {
+        throw new Error("回包里没有图片（手机需 Android 11+ 且无障碍通道在线）");
+      }
+      var img = $("phoneImg");
+      img.src = "data:" + (r.mime || "image/jpeg") + ";base64," + r.image;
+      img.hidden = false;
+      var hint = $("phoneEmpty");
+      if (hint) { hint.hidden = true; }
+      PHONE.fail = 0;
+      PHONE.ms = Date.now() - t0;
+      phoneStat("已连接 · " + PHONE.scr.w + "×" + PHONE.scr.h +
+        " · 上一帧 " + PHONE.ms + "ms" + (PHONE.streaming ? " · 连播 1.2s" : ""));
+    }).catch(function (e) {
+      PHONE.busy = false;
+      PHONE.fail += 1;
+      var why = e.message || String(e);
+      if (PHONE.fail >= 3 && PHONE.streaming) {
+        phoneStream(false);
+        phoneStat("连续 3 次取不到画面，已停连播：" + why, true);
+      } else {
+        phoneStat("取画面失败（第 " + PHONE.fail + " 次）：" + why, true);
+      }
+    });
+  }
+
+  function phoneStream(on) {
+    PHONE.streaming = !!on;
+    if (PHONE.timer) { clearTimeout(PHONE.timer); PHONE.timer = null; }
+    var btn = $("phoneAuto");
+    if (btn) {
+      btn.textContent = "连播：" + (PHONE.streaming ? "开" : "关");
+      btn.classList.toggle("on", PHONE.streaming);
+    }
+    if (!PHONE.streaming) { return; }
+    (function tick() {
+      if (!PHONE.streaming || !PHONE.connected) { return; }
+      phoneShotNow();
+      PHONE.timer = setTimeout(tick, 1200);
+    })();
+  }
+
+  function phoneAct(tool, args) {
+    if (!PHONE.connected) { phoneStat("还没连上手机", true); return; }
+    phoneCall(tool, args).then(function (r) {
+      if (!r || !r.ok) { throw new Error((r && r.err) || "手机没执行"); }
+      // 动作后稍等一拍再回帧：点完界面才刚切过去，抓太快还是旧画面。
+      setTimeout(phoneShotNow, 180);
+    }).catch(function (e) {
+      phoneStat("操作失败：" + (e.message || e), true);
+    });
+  }
+
+  function phoneSendText() {
+    var inp = $("phoneText");
+    if (!inp) { return; }
+    var t = inp.value;
+    if (!t) { return; }
+    inp.value = "";
+    phoneAct("self_ui_text", { text: t });
+  }
+
+  /* 屏幕像素换算：图片是等比缩放的，所以用**实际渲染矩形**做归一化，
+     再乘手机分辨率。窗口缩放、letterbox 都不会错位。 */
+  function phoneMap(clientX, clientY) {
+    var img = $("phoneImg");
+    if (!img || !PHONE.scr.w) { return null; }
+    var r = img.getBoundingClientRect();
+    if (!r.width || !r.height) { return null; }
+    var nx = (clientX - r.left) / r.width;
+    var ny = (clientY - r.top) / r.height;
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) { return null; }
+    return {
+      x: Math.round(nx * (PHONE.scr.w - 1)),
+      y: Math.round(ny * (PHONE.scr.h - 1))
+    };
+  }
+
+  function phoneBindGesture(img) {
+    var down = null;
+    img.addEventListener("pointerdown", function (ev) {
+      if (!PHONE.connected) { return; }
+      ev.preventDefault();
+      if (img.setPointerCapture) { img.setPointerCapture(ev.pointerId); }
+      down = { x: ev.clientX, y: ev.clientY, t: Date.now() };
+    });
+    img.addEventListener("pointerup", function (ev) {
+      if (!down) { return; }
+      var d = down;
+      down = null;
+      var dx = ev.clientX - d.x, dy = ev.clientY - d.y;
+      var held = Date.now() - d.t;
+      var p1 = phoneMap(d.x, d.y);
+      var p2 = phoneMap(ev.clientX, ev.clientY);
+      if (!p1) { return; }
+      if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+        if (!p2) { return; }
+        phoneAct("self_ui_swipe", {
+          x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
+          duration: Math.max(120, Math.min(1200, held))
+        });
+      } else {
+        phoneAct("self_ui_tap_at", { x: p1.x, y: p1.y, long: held >= 600 });
+      }
+    });
+    img.addEventListener("pointercancel", function () { down = null; });
   }
 
   /* ------------------------------------------------------------------ 搜索

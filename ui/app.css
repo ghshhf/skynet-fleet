@@ -790,3 +790,20 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   cursor:pointer}
 .cadd .hbtn{width:auto;height:auto;font-size:11px;padding:4px 12px}
 .cadd .hbtn.go{border-color:var(--accent);color:var(--accent-text)}
+
+/* ---------------- 遥控手机（PC 看屏直点） ---------------- */
+.phone-cfg{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.phone-cfg .cin{flex:1 1 220px}
+.phone-stat{font-size:11.5px;color:var(--fg-3);line-height:1.6;
+  margin:2px 0 8px;min-height:18px;word-break:break-word}
+.phone-stat.err{color:var(--danger)}
+.phone-screen{position:relative;height:62vh;min-height:320px;
+  border:1px solid var(--line-soft);border-radius:10px;background:#0a0a0c;
+  display:flex;align-items:center;justify-content:center;overflow:hidden;
+  user-select:none;-webkit-user-select:none;touch-action:none}
+.phone-screen img{max-width:100%;max-height:100%;display:block;cursor:crosshair}
+.phone-screen .empty{color:var(--fg-3);font-size:12.5px;padding:24px;text-align:center;
+  line-height:1.8}
+.phone-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.phone-row .cin{flex:1 1 220px}
+.phone-legend{font-size:11px;color:var(--fg-3);margin-top:8px;line-height:1.7}
