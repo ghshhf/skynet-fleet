@@ -114,7 +114,7 @@ fun FeatureOverlayRoute(name: String, onOpen: (String) -> Unit) {
         "TRAFFIC" -> TrafficScreen()
         "DISK" -> DiskScreen()
         "FONTS" -> FontScreen()
-        "PERMS" -> SelfPermsScreen()
+        "SELFPERMS" -> SelfPermsScreen()
 
         // 未知名字不白屏：退回工作台目录，人还能从这再点进去。
         else -> FeatureHubScreen(onOpen)

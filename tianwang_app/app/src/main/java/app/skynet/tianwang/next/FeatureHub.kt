@@ -130,7 +130,7 @@ object FeatureHub {
             HubEntry("网络流量", "/proc/net/dev 各接口收发", "TRAFFIC"),
             HubEntry("磁盘与挂载", "df -h 各分区用量", "DISK"),
             HubEntry("字体清单", "/system/fonts 字体文件", "FONTS"),
-            HubEntry("应用权限自查", "本应用危险权限授予状态", "PERMS"),
+            HubEntry("应用权限自查", "本应用危险权限授予状态", "SELFPERMS"),
         )),
     )
 

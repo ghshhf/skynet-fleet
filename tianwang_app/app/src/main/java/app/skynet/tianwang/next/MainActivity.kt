@@ -373,7 +373,7 @@ private enum class Overlay(val title: String, val sub: String) {
     TRAFFIC("网络流量", "/proc/net/dev 各接口收发"),
     DISK("磁盘与挂载", "df -h 各分区用量"),
     FONTS("字体清单", "/system/fonts 字体文件"),
-    PERMS("应用权限自查", "本应用危险权限授予状态"),
+    SELFPERMS("应用权限自查", "本应用危险权限授予状态"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

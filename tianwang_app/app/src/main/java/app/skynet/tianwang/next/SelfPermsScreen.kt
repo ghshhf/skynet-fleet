@@ -33,7 +33,7 @@ fun SelfPermsScreen() {
             Manifest.permission.POST_NOTIFICATIONS to "发送通知",
         ).map { (perm, label) ->
             val granted = ctx.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
-            PermRow(label, perm, granted)
+            SelfPermRow(label, perm, granted)
         }
     }
     Column(
@@ -61,4 +61,4 @@ fun SelfPermsScreen() {
     }
 }
 
-private data class PermRow(val label: String, val perm: String, val granted: Boolean)
+private data class SelfPermRow(val label: String, val perm: String, val granted: Boolean)
