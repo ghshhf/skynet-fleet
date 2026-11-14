@@ -358,6 +358,10 @@ private enum class Overlay(val title: String, val sub: String) {
     PROC("进程查看", "运行中进程 · 按内存排序 · 结束"),
     CLIPBOARD("剪贴板", "读取 / 写入 / 本地历史"),
     LOGCAT("本机日志", "logcat 抓取 / 过滤 / 保存"),
+
+    // ---- 第八批：手机实体工具（应用管理 / 命令收藏）----
+    APPLIST("应用列表", "已装第三方应用 · 点一下复制包名"),
+    CMDFAV("命令收藏", "常用 shell 命令本机存储 · 一键执行"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

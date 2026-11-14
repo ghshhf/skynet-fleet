@@ -100,6 +100,10 @@ fun FeatureOverlayRoute(name: String, onOpen: (String) -> Unit) {
         "CLIPBOARD" -> ClipboardScreen()
         "LOGCAT" -> LogcatScreen()
 
+        // 第八批：手机实体工具（应用管理 / 命令收藏）
+        "APPLIST" -> AppListScreen()
+        "CMDFAV" -> CommandFavScreen()
+
         // 未知名字不白屏：退回工作台目录，人还能从这再点进去。
         else -> FeatureHubScreen(onOpen)
     }

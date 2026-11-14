@@ -121,6 +121,8 @@ object FeatureHub {
             HubEntry("进程查看", "运行中进程 · 按内存排序 · 结束", "PROC"),
             HubEntry("剪贴板", "读取 / 写入 / 本地历史", "CLIPBOARD"),
             HubEntry("本机日志", "logcat 抓取 / 过滤 / 保存", "LOGCAT"),
+            HubEntry("应用列表", "已装第三方应用 · 点一下复制包名", "APPLIST"),
+            HubEntry("命令收藏", "常用 shell 命令本机存储 · 一键执行", "CMDFAV"),
         )),
     )
 
