@@ -352,6 +352,12 @@ private enum class Overlay(val title: String, val sub: String) {
     // ---- 第六批：手机实体工具（系统自检 + 存储浏览）----
     SYSINFO("系统体检", "CPU/内存/电池/存储/屏幕"),
     FILEMAN("文件管理器", "浏览 / 查看 / 删除 / 复制路径"),
+
+    // ---- 第七批：手机实体工具（网络 / 进程 / 剪贴板 / 日志）----
+    NETDIAG("网络诊断", "连通性 / 网关 / DNS / 接口"),
+    PROC("进程查看", "运行中进程 · 按内存排序 · 结束"),
+    CLIPBOARD("剪贴板", "读取 / 写入 / 本地历史"),
+    LOGCAT("本机日志", "logcat 抓取 / 过滤 / 保存"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

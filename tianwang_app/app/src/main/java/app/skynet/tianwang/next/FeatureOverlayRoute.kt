@@ -94,6 +94,12 @@ fun FeatureOverlayRoute(name: String, onOpen: (String) -> Unit) {
         "SYSINFO" -> SysInfoScreen()
         "FILEMAN" -> FileManagerScreen()
 
+        // 第七批：手机实体工具（网络 / 进程 / 剪贴板 / 日志）
+        "NETDIAG" -> NetDiagScreen()
+        "PROC" -> ProcessScreen()
+        "CLIPBOARD" -> ClipboardScreen()
+        "LOGCAT" -> LogcatScreen()
+
         // 未知名字不白屏：退回工作台目录，人还能从这再点进去。
         else -> FeatureHubScreen(onOpen)
     }

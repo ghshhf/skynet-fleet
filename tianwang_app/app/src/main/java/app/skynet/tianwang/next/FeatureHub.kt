@@ -117,6 +117,10 @@ object FeatureHub {
         HubGroup("手机实体工具", listOf(
             HubEntry("系统体检", "CPU/内存/电池/存储/屏幕", "SYSINFO"),
             HubEntry("文件管理器", "浏览 / 查看 / 删除 / 复制路径", "FILEMAN"),
+            HubEntry("网络诊断", "连通性 / 网关 / DNS / 接口", "NETDIAG"),
+            HubEntry("进程查看", "运行中进程 · 按内存排序 · 结束", "PROC"),
+            HubEntry("剪贴板", "读取 / 写入 / 本地历史", "CLIPBOARD"),
+            HubEntry("本机日志", "logcat 抓取 / 过滤 / 保存", "LOGCAT"),
         )),
     )
 
