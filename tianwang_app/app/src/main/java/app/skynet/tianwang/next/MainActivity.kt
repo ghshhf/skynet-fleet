@@ -242,7 +242,7 @@ private enum class Tab(val label: String) {
  * 底栏只放 4 个「每天要用」的，其余一律点一下再进 —— 这是国内外大厂的
  * 共同做法，也是 Material 官方 3–5 个顶级入口的上限。
  */
-private enum class Overlay(val title: String, val sub: String) {
+internal enum class Overlay(val title: String, val sub: String) {
     MODELS("模型与网关", "本地 GGUF + 云端网关"),
     TASKS("任务进度", "项目整体进度"),
     FLEET("编队节点", "我在编队里的位置"),
@@ -920,7 +920,9 @@ private fun App() {
                 Overlay.DIAG -> DiagnosticsScreen()
                 Overlay.REPLAY -> ReplayHostScreen()
                 Overlay.INBOX -> InboxScreen()
-                Overlay.CAPS -> CapabilityCatalogScreen(capsQuery)
+                Overlay.CAPS -> CapabilityCatalogScreen(capsQuery, onOpen = { key ->
+                    Overlay.values().firstOrNull { it.name == key }?.let { overlay = it }
+                })
                 Overlay.APPEARANCE -> AppearanceScreen()
                 Overlay.PERMS -> PermissionMatrixScreen()
                 Overlay.HELP -> HelpScreen()
@@ -935,7 +937,7 @@ private fun App() {
                 Overlay.NOTIFS -> NotificationsScreen()
                 Overlay.REMOTE -> RemoteConsoleScreen(onBack = { overlay = null })
                 // 成批补齐的模块集中在一个路由里，避免 MainActivity 里再铺 35 个分支。
-                // 传枚举名字符串：Overlay 是本文件 private，独立路由文件用它做 when 分发即可。
+                // 传枚举名字符串：路由文件只按名字 when 分发，不引用枚举类型本身。
                 else -> FeatureOverlayRoute(ov?.name.orEmpty()) { key ->
                     Overlay.entries.firstOrNull { it.name == key }?.let { overlay = it }
                 }

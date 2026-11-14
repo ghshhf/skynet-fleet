@@ -13,17 +13,21 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -34,20 +38,35 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 /**
- * 全部能力目录：把这台手机真的挂着的工具按域摊开给人看，能搜、能看参数、能复制名字。
+ * 全部能力目录：把这台手机**真的挂着的全部东西**摊开成一份名单。
  *
- * 对照 DSH Go 的 ui/plugins + ui/features：能力不是只有模型能用，人也得看得到
- * 「这台机器到底会什么、哪些会改状态」。天网原来工具箱只有常用动作，
- * 64 个 `self_*` 工具全藏在 MCP 的 tools/list 里，装了什么全靠读代码。
+ * 之前这块只看 [PhoneMcp.toolList]（50 多个 `self_*` 工具），于是同一台机器上
+ * 存在三份互不相认的名单：
+ *   1. `PhoneMcp.toolList()` —— AI 能调的工具
+ *   2. `Overlay` 枚举 —— 119 个给人点的界面屏
+ *   3. `Chat.Capability` —— 云侧 `/api/caps` 下发的工具卡
+ * 谁也不知道全貌，加一个功能要改三处。
  *
- * 纪律：目录只读 [PhoneMcp.toolList]，不另造名单；标了 sideEffect 的必须显出来，
- * 免得「只读」这两个字变成文案而不是事实。
+ * 这一版把 1 和 2 合成一份 [CapEntry] 目录：
+ *  - 工具行：可展开填参数、**直接执行**（走 [PhoneMcp.executeTool]，跟 AI 同一条路）；
+ *  - 界面行：点一下跳到原来那个屏，功能一个没删。
+ *
+ * 3 那份是云侧下发的显示用数据，格式不同也不执行，暂不并进来 —— 并了反而更乱。
+ *
+ * 纪律：目录不另造名单，工具一律现取 `toolList()`；标了 sideEffect 的必须显出来，
+ * 免得「只读」变成文案而不是事实。
  */
 object CapabilityCatalog {
     data class Domain(val name: String, val tools: List<McpTool>)
+
+    /** 界面入口统一归到这个域，排在工具后面，一眼能分清「能跑」和「只能进」。 */
+    const val UI_DOMAIN = "界面入口"
 
     /** 顺序即页面顺序。未归到任何前缀的进「其它」。 */
     private val RULES = listOf(
@@ -76,6 +95,24 @@ object CapabilityCatalog {
         Triple("self_agent_", "目标委派", "整单交给 agent"),
         Triple("self_status", "状态", "通道状态"),
     )
+
+    /**
+     * 统一目录的一行。
+     *
+     * [toolName] 非空 = 可以直接执行；[overlay] 非空 = 点了跳界面。两者至少有一个。
+     */
+    data class CapEntry(
+        val key: String,
+        val title: String,
+        val desc: String,
+        val domain: String,
+        val sideEffect: Boolean = false,
+        val toolName: String? = null,
+        val overlay: String? = null,
+        val schema: JSONObject? = null,
+    ) {
+        val runnable: Boolean get() = toolName != null
+    }
 
     fun domains(tools: List<McpTool>): List<Domain> {
         val grouped = LinkedHashMap<String, MutableList<McpTool>>()
@@ -107,9 +144,67 @@ object CapabilityCatalog {
         }
     }
 
-    /** 把 inputSchema 里的参数名与说明读出来给人看，不执行任何工具。 */
-    fun params(t: McpTool): List<Pair<String, String>> {
-        val p = t.inputSchema.optJSONObject("properties") ?: return emptyList()
+    /**
+     * 合并两个来源：本机工具（可执行）+ 界面入口（点了跳屏）。
+     *
+     * [ui] 每项是 (Overlay 枚举名, 标题, 一句话说明)。
+     */
+    fun entries(
+        tools: List<McpTool>,
+        ui: List<Triple<String, String, String>>,
+    ): List<CapEntry> {
+        val out = ArrayList<CapEntry>(tools.size + ui.size)
+        for (t in tools) {
+            val hit = RULES.firstOrNull { (p, _, _) -> t.name.startsWith(p) }
+            out.add(
+                CapEntry(
+                    key = t.name,
+                    title = t.name,
+                    desc = t.description,
+                    domain = hit?.second ?: "其它",
+                    sideEffect = t.sideEffect,
+                    toolName = t.name,
+                    schema = t.inputSchema,
+                )
+            )
+        }
+        for ((name, title, sub) in ui) {
+            out.add(
+                CapEntry(
+                    key = "ui.$name",
+                    title = title,
+                    desc = sub,
+                    domain = UI_DOMAIN,
+                    overlay = name,
+                )
+            )
+        }
+        return out
+    }
+
+    fun searchEntries(list: List<CapEntry>, q: String): List<CapEntry> {
+        val s = q.trim().lowercase()
+        if (s.isEmpty()) return list
+        return list.filter { e ->
+            e.key.lowercase().contains(s) ||
+                e.title.lowercase().contains(s) ||
+                e.desc.lowercase().contains(s) ||
+                e.domain.lowercase().contains(s) ||
+                e.overlay?.lowercase()?.contains(s) == true
+        }
+    }
+
+    /** 分组并按域内顺序展开；「界面入口」固定排最后。 */
+    fun groupEntries(list: List<CapEntry>): List<Pair<String, List<CapEntry>>> {
+        val grouped = list.groupBy { it.domain }
+        val normal = grouped.filterKeys { it != UI_DOMAIN }.toList()
+        val ui = grouped[UI_DOMAIN]?.let { listOf(UI_DOMAIN to it) } ?: emptyList()
+        return normal + ui
+    }
+
+    /** 把 inputSchema 里的参数名与说明读出来给人看。 */
+    fun paramsOf(schema: JSONObject?): List<Pair<String, String>> {
+        val p = schema?.optJSONObject("properties") ?: return emptyList()
         val out = ArrayList<Pair<String, String>>()
         val keys = p.keys()
         while (keys.hasNext()) {
@@ -120,6 +215,18 @@ object CapabilityCatalog {
         return out
     }
 
+    /** 把 inputSchema 里的参数名与说明读出来给人看，不执行任何工具。 */
+    fun params(t: McpTool): List<Pair<String, String>> = paramsOf(t.inputSchema)
+
+    /**
+     * 执行一个工具。
+     *
+     * 走 [PhoneMcp.executeTool] —— 跟 MCP 入网、局域网直连、本地模型工具协议
+     * 完全同一个入口。界面不是一个「另一套实现」，只是另一个调用方。
+     */
+    suspend fun run(toolName: String, args: JSONObject): ToolResult =
+        PhoneMcp.executeTool(toolName, args)
+
     fun copyName(ctx: Context, name: String) {
         val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
         cm.setPrimaryClip(ClipData.newPlainText("工具名", name))
@@ -127,21 +234,39 @@ object CapabilityCatalog {
 }
 
 @Composable
-fun CapabilityCatalogScreen(initialQuery: String = "") {
+fun CapabilityCatalogScreen(
+    initialQuery: String = "",
+    onOpen: ((String) -> Unit)? = null,
+) {
     val ctx = LocalContext.current
-    val all = remember { runCatching { PhoneMcp.toolList() }.getOrDefault(emptyList()) }
+    val scope = rememberCoroutineScope()
+    val tools = remember { runCatching { PhoneMcp.toolList() }.getOrDefault(emptyList()) }
+    val uiEntries = remember {
+        Overlay.values().map { Triple(it.name, it.title, it.sub) }
+    }
+    val allEntries = remember(tools, uiEntries) {
+        CapabilityCatalog.entries(tools, uiEntries)
+    }
+
     var q by remember { mutableStateOf(initialQuery) }
     var opened by remember { mutableStateOf("") }
-    val matched = CapabilityCatalog.search(all, q)
-    val groups = CapabilityCatalog.domains(matched)
-    val sideCount = all.count { it.sideEffect }
+    var result by remember { mutableStateOf<Pair<String, ToolResult>?>(null) }
+    var busy by remember { mutableStateOf("") }
+
+    val matched = CapabilityCatalog.searchEntries(allEntries, q)
+    val groups = CapabilityCatalog.groupEntries(matched)
+    val toolCount = allEntries.count { it.runnable }
+    val sideCount = allEntries.count { it.sideEffect }
 
     Column(Modifier.fillMaxSize().padding(14.dp)) {
         Text("全部能力", fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface)
-        Text("本机挂了 ${all.size} 个工具，其中 $sideCount 个会改状态（默认被闸门挡着）。名单直接读 tools/list，不另写一份。",
+        Text(
+            "$toolCount 个工具能直接跑，${allEntries.size - toolCount} 个界面入口点了就进；" +
+                "其中 $sideCount 个会改状态（默认被闸门挡着）。名单现取，不另写一份。",
             fontSize = 11.sp, lineHeight = 16.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(Modifier.height(10.dp))
         BasicTextField(
             value = q,
@@ -154,7 +279,7 @@ fun CapabilityCatalogScreen(initialQuery: String = "") {
                 .background(MaterialTheme.colorScheme.surface)
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             decorationBox = { inner ->
-                if (q.isEmpty()) Text("搜工具名或说明，例如 截图 / lan / mcp",
+                if (q.isEmpty()) Text("搜名字或说明，例如 截图 / lan / 文件",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 inner()
             },
@@ -163,31 +288,87 @@ fun CapabilityCatalogScreen(initialQuery: String = "") {
         Text("命中 ${matched.size} 个 · ${groups.size} 个域", fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(6.dp))
+
         LazyColumn(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            groups.forEach { g ->
-                item(key = "h-${g.name}") {
-                    Text("${g.name} · ${g.tools.size}", fontSize = 12.sp,
+            groups.forEach { (domain, list) ->
+                item(key = "h-$domain") {
+                    Text("$domain · ${list.size}", fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.padding(top = 6.dp, start = 3.dp))
                 }
-                items(g.tools, key = { it.name }) { t ->
-                    ToolRow(t, opened == t.name, onToggle = {
-                        opened = if (opened == t.name) "" else t.name
-                    }, onCopy = { CapabilityCatalog.copyName(ctx, t.name) })
+                items(list, key = { it.key }) { e ->
+                    CapEntryRow(
+                        e = e,
+                        open = opened == e.key,
+                        busy = busy == e.key,
+                        onToggle = { opened = if (opened == e.key) "" else e.key },
+                        onCopy = { CapabilityCatalog.copyName(ctx, e.key) },
+                        onOpenUi = { e.overlay?.let { ov -> onOpen?.invoke(ov) } },
+                        onRun = { args ->
+                            val name = e.toolName
+                            if (name != null) {
+                                busy = e.key
+                                scope.launch {
+                                    val r = withContext(Dispatchers.IO) {
+                                        runCatching { CapabilityCatalog.run(name, args) }
+                                            .getOrElse {
+                                                ToolResult(
+                                                    ok = false,
+                                                    err = "调用失败：${it.message ?: it.javaClass.simpleName}",
+                                                )
+                                            }
+                                    }
+                                    busy = ""
+                                    result = e.title to r
+                                }
+                            }
+                        },
+                    )
                 }
             }
         }
     }
+
+    result?.let { (title, r) ->
+        AlertDialog(
+            onDismissRequest = { result = null },
+            title = {
+                Text(
+                    if (r.ok) title else "失败：$title",
+                    fontSize = 14.sp,
+                    color = if (r.ok) MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.error,
+                )
+            },
+            text = {
+                Text(
+                    (if (r.ok) r.text else r.err).ifBlank { "(没有返回内容)" },
+                    fontSize = 11.5.sp,
+                    lineHeight = 16.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { result = null }) { Text("知道了", fontSize = 12.sp) }
+            },
+        )
+    }
 }
 
 @Composable
-private fun ToolRow(
-    t: McpTool,
+private fun CapEntryRow(
+    e: CapabilityCatalog.CapEntry,
     open: Boolean,
+    busy: Boolean,
     onToggle: () -> Unit,
     onCopy: () -> Unit,
+    onOpenUi: () -> Unit,
+    onRun: (JSONObject) -> Unit,
 ) {
+    val ps = remember(e.key) { CapabilityCatalog.paramsOf(e.schema) }
+    val inputs = remember(e.key) { mutableStateMapOf<String, String>() }
+
     Column(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(9.dp))
@@ -196,33 +377,84 @@ private fun ToolRow(
             .padding(11.dp),
     ) {
         Row {
-            Text(t.name, fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+            Text(e.title, fontSize = 12.sp, fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.weight(1f))
-            if (t.sideEffect) {
+            if (e.sideEffect) {
                 Text("会改状态", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+            } else if (!e.runnable) {
+                Text("界面", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         Spacer(Modifier.height(3.dp))
-        Text(t.description, fontSize = 11.sp, lineHeight = 16.sp,
+        Text(e.desc, fontSize = 11.sp, lineHeight = 16.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (open) {
-            Spacer(Modifier.height(7.dp))
-            val ps = CapabilityCatalog.params(t)
-            if (ps.isEmpty()) {
-                Text("无参数", fontSize = 10.5.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            } else {
-                for ((k, d) in ps) {
-                    Text("· $k — $d", fontSize = 10.5.sp, lineHeight = 15.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        if (!open) return@Column
+
+        Spacer(Modifier.height(7.dp))
+
+        // 界面入口：不执行，只跳转。
+        if (!e.runnable) {
+            Text("这是一个界面屏，功能照旧，点下面进去。", fontSize = 10.5.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(Modifier.fillMaxWidth()) {
+                TextButton(onClick = onOpenUi, enabled = true) {
+                    Text(if (e.overlay != null) "打开界面" else "无入口")
                 }
+                TextButton(onClick = onCopy) { Text("复制名字") }
             }
-            Row(modifier = Modifier.fillMaxWidth()) {
-                TextButton(onClick = onCopy) { Text("复制工具名") }
+            return@Column
+        }
+
+        if (ps.isEmpty()) {
+            Text("无参数", fontSize = 10.5.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            for ((k, d) in ps) {
+                Text("· $k — $d", fontSize = 10.5.sp, lineHeight = 15.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(3.dp))
+                BasicTextField(
+                    value = inputs[k].orEmpty(),
+                    onValueChange = { inputs[k] = it },
+                    singleLine = true,
+                    textStyle = TextStyle(fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurface),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    modifier = Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(horizontal = 9.dp, vertical = 7.dp),
+                    decorationBox = { inner ->
+                        if (inputs[k].orEmpty().isEmpty()) {
+                            Text("填 $k", fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        inner()
+                    },
+                )
+                Spacer(Modifier.height(5.dp))
             }
+        }
+
+        Row(modifier = Modifier.fillMaxWidth()) {
+            TextButton(
+                onClick = {
+                    val args = JSONObject()
+                    for ((k, _) in ps) {
+                        val v = inputs[k].orEmpty().trim()
+                        if (v.isNotEmpty()) args.put(k, v)
+                    }
+                    onRun(args)
+                },
+                enabled = !busy,
+            ) {
+                Text(if (busy) "执行中…" else "执行", fontSize = 12.sp)
+            }
+            TextButton(onClick = onCopy) { Text("复制名字", fontSize = 12.sp) }
         }
     }
 }
