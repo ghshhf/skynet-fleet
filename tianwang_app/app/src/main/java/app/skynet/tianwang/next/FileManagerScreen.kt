@@ -22,7 +22,7 @@ import java.util.*
  * 公共下载/文档/媒体目录），查看文本、删除、复制路径。
  * 不申请额外权限、不碰系统分区；公共目录在 Android 11+ 受存储沙盒限制时可能列不出，如实显示。
  */
-private data class FileItem(
+private data class FmItem(
     val file: File, val name: String, val isDir: Boolean, val size: Long, val mtime: Long,
 )
 
@@ -34,7 +34,7 @@ fun FileManagerScreen() {
     var refresh by remember { mutableStateOf(0) }
     val items = remember(cur, refresh) { listDir(cur, roots) }
     var viewing by remember { mutableStateOf<String?>(null) }
-    var confirmDel by remember { mutableStateOf<FileItem?>(null) }
+    var confirmDel by remember { mutableStateOf<FmItem?>(null) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
@@ -130,11 +130,11 @@ private fun fileRoots(): List<File> {
     return list.distinctBy { it.absolutePath }
 }
 
-private fun listDir(cur: File?, roots: List<File>): List<FileItem> {
-    val base = cur ?: return roots.map { FileItem(it, it.name, true, 0L, it.lastModified()) }
+private fun listDir(cur: File?, roots: List<File>): List<FmItem> {
+    val base = cur ?: return roots.map { FmItem(it, it.name, true, 0L, it.lastModified()) }
     val files = base.listFiles() ?: return emptyList()
     return files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
-        .map { FileItem(it, it.name, it.isDirectory, it.length(), it.lastModified()) }
+        .map { FmItem(it, it.name, it.isDirectory, it.length(), it.lastModified()) }
 }
 
 private fun isText(f: File): Boolean {
