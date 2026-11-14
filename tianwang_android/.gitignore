@@ -1,2 +1,0 @@
-# 构建产物（build.sh 每次 rm -rf 重建，不入库）
-build/

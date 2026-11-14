@@ -34,11 +34,11 @@ android {
         aidl = true
     }
 
-    // 沿用老工程那份密钥（tianwang_android/keystore.jks）。
+    // 沿用第一代那份密钥（tianwang_app/keystore.jks，从已删除的 tianwang_android/ 里迁过来）。
     // 换一份新密钥会导致「覆盖安装」失败——手机只认同一个签名的更新。
     signingConfigs {
         create("rel") {
-            storeFile = file("../../tianwang_android/keystore.jks")
+            storeFile = file("../keystore.jks")
             storePassword = "tianwang"
             keyAlias = "tianwang"
             keyPassword = "tianwang"

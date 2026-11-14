@@ -193,17 +193,7 @@ CASES = [
     # 不发包/编排层参数切分都覆盖，自测自清理不碰真网。
     ("fleet_wallprobe", ["-m", "fleet.wallprobe"], HERE, 30),
     ("fleet_list", ["-m", "fleet", "list"], HERE, 120),
-    # ---- Android 静态门禁：XML 标签 vs Java 强转类型 ----
-    # 一次真事故一条：activity_device.xml 里 btnDevBack 是 <TextView>，
-    # Java 却声明成 Button → 点「基准测试」必崩 ClassCastException。
-    # 这种错编译期查不出来（findViewById 按声明类型推导，不校验布局），
-    # 只能在真机上点一下才知道，所以必须静态拦。纯离线、秒级。
-    ("android_viewcast", ["tools/check_viewcast.py"], HERE, 30),
-    # ---- Android 静态门禁 ②（总纲 §四 第 7 条）：运行时权限 vs Manifest 声明 ----
-    # 代码用 Manifest.permission.X 但清单没声明 ⇒ 运行时 SecurityException，
-    # 编译期查不出、栈里也看不出跟权限有关（详见 tools/check_permissions.py 头部）。
-    ("android_permissions", ["tools/check_permissions.py"], HERE, 30),
-    # ---- 桌面静态门禁 ③（总纲 §四/P2-14）：Tab 数量徽标不许硬编码 ----
+    # ---- 桌面静态门禁（总纲 §四/P2-14）：Tab 数量徽标不许硬编码 ----
     # 「技能 18」这种手写数量不会报错，只会一直停在旧值。查五件事：
     # 每个 tab 有带 id 的 .tn 徽标 / 标签里没数字 / paintTabCounts 从缓存取数 /
     # 赋值语句无数字字面量 / 启动就拉一次。纯离线、秒级。
@@ -327,10 +317,6 @@ CASES = [
     # 令牌不进 journal/fleetpair:// 链接往返/组播 TTL=1 LAN-only/tap 滤坏包。
     # 全离线：socket 全假、journal 用临时 sqlite。
     ("eval_t19_pair_mailbox", ["evals/t19_pair_mailbox.py"], HERE, 180),
-    # N+1c 手机出图：manifest/java 契约静态扫（RUN_COMMAND 常量/权限/不写死模型）
-    # + worker 行为（假 sd+假 sysfs：prompt/steps/size/插电/温度/并发锁/Vulkan
-    # 诚实边界/二进制缺失）。全离线、可测。
-    ("eval_t20_phone_image", ["evals/t20_phone_image.py"], HERE, 120),
     # T24：工具面 v2 —— Sky MCP over HTTP + 权限三档 + 多轮缰绳
     # 钉四组：① 同一请求走 stdio 与 HTTP 两条传输，响应必须一致（协议只有一份，
     # 以后改一边忘另一边 = 手机连上了但工具永远空，极难定位）；

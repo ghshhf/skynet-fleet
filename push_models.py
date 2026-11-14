@@ -1,7 +1,7 @@
 """P2 传模型兜底：把 PC 上的模型推到已连接的安卓手机。
 
 流程：
-  1. 读 fleet/model_catalog.py 的 CATALOG（或 tianwang_android 侧镜像）；
+  1. 读 fleet/model_catalog.py 的 CATALOG；
   2. 对每个档位，按约定本地路径查找模型文件（FLEET_MODELS_DIR / --src）；
   3. adb push 到手机 /sdcard/Android/data/app.skynet.tianwang/files/models/；
   4. chmod 777（sd.cpp mmap 需要可读）；

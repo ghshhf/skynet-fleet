@@ -1,8 +1,8 @@
 name: build-app
 
-# 新一代手机端（tianwang_app）独立一条流水线。
-# 老的 tianwang_android 走 build-android.yml，两份互不影响；
-# 这里只认 tianwang_app/**，改老工程不会连带重启这条。
+# 手机端（tianwang_app）独立一条流水线。
+# 第一代 tianwang_android 及其 build-android.yml 已于 2026-11-14 删除，
+# 这里只认 tianwang_app/**。
 #
 # 为什么放 CI：本机可以没有 Android SDK / NDK，但 GitHub 的 ubuntu 镜像自带 SDK，
 # 整包编译在这里跑，比“等一台真机插上 USB”可靠。

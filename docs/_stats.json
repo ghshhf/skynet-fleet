@@ -1,11 +1,11 @@
 {
-  "generated_at": "2026-11-14 10:28:59",
-  "gates_registered": 189,
-  "eval_files": 101,
+  "generated_at": "2026-11-14 13:49:39",
+  "gates_registered": 186,
+  "eval_files": 100,
   "orphan_evals": [],
   "retired_refs": [],
   "doc_md": 4,
-  "app_build": "49",
+  "app_build": "0.1.49-proto",
   "runtime_declared": [
     {
       "cap": "fleet.memory.sync",

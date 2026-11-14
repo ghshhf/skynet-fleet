@@ -72,11 +72,11 @@ def _read(path):
 # 2026-11-12：放宽到中文文件名与更多扩展名。旧正则只认「反引号 + ASCII」，
 # 总纲里一条已删的中文计划书路径因此漏网了整整 10 天。
 _PATH_RE = re.compile(
-    r"`((?:evals|tools|fleet|docs|tianwang_app|tianwang_android)/[^`\n*?<>]+?\.(?:py|md|json|pptx|txt|html|kts|gradle))`")
-# 裸路径（不在反引号里）：docs/xxx.md、tianwang_android/version.txt。
+    r"`((?:evals|tools|fleet|docs|tianwang_app)/[^`\n*?<>]+?\.(?:py|md|json|pptx|txt|html|kts|gradle))`")
+# 裸路径（不在反引号里）：docs/xxx.md、tianwang_app/version.properties。
 # 只认这几个文件树根，避免把普通英文句子当路径。
 _BARE_PATH_RE = re.compile(
-    r"(?<![`\w/\\])((?:docs|tianwang_app|tianwang_android)/"
+    r"(?<![`\w/\\])((?:docs|tianwang_app)/"
     r"[A-Za-z0-9_\u4e00-\u9fff./\-]+?\.(?:py|md|json|pptx|txt|html|kts|gradle))")
 _FENCE_RE = re.compile(r"```.*?```", re.S)
 

@@ -1,7 +1,8 @@
-# 天网 Next · 手机端第二代
+# 天网 Next · 手机端（唯一在维护的 Android 工程）
 
-Compose 原型。与 `tianwang_android/`（老的、能出货的、手搓构建那份）**并存**，
-包名不同（`app.skynet.tianwang.next`），可以同时装在手机上对照。
+Compose 原型，包名 `app.skynet.tianwang.next`。
+第一代 `tianwang_android` 已于 2026-11-14 删除，能力和密钥都并到本工程，
+手机上只剩这一个包在维护。
 
 ## 为什么另起一份
 
@@ -68,7 +69,8 @@ bash tianwang_app/build.sh          # release，约 2.2 MB
 bash tianwang_app/build.sh debug    # debug，约 55 MB（含 tooling，仅调试用）
 ```
 
-签名沿用 `tianwang_android/keystore.jks`（alias/pass 都是 `tianwang`）。
+签名沿用第一代那份密钥 `tianwang_app/keystore.jks`（alias/pass 都是 `tianwang`，
+随老工程删除一起迁到本工程根目录）。
 
 > debug 包 55 MB 不是代码大，是 `material-icons-extended` 里几千个图标；
 > release 开了 R8 + shrinkResources 之后只留引用到的十几个 ⇒ 2.2 MB。
@@ -189,7 +191,7 @@ python -m fleet.mcp.pair --url ... --room ... --secret ... --serve-stdio
 
 ## 设备配对 / 长期凭据（2026-11-07）
 
-老工程的能力继续往第二代搬：电脑端界面上的 6 位配对码 →
+老工程留下的配对能力已并入：电脑端界面上的 6 位配对码 →
 `POST /api/pair/claim` → 换回 `device_id` + `secret`，存本机，之后每次请求带
 `X-Fleet-Device: deviceId:secret`。配一次长期有效，电脑重启也不用重配。
 
@@ -310,7 +312,7 @@ JNI 每轮重建采样链（`penalties → grammar → top_k → top_p → temp 
 语音：聊天页麦克风 → `AudioRecord` 16k/单声道/PCM16 → 本地 WAV →
 `POST /api/voice/recognize`（`Content-Type: audio/wav`）→ 识别文字落回输入框。
 权限是 `RECORD_AUDIO`，首次点麦克风时请求。**只搬了云侧识别**，
-老工程的本机 `whisper.cpp` 还没接。
+本机 `whisper.cpp` 还没接（第一代那份随老工程删除，这项缺口回到零）。
 
 常驻：入网连接跑在 `PhoneLinkService` 前台服务里，通知常驻；
 `BootReceiver` 开机按上次状态恢复（Android 15 对后台 dataSync 有限制，
@@ -331,4 +333,3 @@ JNI 每轮重建采样链（`penalties → grammar → top_k → top_p → temp 
 - 对等审批：**不做**。手机不能给自己发通行证（那等于自己审自己）；要控另一台设备就走「远程控制台」的直连遥控，人点一下就是意图
 - 远程控制台：手机对端已能看屏 + 点图即点屏 / 拖动即滑动 / 打字；PC 对端仍走 pcctl.*
 - 悬浮窗：通知与剪贴板已接，悬浮窗/悬浮球还没做
-- 老工程删除：等本工程把 `tianwang_android` 的能力接完再谈

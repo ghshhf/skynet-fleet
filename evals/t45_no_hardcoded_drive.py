@@ -79,7 +79,6 @@ _LIT = re.compile(r"""["']([A-Za-z]:[\\/][^"'\n]*)["']""")
 _ALLOW = {
     # 门禁自测要造假路径来验行为，假路径本身没必要跟盘符较劲
     "evals/t14_mcp_and_skills.py": "*",
-    "evals/t20_phone_image.py": "*",
     "evals/t23_html_render.py": "*",
     "evals/t45_no_hardcoded_drive.py": "*",      # 本文件（变异测试要造盘符）
     # locate.py 的自测要验「C:/ D:/ 才算示例」，它自己有第 ⑪ 组照镜子

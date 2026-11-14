@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# 天网 Next · 手机端第二代出包
+# 天网 Next · 手机端（唯一在维护的 Android 工程）
 #
-# 与老工程 tianwang_android/build.sh 的区别：
-#   老的那份是 aapt2+javac+d8+apksigner 手搓五步，零依赖、产物一百多 KB；
-#   这一份走 Gradle（Compose 的依赖树几百 MB，手搓不现实），产物 2 MB 上下。
-# 两份并存，互不影响。
+# 第一代是 aapt2+javac+d8+apksigner 手搓五步、零依赖、产物一百多 KB，
+# 那份工程已于 2026-11-14 删除；这一份走 Gradle（Compose 的依赖树几百 MB，
+# 手搓不现实），产物 2 MB 上下。
 #
 # 用法：
 #   bash tianwang_app/build.sh            # release（推荐，R8 裁资源）

@@ -328,12 +328,15 @@ def doc_count():
 
 
 def app_build():
-    for rel in (os.path.join("tianwang_android", "version.txt"),
-                os.path.join("tianwang_app", "version.txt")):
-        try:
-            return _read(os.path.join(ROOT, rel)).strip()
-        except OSError:
-            continue
+    """读 tianwang_app 的 VERSION_NAME（version.properties 是唯一真源）。"""
+    try:
+        text = _read(os.path.join(ROOT, "tianwang_app", "version.properties"))
+    except OSError:
+        return "?"
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("VERSION_NAME="):
+            return line.split("=", 1)[1].strip() or "?"
     return "?"
 
 
@@ -396,7 +399,7 @@ def render_block(st):
         f"| eval 文件 | **{n(st.get('eval_files'))}** 份 | `evals/*.py` |",
         f"| 游离门禁 | **{len(st.get('orphan_evals') or [])}** 份 | 写了但没登记，等于没写 |",
         f"| 文档 | **{n(st.get('doc_md'))}** 份 | `docs/*.md` |",
-        f"| App build | **{n(st.get('app_build'))}** | `tianwang_android/version.txt`（第二代版本看 `tianwang_app/app/build.gradle.kts`） |",
+        f"| App build | **{n(st.get('app_build'))}** | `tianwang_app/version.properties`（唯一真源） |",
     ]
     # 两个缺口也由脚本算——它们是「该去解释的东西」，不是让人记住的数字
     dec, own, gat = (st.get("capabilities_declared"), st.get("capabilities_owned"),
