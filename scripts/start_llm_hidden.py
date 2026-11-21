@@ -100,8 +100,8 @@ def find_llama(explicit=""):
 #:   Qwen3.5-2B          27/30 · 423 tok · 5.2s   ← 默认
 #:   FunctionGemma-270M   6/30（快，但中文+多工具撑不住，还会直接开始聊天）
 #:   Qwen3-1.7B          域内 3/6，prompt 一长就散
-#:   Qwen3-0.6B          只在 ≤8 个工具时能用
-DEFAULT_MODELS = ("Qwen3.5-2B*.gguf", "Qwen3-1.7B*.gguf", "Qwen3-0.6B*.gguf")
+#: 0.6B 一档已于 2026-11-21 彻底弃用（手机端与 PC 端都不再用），从候选里移除。
+DEFAULT_MODELS = ("Qwen3.5-2B*.gguf", "Qwen3-1.7B*.gguf")
 
 #: 自带对话模板、且**实测比项目模板更准**的模型关键字：这些不套项目模板。
 #: 判据不是「新就好」——Qwen3.5 的模板带自己的 think 段语法，套 qwen3 那份
