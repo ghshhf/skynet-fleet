@@ -796,7 +796,7 @@ def _cmd_pac(_args):
 
 
 def _cmd_system_proxy(args):
-    if len(args) < 2 or args[0] not in ("on", "off"):
+    if not args or args[0] not in ("on", "off"):
         print("  用法：netaccel.py system-proxy on <pac路径> | off")
         return 2
     if args[0] == "on":
