@@ -33,22 +33,14 @@ object ToolScope {
     )
 
     /**
-     * 九个域。`words` 是中文/英文触发词（按出现即记分），`prefixes` 是工具名前缀归属，
-     * `core` 是该域里最该先给模型的那几个（顺序即优先级），`veto` 是让本域出局的否决词。
+     * 各域。`words` 是中文/英文触发词（按出现即记分），`prefixes` 是工具名前缀归属，
+     * `core` 是该域里最该先给模型的那几个（顺序即优先级）。
      */
     private enum class Domain(
         val label: String,
         val words: List<String>,
         val prefixes: List<String>,
         val core: List<String>,
-        /**
-         * 命中这些词时本域直接出局。
-         *
-         * 存在的理由只有一个：**同一个动词属于不同域**。说「网盘里搜一下」时，
-         * 「搜」是网盘动作；不加否决，联网域会靠「搜一下」拿到同样的分，
-         * 结果两边各给一半工具，模型反而更容易选错。
-         */
-        val veto: List<String> = emptyList(),
     ) {
         UI(
             "界面操作",
@@ -134,18 +126,6 @@ object ToolScope {
             listOf("web_"),
             // 多篇汇总排第一：一句话给几个链接时，模型该一次读完，而不是逐条 read。
             listOf("web_digest", "web_search", "web_read"),
-            // 「网盘里搜一下」是网盘动作，不是上网查资料。
-            veto = listOf("网盘", "文件夹", "相册", "剪贴板", "openlist", "alist"),
-        ),
-        CLOUD(
-            "网盘文件",
-            listOf(
-                "网盘", "文件", "目录", "文件夹", "下载", "上传", "搜文件", "搜索文件", "存储",
-                "openlist", "alist",
-                "cloud", "folder", "download", "upload", "drive", "storage",
-            ),
-            listOf("cloud_"),
-            listOf("cloud_nodes", "cloud_list", "cloud_search", "cloud_file_url"),
         ),
         EXT(
             "外部工具",
@@ -288,14 +268,12 @@ object ToolScope {
 
     /**
      * 域得分：命中一个触发词记 1 分；命中多个词自然更高，避免单个歧义词决定全局。
-     * 命中否决词直接 0 分 —— 见 [Domain.veto]。
      *
      * 额外一条硬信号：句子里出现 http(s) 链接就是联网任务。用户最常见的说法是
      * 直接甩一条链接（「https://…」），句子里没有任何「网页/搜索」字样，
      * 光靠词表会判成通用域 —— 模型手里没有联网工具，只能说做不到。
      */
     private fun score(d: Domain, goal: String): Int {
-        if (d.veto.any { hit(goal, it) }) return 0
         var s = d.words.count { hit(goal, it) }
         if (d == Domain.WEB && (goal.contains("http://") || goal.contains("https://"))) s += 10
         return s

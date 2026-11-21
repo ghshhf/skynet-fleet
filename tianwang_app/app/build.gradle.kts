@@ -22,7 +22,18 @@ android {
         // 跟老工程一致：minSdk 28 不是随便挑的（libfleet_sd.so 用到 std::aligned_alloc，
         // Android libc 到 API 28 才有）。将来合并 native 时这里不能降。
         minSdk = 28
-        targetSdk = 35
+        // 🔴 故意钉在 28，别「顺手升级」到 35。
+        //    Android 10+ 的 W^X：targetSdk>=29 的进程落在 untrusted_app 域，
+        //    SELinux 禁止 execute_no_trans app_data_file，于是 App 自己目录下的
+        //    proot loader / Alpine busybox / 以后 apk add 的 python 全都 execve 失败
+        //    （真机 25060RK16C 实测：avc denied execute_no_trans + Permission denied）。
+        //    AOSP private/untrusted_app_27.te 明确保留：
+        //      allow untrusted_app_27 app_data_file:file execute_no_trans;
+        //    且 neverallow 里单独豁免 untrusted_app_27 / runas_app —— Termux 也是这么做的。
+        //    同机 Termux(targetSdk=28) 进程域实测 u:r:untrusted_app_27，Android 16 仍认这个域。
+        //    代价：scoped storage / FGS 类型 / POST_NOTIFICATIONS 等 targetSdk>=29 行为不强制，
+        //    对这台侧载 debug 包无影响；明文流量已由 manifest usesCleartextTraffic=true 保住。
+        targetSdk = 28
         versionCode = verProps.getProperty("VERSION_CODE", "1").trim().toInt()
         versionName = verProps.getProperty("VERSION_NAME", "0.1-proto").trim()
     }

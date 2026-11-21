@@ -65,7 +65,6 @@ fun ToolsScreen(
     onOpenDevice: () -> Unit,
     onOpenAbout: () -> Unit,
     onOpenImage: () -> Unit,
-    onOpenCloudDrive: () -> Unit,
     speakOn: Boolean,
     onToggleSpeak: () -> Unit,
 ) {
@@ -100,9 +99,6 @@ fun ToolsScreen(
         },
         ToolAction("版本与更新", "关于与后端", Icons.Filled.Info) {
             onOpenAbout()
-        },
-        ToolAction("网盘聚合", "对等节点 · 集中各网盘", Icons.Filled.Folder) {
-            onOpenCloudDrive()
         },
     )
 

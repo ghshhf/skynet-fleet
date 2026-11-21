@@ -500,7 +500,10 @@ private fun AddModelCard(onChanged: () -> Unit) {
                                     url = u,
                                     dir = File(Demo.modelDir),
                                     name = name,
-                                ) { d, t -> st = st?.copy(done = d, total = t) }
+                                    // 🔴 必须具名：fetch 末尾还有 isCancelled，尾随 lambda
+                                    //    会被 Kotlin 判给最后一个函数参数，类型对不上。
+                                    onProgress = { d, t -> st = st?.copy(done = d, total = t) },
+                                )
                                 r.onSuccess { f ->
                                     st = ImportState(
                                         name = f.name, done = f.length(),

@@ -397,7 +397,8 @@ object LinuxRuntime {
         KB.setStr(K_READY, "1")
         KB.setStr(K_SHA, actual)
         KB.setStr(K_AT, System.currentTimeMillis().toString())
-        report("Linux 用户态已就绪（${dirSize(dir) / 1024} KB）。")
+        prepareNet()
+        report("Linux 用户态已就绪（${dirSize(dir) / 1024} KB，DNS / 国内 apk 源已配好）。")
         when (prootSource()) {
             ProotSource.NONE -> report("注意：尚未提供 proot，完整隔离暂不可用；默认仍跑 Android shell。可在「运行时」导入 proot 解锁。")
             ProotSource.IMPORTED -> report("已用导入的 proot，可直接进完整 Linux 用户态。")
@@ -412,6 +413,31 @@ object LinuxRuntime {
         val ok: Boolean,
         val ms: Long,
     )
+
+    /**
+     * 给 guest 补上联网两件套：DNS + 国内 apk 源。
+     *
+     * 真机实测（25060RK16C / Alpine 3.20.3）：minirootfs 出厂**不带 /etc/resolv.conf**，
+     * `apk update` 直接报 "temporary error (try again later)"；而 CA 证书
+     * /etc/ssl/certs/ca-certificates.crt 是自带的，HTTPS 不用额外塞东西。
+     * Android 16 上 `getprop net.dns1` 返回空，所以直接用国内公共 DNS，不猜宿主配置。
+     *
+     * 每次 exec 前幂等补一次：换 WiFi、rootfs 被重装都能自愈，成本只是两个小文件。
+     */
+    private fun prepareNet() {
+        val rd = rootfsDir()
+        val dns = "nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 8.8.8.8\n"
+        val repo = "https://mirrors.tuna.tsinghua.edu.cn/alpine/v$RELEASE/main\n" +
+            "https://mirrors.tuna.tsinghua.edu.cn/alpine/v$RELEASE/community\n"
+        runCatching {
+            val resolv = File(rd, "etc/resolv.conf")
+            if (!resolv.isFile || resolv.readText() != dns) resolv.writeText(dns)
+            val repos = File(rd, "etc/apk/repositories")
+            repos.parentFile?.mkdirs()
+            val cur = runCatching { repos.readText() }.getOrDefault("")
+            if (!cur.contains("tsinghua")) repos.writeText(repo)
+        }
+    }
 
     private fun androidShell(): String {
         val sys = "/system/bin/sh"
@@ -433,8 +459,17 @@ object LinuxRuntime {
         val proot = prootBinary()
         val linux = proot != null && rootfsReady()
         val raw = if (linux) {
+            prepareNet()
             val rd = rootfsDir().absolutePath
-            val cmd = "${proot!!.absolutePath} --kill-on-exit --link2symlink -0 " +
+            // 真机实测（25060RK16C / Android 16）：
+            //  ① Android 没有 /tmp，PROOT_TMP_DIR 必须给宿主可写绝对路径（工作区），
+            //     给 guest 路径 /tmp 会报 "can't create temporary directory: Permission denied"；
+            //  ② --link2symlink 会让 proot 去 chmod 一个不存在的临时文件，直接把 execve 拖死，
+            //     去掉后 /bin/sh 正常进 Alpine；
+            //  ③ guest 内默认 PATH 没有 /bin，cat / apk 全部 not found，得显式带上。
+            val cmd = "export PROOT_TMP_DIR='${ws.absolutePath}'; " +
+                "export PATH=/bin:/usr/bin:/sbin:/usr/sbin; " +
+                "${proot!!.absolutePath} --kill-on-exit -0 " +
                 "-r '$rd' " +
                 "-b '${ws.absolutePath}':/workspace -b /dev -b /proc -b /sys " +
                 "-w /workspace /bin/sh '/workspace/${script.name}'"

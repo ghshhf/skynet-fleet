@@ -1,18 +1,16 @@
 """下载设备：把「下载」整个领域吸收进天网源码（不封装外部 daemon、不调黑盒 exe）。
 
 吸收来源（源码已拉至 /d/refs，吸收而非 vendored）：
-- QuarkPanTool (ihmily)：夸克网盘官方 API —— cookie → drive-pc.quark.cn/1/clouddrive/file/download 拿直链
-- LinkSwift (hmjz100)：9 家网盘直链提取思路（百度/阿里/夸克/迅雷/天翼/UC/123/移动/光鸭）
 - aria2 设计理念：多源 / 分片 / 断点续传 / 并发闸 —— 用标准库 urllib 重写，零第三方依赖
 
 设计原则（对齐 OSINT「提取万物融入己身」）：
 - 下载引擎零依赖（urllib + 标准库），分片多线程、断点续传、多源、代理、并发闸、hash 校验
-- 网盘层 = 拿直链（官方 API，不破解限速），再交给引擎下载；QuarkClient 为样本实现，其余家登记端点清单待读源码内化
 - 任务管理：进度 / 暂停 / 续传，内存任务表
 - AI 读本文件即可知道如何调用（capabilities 经 catalog 暴露）
+
+网盘相关能力（网盘直链/挂载）已移除：用别人的现成方案更好更方便；本模块只做通用直链下载。
 """
 import os
-import re
 import sys
 import json
 import time
@@ -29,7 +27,6 @@ import socketserver
 import http.server
 
 from ..core import BaseDevice, DeviceResult as R
-from .. import net   # 出向唯一正道（网盘 API 也要躲开僵尸 HTTP_PROXY）
 
 
 # ============================ 下载引擎 ============================
@@ -189,128 +186,6 @@ class DownloadEngine:
         self._paused = True
 
 
-# ============================ 网盘层 ============================
-class PanClient:
-    """网盘基类。子类实现 get_share_detail / get_download_urls。
-    设计：网盘层只负责「拿直链」（官方 API，不破解限速），下载交给 DownloadEngine。"""
-    NAME = 'base'
-
-    def __init__(self, cookie=None):
-        self.cookie = cookie or ''
-
-    def get_download_urls(self, fids):
-        raise NotImplementedError
-
-    def get_share_detail(self, pwd_id, stoken='', password=''):
-        raise NotImplementedError
-
-
-class QuarkClient(PanClient):
-    """夸克网盘（吸收 QuarkPanTool）。
-    登录态 = 夸克网页 cookie。提取方式：浏览器登录 pan.quark.cn → 取 domain 含 quark 的 cookie
-    拼成 k=v;k=v。可放环境变量 QUARK_COOKIE 或文件 cookies.txt。
-    真链路：fids → POST /1/clouddrive/file/download → download_url 直链 → 引擎下载。
-    """
-    NAME = 'quark'
-    BASE = 'https://drive-pc.quark.cn/1/clouddrive'
-    UA_EDGE = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-               '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0')
-    UA_QUARK = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                '(KHTML, like Gecko) quark-cloud-drive/2.5.56 Chrome/100.0.4896.160 '
-                'Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch')
-
-    def __init__(self, cookie=None):
-        cookie = cookie or os.environ.get('QUARK_COOKIE') or ''
-        if not cookie and os.path.exists('cookies.txt'):
-            try:
-                cookie = open('cookies.txt', 'r', encoding='utf-8').read().strip()
-            except Exception:
-                pass
-        super().__init__(cookie)
-        self.ua = self.UA_EDGE
-
-    def _headers(self):
-        return {
-            'User-Agent': self.ua,
-            'Accept': 'application/json, text/plain, */*',
-            'Content-Type': 'application/json',
-            'accept-language': 'zh-CN',
-            'origin': 'https://pan.quark.cn',
-            'referer': 'https://pan.quark.cn/',
-            'cookie': self.cookie,
-        }
-
-    def _post(self, path, data, params=None):
-        url = self.BASE + path
-        if params:
-            url += '?' + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'),
-                                     headers=self._headers(), method='POST')
-        try:
-            with net.urlopen(req, timeout=60) as r:
-                return json.loads(r.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            try:
-                return json.loads(e.read().decode('utf-8'))
-            except Exception:
-                return {'code': -1, 'status': -1, 'message': str(e)}
-
-    def get_download_urls(self, fids):
-        if isinstance(fids, str):
-            fids = [fids]
-        params = {'pr': 'ucpro', 'fr': 'pc', 'sys': 'win32', 've': '2.5.56', 'ut': '', 'guid': ''}
-        j = None
-        for _ in range(2):
-            j = self._post('/file/download', {'fids': fids}, params)
-            if j.get('code') == 23018:
-                self.ua = self.UA_QUARK   # 触发风控换 UA 重试
-                continue
-            break
-        if not j or j.get('status') != 200 or not j.get('data'):
-            return {'ok': False, 'err': (j or {}).get('message', 'no data')}
-        files = [{'file_name': it['file_name'], 'download_url': it['download_url']}
-                 for it in j['data']]
-        return {'ok': True, 'files': files}
-
-    def get_stoken(self, pwd_id, password=''):
-        j = self._post('/share/sharepage/token',
-                       {'pwd_id': pwd_id, 'passcode': password},
-                       {'pr': 'ucpro', 'fr': 'pc'})
-        if j.get('status') != 200 or not j.get('data'):
-            return {'ok': False, 'err': j.get('message', 'token 失败')}
-        return {'ok': True, 'stoken': j['data']['stoken']}
-
-    def get_share_detail(self, pwd_id, stoken='', password=''):
-        if not stoken:
-            t = self.get_stoken(pwd_id, password)
-            if not t.get('ok'):
-                return t
-            stoken = t['stoken']
-        j = self._post('/share/sharepage/detail',
-                       {'pwd_id': pwd_id, 'stoken': stoken, 'pdir_cid': '0', 'force': 0},
-                       {'pr': 'ucpro', 'fr': 'pc'})
-        if j.get('status') != 200 or not j.get('data') or 'list' not in j['data']:
-            return {'ok': False, 'err': j.get('message', 'detail 失败')}
-        files = [{'fid': it['fid'], 'file_name': it['file_name'], 'size': it.get('size', 0)}
-                 for it in j['data']['list']]
-        return {'ok': True, 'files': files, 'stoken': stoken}
-
-
-# 其余网盘：登记官方直链端点思路（吸收 LinkSwift 覆盖的 9 家），待读各自源码内化实现。
-# 不编造 API 字段——只留清晰扩展点，避免「看起来能下载其实调不通」。
-PAN_REGISTRY = {
-    'quark':   {'client': 'QuarkClient', 'desc': '夸克网盘（已实现样本）', 'status': 'ready'},
-    'baidu':   {'client': None, 'desc': '百度网盘（需 BDUSS，直链 API 待内化）', 'status': 'stub'},
-    'aliyun':  {'client': None, 'desc': '阿里云盘（需 token，openapi 待内化）', 'status': 'stub'},
-    'xunlei':  {'client': None, 'desc': '迅雷云盘（需 xl_token，待内化）', 'status': 'stub'},
-    'tianyi':  {'client': None, 'desc': '天翼云盘（需 cookie，待内化）', 'status': 'stub'},
-    'uc':      {'client': None, 'desc': 'UC 网盘（待内化）', 'status': 'stub'},
-    'pan123':  {'client': None, 'desc': '123 网盘（待内化）', 'status': 'stub'},
-    'mobile':  {'client': None, 'desc': '移动云盘（待内化）', 'status': 'stub'},
-    'guangya': {'client': None, 'desc': '光鸭网盘（待内化）', 'status': 'stub'},
-}
-
-
 # ============================ 任务管理 ============================
 TASKS = {}   # task_id -> dict
 
@@ -322,19 +197,14 @@ class Download(BaseDevice):
 
     def __init__(self, name="download:engine", **kw):
         super().__init__(name, via="internet", **kw)
-        self.meta.setdefault("note", "下载领域全内化：直链/网盘/分片/续传/多源/代理，零外部 daemon")
+        self.meta.setdefault("note", "下载领域全内化：直链/分片/续传/多源/代理，零外部 daemon")
 
     def probe(self):
-        # 标准库 urllib 总在，引擎零依赖；网盘需 cookie（运行时提供）
+        # 标准库 urllib 总在，引擎零依赖
         return True, ""
 
     def caps(self):
-        return ("download.direct", "download.pan", "download.task")
-
-    def _pan_client(self, pan, cookie):
-        if pan != 'quark':
-            return None   # 其余家未实现
-        return QuarkClient(cookie=cookie)
+        return ("download.direct", "download.task")
 
     def _hash_tuple(self, verify):
         if not verify:
@@ -359,54 +229,6 @@ class Download(BaseDevice):
         r = eng.download(urls, dest, resume=args.get('resume', True),
                          multi_source=args.get('multi_source', False))
         return r
-
-    def _pan(self, args):
-        pan = args.get('pan', 'quark')
-        client = self._pan_client(pan, args.get('cookie'))
-        if client is None:
-            return {'ok': False, 'err': '未知或未实现的网盘: %s（已支持: quark）' % pan}
-        if args.get('mode') == 'share':
-            share_url = args.get('share_url')
-            if not share_url:
-                return {'ok': False, 'err': 'share 模式需要 share_url'}
-            pwd_id = self._parse_share(share_url)
-            if not pwd_id:
-                return {'ok': False, 'err': '无法从分享链接解析 pwd_id'}
-            detail = client.get_share_detail(pwd_id, '', args.get('password', ''))
-            if not detail.get('ok'):
-                return detail
-            fids = [f['fid'] for f in detail['files']]
-        else:
-            fids = args.get('fids')
-            if isinstance(fids, str):
-                fids = [x.strip() for x in fids.split(',') if x.strip()]
-        if not fids:
-            return {'ok': False, 'err': '缺少 fids 或有效分享'}
-        urls = client.get_download_urls(fids)
-        if not urls.get('ok'):
-            return urls
-        dest_dir = args.get('dest', 'downloads')
-        os.makedirs(dest_dir, exist_ok=True)
-        eng = DownloadEngine(
-            concurrency=int(args.get('concurrency', 4)),
-            proxy=args.get('proxy'),
-            verify_hash=self._hash_tuple(args.get('verify')),
-        )
-        results = []
-        for fi in urls['files']:
-            d = os.path.join(dest_dir, fi['file_name'])
-            r = eng.download([fi['download_url']], d, resume=args.get('resume', True))
-            r['file'] = fi['file_name']
-            results.append(r)
-        return {'ok': all(x['ok'] for x in results), 'files': results}
-
-    @staticmethod
-    def _parse_share(share_url):
-        m = re.search(r'/s/([A-Za-z0-9]+)', share_url)
-        if m:
-            return m.group(1)
-        m = re.search(r'pwd_id=([A-Za-z0-9]+)', share_url)
-        return m.group(1) if m else None
 
     def _task(self, args):
         action = args.get('action', 'list')
@@ -443,8 +265,6 @@ class Download(BaseDevice):
         try:
             if op == 'direct':
                 m = self._direct(args)
-            elif op == 'pan':
-                m = self._pan(args)
             elif op == 'task':
                 m = self._task(args)
             else:

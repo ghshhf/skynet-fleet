@@ -9,7 +9,11 @@ import java.io.File
  * 谁先回用谁、或者把两边答案并排给用户看。
  */
 object LocalAsk {
-    suspend fun ask(prompt: String, maxTokens: Int = 256): ToolResult {
+    suspend fun ask(
+        prompt: String,
+        maxTokens: Int = 256,
+        history: List<ChatMsg> = emptyList(),
+    ): ToolResult {
         if (prompt.isBlank()) return ToolResult(false, err = "缺 prompt：写清要问什么")
         if (!ModelGate.enter()) {
             return ToolResult(false, err = "本机模型正忙（另一个目标/问答还在跑），等它结束再派")
@@ -26,7 +30,9 @@ object LocalAsk {
             val profile = base.copy(maxTokens = maxTokens.coerceIn(32, 2048))
             return LocalBackend.chat(
                 profile = profile,
-                messages = listOf(ChatMsg(role = ChatMsg.Role.USER, text = prompt)),
+                // 带上历史，native 才会把「上一轮问答」拼进模板 —— 这样新 prompt
+                // 是上一轮 KV 的严格前缀，nNew 只剩新问题那十几个 token。
+                messages = history + ChatMsg(role = ChatMsg.Role.USER, text = prompt),
                 onDelta = {},
                 onTool = {},
             ).fold(

@@ -32,7 +32,7 @@
 | eval 文件 | **101** 份 | `evals/*.py` |
 | 游离门禁 | **0** 份 | 写了但没登记，等于没写 |
 | 文档 | **4** 份 | `docs/*.md` |
-| App build | **0.1.49-proto** | `tianwang_app/version.properties`（唯一真源） |
+| App build | **0.1.70-proto** | `tianwang_app/version.properties`（唯一真源） |
 
 | 缺口 | 条 | 含义 |
 |---|---|---|

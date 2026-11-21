@@ -496,7 +496,11 @@ object PhoneSelf {
                     "self.peer.goal" -> withContext(Dispatchers.IO) { LanHub.peerGoal(args) }
                     // 双机并行算力：内部自己并发，本机与对端同时跑。
                     "self.model.ask" -> withContext(Dispatchers.Default) {
-                        LocalAsk.ask(strArg(args, "prompt"), intArg(args, "max_tokens", 256))
+                        LocalAsk.ask(
+                            prompt = strArg(args, "prompt"),
+                            maxTokens = intArg(args, "max_tokens", 256),
+                            history = historyArg(args["history"]),
+                        )
                     }
                     // 电脑/API 算力：key 在电脑上，手机只发问题。
                     "self.api.ask" -> PcAsk.ask(
@@ -1206,6 +1210,38 @@ object PhoneSelf {
     }
 
     // ---------------------------------------------------------------- 参数
+
+    /**
+     * 多轮历史：无头通道（广播 / 局域网 / MCP）都能把上一轮问答原样带回来，
+     * native 才会拼成「上一轮 KV 的严格前缀」，从而只重算新增的十几个 token。
+     * 兼容 JSONArray、List、以及「JSON 数组字符串」三种传法。
+     */
+    private fun historyArg(v: Any?): List<ChatMsg> {
+        val arr: List<Any?> = when (v) {
+            is org.json.JSONArray -> (0 until v.length()).map { v.opt(it) }
+            is List<*> -> v
+            is String -> runCatching {
+                val a = org.json.JSONArray(v)
+                (0 until a.length()).map { a.opt(it) }
+            }.getOrDefault(emptyList())
+            else -> emptyList()
+        }
+        return arr.mapNotNull { e ->
+            val o = when (e) {
+                is org.json.JSONObject -> e
+                is Map<*, *> -> org.json.JSONObject(
+                    e.entries.associate { it.key.toString() to it.value })
+                else -> null
+            } ?: return@mapNotNull null
+            val role = when (o.optString("role").lowercase()) {
+                "assistant" -> ChatMsg.Role.ASSISTANT
+                "system" -> ChatMsg.Role.SYSTEM
+                else -> ChatMsg.Role.USER
+            }
+            val text = o.optString("text").ifBlank { o.optString("content") }
+            if (text.isBlank()) null else ChatMsg(role = role, text = text)
+        }
+    }
 
     private fun strArg(args: Map<String, Any?>, key: String): String =
         args[key]?.toString()?.trim().orEmpty()

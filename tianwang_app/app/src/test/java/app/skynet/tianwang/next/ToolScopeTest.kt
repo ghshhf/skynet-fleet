@@ -32,7 +32,6 @@ class ToolScopeTest {
         "self_peer_probe", "self_peer_pick", "self_peer_call", "self_agent_goal",
         "self_peer_goal", "self_model_ask", "self_api_ask", "self_peer_pool", "self_dns_resolve",
         "self_ddns_status", "self_ddns_config", "self_ddns_publish", "self_ddns_watch",
-        "cloud_nodes", "cloud_list", "cloud_search", "cloud_file_url",
         "web_search", "web_read", "web_digest",
     )
 
@@ -44,7 +43,7 @@ class ToolScopeTest {
 
     @Test
     fun everyToolHasDomain() {
-        assertEquals(67, names.size)
+        assertEquals(63, names.size)
         for (n in names) {
             assertTrue("工具 $n 没有归属域，那一域的目标永远拿不到它", ToolScope.domainLabel(n).isNotBlank())
         }
@@ -54,7 +53,6 @@ class ToolScopeTest {
     fun uiGoalPicksUiTools() {
         val got = pickedNames("帮我点一下设置里的关于手机")
         assertTrue("应给到 self_ui_tap，实际：$got", "self_ui_tap" in got)
-        assertTrue("不该出现网盘工具，实际：$got", got.none { it.startsWith("cloud_") })
         assertTrue(got.size <= ToolScope.DEFAULT_LIMIT)
     }
 
@@ -63,22 +61,6 @@ class ToolScopeTest {
         val withExt = table() + McpTool("mcp__pc__search", "外部搜索", JSONObject(), sideEffect = true)
         val got = ToolScope.pick("用 mcp 查一下这台电脑", withExt).tools.map { it.name }
         assertTrue("说 mcp 却没给外部工具，实际：$got", "mcp__pc__search" in got)
-        assertTrue(got.size <= ToolScope.DEFAULT_LIMIT)
-    }
-
-    @Test
-    fun cloudGoalPicksCloudTools() {
-        val got = pickedNames("网盘里搜一下上个月的报告")
-        // 网盘域只有 4 个工具，必须一个不漏地给全
-        for (n in listOf("cloud_nodes", "cloud_list", "cloud_search", "cloud_file_url")) {
-            assertTrue("网盘目标漏了 $n，实际：$got", n in got)
-        }
-        // 余下名额只能是通用底座（status/dump/find/tap），不能塞别的领域来占 token
-        assertTrue("不该出现 ddns，实际：$got", got.none { it.startsWith("self_ddns_") })
-        assertTrue(
-            "不该出现高权限工具，实际：$got",
-            got.none { it.startsWith("self_shell_") || it.startsWith("self_owner_") },
-        )
         assertTrue(got.size <= ToolScope.DEFAULT_LIMIT)
     }
 
@@ -165,7 +147,6 @@ class ToolScopeTest {
     fun webGoalPicksWebTools() {
         val got = pickedNames("上网搜一下今天有什么新闻")
         assertTrue("应给到 web_search，实际：$got", "web_search" in got)
-        assertTrue("不该出现网盘工具，实际：$got", got.none { it.startsWith("cloud_") })
         assertTrue(got.size <= ToolScope.DEFAULT_LIMIT)
     }
 
@@ -173,18 +154,6 @@ class ToolScopeTest {
     fun weatherGoalGoesOnline() {
         // 查天气必须联网。落到通用域的话，模型手里没有联网工具，只会答「我做不到」。
         assertTrue("天气应命中联网域", "web_search" in pickedNames("今天天气怎么样"))
-    }
-
-    @Test
-    fun cloudVetoesWebDomain() {
-        // 「网盘里搜一下」是网盘动作。联网域不否决的话会靠「搜一下」平分，
-        // 两边各给一半工具，小模型反而更容易选错。
-        val r = ToolScope.pick("网盘里搜一下上个月的报告", table())
-        assertEquals("网盘文件", r.domain)
-        assertTrue(
-            "联网工具不该混进网盘目标：${r.tools.map { it.name }}",
-            r.tools.none { it.name.startsWith("web_") },
-        )
     }
 
     @Test
@@ -214,7 +183,7 @@ class ToolScopeTest {
 
     @Test
     fun limitIsRespected() {
-        for (goal in listOf("点一下设置", "网盘搜文件", "派给另一台", "看看电量", "天气怎么样")) {
+        for (goal in listOf("点一下设置", "搜一下文件", "派给另一台", "看看电量", "天气怎么样")) {
             val r = ToolScope.pick(goal, table(), limit = 5)
             assertTrue("「$goal」超出 limit：${r.tools.map { it.name }}", r.tools.size <= 5)
         }
@@ -232,7 +201,7 @@ class ToolScopeTest {
     @Test
     fun pickedToolsAlwaysComeFromInputTable() {
         val all = table()
-        for (goal in listOf("点一下", "网盘", "派单", "电量", "随便说点什么")) {
+        for (goal in listOf("点一下", "文件", "派单", "电量", "随便说点什么")) {
             val r = ToolScope.pick(goal, all)
             assertNotNull(r.domain)
             for (t in r.tools) {
@@ -246,10 +215,6 @@ class ToolScopeTest {
         // 对等节点派单常用英文，域判断不能只认中文
         assertTrue("tap 应命中界面域", "self_ui_tap" in pickedNames("tap the Settings button"))
         assertTrue(
-            "cloud 应命中网盘域",
-            pickedNames("search my cloud folder").any { it.startsWith("cloud_") },
-        )
-        assertTrue(
             "battery 应命中系统域",
             "self_battery_status" in pickedNames("what is the battery level"),
         )
@@ -257,9 +222,7 @@ class ToolScopeTest {
 
     @Test
     fun englishWordBoundaryDoesNotLeak() {
-        // 「profile」里有 file、「report」里有 port：用 contains 会被误判到网盘/网络域
-        val r = ToolScope.pick("show my profile page", table())
-        assertTrue("被 file/profile 误判到网盘域：${r.domain}", r.domain != "网盘文件")
+        // 「report」里有 port：用 contains 会被误判到网络域
         val r2 = ToolScope.pick("write a short report", table())
         assertTrue("被 port/report 误判到网络域：${r2.domain}", r2.domain != "网络接入")
     }

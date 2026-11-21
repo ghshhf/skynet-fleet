@@ -124,7 +124,7 @@ object Replan {
      */
     private val CONTENT_READS = setOf(
         "web_read", "web_search", "web_digest",
-        "self_model_ask", "self_api_ask", "cloud_search",
+        "self_model_ask", "self_api_ask",
     )
 
     /**

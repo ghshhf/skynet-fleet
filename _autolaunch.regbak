@@ -1,0 +1,2 @@
+﻿HKLM_SkynetNetaccel="C:\Users\21393\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pythonw.exe" "E:\xmanbian\skynet-fleet\_boot_network_layer.py"
+HKCU_Netforce4BStack="G:\Python312\pythonw.exe" "E:\xmanbian\netforce\_kb\stack_4b.py"

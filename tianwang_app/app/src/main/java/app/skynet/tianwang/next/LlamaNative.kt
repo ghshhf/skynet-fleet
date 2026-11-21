@@ -54,11 +54,42 @@ object LlamaNative {
      */
     external fun nativeGpuInfo(): String
 
+    /** 后端注册 / 设备枚举全量诊断，纯文本，走 DebugBridge 回执。 */
+    external fun nativeBackendDiag(): String
+
     /** 请求中止当前生成：下一个 token 边界退出，已产出的内容照常返回。 */
     external fun nativeAbort()
 
     /** 上一轮统计 "firstMs,totalMs,tokens"。 */
     external fun nativeLastStats(): String
+
+    /**
+     * 运行时 A/B 参数开关（全部 0 = 完全恢复上游默认）。
+     * 只影响**下一次** nativeLoadModel，已有会话不会变 —— 调用方需先 releaseAll()。
+     */
+    external fun nativeSetTuning(
+        kvQ: Int, fa: Int, nBatch: Int, nUBatch: Int,
+        threads: Int, threadsBatch: Int, offloadKqv: Int, opOffload: Int,
+        loadMode: Int, lazyMode: Int, prefillMode: Int, prefillChunk: Int,
+    ): String
+
+    /** 上一轮的分段耗时：加载 / prefill / 解码，纯文本。 */
+    external fun nativePerfDiag(): String
+
+    fun tune(
+        kvQ: Int = 0, fa: Int = 0, nBatch: Int = 0, nUBatch: Int = 0,
+        threads: Int = 0, threadsBatch: Int = 0, offloadKqv: Int = 0,
+        opOffload: Int = 0, loadMode: Int = 0, lazyMode: Int = 0,
+        prefillMode: Int = 1,   // 默认分块 prefill：真机 A/B 快约 9 倍
+        prefillChunk: Int = 4,  // 交替复验稳定 -12.7%（31.5 → 27.5 ms/tok）；16+ 会踩慢 GEMM
+    ): String = if (!ensureLoaded()) "native 库未加载"
+    else runCatching {
+        nativeSetTuning(kvQ, fa, nBatch, nUBatch, threads, threadsBatch,
+            offloadKqv, opOffload, loadMode, lazyMode, prefillMode, prefillChunk)
+    }.getOrDefault("tuning 失败（native 抛异常）")
+
+    fun perfDiag(): String = if (!ensureLoaded()) "native 库未加载"
+    else runCatching { nativePerfDiag() }.getOrDefault("性能诊断失败（native 抛异常）")
 
     /**
      * 生成一轮回复，逐段回调 [TokenCallback.onDelta]（native 线程上来，
@@ -97,6 +128,10 @@ object LlamaNative {
             else (s.substring(0, i).toIntOrNull() ?: 0) to s.substring(i + 1)
         }.getOrDefault(0 to "")
     }
+
+    fun backendDiag(): String =
+        if (!ensureLoaded()) "native 库未加载"
+        else runCatching { nativeBackendDiag() }.getOrDefault("后端诊断失败（native 抛异常）")
 
     /** 上一轮统计。null = 还没跑过。 */
     fun lastStats(): GenStats? {

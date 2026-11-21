@@ -506,11 +506,16 @@ object PhoneMcp {
         ),
         McpTool(
             "self_model_ask",
-            "用本机本地模型单轮回答一句话（只读；不调工具；执行期间独占模型）。",
+            "用本机本地模型回答（只读；不调工具；执行期间独占模型）。传 history 即为多轮对话，" +
+                "上一轮 KV 会作为严格前缀复用，只重算新增 token。",
             schema(
                 mapOf(
                     "prompt" to prop("string", "要问的话"),
                     "max_tokens" to prop("integer", "最多生成多少 token，默认 256，上限 2048"),
+                    "history" to JSONObject()
+                        .put("type", "array")
+                        .put("description", "多轮历史，按时间顺序：[{\"role\":\"user|assistant\",\"text\":\"...\"}]")
+                        .put("items", JSONObject().put("type", "object")),
                 ),
                 listOf("prompt"),
             ),
@@ -584,48 +589,65 @@ object PhoneMcp {
             schema(mapOf("enabled" to prop("boolean", "true=开，false=关")), listOf("enabled")),
             sideEffect = true,
         ),
-        // 网盘聚合：本机作为对等节点对外提供能力，别的设备可 self_lan_call / self_peer_call 调用。
+        // 模型下载：界面无关、无头可触发。十几个 GB 的 MoE 不能靠点按钮，
+        // 也不能挂在广播回执上 —— start 只负责起任务，进度另查。
         McpTool(
-            "cloud_nodes", "列出本机保存的网盘节点连接，并自动发现局域网里可达的其它节点。",
+            "self_model_dl_start", "手机自己从链接后台下载 GGUF（不经过电脑、不依赖界面）；.part 断点续传 + 双通道源。",
+            schema(
+                mapOf(
+                    "url" to prop("string", "GGUF 直链，只收 http/https"),
+                    "name" to prop("string", "保存文件名，可省（默认取 URL 末段）"),
+                    "expected_bytes" to prop("integer", "已知文件精确字节数，可省"),
+                ),
+                listOf("url"),
+            ),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_model_dl_status", "查后台模型下载进度：阶段、已下/总量、百分比、均速、.part 大小、最后错误。",
             schema(emptyMap()),
         ),
         McpTool(
-            "cloud_list", "列出某个网盘节点目录下的文件与文件夹（默认第一个连接、根目录）。",
-            schema(
-                mapOf(
-                    "index" to prop("integer", "用第几个连接，从 0 开始，默认 0"),
-                    "host" to prop("string", "或按节点地址指定，可临时用 user/pass 直连"),
-                    "user" to prop("string", "host 直连时的账号"),
-                    "pass" to prop("string", "host 直连时的密码（不回显、不落盘）"),
-                    "path" to prop("string", "目录路径，默认 /"),
-                ),
-            ),
+            "self_model_dl_cancel", "取消后台模型下载；.part 保留，重新 start 自动从断点续上。",
+            schema(emptyMap()),
+            sideEffect = true,
         ),
         McpTool(
-            "cloud_search", "在网盘节点里按文件名搜索；节点没建索引时自动遍历目录树。",
-            schema(
-                mapOf(
-                    "query" to prop("string", "文件名关键词"),
-                    "index" to prop("integer", "用第几个连接，默认 0"),
-                    "host" to prop("string", "或按节点地址指定"),
-                    "user" to prop("string", "host 直连时的账号"),
-                    "pass" to prop("string", "host 直连时的密码"),
-                ),
-                listOf("query"),
-            ),
+            "self_model_list", "列出手机本地 GGUF（按体积降序）与当前选中的模型 id。",
+            schema(emptyMap()),
         ),
         McpTool(
-            "cloud_file_url", "取网盘里某个文件的下载直链（不下载，只返回地址）。",
-            schema(
-                mapOf(
-                    "path" to prop("string", "文件完整路径"),
-                    "index" to prop("integer", "用第几个连接，默认 0"),
-                    "host" to prop("string", "或按节点地址指定"),
-                    "user" to prop("string", "host 直连时的账号"),
-                    "pass" to prop("string", "host 直连时的密码"),
-                ),
-                listOf("path"),
-            ),
+            "self_model_select", "无头选中本地模型：按 name 文件名子串或 id 全路径，写入 lastModelId。",
+            schema(mapOf(
+                "name" to prop("string", "文件名子串，如 Qwen3-30B"),
+                "id" to prop("string", "或给模型绝对路径"),
+            )),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_model_mode", "无头查看/切换本地推理模式（auto / cpu / gpu / hybrid），并回报 GPU 后端设备数。",
+            schema(mapOf(
+                "mode" to prop("string", "不传 = 只查看；传 auto|cpu|gpu|hybrid 切换，下次加载模型生效"),
+            )),
+            sideEffect = true,
+        ),
+        McpTool(
+            "self_model_tune", "无头 A/B 推理参数（KV 量化 / FlashAttention / batch / 线程 / 加载方式）；不传任何参数 = 只看分段耗时，不改配置。",
+            schema(mapOf(
+                "kv_q" to prop("integer", "0=f16 默认 / 1=q8_0 / 2=q4_0"),
+                "fa" to prop("integer", "0=AUTO / 1=强制开 / 2=强制关"),
+                "n_batch" to prop("integer", "0=默认 2048"),
+                "n_ubatch" to prop("integer", "0=默认 512"),
+                "threads" to prop("integer", "0=按设备计划"),
+                "threads_batch" to prop("integer", "0=按设备计划"),
+                "offload_kqv" to prop("integer", "0=默认 / 1=开 / -1=关"),
+                "op_offload" to prop("integer", "0=默认 / 1=开 / -1=关"),
+                "load_mode" to prop("integer", "0=AUTO / 1=MMAP / 2=MLOCK / 3=MMAP_MLOCK / 4=DIRECT_IO / 5=NONE"),
+                "lazy_mode" to prop("integer", "0=默认 / 1=OFF / 2=AUTO / 3=ON"),
+                "prefill_mode" to prop("integer", "默认 1=小批次 prefill（真机快约 9 倍）；0=一次 batch，给有 coopmat 的 GPU 回退"),
+                "prefill_chunk" to prop("integer", "小批次大小：4=默认（实测 -12.7%）/ 1=逐 token / 2 / 8；16 及以上会踩回 Mali 慢 GEMM（10~26s）"),
+            )),
+            sideEffect = true,
         ),
     ) + WebTool.tools
 
@@ -677,9 +699,7 @@ object PhoneMcp {
             "self_mcp_refresh" -> return audited(mcpName, args, startedAt,
                 ToolResult(true, text = McpServers.refresh(args.optString("name").takeIf { it.isNotBlank() })))
         }
-        // 网盘能力不走 PhoneSelf 的无障碍分派：它不依赖界面，也不该被无障碍开关挡住。
-        if (mcpName.startsWith("cloud_")) return cloudTool(mcpName, args)
-        // 联网同一个道理：能不能上网和「无障碍通没通」是两件事。
+        // 联网：能不能上网和「无障碍通没通」是两件事。
         if (mcpName.startsWith("web_")) return WebTool.run(mcpName, args)
         // 代码运行时：与界面无关，不走 PhoneSelf 的无障碍分派；
         // 局域网对端（电脑 / 另一台手机）可直接让这台手机写代码、跑脚本、跑任务。
@@ -687,6 +707,88 @@ object PhoneMcp {
         // 会话层：同样跟界面无关。stdin 可写、输出流式、长驻，
         // 是 apk add / 编译 / 长任务能在手机上真跑起来的前提。
         if (mcpName.startsWith("self_tty_")) return TtyMcp.run(mcpName, args)
+        // 模型下载：与界面、无障碍、Shizuku 都无关。start 立即回执，任务挂在 App.scope，
+        // 进程被杀（含覆盖安装发版）后 .part 仍在，重新 start 就从断点接着下。
+        // 推理后端：模式切换必须无头可用 —— GPU 后端编进来之后，A/B 实测不能靠点界面。
+        if (mcpName == "self_model_mode") {
+            val raw = args.optString("mode", "").trim()
+            var switched = ""
+            if (raw.isNotEmpty()) {
+                val m = InferenceMode.entries.firstOrNull {
+                    it.key.equals(raw, ignoreCase = true) || it.name.equals(raw, ignoreCase = true)
+                } ?: return ToolResult(false, err = "未知模式：$raw（可用 auto / cpu / gpu / hybrid）")
+                Prefs.mode = m
+                val freed = LocalBackend.releaseAll()
+                ActionLog.add(mcpName, args, true, "", System.currentTimeMillis() - startedAt)
+                switched = "已卸载 $freed 个旧会话，下次提问按新模式重新加载"
+            }
+            val gpu = try {
+                LlamaNative.gpuInfo()
+            } catch (t: Throwable) {
+                0 to "读取失败：${t.message}"
+            }
+            val models = ModelCatalog.local()
+            val cur = models.firstOrNull { it.id == Prefs.lastModelId } ?: models.firstOrNull()
+            return ToolResult(true, text = buildString {
+                append("推理模式：${Prefs.mode.label}（${Prefs.mode.key}）\n")
+                append("GPU 后端：${gpu.first} 个设备 ${gpu.second}\n")
+                append("CPU：${Runtime.getRuntime().availableProcessors()} 核全开\n")
+                if (switched.isNotEmpty()) append(switched).append('\n')
+                if (cur != null) {
+                    val p = LocalBackend.previewPlan(cur)
+                    append("当前模型：${cur.label}（${cur.fileMb} MB）\n")
+                    append("推理计划：threads=${p.threads} ctx=${p.ctx} gpuPercent=${p.gpuPercent} fits=${p.fits} needMb=${p.needMb}\n")
+                    append("计划理由：${p.reason}\n")
+                } else append("当前模型：无本地 GGUF\n")
+                append("---- 后端诊断 ----\n")
+                append(LlamaNative.backendDiag())
+                append("\n上一轮耗时：").append(LlamaNative.perfDiag())
+            })
+        }
+        // 2026-11-15：把「慢在哪一段」变成可远程问的一行数据。
+        // 不带任何参数 = 纯查看（不重置、不卸载会话），A/B 每组跑完直接问它。
+        if (mcpName == "self_model_tune") {
+            val keys = listOf("kv_q", "fa", "n_batch", "n_ubatch", "threads",
+                "threads_batch", "offload_kqv", "op_offload", "load_mode", "lazy_mode",
+                "prefill_mode", "prefill_chunk")
+            if (keys.none { args.has(it) }) {
+                return ToolResult(true, text = buildString {
+                    append("查看模式（未改参数、未卸载会话）\n")
+                    append("上一轮耗时：").append(LlamaNative.perfDiag()).append('\n')
+                    append("---- 后端诊断 ----\n")
+                    append(LlamaNative.backendDiag())
+                })
+            }
+            fun i(k: String) = args.optInt(k, 0)
+            // 逐 token 是默认；调别的参数时不能被 silently 重置回慢的 batch 模式。
+            val pm = if (args.has("prefill_mode")) args.optInt("prefill_mode", 1) else 1
+            // 调别的参数时不能被 silently 重置回 chunk=1（实测慢 12.7%）
+            val pc = if (args.has("prefill_chunk")) args.optInt("prefill_chunk", 4) else 4
+            val conf = LlamaNative.tune(
+                kvQ = i("kv_q"), fa = i("fa"), nBatch = i("n_batch"), nUBatch = i("n_ubatch"),
+                threads = i("threads"), threadsBatch = i("threads_batch"),
+                offloadKqv = i("offload_kqv"), opOffload = i("op_offload"),
+                loadMode = i("load_mode"), lazyMode = i("lazy_mode"),
+                prefillMode = pm, prefillChunk = pc,
+            )
+            val freed = LocalBackend.releaseAll()
+            ActionLog.add(mcpName, args, true, "", System.currentTimeMillis() - startedAt)
+            return ToolResult(true, text = buildString {
+                append("参数：$conf\n")
+                append("已卸载 $freed 个旧会话，下次提问按新参数加载\n")
+                append("上一轮耗时（改之前的配置）：").append(LlamaNative.perfDiag()).append('\n')
+                append("---- 后端诊断 ----\n")
+                append(LlamaNative.backendDiag())
+            })
+        }
+        if (mcpName.startsWith("self_model_dl_") ||
+            mcpName == "self_model_list" || mcpName == "self_model_select") {
+            val r = ModelFetch.run(mcpName, args)
+            if (toolList().firstOrNull { it.name == mcpName }?.sideEffect == true) {
+                ActionLog.add(mcpName, args, r.ok, r.err, System.currentTimeMillis() - startedAt)
+            }
+            return r
+        }
         val selfName = when (mcpName) {
             "self_status" -> "self.status"
             "self_ui_dump" -> "self.ui.dump"
@@ -768,71 +870,6 @@ object PhoneMcp {
     private fun audited(name: String, args: JSONObject, startedAt: Long, r: ToolResult): ToolResult {
         ActionLog.add(name, args, r.ok, r.err, System.currentTimeMillis() - startedAt)
         return r
-    }
-
-    /**
-     * 网盘聚合能力：这台手机作为对等节点，把「我能看到的网盘」开放给编队里其它设备。
-     * 连接地址/凭据只从本机配置读取（或调用方临时直给），不回显密码、不写日志。
-     */
-    private suspend fun cloudTool(name: String, args: JSONObject): ToolResult {
-        val conns = CloudDrivePrefs.load()
-        if (name == "cloud_nodes") {
-            val found = runCatching { CloudDriveNodes.discover() }.getOrDefault(emptyList())
-            return ToolResult(true, text = buildString {
-                append("本机保存的节点连接（${conns.size}）：\n")
-                if (conns.isEmpty()) append("  （暂无，可在工具箱「网盘聚合」里添加）\n")
-                conns.forEachIndexed { i, c ->
-                    append("  [$i] ${c.name} · ${c.type} · ${c.host}\n")
-                }
-                append("可达节点（${found.size}）：\n")
-                if (found.isEmpty()) append("  （没发现，节点地址可手动填）\n")
-                found.forEach { append("  ${it.name} · ${it.host}\n") }
-            })
-        }
-        val host = args.optString("host").orEmpty()
-        val idx = if (args.has("index")) args.optInt("index", 0) else 0
-        val c = if (host.isNotBlank()) {
-            conns.firstOrNull { it.host.trimEnd('/') == host.trimEnd('/') }
-                ?: CloudConn(
-                    type = if (host.contains("webdav", true)) "webdav" else "openlist",
-                    name = host, host = host,
-                    user = args.optString("user"), pass = args.optString("pass"),
-                )
-        } else {
-            conns.getOrNull(idx)
-        } ?: return ToolResult(false, err = "本机没有第 $idx 个节点连接，先添加或传 host")
-        return try {
-            when (name) {
-                "cloud_list" -> {
-                    val p = args.optString("path").ifBlank { "/" }
-                    val list = CloudDriveApi.list(c, p)
-                    ToolResult(true, text = buildString {
-                        append("节点 ${c.name} 目录 $p（${list.size} 项）：\n")
-                        list.forEach {
-                            append(if (it.isDir) "  [目录] " else "  [文件] ")
-                                .append(it.name).append(" · ").append(it.path).append('\n')
-                        }
-                    })
-                }
-                "cloud_search" -> {
-                    val q = args.optString("query")
-                    if (q.isBlank()) return ToolResult(false, err = "缺 query")
-                    val list = CloudDriveApi.search(c, q)
-                    ToolResult(true, text = buildString {
-                        append("节点 ${c.name} 搜「$q」（${list.size} 项）：\n")
-                        list.forEach { append("  ").append(it.path).append('\n') }
-                    })
-                }
-                "cloud_file_url" -> {
-                    val p = args.optString("path")
-                    if (p.isBlank()) return ToolResult(false, err = "缺 path")
-                    ToolResult(true, text = CloudDriveApi.fileUrl(c, p))
-                }
-                else -> ToolResult(false, err = "未知工具：$name")
-            }
-        } catch (t: Throwable) {
-            ToolResult(false, err = t.message ?: t.javaClass.simpleName)
-        }
     }
 
     private fun prop(type: String, desc: String): JSONObject =

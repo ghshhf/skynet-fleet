@@ -42,7 +42,6 @@ from .kinds.rdv_auto_layer import RdvAutoLayer
 from .kinds.mqtt_bus import MqttBus
 from .kinds.osint import Osint
 from .kinds.download import Download
-from .kinds.drive import Drive
 from .kinds.circle import Circle
 from .kinds.geo import Geo
 from .kinds.wintool import WinTool
@@ -425,7 +424,7 @@ CAPABILITIES = [
                params=(Param("domain", "str", True, "域名，如 example.com"),
                        Param("history", "bool", doc="读上一次快照对比（delta），默认 False")),
                note="只读：内化 OpenOSINT exposure 评分模型，全免费源；A≥90 B≥80 C≥65 D≥50，critical 压到 D；仅查自有/授权域名"),
-    # ---- 下载层（把「下载」整个领域内化进源码：直链/网盘/分片/续传/多源/代理，零外部 daemon）----
+    # ---- 下载层（把「下载」整个领域内化进源码：直链/分片/续传/多源/代理，零外部 daemon）----
     Capability("download.direct", "直链/多源下载：分片多线程、断点续传、代理、并发闸、hash 校验（吸收 aria2 设计，urllib 零依赖）",
                params=(Param("urls", "str", True, "下载地址，多源用逗号分隔"),
                        Param("dest", "str", doc="落盘路径，默认 downloads/out.bin"),
@@ -435,64 +434,10 @@ CAPABILITIES = [
                        Param("resume", "bool", doc="断点续传，默认 True"),
                        Param("verify", "str", doc="校验 algo:hexdigest，如 sha256:abc...")),
                note="只读落盘：从公开直链拉文件；多源需同源内容一致；不破解任何限速"),
-    Capability("download.pan", "网盘下载（吸收 QuarkPanTool）：夸克官方 API 拿直链 → 引擎下载；分享链接/自有文件均可",
-               params=(Param("pan", "str", doc="网盘，默认 quark（其余家待内化）"),
-                       Param("mode", "str", doc="share=分享链接 / file=自有 fids"),
-                       Param("share_url", "str", doc="分享链接（mode=share）"),
-                       Param("password", "str", doc="分享提取码"),
-                       Param("fids", "str", doc="文件 fid，逗号分隔（mode=file）"),
-                       Param("cookie", "str", doc="网盘登录态 cookie；缺省读 QUARK_COOKIE 或 cookies.txt"),
-                       Param("dest", "str", doc="落盘目录，默认 downloads")),
-               note="仅用官方 API 拿直链，不破解限速；限速取决于账号（会员满速）。需你提供登录态，不外传"),
     Capability("download.task", "下载任务管理：列表/进度/暂停/续传/移除",
                params=(Param("action", "str", True, "list/status/pause/resume/remove"),
                        Param("task_id", "str", doc="任务 id（status/pause/resume/remove 需要）")),
                note="内存任务表；pause 设暂停标志，resume 从断点续传"),
-    # ---- 挂载层（网盘/远端存储 → 真盘符）：下载解决「拿回来」，挂载解决「就在那儿」----
-    Capability("drive.setup", "一键准备 Windows 挂载环境：WebClient 服务 + BasicAuthLevel + 解除 50MB 限制 + 防火墙",
-               note="改的是 HKLM 与防火墙规则，属于系统级设置；四步各自回报真实成败，不假装成功"),
-    Capability("drive.mount", "挂一个存储到天网：本地目录 / 远端 WebDAV / 夸克网盘 → 得到一个可映射成盘符的地址",
-               params=(Param("name", "str", True, "挂载点名字（字母数字开头，最长 32）"),
-                       Param("backend", "str", doc="local / webdav / quark，默认 local"),
-                       Param("path", "str", doc="backend=local 时的本机目录"),
-                       Param("url", "str", doc="backend=webdav 时的远端地址"),
-                       Param("user", "str", doc="webdav 用户名"),
-                       Param("password", "str", doc="webdav 密码 / require_auth 时的口令"),
-                       Param("cookie", "str", doc="backend=quark 时的登录 cookie；缺省读 QUARK_COOKIE"),
-                       Param("write", "bool", doc="允许写，默认 False（只读）"),
-                       Param("require_auth", "bool", doc="要求 Basic 认证，默认 False"),
-                       Param("host", "str", doc="绑定地址，默认 0.0.0.0（绑回环 Windows 挂不上）"),
-                       Param("port", "int", doc="端口，默认 8731（占用则自动往后找）")),
-               side_effect=True,
-               note="返回里带 windows_cmd，复制即可 net use 成盘符；默认只读，写要显式 write=True"),
-    Capability("drive.unmount", "摘掉一个挂载点",
-               params=(Param("name", "str", True, "挂载点名字")), side_effect=True),
-    Capability("drive.mounts", "列出所有挂载点与 WebDAV 服务状态"),
-    Capability("drive.list", "列网盘/远端目录（统一用 name:/path 定位）",
-               params=(Param("path", "str", True, "形如 pan:/2026/，根写作 pan:/")),
-               note="只读"),
-    Capability("drive.stat", "看一个文件或目录的属性（大小/类型/修改时间）",
-               params=(Param("path", "str", True, "形如 pan:/a/b.txt")), note="只读"),
-    Capability("drive.read", "读一个远端文件（文本返回 text，二进制返回 base64）",
-               params=(Param("path", "str", True, "形如 pan:/a/b.txt")), note="只读；单次上限 32MB"),
-    Capability("drive.write", "写一个文件到网盘/远端（自动建目录、原子替换）",
-               params=(Param("path", "str", True, "形如 pan:/a/b.txt"),
-                       Param("text", "str", doc="文本内容（UTF-8）"),
-                       Param("base64", "str", doc="二进制内容（base64）")),
-               side_effect=True, note="只读挂载上会被拒绝；单次上限 32MB"),
-    Capability("drive.mkdir", "建目录",
-               params=(Param("path", "str", True, "形如 pan:/newdir")), side_effect=True),
-    Capability("drive.remove", "删除文件或目录（目录递归）",
-               params=(Param("path", "str", True, "形如 pan:/old.txt")),
-               side_effect=True, destructive=True),
-    Capability("drive.move", "移动/改名（同一挂载点内）",
-               params=(Param("from", "str", True, "源路径"), Param("to", "str", True, "目标路径")),
-               side_effect=True),
-    Capability("drive.copy", "复制文件（同一挂载点内）",
-               params=(Param("from", "str", True, "源路径"), Param("to", "str", True, "目标路径")),
-               side_effect=True),
-    Capability("drive.url", "把一个挂载内路径转成可直接访问的 HTTP 地址（给浏览器/播放器/别的设备）",
-               params=(Param("path", "str", True, "形如 pan:/a/b.mp4")), note="只读"),
     # ---- 关系圈（从一个标识拆出「跟它有关的一圈」）----
     Capability("circle.signals", "关系圈的信号表：每条边凭什么建、权重多少、哪几条只是线索不是结论"),
     Capability("circle.expand", "从一个标识扩一层：域名拆子域/查 IP/看注册人，IP 反查同机域名，昵称跨平台",
@@ -2718,8 +2663,6 @@ def build(path=None, gate=None, ttl=5.0, with_nodes=True):
     reg.add(NatTraversal())
     reg.add(Osint())
     reg.add(Download())
-    # 挂载层：把网盘/远端存储变成真盘符。下载解决「拿回来」，它解决「就在那儿」。
-    reg.add(Drive())
     # 关系圈 + 定位：一个从「关系」找同一圈，一个从「内容」读位置线索。
     # 它们共用同一条纪律：只报证据与强度，不替用户下「同一主体」的结论。
     reg.add(Circle())

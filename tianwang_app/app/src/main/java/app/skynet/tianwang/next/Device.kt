@@ -210,7 +210,11 @@ object Dev {
     fun plan(ctx: Context, modelFileMb: Long, mode: InferenceMode, model: ModelProfile): InferencePlan {
         val d = profile(ctx)
 
-        val threads = d.perfCores.coerceIn(1, d.totalCores)
+        // 2026-11-15 主人令「能启动的都先启动」：算力全开，不在软件层再留余量。
+        // 这台机器是天玑 9400+ 全大核（1×X925@3.73G + 3×X4@3.3G + 4×A720@2.4G），
+        // 没有 A5x 级小核拖流水线，所以 8 核全给比只给 4 个高频核更合理。
+        // 换到真·大小核设备若实测变慢，回退到 d.perfCores 即可（一行，无其它依赖）。
+        val threads = d.totalCores.coerceAtLeast(1)
 
         // ---- ctx：剩余内存 → 能塞多少 token ----
         val modelMb = if (modelFileMb > 0) modelFileMb else 1024L
@@ -232,15 +236,25 @@ object Dev {
             InferenceMode.HYBRID ->
                 if (d.hasGpu) 60 to "指定混合，GPU 承担六成层"
                 else 0 to "指定混合但无 GPU 后端，回落 CPU"
+            // 2026-11-15 真机 A/B 后重写（版本 61，LFM2-8B-A1B-Q4_0 / 4.41GB）：
+            //   CPU 32.7s/24.0s，GPU100 21.7s/14.2s，混合60 21.0s/15.6s，
+            //   三种都活着，没触发 LMK。旧判据「可用内存 > 模型×2」在这台机上
+            //   永远不成立（实测可用仅约 5.3GB），等于把更快的配置无条件排除，
+            //   这正是主人说的「能启动的都先启动」被软件层挡住的地方。
+            // 梯度按「模型能否整体放进可用内存」分，不再要求两倍余量：
+            //   · 放得进（<0.9×可用）→ 全量 GPU，实测最优；
+            //   · 略超（<1.6×可用）→ 混合，别把全部权重复制进不可回收 buffer；
+            //   · 严重超（11GB 模型 / 5GB 可用，只能靠 zram）→ 纯 CPU，
+            //     此时再叠 GPU buffer 只会加剧缺页，不是「保守」，是避免负优化。
             InferenceMode.AUTO ->
-                if (d.hasGpu && !d.lowRamDevice && d.availRamMb > modelMb * 2)
-                    100 to "自适应：有 GPU 且内存宽裕 → 全量"
-                else if (d.hasGpu && d.availRamMb > modelMb * 1.3)
-                    60 to "自适应：有 GPU 但内存偏紧 → 混合"
-                else if (d.hasGpu)
-                    0 to "自适应：内存不足以给 GPU 留缓冲 → 纯 CPU"
-                else
+                if (!d.hasGpu)
                     0 to "自适应：本构建无 GPU 后端 → 纯 CPU"
+                else if (modelMb <= d.availRamMb * 9 / 10)
+                    100 to "自适应：模型放得进可用内存 → GPU 全量（实测最快）"
+                else if (modelMb <= d.availRamMb * 16 / 10)
+                    60 to "自适应：模型略超可用内存 → 混合"
+                else
+                    0 to "自适应：模型远超可用内存（靠 swap）→ 纯 CPU，不叠 GPU buffer"
         }
 
         val reason = buildString {

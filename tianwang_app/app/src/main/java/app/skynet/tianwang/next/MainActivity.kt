@@ -266,7 +266,6 @@ internal enum class Overlay(val title: String, val sub: String, val use: Overlay
     DEVICE("设备与权限", "无障碍 / 通知 / 手机入网"),
     ABOUT("关于与版本", "版本与后端信息"),
     IMAGE("本机出图", "手机自己跑 diffusion · 提示词出片"),
-    CLOUDDRIVE("网盘聚合", "对等节点 · 集中各网盘"),
     ONBOARD("首次引导", "再看一遍这台手机的能力就绪清单"),
     SAFE("安全模式", "一键停止全部远控"),
     DIAG("诊断与导出", "脱敏状态包 · 可复制可分享"),
@@ -895,7 +894,6 @@ private fun App() {
                     onOpenImage = { overlay = Overlay.IMAGE },
                     speakOn = speakOn,
                     onToggleSpeak = { speakOn = Speech.toggle() },
-                    onOpenCloudDrive = { overlay = Overlay.CLOUDDRIVE },
                 )
                 Tab.ME -> MineScreen(
                     onFavorites = { overlay = Overlay.FAVORITES },
@@ -930,7 +928,6 @@ private fun App() {
                     autoSelftest = launchSelftest,
                     autoPrompt = launchPrompt,
                 )
-                Overlay.CLOUDDRIVE -> CloudDriveScreen(onBack = { overlay = null })
                 Overlay.ONBOARD -> OnboardingScreen(onDone = { overlay = null })
                 Overlay.SAFE -> SafeModeScreen()
                 Overlay.DIAG -> DiagnosticsScreen()

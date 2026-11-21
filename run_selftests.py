@@ -146,7 +146,6 @@ CASES = [
     # 上一轮那 43 项 193 秒里没有一项真的跑过它们（只是 import 了 catalog）。
     # 四个加起来 5.7 秒，45 条断言：这笔账才是对的。
     ("fleet_geo", ["-m", "fleet.kinds.geo", "--selftest"], HERE, 30),
-    ("fleet_drive", ["-m", "fleet.kinds.drive", "--selftest"], HERE, 60),
     ("fleet_circle", ["-m", "fleet.kinds.circle", "--selftest"], HERE, 30),
     ("fleet_wintool", ["-m", "fleet.kinds.wintool", "--selftest"], HERE, 60),
     # 图片流水线（2026-11-06 从 2 项扩到 9 项）：造 3 张不同比例的图当向量，

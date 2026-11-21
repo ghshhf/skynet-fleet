@@ -18,13 +18,21 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/resource.h>
 #include <android/log.h>
 
 #include "llama.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#if defined(GGML_USE_VULKAN)
+#include "ggml-vulkan.h"
+#endif
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "LlamaJNI", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "LlamaJNI", __VA_ARGS__)
@@ -49,6 +57,141 @@ static std::atomic<bool> g_abort{false};
 static std::atomic<long long> g_firstMs{-1};
 static std::atomic<long long> g_totalMs{0};
 static std::atomic<int>       g_tokens{0};
+
+/**
+ * 2026-11-15：推理参数 A/B 的运行时开关。
+ *
+ * 全部默认 0 = **完全保持旧行为**，所以这层加进来不改变任何已有结果。
+ * 由 self_model_tune 无头设置、卸载会话后下次加载生效；一次只动一个变量做对照，
+ * 不把「猜出来的最优组合」一次焊进代码（主人 11-12 定的「不叠 buff」）。
+ */
+struct Tune {
+    std::atomic<int> kvQ{0};          // 0=F16(默认) 1=Q8_0 2=Q4_0
+    std::atomic<int> fa{0};           // 0=AUTO(默认) 1=ON 2=OFF
+    std::atomic<int> nBatch{0};       // 0=上游默认 2048
+    std::atomic<int> nUBatch{0};      // 0=上游默认 512
+    std::atomic<int> threads{0};      // 0=按 Dev.plan
+    std::atomic<int> threadsBatch{0};
+    std::atomic<int> offloadKqv{0};   // 0=上游默认 true, 1=强制开, -1=强制关
+    std::atomic<int> opOffload{0};
+    std::atomic<int> loadMode{0};     // 0=AUTO 1=MMAP 2=MLOCK 3=MMAP_MLOCK 4=DIRECT_IO 5=NONE
+    std::atomic<int> lazyMode{0};     // 0=默认 1=OFF 2=AUTO 3=ON
+    // 2026-11-15 真机 A/B 定案：Mali-G925 上一次 batch GEMM 固定 ~13.5s，
+    // 拆成逐 token 只要 1.5s/48 tok（首字 14.1s → 1.7s，约 9 倍）。
+    // 默认走逐 token；留 0 是给「有 cooperative matrix / int8 dot 的 GPU」换机回退用。
+    std::atomic<int> prefillMode{1};  // 0=一次 batch 1=逐 token（默认）
+    // 每次 llama_decode 都有固定提交/同步开销；小批次提交更省，但批次一大
+    // 会踩回 Mali 的慢 batch GEMM。真机 A/B + 交替复验（各 6 次稳态）：
+    //   chunk 1  31.2~31.6 ms/tok（中位 31.5）
+    //   chunk 4  25.8~27.7 ms/tok（中位 27.5）  ← 区间不重叠，稳定 -12.7%
+    //   chunk 8  开始抖动；chunk 16/32 直接回到 10~26 s 的慢 GEMM
+    // ⇒ 临界点在 8~16 之间，4 是安全甜点，固化为默认。
+    std::atomic<int> prefillChunk{4};
+} g_tune;
+
+// 分段时间（毫秒）：加载 / prefill / 逐 token 生成。
+// 之前只有「总耗时 14 秒」一个数，无法判断慢在缺页、prefill 还是解码 ——
+// 这是回答「还能不能更快」必须有的证据。
+static std::atomic<long long> g_loadMs{0};
+static std::atomic<long long> g_prefillMs{0};
+static std::atomic<long long> g_decodeMs{0};
+static std::atomic<int>       g_promptTok{0};
+
+static long long nowMs() {
+    return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/**
+ * 2026-11-15 深夜：追查「每轮固定 ~14 秒」的内核级快照。
+ *
+ * 墙钟只能告诉我们「慢」，分不清是 CPU/GPU 真在算，还是在等缺页换入、
+ * 等 GPU fence。所以一轮生成前后各取一次 /proc/self：
+ *   utime/stime  → CPU 真正烧了多少毫秒（若是等 I/O/GPU，这里几乎不涨）
+ *   majflt       → 主缺页次数（zram 换入会在这里暴涨）
+ *   read_bytes   → 真从块设备读了什么
+ *   VmSwap       → 本进程被换出多少
+ * 这是「看清楚那 14 秒是什么」而不是继续猜的唯一办法。
+ */
+struct ProcSnap {
+    long long utime = 0, stime = 0, majflt = 0, rchar = 0, readBytes = 0;
+    long long vmRssKb = 0, vmSwapKb = 0;
+};
+static long long g_clkTck = 0;
+
+static ProcSnap readProcSnap() {
+    if (g_clkTck <= 0) {
+        long t = sysconf(_SC_CLK_TCK);
+        g_clkTck = (t > 0 ? t : 100);
+    }
+    ProcSnap p{};
+    FILE* f = fopen("/proc/self/stat", "r");
+    if (f) {
+        char b[2048];
+        if (fgets(b, sizeof(b), f)) {
+            char* rp = strrchr(b, ')');       // comm 里可能有空格/括号，从右找
+            if (rp) {
+                char* q = rp + 1;
+                while (*q == ' ') ++q;
+                while (*q && *q != ' ') ++q;  // state 是字母，strtoll 吃不动，先跳过
+                long long v[24] = {0};
+                int n = 1;                    // v[0] = state 占位，索引与字段号对齐
+                while (*q && n < 24) {
+                    while (*q == ' ') ++q;
+                    if (!*q) break;
+                    char* prev = q;
+                    v[n++] = strtoll(q, &q, 10);
+                    if (q == prev) break;     // 防非数字字段卡死
+                }
+                // majflt(field12)=v[9], utime(field14)=v[11], stime(field15)=v[12]
+                if (n > 12) { p.majflt = v[9]; p.utime = v[11]; p.stime = v[12]; }
+            }
+        }
+        fclose(f);
+    }
+    f = fopen("/proc/self/io", "r");
+    if (f) {
+        char k[64]; long long v;
+        while (fscanf(f, "%63s %lld", k, &v) == 2) {
+            if (strcmp(k, "rchar:") == 0) p.rchar = v;
+            else if (strcmp(k, "read_bytes:") == 0) p.readBytes = v;
+        }
+        fclose(f);
+    }
+    f = fopen("/proc/self/status", "r");
+    if (f) {
+        char b[256];
+        while (fgets(b, sizeof(b), f)) {
+            long long v = 0;
+            if (sscanf(b, "VmRSS: %lld", &v) == 1) p.vmRssKb = v;
+            else if (sscanf(b, "VmSwap: %lld", &v) == 1) p.vmSwapKb = v;
+        }
+        fclose(f);
+    }
+    return p;
+}
+
+/** 工作线程真实 CPU 时间（getrusage 比 /proc/self/stat 可靠，不会把多线程算漏/算错）。 */
+static long long threadCpuMs(bool sys) {
+    struct rusage ru{};
+    if (getrusage(RUSAGE_THREAD, &ru) != 0) return 0;
+    const struct timeval& t = sys ? ru.ru_stime : ru.ru_utime;
+    return (long long) t.tv_sec * 1000 + t.tv_usec / 1000;
+}
+static std::atomic<long long> g_cpuThreadUserMs{0};
+static std::atomic<long long> g_cpuThreadSysMs{0};
+static std::atomic<int>       g_prefillCalls{0};
+static std::atomic<int>       g_prefillRetry{0};
+static std::atomic<int>       g_graphReallocDiff{0};
+
+static std::atomic<long long> g_firstSampleMs{0};  // 第一次 sampler_sample 耗时 = 等 GPU 队列
+static std::atomic<long long> g_firstDecodeMs{0};  // 第一次单 token decode 耗时
+static std::atomic<long long> g_cpuUserMs{0};
+static std::atomic<long long> g_cpuSysMs{0};
+static std::atomic<long long> g_majflt{0};
+static std::atomic<long long> g_readBytes{0};
+static std::atomic<long long> g_vmRssKb{0};
+static std::atomic<long long> g_vmSwapKb{0};
 
 static std::string jstr2std(JNIEnv* env, jstring js) {
     if (!js) return std::string();
@@ -146,7 +289,12 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeGpuInfo(JNIEnv* env, jobject /*t
     for (size_t i = 0; i < n; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev) continue;
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        // 2026-11-15：Vulkan 后端在 UMA 手机（Mali/Immortalis/Adreno）上上报的是
+        // IGPU 而不是 GPU —— ggml_backend_vk_device_get_type() 按 is_integrated_gpu
+        // 分流。只数 GPU 会让「后端和设备都在」被误报成 0，Dev.plan() 因此永远
+        // 回落 CPU。手机本来就没有独显，IGPU 就是这台机器唯一的 GPU。
+        const auto t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
             if (gpu == 0) name = ggml_backend_dev_name(dev) ? ggml_backend_dev_name(dev) : "gpu";
             ++gpu;
         }
@@ -154,6 +302,50 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeGpuInfo(JNIEnv* env, jobject /*t
     char buf[256];
     snprintf(buf, sizeof(buf), "%d|%s", gpu, name.c_str());
     return env->NewStringUTF(buf);
+}
+
+/**
+ * 后端诊断（2026-11-15）：把「哪些后端注册了、各自认出几个设备」原样回执出来。
+ * 存在的理由：GPU 报 0 时，光靠 gpuInfo() 一个数字分不清是「后端没编进来」
+ * 「实例初始化抛异常」还是「设备类型被过滤」。这个接口一次给全，不靠猜。
+ */
+JNIEXPORT jstring JNICALL
+Java_app_skynet_tianwang_next_LlamaNative_nativeBackendDiag(JNIEnv* env, jobject /*thiz*/) {
+    llama_backend_init();
+    std::string out;
+    char line[512];
+
+    const size_t regs = ggml_backend_reg_count();
+    snprintf(line, sizeof(line), "后端注册数=%zu\n", regs);
+    out += line;
+    for (size_t r = 0; r < regs; ++r) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(r);
+        if (!reg) continue;
+        const char* rn = ggml_backend_reg_name(reg);
+        snprintf(line, sizeof(line), "  reg[%zu] %s : dev=%zu\n",
+                 r, rn ? rn : "?", ggml_backend_reg_dev_count(reg));
+        out += line;
+    }
+
+    const size_t devs = ggml_backend_dev_count();
+    snprintf(line, sizeof(line), "设备总数=%zu\n", devs);
+    out += line;
+    for (size_t i = 0; i < devs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const char* dn = ggml_backend_dev_name(dev);
+        const char* dd = ggml_backend_dev_description(dev);
+        snprintf(line, sizeof(line), "  dev[%zu] %s type=%d : %s\n",
+                 i, dn ? dn : "?", (int) ggml_backend_dev_type(dev), dd ? dd : "");
+        out += line;
+    }
+#if defined(GGML_USE_VULKAN)
+    snprintf(line, sizeof(line), "Vulkan 视角设备数=%d\n", ggml_backend_vk_get_device_count());
+    out += line;
+#else
+    out += "Vulkan 视角：本构建未开 GGML_VULKAN\n";
+#endif
+    return env->NewStringUTF(out.c_str());
 }
 
 /**
@@ -189,7 +381,25 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeLoadModel(
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
+    // A/B：加载方式。MLOCK 在 Android 上可能被 RLIMIT_MEMLOCK 拒掉，
+    // 失败会让 llama_model_load_from_file 返回 nullptr —— 那也是一条真实结论。
+    switch (g_tune.loadMode.load()) {
+        case 1: mp.load_mode = LLAMA_LOAD_MODE_MMAP;       break;
+        case 2: mp.load_mode = LLAMA_LOAD_MODE_MLOCK;      break;
+        case 3: mp.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; break;
+        case 4: mp.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  break;
+        case 5: mp.load_mode = LLAMA_LOAD_MODE_NONE;       break;
+        default: break;   // 0 = 上游 AUTO
+    }
+    switch (g_tune.lazyMode.load()) {
+        case 1: mp.lazy_mode = LLAMA_LAZY_MODE_OFF;  break;
+        case 2: mp.lazy_mode = LLAMA_LAZY_MODE_AUTO; break;
+        case 3: mp.lazy_mode = LLAMA_LAZY_MODE_ON;   break;
+        default: break;
+    }
+    const long long tLoad0 = nowMs();
     s->model = llama_model_load_from_file(path.c_str(), mp);
+    g_loadMs.store(nowMs() - tLoad0);
     if (!s->model) { LOGE("模型加载失败: %s", path.c_str()); delete s; return 0; }
 
     // 真层数以模型自报为准（GGUF 可能没读到）
@@ -204,6 +414,28 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeLoadModel(
     // 线程数由调用方按设备性能核数算好；这里只在明显非法时兜底到 1
     cp.n_threads       = nThreads > 0 ? nThreads : 1;
     cp.n_threads_batch = cp.n_threads;
+    cp.no_perf         = false;   // 打开上游计时，才能拿到 graph 重分配次数
+
+    // ---- A/B 参数（全部默认 0 = 上游默认，不改已有行为）----
+    const int kv = g_tune.kvQ.load();
+    if (kv == 1)      { cp.type_k = GGML_TYPE_Q8_0; cp.type_v = GGML_TYPE_Q8_0; }
+    else if (kv == 2) { cp.type_k = GGML_TYPE_Q4_0; cp.type_v = GGML_TYPE_Q4_0; }
+    const int fa = g_tune.fa.load();
+    if (fa == 1)      cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    else if (fa == 2) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    if (g_tune.nBatch.load()  > 0) cp.n_batch  = (uint32_t) g_tune.nBatch.load();
+    if (g_tune.nUBatch.load() > 0) cp.n_ubatch = (uint32_t) g_tune.nUBatch.load();
+    if (g_tune.threads.load() > 0) cp.n_threads = g_tune.threads.load();
+    if (g_tune.threadsBatch.load() > 0) cp.n_threads_batch = g_tune.threadsBatch.load();
+    const int okqv = g_tune.offloadKqv.load();
+    if (okqv != 0) cp.offload_kqv = (okqv > 0);
+    const int oop = g_tune.opOffload.load();
+    if (oop != 0) cp.op_offload = (oop > 0);
+    LOGI("[tune] 生效: ctx=%u threads=%d/%d batch=%u/%u kv=%s fa=%d okqv=%d op=%d load=%lldms",
+         cp.n_ctx, cp.n_threads, cp.n_threads_batch, cp.n_batch, cp.n_ubatch,
+         kv == 1 ? "q8_0" : kv == 2 ? "q4_0" : "f16", (int) cp.flash_attn_type,
+         (int) cp.offload_kqv, (int) cp.op_offload, (long long) g_loadMs.load());
+
     s->ctx = llama_init_from_model(s->model, cp);
     if (!s->ctx) {
         LOGE("上下文创建失败（ctx=%u threads=%d）", want, cp.n_threads);
@@ -257,6 +489,60 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeLastStats(JNIEnv* env, jobject) 
     return env->NewStringUTF(buf);
 }
 
+/** 无头设置 A/B 参数（全部 0 = 恢复上游默认）。返回当前生效配置。 */
+JNIEXPORT jstring JNICALL
+Java_app_skynet_tianwang_next_LlamaNative_nativeSetTuning(
+        JNIEnv* env, jobject, jint kvQ, jint fa, jint nBatch, jint nUBatch,
+        jint threads, jint threadsBatch, jint offloadKqv, jint opOffload,
+        jint loadMode, jint lazyMode, jint prefillMode, jint prefillChunk) {
+    g_tune.kvQ.store(kvQ);
+    g_tune.fa.store(fa);
+    g_tune.nBatch.store(nBatch);
+    g_tune.nUBatch.store(nUBatch);
+    g_tune.threads.store(threads);
+    g_tune.threadsBatch.store(threadsBatch);
+    g_tune.offloadKqv.store(offloadKqv);
+    g_tune.opOffload.store(opOffload);
+    g_tune.loadMode.store(loadMode);
+    g_tune.lazyMode.store(lazyMode);
+    g_tune.prefillMode.store(prefillMode);
+    g_tune.prefillChunk.store(prefillChunk > 0 ? prefillChunk : 1);
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "kvQ=%d fa=%d batch=%d/%d threads=%d/%d offload_kqv=%d op_offload=%d load=%d lazy=%d prefill=%d/chunk=%d",
+             kvQ, fa, nBatch, nUBatch, threads, threadsBatch,
+             offloadKqv, opOffload, loadMode, lazyMode, prefillMode,
+             g_tune.prefillChunk.load());
+    LOGI("[tune] %s", buf);
+    return env->NewStringUTF(buf);
+}
+
+/** 上一轮的三段耗时。慢在哪一段，看这个就够，不用再猜。 */
+JNIEXPORT jstring JNICALL
+Java_app_skynet_tianwang_next_LlamaNative_nativePerfDiag(JNIEnv* env, jobject) {
+    const long long load = g_loadMs.load();
+    const long long pre = g_prefillMs.load();
+    const long long dec = g_decodeMs.load();
+    const int np = g_promptTok.load();
+    const int nt = g_tokens.load();
+    char buf[1024];
+    snprintf(buf, sizeof(buf),
+             "加载 %lld | prefill %lld/%dtok | 解码 %lld/%dtok | 首字 %lld | 合计 %lld ms || "
+             "首次采样等待 %lld ms | 首decode %lld ms | 进程CPU %lld+%lld ms | "
+             "线程CPU %lld+%lld ms | prefill调用 %d(重试%d) | graph重分配 %d | "
+             "主缺页 +%lld | 块读 +%.1f MB | RSS %.0f MB / Swap %.0f MB",
+             load, pre, np, dec, nt,
+             (long long) g_firstMs.load(), (long long) g_totalMs.load(),
+             (long long) g_firstSampleMs.load(), (long long) g_firstDecodeMs.load(),
+             (long long) g_cpuUserMs.load(), (long long) g_cpuSysMs.load(),
+             (long long) g_cpuThreadUserMs.load(), (long long) g_cpuThreadSysMs.load(),
+             (int) g_prefillCalls.load(), (int) g_prefillRetry.load(),
+             (int) g_graphReallocDiff.load(),
+             (long long) g_majflt.load(), g_readBytes.load() / 1048576.0,
+             g_vmRssKb.load() / 1024.0, g_vmSwapKb.load() / 1024.0);
+    return env->NewStringUTF(buf);
+}
+
 /**
  * 生成一轮回复，逐段回调 onDelta（已对齐 UTF-8 边界，中文不会被拆半字节）。
  *
@@ -278,6 +564,17 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeChatMessages(
     g_firstMs.store(-1);
     g_totalMs.store(0);
     g_tokens.store(0);
+    g_firstSampleMs.store(0);
+    g_firstDecodeMs.store(0);
+    g_cpuUserMs.store(0);
+    g_cpuSysMs.store(0);
+    g_majflt.store(0);
+    g_readBytes.store(0);
+    g_cpuThreadUserMs.store(0);
+    g_cpuThreadSysMs.store(0);
+    g_prefillCalls.store(0);
+    g_prefillRetry.store(0);
+    g_graphReallocDiff.store(0);
 
     jsize n = env->GetArrayLength(jroles);
     if (n <= 0) return env->NewStringUTF("");
@@ -357,48 +654,143 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeChatMessages(
     if (llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), np, true, true) < 0)
         return env->NewStringUTF("");
 
-    // ---------- KV 前缀复用：只 decode 与上次不同的那一段 ----------
+    // ---------- KV 前缀复用（版本 68：账本一致化 + 精准截断） ----------
+    // 🔴 66/67 版为了消除 rc=-1 用「kvLen != common 就全清」，代价是每轮把
+    //    模板固定前缀（真机约 35 token）也一起重算：逐 token 下 1.5 s 里约七成
+    //    是重复劳动。日志实证：[kv] KV末尾=50/54 ≠ 可复用前缀=35 → 全清。
+    //
+    //    本版立一条不变式：KV ≡ 账本 ≡ 已 decode 的 token 序列（含上一轮回答）。
+    //      · 生成结束不再回滚 KV，回答留在里面，前缀才能越过模板继续复用；
+    //      · 下一轮按最长公共前缀 common 精准截断 [common, ∞)，只重算新增部分；
+    //      · 每一步都读回 seq_pos_max 验证；截断没回退就 clear 全清兜底，
+    //        绝不把 pos[0]=common 提交给一个还停在旧末尾的 KV（rc=-1 的根因）。
+    //      · iswa/共享 cells 路径下 seq_rm 可能早退，所以「验证」不是可选项。
+    llama_memory_t mem = llama_get_memory(s->ctx);
+    auto kvLenOf = [&]() -> size_t {
+        const llama_pos m = llama_memory_seq_pos_max(mem, 0);
+        return m >= 0 ? (size_t) (m + 1) : 0;
+    };
+    const uint32_t nCtx = llama_n_ctx(s->ctx);
+
+    size_t kvLen = kvLenOf();
     size_t common = 0;
     const size_t nCached = s->cached.size();
-    while (common < nCached && common < (size_t) np && s->cached[common] == toks[common]) ++common;
-    if (common < nCached) {
-        // 丢掉从 common 往后的一切（含上次生成残留）
-        llama_memory_seq_rm(llama_get_memory(s->ctx), 0, (llama_pos) common, -1);
-        s->cached.resize(common);
+    if (kvLen == nCached) {
+        while (common < nCached && common < (size_t) np && s->cached[common] == toks[common]) ++common;
+    } else {
+        LOGI("[kv] 账本=%zu ≠ KV末尾=%zu → 本轮弃用前缀", nCached, kvLen);
     }
-    LOGI("[kv] prompt=%d token, 复用前缀=%zu, 需新算=%d", np, common, (int) ((size_t) np - common));
+
+    // 上下文快满 / prompt 与账本完全相同（没有新 token 可提交）时，重开一轮最稳。
+    const bool ctxTight = (kvLen + (size_t) (np - (int) common) + 8 >= nCtx);
+    bool hardClear = (kvLen != nCached) || ctxTight || common == (size_t) np;
+
+    // 🔴 版本 69 收敛：版本 68 真机实测 `seq_rm(common, -1)` 在 LFM2 上完全无效
+    //    （[kv] 截断 前=50 后=50）。根因是 hybrid memory：
+    //    llama_memory_hybrid::seq_rm 先调 recurrent 侧，而 recurrent 只允许回滚到
+    //    「最后一次 ubatch 快照」范围内，rollback=15 > rs_max 就 return false，
+    //    hybrid 随即短路，attention 侧根本没删（llama-memory-recurrent.cpp:199-217）。
+    //    ⇒ 这类模型不能按任意位置截断，只有 p0=0 的全清有效。
+    //    所以：kvLen == common（真·多轮严格前缀）直接增量；否则一次 clear，
+    //    不再浪费一次注定失败的 seq_rm。
+    if (!hardClear && kvLen > common) {
+        LOGI("[kv] KV末尾=%zu > 可复用前缀=%zu，hybrid 不能部分回滚 → clear 后重算",
+             kvLen, common);
+        hardClear = true;
+    }
+
+    if (hardClear) {
+        llama_memory_clear(mem, false);   // 只清位置账本，不擦 buffer（数据会被覆盖）
+        kvLen = kvLenOf();
+        s->cached.clear();
+        common = 0;
+        if (kvLen != 0) LOGI("[kv] clear 后 KV末尾仍=%zu → 交给全量重算自愈分支", kvLen);
+    }
+    LOGI("[kv] prompt=%d token, 账本/KV=%zu/%zu, 复用前缀=%zu, 需新算=%d, ctx=%u",
+         np, s->cached.size(), kvLen, common, np - (int) common, (unsigned) nCtx);
 
     jclass cbCls = callback ? env->GetObjectClass(callback) : nullptr;
     jmethodID onDelta = cbCls ? env->GetMethodID(cbCls, "onDelta", "(Ljava/lang/String;)V") : nullptr;
 
-    const long long tGen = (long long) (std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const long long tGen = nowMs();
+    const ProcSnap p0 = readProcSnap();   // 本轮开始时的 CPU/缺页/换出账本
+    const long long cpuU0 = threadCpuMs(false), cpuS0 = threadCpuMs(true);
 
     // 新算的那段：必须手填 pos（llama_batch_get_one 会从 0 开始编号，跟前缀冲突）
     const int nNew = np - (int) common;
-    if (nNew > 0) {
-        llama_batch b = llama_batch_init(nNew, 0, 1);
-        for (int i = 0; i < nNew; ++i) {
-            b.token[i]    = toks[(size_t) common + i];
-            b.pos[i]      = (llama_pos) (common + i);
-            b.n_seq_id[i] = 1;
-            b.seq_id[i][0] = 0;
-            b.logits[i]   = (i == nNew - 1) ? 1 : 0;   // 只要最后一个位置的 logits
+    auto prefill = [&](int start, int count) -> bool {
+        const long long tpAll = nowMs();
+        if (g_tune.prefillMode.load() == 1) {
+            // 逐 token prefill：Mali 上一次 batch GEMM(mul_mm) 实测要 ~13.5s，
+            // 而单 token graph(mul_mv) 只要 7~98ms。把 prefill 拆成 token 流，
+            // 顺带天然满足「Y = X+1」的位置连续性要求。
+            // 版本 69：改成按 prefillChunk 分块提交，A/B 找「小批次仍走快路径」的
+            // 临界点 —— 每次 llama_decode 都有固定开销，1 token 未必最优。
+            const int chunk = std::max(1, g_tune.prefillChunk.load());
+            int calls = 0;
+            for (int i = 0; i < count; i += chunk) {
+                const int n = std::min(chunk, count - i);
+                llama_batch b = llama_batch_init(n, 0, 1);
+                for (int j = 0; j < n; ++j) {
+                    b.token[j]     = toks[(size_t) start + i + j];
+                    b.pos[j]       = (llama_pos) (start + i + j);
+                    b.n_seq_id[j]  = 1;
+                    b.seq_id[j][0] = 0;
+                    b.logits[j]    = (i + j == count - 1) ? 1 : 0;
+                }
+                b.n_tokens = n;
+                const int rc = llama_decode(s->ctx, b);
+                llama_batch_free(b);
+                ++calls;
+                if (rc != 0) {
+                    LOGI("[prefill] 分块#%d(chunk=%d n=%d) rc=%d 累计=%lldms",
+                         calls, chunk, n, rc, nowMs() - tpAll);
+                    return false;
+                }
+            }
+            g_prefillCalls.fetch_add(calls);
+            LOGI("[prefill] 分块 chunk=%d start=%d count=%d 调用=%d 全 rc=0 cost=%lldms",
+                 chunk, start, count, calls, nowMs() - tpAll);
+            return true;
         }
-        b.n_tokens = nNew;
-        if (llama_decode(s->ctx, b) != 0) {
-            LOGE("prefill decode 失败");
-            llama_batch_free(b);
-            // 🔴 光清账本不够（2026-10-26 修）：KV 里的脏 cell 不清，
-            //    下一轮 common=0 时又不会调用 seq_rm，于是**每一轮都失败**，
-            //    一次失败把整个会话彻底废掉。这里必须连 KV 一起清干净。
-            llama_memory_seq_rm(llama_get_memory(s->ctx), 0, 0, -1);
+        llama_batch b = llama_batch_init(count, 0, 1);
+        for (int i = 0; i < count; ++i) {
+            b.token[i]     = toks[(size_t) start + i];
+            b.pos[i]       = (llama_pos) (start + i);
+            b.n_seq_id[i]  = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i]    = (i == count - 1) ? 1 : 0;   // 只要最后一个位置的 logits
+        }
+        b.n_tokens = count;
+        const long long tp = nowMs();
+        const int rc = llama_decode(s->ctx, b);
+        LOGI("[prefill] start=%d count=%d rc=%d cost=%lldms", start, count, rc, nowMs() - tp);
+        g_prefillCalls.fetch_add(1);
+        llama_batch_free(b);
+        return rc == 0;
+    };
+    if (nNew > 0 && !prefill((int) common, nNew)) {
+        g_prefillRetry.fetch_add(1);
+        // 🔴 真机 25060RK16C / LFM2-8B-A1B 实测：第一轮 552 token 能生成 512 token，
+        //    第二轮起「复用前缀=33」时 prefill decode 必失败，用户看到的是
+        //    「模型回了空串」，而且清账本后下一轮还是复用同一段脏前缀，永久坏掉。
+        //    修法：前缀失败就清干净 KV + 账本，全量重算一次（只多算几十 token）；
+        //    只有全量也失败才认输。不返回空串，会话自愈。
+        LOGE("前缀 prefill 失败，清 KV 全量重算");
+        llama_memory_clear(mem, false);
+        s->cached.clear();
+        common = 0;
+        if (!prefill(0, np)) {
+            LOGE("全量 prefill 仍失败");
+            llama_memory_clear(mem, false);
             s->cached.clear();
             return env->NewStringUTF("");
         }
-        llama_batch_free(b);
     }
     s->cached.assign(toks.begin(), toks.end());
+    // prefill 段到此结束：从 tGen 到这里包含模板/tokenize/新算前缀，不含模型加载。
+    g_prefillMs.store(nowMs() - tGen);
+    g_promptTok.store(nNew > 0 ? nNew : 0);
 
     std::string out, pending;
     char piece[512];
@@ -455,7 +847,13 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeChatMessages(
         if (g_abort.load()) { aborted = 1; break; }
         if ((size_t) pos >= llama_n_ctx(s->ctx)) { ctxFull = 1; break; }
 
+        const bool firstStep = (generated == 0);
+        const long long tSample = firstStep ? nowMs() : 0;
+        // Vulkan 是异步提交：prefill 的 llama_decode 只管下令，真正等 GPU 干完
+        // 往往发生在第一次要读 logits 的 sampler_sample 里。单独量它，才能判断
+        // 那 14 秒是「算得慢」还是「提交完在等」。
         id = llama_sampler_sample(s->smpl, s->ctx, -1);
+        if (firstStep) g_firstSampleMs.store(nowMs() - tSample);
         llama_sampler_accept(s->smpl, id);
         if (llama_vocab_is_eog(vocab, id)) { eog = 1; break; }
 
@@ -487,7 +885,15 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeChatMessages(
         one.seq_id[0][0] = 0;
         one.logits[0]   = 1;
         one.n_tokens    = 1;
-        if (llama_decode(s->ctx, one) != 0) { llama_batch_free(one); LOGE("decode 失败"); break; }
+        const long long tDec = firstStep ? nowMs() : 0;
+        const int drc = llama_decode(s->ctx, one);
+        if (firstStep) g_firstDecodeMs.store(nowMs() - tDec);
+        if (drc != 0) {
+            llama_batch_free(one);
+            s->cached.pop_back();       // 账本回滚：没 decode 成功的 token 不能留在账本里
+            LOGE("decode 失败（账本已回滚 1 token）");
+            break;
+        }
         llama_batch_free(one);
         ++pos;
 
@@ -497,28 +903,46 @@ Java_app_skynet_tianwang_next_LlamaNative_nativeChatMessages(
     long long tEnd = (long long) (std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     g_totalMs.store(tEnd - tGen);
+    g_decodeMs.store(tEnd - tGen - g_prefillMs.load());
     g_tokens.store(generated);
 
-    // 🔴 把 KV 回滚到「只有 prompt」的边界，账本同步 —— 这一步是关键。
-    //
-    //    生成期间每个采样出来的 token 都被 decode 进了 KV，所以生成结束时
-    //    KV 里的位置是 [0, np+generated)，而账本 `cached` 只有 np 个 prompt token。
-    //    **两边长度不一致**，而这个函数只拿账本算 `common`：
-    //      · 下一轮历史一变（用户换了句话、或前端把上一轮回答裁短了），
-    //        新 prompt 的 token 从 pos=np 开始就和 KV 里残留的生成内容对不上；
-    //      · 账本说「从 np 开始都是新的」，于是 `common == nCached` ⇒
-    //        `llama_memory_seq_rm` 根本不会被调用 ⇒ 旧 cell 没删，直接在
-    //        同一批位置上叠着写。
-    //    真机日志里那两次 `prefill decode 失败` 就是这么来的
-    //    （00:02:11 中止过一次，00:02:17 / 00:02:43 两次 prefill 全挂），
-    //    而且**坏一次就再也起不来**：账本被清空但 KV 还脏着，下一轮 common=0，
-    //    还是不删 KV，继续失败 —— 用户看到的就是「这个模型根本不能用」。
-    //
-    //    修法是立一条不变式：**KV ≡ 账本 ≡ prompt token**，任何时候都成立。
-    //    代价是下一轮要重算「上一轮回答 + 新问题」那几十个 token（毫秒级），
-    //    换来的是前缀复用依然有效、且永远不会读到错位的位置。
-    llama_memory_seq_rm(llama_get_memory(s->ctx), 0, (llama_pos) np, -1);
-    s->cached.assign(toks.begin(), toks.end());
+    const ProcSnap p1 = readProcSnap();
+    const long long tck = g_clkTck > 0 ? g_clkTck : 100;
+    g_cpuUserMs.store((p1.utime - p0.utime) * 1000 / tck);
+    g_cpuSysMs.store((p1.stime - p0.stime) * 1000 / tck);
+    g_majflt.store(p1.majflt - p0.majflt);
+    g_readBytes.store(p1.readBytes - p0.readBytes);
+    g_vmRssKb.store(p1.vmRssKb);
+    g_vmSwapKb.store(p1.vmSwapKb);
+    g_cpuThreadUserMs.store(threadCpuMs(false) - cpuU0);
+    g_cpuThreadSysMs.store(threadCpuMs(true) - cpuS0);
+    const auto perf = llama_perf_context(s->ctx);
+    g_graphReallocDiff.store(perf.n_reallocs_diff);
+    LOGI("[diag] sample_wait=%lldms first_decode=%lldms proc_cpu=%lld+%lldms "
+         "thread_cpu=%lld+%lldms prefill=%d(retry%d) realloc_diff=%d majflt=+%lld "
+         "read=+%.1fMB rss=%.0fMB swap=%.0fMB",
+         (long long) g_firstSampleMs.load(), (long long) g_firstDecodeMs.load(),
+         (long long) g_cpuUserMs.load(), (long long) g_cpuSysMs.load(),
+         (long long) g_cpuThreadUserMs.load(), (long long) g_cpuThreadSysMs.load(),
+         (int) g_prefillCalls.load(), (int) g_prefillRetry.load(),
+         (int) g_graphReallocDiff.load(),
+         (long long) g_majflt.load(), g_readBytes.load() / 1048576.0,
+         g_vmRssKb.load() / 1024.0, g_vmSwapKb.load() / 1024.0);
+
+    // 🔴 版本 68：不再把 KV 回滚到「只有 prompt」。
+    //    66 版删掉生成结果，是为了躲 rc=-1；现在下一轮会自己按 common 精准截断
+    //    并逐项验证，把回答留在 KV 里才能让前缀越过模板、一直复用到回答末尾。
+    //    不变式：KV ≡ 账本 ≡ prompt + 已成功 decode 的生成 token。
+    //    一旦不成立（异常中断等），立刻清干净，下一轮从零起，绝不带着脏 KV 继续。
+    const size_t kvEnd = kvLenOf();
+    if (kvEnd != s->cached.size()) {
+        LOGI("[kv] 结束不一致：账本=%zu KV末尾=%zu → 清干净", s->cached.size(), kvEnd);
+        llama_memory_clear(mem, false);
+        s->cached.clear();
+    } else {
+        LOGI("[kv] 结束一致：账本/KV=%zu，保留 %d 个生成 token 供下轮复用",
+             kvEnd, generated);
+    }
 
     LOGI("生成结束: %d token, %zu 字节, stop=%s", generated, out.size(),
          aborted ? "abort" : eog ? "eog" : ctxFull ? "ctxFull" : "maxTokens");

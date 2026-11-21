@@ -212,6 +212,19 @@ object LocalBackend : ModelBackend {
             handles.remove(profileId)?.let { LlamaNative.nativeFreeModel(it.handle) }
         }
     }
+
+    /**
+     * 卸载全部会话（2026-11-15）：推理模式一变，threads / ctx / gpuPercent
+     * 全部要重算，而 sessionFor() 命中缓存就直接返回旧句柄 —— 不卸载的话
+     * 「切换后下次加载生效」是句空话，A/B 实测也会一直量到同一种配置。
+     * 返回卸载数量，让回执能证明真的换过了，而不是只改了个开关。
+     */
+    fun releaseAll(): Int = synchronized(handles) {
+        val n = handles.size
+        handles.values.forEach { LlamaNative.nativeFreeModel(it.handle) }
+        handles.clear()
+        n
+    }
 }
 
 /**
