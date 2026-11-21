@@ -371,20 +371,53 @@ def gateway_stop():
     return False, "非 Windows 不支持"
 
 
+def _git_proxy_domains():
+    """需要走代理的 git 域名前缀（给 http.<url>.proxy 用）。
+
+    从受管域名表派生：去掉 `*.` 通配（git URL 匹配是前缀、不吃通配符），
+    保留所有裸域与具体子域（api./export. 等本就是独立条目）。
+    github.com 的前缀匹配会自动覆盖 github.com/... 下的所有路径，
+    但不会跨到 gist.github.com 这类不同注册域——那些若有需要须单独登记。
+    """
+    out = []
+    for d in sites_domains():
+        bare = d[2:] if d.startswith("*.") else d
+        if bare and bare not in out:
+            out.append(bare)
+    return out
+
+
+# git 按域名作用域的代理配置键前缀；结尾斜杠是 git 官方推荐写法（精确前缀匹配）。
+_GIT_PROXY_KEY = "http.https://{host}/.proxy"
+
+
 def git_proxy(on):
-    """git 全局代理开关。on=True 设 http/https proxy 到 7810；False 清掉。"""
+    """git 代理开关（按域名作用域，非全局）。
+
+    on=True:  清掉旧的全局 http.proxy/https.proxy（避免误伤 gitee/内网仓库），
+              只给受管域名写 http.https://<域名>/.proxy = 7810。
+    off=False: 清掉所有作用域键 + 全局键（兼容旧配置残留）。
+    """
     val = f"http://{PROXY_ADDR}" if on else None
+    doms = _git_proxy_domains()
     try:
-        if val:
-            for k in ("http.proxy", "https.proxy"):
-                _fleet_text.run(["git", "config", "--global", k, val],
-                    timeout=10, check=True)
-            return True, f"git 代理已设 {val}（仅 GitHub 系域名经 gitport）"
+        # 无论开关，都先清全局键：老版本留下的全局代理会让"按域名"形同虚设。
+        for k in ("http.proxy", "https.proxy"):
+            _fleet_text.run(["git", "config", "--global", "--unset", k],
+                timeout=10)  # 不存在时返回非 0，忽略
+
+        if on:
+            for d in doms:
+                _fleet_text.run(["git", "config", "--global",
+                    _GIT_PROXY_KEY.format(host=d), val], timeout=10, check=True)
         else:
-            for k in ("http.proxy", "https.proxy"):
-                _fleet_text.run(["git", "config", "--global", "--unset", k],
-                    timeout=10)
-            return True, "git 代理已清除"
+            for d in doms:
+                _fleet_text.run(["git", "config", "--global", "--unset",
+                    _GIT_PROXY_KEY.format(host=d)], timeout=10)
+        n = len(doms) if on else 0
+        scope = ("仅 " + ", ".join(doms[:3]) + ("…" if len(doms) > 3 else "")) if on else ""
+        return True, (f"git 代理已按域名生效 {val}：{n} 个域名{scope}，其余仓库直连"
+                      if on else "git 代理已清除（全局 + 作用域）")
     except (OSError, subprocess.SubprocessError, subprocess.CalledProcessError) as e:
         return False, f"git 配置失败：{e}"
 
@@ -644,11 +677,22 @@ def status():
 
 
 def _git_proxy_state():
+    """返回 git 代理状态描述：优先按域名作用域键，兼容旧全局键。"""
     try:
+        # 新：作用域键（取 github.com 为代表）
+        r = _fleet_text.run(["git", "config", "--global", "--get",
+            _GIT_PROXY_KEY.format(host="github.com")], timeout=10)
+        v = (r.stdout or "").strip()
+        if v:
+            n = len([d for d in _git_proxy_domains()
+                     if (_fleet_text.run(["git", "config", "--global", "--get",
+                         _GIT_PROXY_KEY.format(host=d)], timeout=10).stdout or "").strip()])
+            return f"{v}（按域名作用域，{n} 个）"
+        # 旧：全局键残留（提示需要 git-proxy on 迁移）
         r = _fleet_text.run(["git", "config", "--global", "--get", "http.proxy"],
             timeout=10)
         v = (r.stdout or "").strip()
-        return v if v else None
+        return (v + "（全局！建议 git-proxy on 改为按域名）") if v else None
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -668,6 +712,11 @@ def _selftest():
     # 通配能同时覆盖裸域与子域
     assert "shExpMatch(host, \"*.github.com\")" in pac
     assert "youtube" not in pac.lower(), "PAC 里不该再有 youtube"
+    # ②b git 代理按域名作用域：派生域名不含通配符，键格式正确，且不是全局键
+    gdoms = _git_proxy_domains()
+    assert gdoms and all(not d.startswith("*.") for d in gdoms), gdoms
+    assert "github.com" in gdoms, gdoms
+    assert _GIT_PROXY_KEY.format(host="github.com") == "http.https://github.com/.proxy"
     # ③ 端口常量
     assert PROXY_PORT == 7810 and WEBUI_PORT == 7811 and LAN_PORT == 7822
     # ④ 二进制定位（debug 或 release 至少一个应存在，否则只告警不报错）
