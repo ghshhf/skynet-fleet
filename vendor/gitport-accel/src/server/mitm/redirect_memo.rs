@@ -29,6 +29,26 @@ fn memo_key(path: &str, query: Option<&str>) -> String {
     }
 }
 
+/// 302 落点必须是已知头像域：否则一次异常跳转会让该路径 6 小时内全部本地直答这个跳转。
+fn is_avatar_target(location: &str) -> bool {
+    let host = location
+        .strip_prefix("https://")
+        .or_else(|| location.strip_prefix("http://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or("");
+    let host = host
+        .rsplit('@')
+        .next()
+        .unwrap_or(host) // 剥 userinfo
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "user-images.githubusercontent.com"
+        || host == "private-user-images.githubusercontent.com"
+        || (host.starts_with("avatars") && host.ends_with(".githubusercontent.com"))
+}
+
 /// 命中 = 本地直答的 302 目标；未命中/过期 = None（照常走上游，顺手重学）。
 pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Option<String> {
     if host != "github.com" || !is_avatar_entry(path) {
@@ -41,17 +61,28 @@ pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Op
         g.remove(&k);
         return None;
     }
+    if !is_avatar_target(&loc) {
+        g.remove(&k); // 历史遗留的异常落点：当场清掉
+        return None;
+    }
     Some(loc)
 }
 
-/// 从上游响应学习 302 目标：拨号后与复用快路径两个分支共用，只挂一处会漏学（头像几乎都走复用）。
+/// 从上游响应学习跳转目标：唯一学习点在 get_direct 成功路径——新拨与复用都经过它。
 pub(super) fn observe_response(
     host: &str,
     uri: &http::Uri,
     status: http::StatusCode,
     headers: &http::HeaderMap,
 ) {
-    if status != http::StatusCode::FOUND {
+    // 头像入口偶尔走 301/307/308，只认 302 会漏学；落点仍由 is_avatar_target 严格校验。
+    if !matches!(
+        status,
+        http::StatusCode::MOVED_PERMANENTLY
+            | http::StatusCode::FOUND
+            | http::StatusCode::TEMPORARY_REDIRECT
+            | http::StatusCode::PERMANENT_REDIRECT
+    ) {
         return;
     }
     if let Some(loc) = headers.get("location").and_then(|v| v.to_str().ok()) {
@@ -59,9 +90,13 @@ pub(super) fn observe_response(
     }
 }
 
-/// 上游回了 302 就记一笔（只认头像入口形态；非 302/空 Location 调用方自会过滤）。
+/// 记一笔跳转（301/302/307/308；只认头像入口形态 + 头像域落点，其余不记）。
 pub(super) fn observe(host: &str, path: &str, query: Option<&str>, location: &str) {
-    if host != "github.com" || !is_avatar_entry(path) || location.is_empty() {
+    if host != "github.com"
+        || !is_avatar_entry(path)
+        || location.is_empty()
+        || !is_avatar_target(location)
+    {
         return;
     }
     let mut g = memo().lock().unwrap_or_else(|p| p.into_inner());

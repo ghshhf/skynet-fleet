@@ -1,6 +1,11 @@
 use super::*;
 use std::time::Duration;
 
+/// 测试段：四元组补成生产六元组（owner/ramp 默认 0，普通合并测试用不到）。
+fn t(s: u64, e: u64, at: Instant, b: BoxBody) -> (u64, u64, Instant, BoxBody, String, u64) {
+    (s, e, at, b, "test".to_string(), 0)
+}
+
 /// 平均切必须零缝覆盖整个区间，相邻段共享边界。
 #[test]
 fn split_even_covers_without_gap() {
@@ -72,27 +77,6 @@ fn content_range_total_parse() {
     assert_eq!(content_range_total(None), None);
 }
 
-/// 让位份额：速率反比（3 倍速的帮手拿大头），并扣掉它建连+爬坡期间的空转。
-#[test]
-fn split_keep_is_rate_proportional() {
-    const MB: u64 = 1024 * 1024;
-    let keep = split_keep(8 * MB, 1e6, 3e6, SPLIT_SETUP_SECS);
-    // 1MB/s 的持有者约保留 (0.5×3MB + 8MB)/4 ≈ 2.37MB，不到一半
-    assert!(
-        (2 * MB..3 * MB).contains(&keep),
-        "持有者只该留一小截，实际 {keep}"
-    );
-    // 速率相同：各一半（建连成本让持有者略多留）
-    let even = split_keep(8 * MB, 2e6, 2e6, SPLIT_SETUP_SECS);
-    assert!(even > 4 * MB && even < 5 * MB, "实际 {even}");
-    // 永远不能把一段切没
-    assert_eq!(
-        split_keep(MIN_PIECE, 1e6, 9e6, SPLIT_SETUP_SECS),
-        MIN_PIECE / 2
-    );
-    assert!(split_keep(4 * MIN_PIECE, 1.0, 1000.0, SPLIT_SETUP_SECS) <= 3 * MIN_PIECE);
-}
-
 fn seg(data: &'static [u8]) -> BoxBody {
     BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
         vec![Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(
@@ -150,20 +134,30 @@ fn drain(m: &mut MergeBody, out: &mut Vec<u8>) -> bool {
     }
 }
 
+/// 给段造一个"首帧在 now−1s、已收 got B"的速率样本，供判据测试用。
+fn with_rate(m: &mut MergeBody, start: u64, got: u64, now: Instant) {
+    let s = m.segs.get_mut(&start).unwrap();
+    s.first_at = Some(now - Duration::from_secs(1));
+    s.begin = now - Duration::from_secs(1);
+    s.got = got;
+    s.recent.push_back((now - Duration::from_secs(1), 0));
+    s.last_poll = now;
+}
+
 /// 顺序泵：段 1 供完接段 2；段 1 早断登记缺口，补发流续到边界再接段 2。
 #[test]
 fn merge_pumps_and_rescues() {
     let now = Instant::now();
     // 段 1 [0..6) 只供 2B 就 EOF（缺口 [2..6)）；段 2 [6..10) 完整。
     let mut m = MergeBody::new(
-        vec![(0, 6, now, seg(b"AA")), (6, 10, now, seg(b"BBBB"))],
+        vec![t(0, 6, now, seg(b"AA")), t(6, 10, now, seg(b"BBBB"))],
         10,
     );
     let mut out = Vec::new();
     assert!(!drain(&mut m, &mut out), "缺口在，交付不可能结束");
     assert_eq!(out, b"AA");
     assert_eq!(m.take_fill(), Some((2, 6)), "缺口 [2..6) 排进补发");
-    m.feed(2, 6, now, seg(b"CCCC"));
+    m.feed(2, 6, now, seg(b"CCCC"), "test".into(), 0);
     assert!(drain(&mut m, &mut out), "补上后应走完");
     assert_eq!(out, b"AACCCCBBBB");
     assert_eq!(m.sent(), 10);
@@ -213,8 +207,8 @@ fn segments_are_read_concurrently() {
     let tail_polls = Arc::new(AtomicUsize::new(0));
     let mut m = MergeBody::new(
         vec![
-            (0, 4, now, BoxBody::new(Stuck(stuck_polls.clone()))),
-            (
+            t(0, 4, now, BoxBody::new(Stuck(stuck_polls.clone()))),
+            t(
                 4,
                 8,
                 now,
@@ -244,7 +238,7 @@ fn segments_are_read_concurrently() {
 fn merge_no_gap_when_boundary_aligned() {
     let now = Instant::now();
     let mut m = MergeBody::new(
-        vec![(0, 4, now, seg(b"AAAA")), (4, 8, now, seg(b"BBBB"))],
+        vec![t(0, 4, now, seg(b"AAAA")), t(4, 8, now, seg(b"BBBB"))],
         8,
     );
     let mut out = Vec::new();
@@ -253,29 +247,52 @@ fn merge_no_gap_when_boundary_aligned() {
     assert_eq!(out, b"AAAABBBB");
 }
 
+/// 上游多给的尾巴不能溢出声明总长：交付线到 total 即收，多余字节丢弃（直连切片搬来的回归钉子）。
+#[test]
+fn merge_stops_at_declared_total() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![t(0, 40, now, seg(&[3u8; 100]))], 40);
+    let mut out = Vec::new();
+    assert!(drain(&mut m, &mut out));
+    assert_eq!(out.len(), 40);
+    assert!(out.iter().all(|&b| b == 3));
+}
+
 /// 让位：父段边界一缩，交到新边界就放手，尾巴原样排给下一条流；多收到的字节必须丢掉，不能当成已交付——否则接手方会重下一遍。
 #[test]
 fn cut_shrinks_boundary_and_hands_off_tail() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 100, now, seg(&[b'A'; 100]))], 100);
-    let cut = m.cut(0, 40, now).expect("应能切");
+    let mut m = MergeBody::new(vec![t(0, 100, now, seg(&[b'A'; 100]))], 100);
+    let cut = m.cut(0, 40).expect("应能切");
     assert_eq!(cut, (40, 100));
     assert_eq!(m.take_fill(), Some((40, 100)));
     let mut out = Vec::new();
     assert!(!drain(&mut m, &mut out), "尾巴还没人接");
     assert_eq!(out.len(), 40, "父流交到新边界就停");
     assert!(out.iter().all(|&b| b == b'A'));
-    m.feed(40, 100, now, seg(&[b'C'; 60]));
+    m.feed(40, 100, now, seg(&[b'C'; 60]), "test".into(), 0);
     assert!(drain(&mut m, &mut out));
     assert_eq!(out.len(), 100);
     assert!(out[40..].iter().all(|&b| b == b'C'), "尾部必须来自接手的流");
+}
+
+/// 整段让出：cut 到 pos 时把 [pos, end) 全部排补发，父段只剩已收部分。
+#[test]
+fn cut_to_pos_hands_off_whole_remaining() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![t(0, 100, now, stalled(b"AAAA"))], 100);
+    with_rate(&mut m, 0, 40, now); // pos=40, remaining=60
+    let cut = m.cut(0, 40).expect("切到 pos 应允许");
+    assert_eq!(cut, (40, 100));
+    assert_eq!(m.segs.get(&0).unwrap().end, 40, "父段只剩已收那截");
+    assert_eq!(m.take_fill(), Some((40, 100)), "整段剩余全排补发");
 }
 
 /// 停滞只收自己没收到的那截，缓冲里的字节一个都不丢。
 #[test]
 fn reap_keeps_received_bytes() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 10, now, stalled(b"AAAA"))], 10);
+    let mut m = MergeBody::new(vec![t(0, 10, now, stalled(b"AAAA"))], 10);
     let mut out = Vec::new();
     assert!(!drain(&mut m, &mut out), "供完 4B 就该停住等");
     assert_eq!(out, b"AAAA");
@@ -287,137 +304,140 @@ fn reap_keeps_received_bytes() {
     assert_eq!(m.take_fill(), Some((4, 10)), "只补没收到的那截");
     assert!(!drain(&mut m, &mut out));
     assert_eq!(out, b"AAAA");
-    m.feed(4, 10, now, seg(b"BBBBBB"));
+    m.feed(4, 10, now, seg(b"BBBBBB"), "test".into(), 0);
     assert!(drain(&mut m, &mut out));
     assert_eq!(out, b"AAAABBBBBB");
 }
 
-/// 没有闲连接也能抢：新开一条流要付的建连成本，已经折进收益判据。
-#[test]
-fn plan_cut_pays_setup_without_idle_connection() {
-    let now = Instant::now();
-    let slow = 4 * MIN_PIECE;
+/// 两段 fixture：慢段 [0,1M) v=100k/s（drain 9s，设 ramp），快段 [1M,2M) v=500k/s（drain 1s，最快、保留）。
+/// 快段 ramp=0 但 drain 1s>0，公式本也判切——靠"最快闸门"留下。
+fn rebalance_two_seg_fixture(now: Instant, slow_ramp: u64) -> MergeBody {
     let mut m = MergeBody::new(
         vec![
-            (0, slow, now - Duration::from_secs(2), stalled(b"")),
-            (
-                slow,
-                8 * MIN_PIECE,
-                now - Duration::from_secs(2),
-                stalled(b""),
-            ),
+            t(0, 1_000_000, now, stalled(b"")),
+            t(1_000_000, 2_000_000, now, stalled(b"")),
         ],
-        8 * MIN_PIECE,
+        2_000_000,
     );
-    // 手工造两条速率样本：一条慢（5KB/s）、一条快（256KB/s）。
-    for (k, got) in [(0u64, 10_000u64), (slow, MIN_PIECE)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
-    let cut = m
-        .plan_cut(now)
-        .expect("收益远大于建连成本，credit=0 也该切");
-    assert_eq!(cut.1, slow, "尾巴应到段尾为止");
-    assert!(cut.0 > 10_000 && cut.0 < slow, "切点 {cut:?}");
+    with_rate(&mut m, 0, 100_000, now); // 慢：v=100k/s, remaining=900k → 9s
+    with_rate(&mut m, 1_000_000, 500_000, now); // 快：v=500k/s, remaining=500k → 1s
+    m.segs.get_mut(&0).unwrap().ramp = slow_ramp;
+    m
 }
 
-/// 两家一样快：谁都不该被抢——抢过来还得付建连，纯亏。
 #[test]
-fn plan_cut_spares_when_no_faster_peer() {
+fn rebalance_cuts_when_remaining_slower_than_ramp() {
     let now = Instant::now();
-    let half = 4 * MIN_PIECE;
+    let mut m = rebalance_two_seg_fixture(now, 1_000);
+    let moved = m.rebalance(now);
+    assert_eq!(moved, 900_000, "整段剩余让出");
+    assert_eq!(m.segs.get(&0).unwrap().end, 100_000, "慢段只剩已收那截");
+    assert_eq!(m.segs.get(&1_000_000).unwrap().end, 2_000_000, "最快段保留不切");
+    assert_eq!(m.take_fill(), Some((100_000, 1_000_000)));
+    assert_eq!(m.last_cut_owner.as_deref(), Some("test"));
+}
+
+#[test]
+fn rebalance_spares_when_ramp_not_worth_it() {
+    let now = Instant::now();
+    let mut m = rebalance_two_seg_fixture(now, 20_000); // ramp 20s > 留着 9s → 不切
+    assert_eq!(m.rebalance(now), 0, "爬坡比留着还慢，不动刀");
+    assert!(m.fill.is_empty());
+}
+
+#[test]
+fn rebalance_ignores_seg_without_first_frame() {
+    let now = Instant::now();
+    // 有 bytes 但没首帧样本 → 没速率，不动刀、也不参与最快比较。
+    let mut m = MergeBody::new(vec![t(0, 1_000_000, now, stalled(b""))], 1_000_000);
+    m.segs.get_mut(&0).unwrap().got = 100_000;
+    m.segs.get_mut(&0).unwrap().last_poll = now;
+    assert_eq!(m.rebalance(now), 0, "没首帧不动刀");
+    assert!(m.fill.is_empty());
+}
+
+#[test]
+fn rebalance_cuts_small_tail_when_slow_enough() {
+    let now = Instant::now();
+    // 小尾巴 4KB 也切：判据只看时间，不看字节数。配一条更快的段作对照（最快、不切）。
     let mut m = MergeBody::new(
         vec![
-            (0, half, now - Duration::from_secs(2), stalled(b"")),
-            (
-                half,
-                8 * MIN_PIECE,
-                now - Duration::from_secs(2),
-                stalled(b""),
-            ),
+            t(0, 5_000, now, stalled(b"")),
+            t(5_000, 20_000, now, stalled(b"")),
         ],
-        8 * MIN_PIECE,
+        20_000,
     );
-    for k in [0u64, half] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = MIN_PIECE;
-        s.last_poll = now;
-    }
-    assert!(m.plan_cut(now).is_none(), "同样快，没有抢的收益");
+    with_rate(&mut m, 0, 1_000, now); // 慢：v=1000B/s, remaining=4000 → 4s
+    with_rate(&mut m, 5_000, 10_000, now); // 快陪衬：v=10k/s, remaining=10k → 1s
+    m.segs.get_mut(&0).unwrap().ramp = 100; // 爬坡 0.1s → 切
+    assert_eq!(m.rebalance(now), 4_000, "小尾巴够慢照样切，无字节下限");
 }
 
-/// 比最快慢就切，但只剩 0.1MB 时抢过去反而更久（要付建连）——这时候不动刀，是算术不是门槛：remaining/best + 建连 >= remaining/我。
 #[test]
-fn plan_cut_skips_when_handoff_costs_more() {
+fn rebalance_only_cuts_once() {
     let now = Instant::now();
-    let half = 2 * MIN_PIECE;
+    let mut m = rebalance_two_seg_fixture(now, 1_000);
+    assert!(m.rebalance(now) > 0, "第一轮切");
+    assert_eq!(m.take_fill(), Some((100_000, 1_000_000)), "尾巴排补发");
+    // 再来一段满足判据（v=100k < 最快 500k）也不切。
+    m.feed(2_000_000, 3_000_000, now, stalled(b""), "test".into(), 1_000);
+    with_rate(&mut m, 2_000_000, 100_000, now);
+    assert_eq!(m.rebalance(now), 0, "只切一次，之后不再动刀");
+    assert!(m.fill.is_empty(), "第二轮没有再排队尾巴");
+}
+
+/// 最快段即使公式判切也保留不切（本就满速，切下来重派反而亏）；慢段照切。
+#[test]
+fn rebalance_spares_fastest_even_if_worth_cutting() {
+    let now = Instant::now();
     let mut m = MergeBody::new(
         vec![
-            (0, half, now - Duration::from_secs(2), stalled(b"")),
-            (
-                half,
-                4 * MIN_PIECE,
-                now - Duration::from_secs(2),
-                stalled(b""),
-            ),
+            t(0, 20_000_000, now, stalled(b"")),
+            t(20_000_000, 30_000_000, now, stalled(b"")),
         ],
-        4 * MIN_PIECE,
+        30_000_000,
     );
-    // 慢家 0.95MB/s、快家 1.5MB/s：慢家只剩 0.1MB，抢过去还得付 0.5s 建连，不划算。
-    for (k, got) in [(0u64, 1_900_000u64), (half, 3_000_000u64)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
-    assert!(m.plan_cut(now).is_none(), "抢过去更久就不该抢");
+    with_rate(&mut m, 0, 10_000_000, now); // A 快：10MB/s, remaining=10M → 1s，ramp 0 → 公式也判切
+    with_rate(&mut m, 20_000_000, 1_000_000, now); // B 慢：1MB/s, remaining=9M → 9s，ramp 0 → 判切
+    let moved = m.rebalance(now);
+    assert_eq!(moved, 9_000_000, "只切慢段 B");
+    assert_eq!(m.segs.get(&0).unwrap().end, 20_000_000, "最快段 A 保留不切");
 }
 
-/// 刀口上限按帮手实测速率折算（≈3 秒的量）：快源被钉死的再平衡上限随速度放开。
+/// 并列最快的两段都不切。
 #[test]
-fn plan_cut_caps_handoff_size() {
+fn rebalance_spares_all_when_tied_fastest() {
     let now = Instant::now();
-    let big = 40 * 1024 * 1024;
     let mut m = MergeBody::new(
         vec![
-            (0, big / 2, now - Duration::from_secs(2), stalled(b"")),
-            (big / 2, big, now - Duration::from_secs(2), stalled(b"")),
+            t(0, 2_000_000, now, stalled(b"")),
+            t(2_000_000, 4_000_000, now, stalled(b"")),
         ],
-        big,
+        4_000_000,
     );
-    // 慢家 0.5MB/s（还剩 19MB）；快家 2MB/s。快家该接走大头。
-    for (k, got) in [(0u64, 1_048_576u64), (big / 2, 4 * 1024 * 1024u64)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
-    let (from, to) = m.plan_cut(now).expect("38 秒太久，该抢");
-    let handoff = to - from;
-    assert!(handoff >= MIN_PIECE, "刀口太小不值一次建连");
-    assert!(
-        handoff <= handoff_cap(2.0 * 1024.0 * 1024.0),
-        "刀口 {handoff} 超过按速折算的封顶"
-    );
+    with_rate(&mut m, 0, 1_000_000, now); // 同速 1MB/s，drain 各 1s，ramp 0 → 公式都判切
+    with_rate(&mut m, 2_000_000, 1_000_000, now);
+    assert_eq!(m.rebalance(now), 0, "并列最快都保留");
+    assert!(m.fill.is_empty());
 }
 
-/// 刀口随帮手速率缩放：10MB/s 的快源该拿到比 4MB 旧常数大得多的刀口，否则快源下完自己的份额后只能以旧常数的龟速捡尾巴，聚合速率上不去。
+/// 单段即全场最快 → 永不切自己。
 #[test]
-fn handoff_cap_scales_with_helper_speed() {
-    assert_eq!(handoff_cap(1024.0), MIN_PIECE, "太小的速率钳在下限");
-    assert_eq!(handoff_cap(1e7), 30_000_000, "10MB/s 帮手 ≈ 3s 的量");
-    assert_eq!(
-        handoff_cap(1e9),
-        64 * 1024 * 1024,
-        "再快也钳在 64MB，防一次让位掏空整段"
-    );
+fn rebalance_single_seg_never_cuts() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![t(0, 1_000_000, now, stalled(b""))], 1_000_000);
+    with_rate(&mut m, 0, 100_000, now); // drain 9s，ramp 0 → 公式判切
+    assert_eq!(m.rebalance(now), 0, "单段是最快，不切自己");
+    assert!(m.fill.is_empty());
 }
 
-/// 近期速率：滑窗有样本按滑窗算，样本不足退回全片均速（短段的全片就是全部真相）。
+/// 近期速率：首帧起算、样本按滑窗折算，无预热门槛。
 #[test]
 fn recent_rate_prefers_sliding_window() {
     let now = Instant::now();
-    let mut s = Seg::new(0, 1 << 20, now, seg(b""));
-    s.begin = now - Duration::from_secs(2);
+    let mut s = Seg::new(0, 1 << 20, now, seg(b""), "test".into(), 0);
+    assert_eq!(s.rate(now), 0.0, "没首帧 = 没样本 = 0");
+    s.on_first_frame(now - Duration::from_secs(2));
     s.got = 1000;
     assert!(
         (s.recent_rate(now) - 500.0).abs() < 1.0,
@@ -437,9 +457,9 @@ fn recent_rate_prefers_sliding_window() {
 #[test]
 fn dead_fill_counter_resets_on_progress() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 4, now, seg(b"AAAA"))], 4);
+    let mut m = MergeBody::new(vec![t(0, 4, now, seg(b"AAAA"))], 4);
     for _ in 0..MAX_DEAD_FILLS {
-        m.fail_fill();
+        m.dead_fills += 1;
     }
     assert!(m.exhausted());
     let mut out = Vec::new();

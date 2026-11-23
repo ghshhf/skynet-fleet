@@ -28,11 +28,22 @@ fn main() {
 }
 
 fn run() {
+    let t0 = std::time::Instant::now();
     if desktop::already_running() {
-        if !desktop::signal_show(config::webui_port()) {
-            desktop::notify_already_running();
+        if desktop::signal_show(config::webui_port()) {
+            return;
         }
-        return;
+        // ok:false = 旧实例界面已死；等它让出单实例锁后接管，一直不放才认已在运行。
+        for _ in 0..20 {
+            if !desktop::already_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if desktop::already_running() {
+            desktop::notify_already_running();
+            return;
+        }
     }
     // 工作目录切到 exe 目录：自启/快捷方式的 cwd 不可靠，数据文件按相对路径读写。
     let exe_dir = std::env::current_exe()
@@ -45,6 +56,7 @@ fn run() {
     logger::set_crash_path(&cache_dir);
     settings::init_exe_dir(&exe_dir);
     settings::load();
+    let t_settings = t0.elapsed();
 
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "-headless");
@@ -64,10 +76,15 @@ fn run() {
         Arc::new(move |msg: &str| l.log(msg))
     };
     pool::serial_load(&exe_dir, settings::last_ips(), Some(log_fn.clone()));
-    let ca = certgen::load_or_generate(&exe_dir, Some(&log_fn)).ok();
-    if ca.is_none() {
-        log_fn("CA 初始化失败, MITM 不可用");
-    }
+    let t_routes = t0.elapsed();
+    let ca = match certgen::load_or_generate(&exe_dir) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            log_fn(&format!("CA 初始化失败, MITM 不可用: {e}"));
+            None
+        }
+    };
+    let t_ca = t0.elapsed();
 
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -76,8 +93,8 @@ fn run() {
             .expect("tokio runtime 创建失败"),
     );
 
-    server::upstream::start_keepalive(&rt);
     server::mitm::mirror::start_ect_ticker();
+    server::status::start_ticker(log_fn.clone());
 
     let srv = Arc::new(server::ProxyServer {
         log: log_fn.clone(),
@@ -91,6 +108,16 @@ fn run() {
             log_fn(&format!("[启动] 系统代理: 未接管 —— {e}"));
         }
     }
+    let t_proxy = t0.elapsed();
+    // 开机慢的取证：一看就知道卡在路由表、证书还是系统代理接管。
+    log_fn(&format!(
+        "[启动] 核心 {}ms（配置 {} / 路由表 {} / CA {} / 代理 {}）",
+        t_proxy.as_millis(),
+        t_settings.as_millis(),
+        t_routes.saturating_sub(t_settings).as_millis(),
+        t_ca.saturating_sub(t_routes).as_millis(),
+        t_proxy.saturating_sub(t_ca).as_millis(),
+    ));
     let me = settings::exe_name();
     match settings::autostart_state() {
         // 登记的是本 exe（或本来就没登记）是常态，不出声；指向别处才是真问题。
@@ -126,6 +153,8 @@ fn run() {
     }
 
     let on_quit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        // 运行时延迟回流是内存态：退出时落一次盘，下次冷启动还有排序基线（事件驱动，无定时器）。
+        pool::save_routes_now();
         settings::remove_system_proxy();
         let rt = rt.clone();
         std::thread::spawn(move || {

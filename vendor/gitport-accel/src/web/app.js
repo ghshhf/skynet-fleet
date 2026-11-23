@@ -15,9 +15,9 @@ let logSeq = 0;
 let S = { running: false, mitm: false, port: 7810 };
 
 const titles = {
-  overview: ['概览', '代理状态与 GitHub 连通性一览'],
-  logs:     ['运行日志', '实时运行日志 · 增量拉取'],
-  settings: ['设置', '应用行为偏好 · 分流接管 · MITM'],
+  overview: ['概览'],
+  logs:     ['日志'],
+  settings: ['设置'],
 };
 
 async function copyText(t) {
@@ -51,7 +51,6 @@ function route() {
   document.querySelectorAll('.item').forEach(a => a.classList.toggle('active', a.dataset.view === view));
   const t = titles[view] || titles.overview;
   $('pageTitle').textContent = t[0];
-  $('pageSub').textContent = t[1];
 }
 window.onhashchange = route;
 
@@ -93,6 +92,8 @@ function logTone(l) {
   // 顺序即优先级：降级类（冷却/垫底/拦截）先判黄——红先判则黄永远走不到（2026-10-18 实测只看到红绿）。
   if (/冷却|垫底|降权|拦截|假页|退化|注入/.test(l)) return 'warn';
   if (/失败|错误|全灭|超时|拒绝|状态 [45]\d\d/.test(l)) return 'err';
+  // 后台动作（建造/换 IP/通道生命周期）：压暗，不与「用通道」这条主线争注意力。
+  if (/\[建连\]|\[串发\]|\[会话通道\]/.test(l)) return 'bg';
   if (/via |握手|复用连接|新连接|已解密|成功|已保存/.test(l)) return 'ok';
   return '';
 }
@@ -108,7 +109,14 @@ async function refreshLogs() {
     for (const l of lines) {
       const row = document.createElement('div');
       row.className = 'lg ' + logTone(l);
-      row.textContent = l;
+      const m = l.match(/^\[(\d\d:\d\d:\d\d)\] ([\s\S]*)$/);
+      const ts = document.createElement('span');
+      ts.className = 'lt';
+      ts.textContent = m ? '[' + m[1] + ']' : '';
+      const msg = document.createElement('span');
+      msg.className = 'lm';
+      msg.textContent = m ? m[2] : l;
+      row.append(ts, msg);
       frag.appendChild(row);
     }
     box.appendChild(frag);
@@ -118,6 +126,10 @@ async function refreshLogs() {
   logSeq = d.latest;
 }
 
+async function clearLogs() {
+  try { await fetch('/api/logs/clear', { method: 'POST' }); } catch (e) { return; }
+  document.getElementById('logsBox').textContent = '';
+}
 
 /* ---------- 开关 ---------- */
 async function postJSON(url, body) {
@@ -141,7 +153,7 @@ function applySettings(s) {
   $('swGh').checked = s.githubPAC !== false; // 旧版无此键时维持缺省(开)
 }
 function applyMirrors(s) {
-  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted}));
+  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, invalid: !!w.invalid}));
   renderMirrors();
 }
 /* 一次 /api/settings 喂两边：开关回显 + 镜像列表（启动与切页都不再拉两次） */
@@ -171,19 +183,19 @@ const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'\u0026amp;','<':'
 function renderMirrors() {
   $('mirrorRows').innerHTML = MIRRORS.length
     ? MIRRORS.map((m, i) => mirrorRow(m, i)).join('')
-    : '<div class="pool-empty">还没有自定义镜像——点下方「＋ 添加镜像」，填入地址后点「启动」</div>';
+    : '<div class="pool-empty">暂无镜像</div>';
 }
 
 function mirrorRow(m, i) {
   const toggle = m.on ? '关闭' : '启动';
   const cls = m.on ? 'btn sm' : 'btn sm primary';
-  const trust = '<label class="trust-label" title="信任此镜像：带签名(github 302 落点)的下载地址也放行给它。签名等效 1 小时提货凭证，仅对你完全信任的自建/无日志镜像开启。">' +
-    '<input type="checkbox" data-act="trust" data-idx="' + i + '"' + (m.trusted ? ' checked' : '') + '>信任</label>';
+  // 用法试探没过：标红且不进链。地址本身可能没问题（镜像挂了/用法不在已知家族里），
+  // 所以留着让用户改或删，不替他清掉。
   return '<div class="mirror-row">' +
-    '<input type="text" class="text-input" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">' +
-    trust +
+    '<input type="text" class="text-input' + (m.invalid ? ' invalid' : '') + '" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off"' +
+    (m.invalid ? ' title="不可用"' : '') + '>' +
     '<button class="' + cls + '" data-act="toggle" data-idx="' + i + '">' + toggle + '</button>' +
-    '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="彻底删除（注册表与镜像链一并清除）">' + TRASH_SVG + '</button>' +
+    '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="删除">' + TRASH_SVG + '</button>' +
     '</div>';
 }
 
@@ -199,12 +211,12 @@ async function commitMirrors(opts = {}) {
       }
     } catch (e) { /* 拉取失败按本地状态提交 */ }
   }
-  const mirrors = MIRRORS.filter(m => m.url).map(m => ({url: m.url, on: !!m.on, trusted: !!m.trusted}));
+  const mirrors = MIRRORS.filter(m => m.url).map(m => ({url: m.url, on: !!m.on}));
   let r;
   try { r = await postJSON('/api/settings/workerMirrors', {mirrors}); }
   catch (e) { alert('保存失败: ' + e); return; }
   if (!r.ok) { alert('保存失败: ' + (r.error || '')); }
-  MIRRORS = (r.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted}));
+  MIRRORS = (r.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, invalid: !!w.invalid}));
   renderMirrors();
 }
 
@@ -236,15 +248,6 @@ $('mirrorRows').addEventListener('click', async e => {
   }
 });
 
-/* 信任是 checkbox: click 监听只认 button[data-act], 收不到它——单独挂 change。 */
-$('mirrorRows').addEventListener('change', async e => {
-  if (!e.target.matches('input[data-act="trust"]')) return;
-  const row = MIRRORS[+e.target.dataset.idx];
-  if (!row) return;
-  row.trusted = e.target.checked;
-  await commitMirrors();
-});
-
 $('mirrorRows').addEventListener('input', e => {
   // 只认文本框: trust checkbox 同样带 data-idx, 但没有 url 语义
   if (e.target.matches('input[type="text"][data-idx]')) {
@@ -270,7 +273,7 @@ async function runCal(btn) {
     const timer = setInterval(async () => {
       try {
         const st = await (await fetch('/api/calibrate')).json();
-        if (st.running) { box.textContent = '图片链校准中…（进度见「运行日志」页）'; return; }
+        if (st.running) { box.textContent = '校准中…'; return; }
         clearInterval(timer);
         box.textContent = st.report || '图片链校准完成（无可校准的链）';
         toast('图片链校准完成');

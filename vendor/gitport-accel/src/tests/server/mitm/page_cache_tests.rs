@@ -4,18 +4,18 @@ fn search_skeleton_gate() {
     let k = "GET github.com/search?q=x&type=repositories-cloggedout-gz";
     let full = "<html>{}react-app.embeddedData{}</html>".to_string();
     assert!(
-        !is_search_skeleton(k, full.as_bytes(), false),
+        !is_search_skeleton(k, full.as_bytes(), "identity"),
         "含结果载体的正常页应缓存"
     );
     assert!(
-        is_search_skeleton(k, b"<html>Your search did not match</html>", false),
+        is_search_skeleton(k, b"<html>Your search did not match</html>", "identity"),
         "无结果载体的骨架应拦截"
     );
     // 非 /search? 键不受此判定(count XHR 的骨架照缓存,无害)
     assert!(!is_search_skeleton(
         "GET github.com/search/count?q=x-cloggedout",
         b"{}",
-        false
+        "identity"
     ));
 }
 
@@ -30,14 +30,14 @@ fn search_skeleton_gate_gzip() {
         .unwrap();
     let gz = enc.finish().unwrap();
     assert!(
-        !is_search_skeleton(k, &gz, true),
+        !is_search_skeleton(k, &gz, "gzip"),
         "gzip 正常页解压后应命中载体标志"
     );
     let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
     enc.write_all(b"<html>Your search did not match any</html>")
         .unwrap();
     let gz = enc.finish().unwrap();
-    assert!(is_search_skeleton(k, &gz, true), "gzip 骨架应拦截");
+    assert!(is_search_skeleton(k, &gz, "gzip"), "gzip 骨架应拦截");
 }
 
 use super::*;
@@ -73,10 +73,26 @@ fn no_cache_header_bypasses_cache() {
         None,
         true
     ));
+    // 仓库首页（两段）不再缓存：v7 起仓库页零转换直出（html 永不缓存）
     assert!(!cache_eligible_rules(
         "github.com",
         &Method::GET,
         "/octocat/repo",
+        None,
+        true
+    ));
+    assert!(!cache_eligible_rules(
+        "github.com",
+        &Method::GET,
+        "/octocat/repo/",
+        None,
+        true
+    ));
+    // 三段非列表段仍不准入
+    assert!(!cache_eligible_rules(
+        "github.com",
+        &Method::GET,
+        "/octocat/repo/foo",
         None,
         true
     ));
@@ -93,7 +109,7 @@ fn search_query_normalization() {
             })
             .build()
             .unwrap();
-        page_cache_key(&uri, "github.com", None, true)
+        page_cache_key(&uri, "github.com", None, "gzip")
     };
     let base = mk("/search", Some("q=rust&type=repositories"));
     assert_eq!(
@@ -109,9 +125,15 @@ fn search_query_normalization() {
     // 非 /search：原样保留（顺序与 p=1 都不动）
     let repo = mk("/octocat/repo/issues", Some("q=1&page=2"));
     assert!(repo.contains("?q=1&page=2"), "其他路径的查询串不能被归一化");
+    // v6.2：默认页显式补 p=1（无 p 的键里必须出现 p=1）
+    assert!(base.contains("p=1"), "无 p 的搜索键应补 p=1: {base}");
+    // 翻到第 N 页不能被合并成第一页
+    let p2 = mk("/search", Some("q=rust&type=repositories&p=2"));
+    assert_ne!(p2, base, "p=2 与默认页必须不同键");
+    assert!(p2.contains("p=2"));
 }
 
-/// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。
+/// 软导航的 /search 翻页也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页永远不入缓存；非 /search 软导航照旧不收。
 #[test]
 fn search_page_eligible_regardless_of_nav_kind() {
     assert!(
@@ -201,8 +223,7 @@ fn test_hdrs() -> Vec<Vec<String>> {
     ]
 }
 
-/// A. 读写往返、类型闸门、坏文件自愈、PeekRaw 拼回。
-// own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+/// A. 读写往返、类型闸门、坏文件自愈、PeekRaw 拼回；跨 await 持 own_dir 锁是本意（目录清理守卫）。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn roundtrip_gates_and_self_heal() {
@@ -411,8 +432,7 @@ fn capacity_wipe_on_growth() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// C. 键的语义（身份 / 编码 / 会话边界）、写后失效、未登录页防污染、闸门页。
-// own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+/// C. 键的语义（身份/编码/会话边界）、写后失效、未登录页防污染、闸门页；跨 await 持 own_dir 锁是本意（目录清理守卫）。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn keys_invalidation_and_pollution() {
@@ -465,12 +485,14 @@ async fn keys_invalidation_and_pollution() {
     );
     assert!(page_cache_get(other_key).is_some(), "无关页面不得被牵连");
 
-    // ⑩ 身份标签：账号进键（同机两个账号不得共享页面）
+    // ⑩ 身份标签：会话号哈希进键（同机两个会话不得共享页面）；伪造 dotcom_user 不改变键
     let a = session_fingerprint(Some("user_session=abc; dotcom_user=alice"));
+    let forged = session_fingerprint(Some("user_session=forged; dotcom_user=alice"));
     let a2 = session_fingerprint(Some("user_session=zzz; dotcom_user=alice"));
     let b = session_fingerprint(Some("dotcom_user=bob; user_session=q"));
-    assert_eq!(a, "-calice", "登录态标签带账号名");
-    assert_eq!(a, a2, "同账号轮换 user_session 不换键");
+    assert_eq!(a, format!("-cs{}", page_file_name("abc")), "登录态标签 = 会话号摘要");
+    assert_ne!(a, forged, "伪造 user_session 不得撞出别人的键");
+    assert_ne!(a, a2, "会话号变了必须换键(账号名不再是键的一部分)");
     assert_ne!(a, b, "不同账号必须分键（A 的设置页不能给 B）");
     assert_eq!(session_fingerprint(None), "-cloggedout", "未登录固定标签");
     assert_eq!(
@@ -478,11 +500,7 @@ async fn keys_invalidation_and_pollution() {
         "-cloggedout",
         "只有 _gh_sess 不算登录"
     );
-    // 拿不到 dotcom_user：退回 session 值哈希，仍按账号分开（轮换只损失命中）
-    let h1 = session_fingerprint(Some("user_session=abc"));
-    let h2 = session_fingerprint(Some("user_session=xyz"));
-    assert!(h1.starts_with("-cs") && h1 != h2, "{h1} / {h2}");
-    // _gh_sess 每个响应都轮换：兜底哈希只取 user_session 值，键必须稳住
+    // _gh_sess 每个响应都轮换：哈希只取 user_session 值，键必须稳住
     assert_eq!(
         session_fingerprint(Some("user_session=abc; _gh_sess=r1; _octo=GH1.1")),
         session_fingerprint(Some("user_session=abc; _gh_sess=r2; _octo=GH1.1")),
@@ -492,39 +510,40 @@ async fn keys_invalidation_and_pollution() {
     let uri: http::Uri = "https://github.com/settings/profile?tab=x".parse().unwrap();
     let alice = "user_session=s1; dotcom_user=alice";
     let bob = "user_session=s2; dotcom_user=bob";
-    let gz = page_cache_key(&uri, "github.com", Some(alice), true);
-    let id = page_cache_key(&uri, "github.com", Some(alice), false);
-    assert!(gz.contains("?tab=x") && gz.ends_with("-calice-gz"), "{gz}");
-    assert!(id.ends_with("-calice-id"), "{id}");
+    let gz = page_cache_key(&uri, "github.com", Some(alice), "gzip");
+    let id = page_cache_key(&uri, "github.com", Some(alice), "identity");
+    let fp = session_fingerprint(Some(alice));
+    assert!(gz.contains("?tab=x") && gz.ends_with(&format!("{fp}-gz")), "{gz}");
+    assert!(id.ends_with(&format!("{fp}-id")), "{id}");
     assert_ne!(
         gz,
-        page_cache_key(&uri, "github.com", Some(bob), true),
+        page_cache_key(&uri, "github.com", Some(bob), "gzip"),
         "同机换账号必须换键"
     );
     // ⑩a 首页键带 -k（不带会话号，跨会话复用）
     let home_uri: http::Uri = "https://github.com/".parse().unwrap();
     assert!(
-        live_cache_key(&home_uri, "github.com", Some(alice), true, "").ends_with("-k"),
+        live_cache_key(&home_uri, "github.com", Some(alice), "gzip", "").ends_with("-k"),
         "首页骨架键必须带 -k"
     );
 
     // ⑩b 换会话后旧键必须失效（不依赖清盘是否成功）
-    let k_before = live_cache_key(&uri, "github.com", Some(alice), true, "");
+    let k_before = live_cache_key(&uri, "github.com", Some(alice), "gzip", "");
     set_last_nav(0);
     assert!(note_nav(), "伪造一次空闲");
-    let k_after = live_cache_key(&uri, "github.com", Some(alice), true, "");
+    let k_after = live_cache_key(&uri, "github.com", Some(alice), "gzip", "");
     assert_ne!(k_before, k_after, "换会话后同一页面必须是新键");
     // ⑩c 两次"进程首启"的会话号必须不同：否则重启后又拿回 -s2，与上一轮的盘上条目撞号
     let k1 = {
         set_last_nav(0);
         note_nav();
-        live_cache_key(&uri, "github.com", None, true, "")
+        live_cache_key(&uri, "github.com", None, "gzip", "")
     };
     std::thread::sleep(std::time::Duration::from_millis(3));
     let k2 = {
         set_last_nav(0);
         note_nav();
-        live_cache_key(&uri, "github.com", None, true, "")
+        live_cache_key(&uri, "github.com", None, "gzip", "")
     };
     assert_ne!(k1, k2, "重启后会话号不得与上一轮相同");
 
@@ -576,11 +595,11 @@ async fn keys_invalidation_and_pollution() {
     std::io::Write::write_all(&mut enc, &html).unwrap();
     let gzbody = enc.finish().unwrap();
     assert!(
-        !is_logged_out_body(&plain_prefix(&gzbody, false)),
+        !is_logged_out_body(&plain_prefix(&gzbody, "identity")),
         "压缩体裸扫扫不到——这就是旧版失效的原因"
     );
     assert!(
-        is_logged_out_body(&plain_prefix(&gzbody, true)),
+        is_logged_out_body(&plain_prefix(&gzbody, "gzip")),
         "解压后必须认出未登录页"
     );
     let poisoned_gz = hyper::Response::builder()
@@ -606,13 +625,13 @@ async fn keys_invalidation_and_pollution() {
     // ⑪c 闸门页：按请求 URL 回 200，写入侧与读侧都必须拦
     let gate_html = b"<html><head><title>Verify your two-factor authentication (2FA) settings</title></head><body><h1>Verify your two-factor authentication (2FA) settings</h1><p>This is a one-time verification of your recently configured 2FA credentials.</p></body></html>";
     assert!(
-        is_gate_page(&plain_prefix(gate_html, false)),
+        is_gate_page(&plain_prefix(gate_html, "identity")),
         "2FA 验证页必须识别"
     );
     assert!(
         !is_gate_page(&plain_prefix(
             b"<html><body class=\"logged-in env-production\">repo</body></html>",
-            false
+            "identity"
         )),
         "普通页面不得误判"
     );
@@ -698,6 +717,7 @@ fn list_path_gate() {
         "/search/count",
         "/search/blackbird_count",
         "/search/warm_blackbird_caches",
+        "/search/custom_scopes",
         "/in-product-messaging/",
         "/github-copilot/chat/repositories_search",
     ] {
@@ -711,4 +731,190 @@ fn list_path_gate() {
     assert!(is_home_path(""));
     assert!(!is_home_path("/feed"));
     assert!(!is_home_path("/o/r"));
+}
+
+/// 截断的 keep 骨架（无 </html>）必须读失败并删文件自愈：h2 响应无 content-length，中途断流 collect 照样成功，截断页 7 天内每次后退都命中=必现白屏。
+#[test]
+fn truncated_keep_entry_self_destructs() {
+    let (dir, _g) = own_dir("trunc");
+    let ck = "GET github.com/-cloggedout-gz-k";
+    let _ = persist_page_entry_blocking(
+        &dir,
+        ck,
+        b"<html><head>truncated page without closing tag",
+        200,
+        &test_hdrs(),
+    );
+    let keep = dir.join("keep");
+    assert_eq!(std::fs::read_dir(&keep).unwrap().count(), 1);
+    assert!(
+        load_disk_entry_reason(ck, true).is_err(),
+        "截断骨架必须当 miss"
+    );
+    assert_eq!(
+        std::fs::read_dir(&keep).unwrap().count(),
+        0,
+        "截断条目必须当场删除(自愈)"
+    );
+    // 完整骨架照常命中
+    let _ = persist_page_entry_blocking(&dir, ck, b"<html>ok</html>", 200, &test_hdrs());
+    assert!(load_disk_entry_reason(ck, true).is_ok(), "完整骨架必须命中");
+}
+
+/// 大 Cookie 被 h2 拆多行：user_session 在第二行也必须认出登录态，否则登录流量记成 -cloggedout，与爬虫混池污染。
+#[test]
+fn split_cookie_headers_still_fingerprint_account() {
+    let req = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri("https://github.com/")
+        .header("cookie", "_gh_sess=abc; _device_id=xyz")
+        .header("cookie", "user_session=tok123; dotcom_user=zhidian-cmd")
+        .body(())
+        .unwrap();
+    let joined = all_cookies(req.headers()).expect("应有 cookie");
+    assert!(
+        joined.contains("_gh_sess=abc") && joined.contains("user_session=tok123"),
+        "两行 cookie 都要在: {joined}"
+    );
+    assert_eq!(session_value(Some(&joined)), Some("tok123"));
+    assert_eq!(
+        session_fingerprint(Some(&joined)),
+        format!("-cs{}", page_file_name("tok123")),
+        "自报账号名(dotcom_user)不参与指纹，只认会话号摘要"
+    );
+}
+
+/// v6.9 资产缓存已物理删除（实测 48 分钟 132 请求 0 命中）；本测试的存在就是文档——想重启先读 git 历史里三颗雷：逻辑键互踩、缺 CORS、单 token br 收窄。
+#[test]
+fn asset_cache_is_removed_by_design() {
+    // 没有可断言的函数了（is_asset_req/asset_cache_key 已删）；这里只钉页面缓存键从不含资产域。
+    let mk = |p: &str| page_cache_key(&p.parse::<http::Uri>().unwrap(), "github.com", None, "br");
+    assert!(
+        !mk("/octocat/repo").contains("githubassets"),
+        "页面键与资产域无关"
+    );
+}
+
+/// no-store 不落盘；private 不拒——GitHub 用它表达浏览器别共享，代理已按会话号分钥匙语义等价，全拒会干掉页面缓存。
+#[test]
+fn no_store_responses_are_never_saved() {
+    let mk = |cc: &str| {
+        let mut h = http::HeaderMap::new();
+        h.insert("cache-control", cc.parse().unwrap());
+        h
+    };
+    assert!(resp_no_store(&mk("no-store, max-age=0")));
+    assert!(resp_no_store(&mk("private, NO-STORE")), "大小写不敏感");
+    assert!(!resp_no_store(&mk("max-age=0, private, must-revalidate")));
+    assert!(!resp_no_store(&http::HeaderMap::new()));
+}
+
+/// v6.12 失效改标不删（-k 首页骨架）：写失效不再删 keep 条目，改把 mtime 拨过期（交旧+后台重拉）；重拉覆盖后自动解除。
+#[test]
+fn write_invalidation_marks_keep_snapshot_expired() {
+    let (dir, _g) = own_dir("stalemark");
+    let key = "GET github.com/-cloggedout-gz-k";
+    persist_page_entry_blocking(
+        &dir,
+        key,
+        b"<html>home v1 body with some padding to pass seg minimum</html>",
+        200,
+        &test_hdrs(),
+    )
+    .unwrap();
+    let (_, expired) = load_disk_entry_reason(key, false).unwrap();
+    assert!(!expired, "新骨架不该标过期");
+    // 写失效（前缀命中首页键）：条目不删，标过期，交旧
+    invalidate_prefix_blocking(&dir, "github.com", "/");
+    assert!(
+        load_disk_entry(key, false).is_some(),
+        "keep 条目不得被写失效删除"
+    );
+    let ((_, _, body), expired) = load_disk_entry_reason(key, false).unwrap();
+    assert!(expired, "写失效后必须标过期(交旧+后台重拉)");
+    assert_eq!(
+        body.as_ref(),
+        &b"<html>home v1 body with some padding to pass seg minimum</html>"[..],
+        "交旧的体必须完整"
+    );
+    // 模拟后台重拉覆盖入库：mtime 复新 → 过期解除
+    persist_page_entry_blocking(
+        &dir,
+        key,
+        b"<html>home v2 body with some padding to pass seg minimum</html>",
+        200,
+        &test_hdrs(),
+    )
+    .unwrap();
+    let ((_, _, body), expired) = load_disk_entry_reason(key, false).unwrap();
+    assert!(!expired, "重拉覆盖后过期必须解除");
+    assert_eq!(
+        body.as_ref(),
+        &b"<html>home v2 body with some padding to pass seg minimum</html>"[..]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- v7 资产库 ----------
+
+/// 日志捕获：断言 [资产] 行。
+fn log_capture() -> (LogFn, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let cap = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = cap.clone();
+    (
+        std::sync::Arc::new(move |s: &str| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(s.to_string());
+        }),
+        cap,
+    )
+}
+
+fn get_req(uri: &str) -> hyper::Request<BoxBody> {
+    hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(uri)
+        .body(protocol::empty_body())
+        .unwrap()
+}
+
+/// v7 资产分支：白名单 200 入库 → cache_take 本地回放。
+#[tokio::test]
+async fn asset_branch_stores_and_replays() {
+    let (dir, _g) = own_dir("assets");
+    let (log, _lines) = log_capture();
+    let url = "https://github.githubassets.com/assets/core-cccc3333.js";
+    let req = get_req(url);
+
+    // 入库（200 + application/javascript），响应原样交回
+    let resp = hyper::Response::builder()
+        .status(200)
+        .header("content-type", "application/javascript; charset=utf-8")
+        .body(protocol::full_body(Bytes::from_static(b"console.log(1)")))
+        .unwrap();
+    let out = collect_asset(&log, &req, resp).await;
+    assert_eq!(out.status(), 200, "响应原样交回");
+    // 管家线程异步落盘：轮询等待（上限 2s）
+    let mut stored = None;
+    for _ in 0..40 {
+        if let Some(hit) = asset_store::take(&dir, url) {
+            stored = Some(hit);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let stored = stored.expect("必须入库（管家异步写盘）");
+    let stored_body = http_body_util::BodyExt::collect(stored.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(stored_body.as_ref(), b"console.log(1)");
+
+    // 回放：资产库强绑定入口本地命中
+    let hit = asset_store::serve_or_fetch(&log, &req, asset_store::ASSET_HOST)
+        .await
+        .expect("必须本地命中");
+    assert_eq!(hit.status(), 200);
+    let _ = std::fs::remove_dir_all(&dir);
 }

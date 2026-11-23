@@ -29,26 +29,22 @@ pub struct App {
     pub version: &'static str,
 }
 
-fn local_host(h: &str) -> bool {
-    matches!(
-        crate::server::host_only(&h.to_lowercase()),
-        "127.0.0.1" | "localhost"
-    )
+impl App {
+    /// 日志闭包收口：LogFn 拼装的唯一出口。
+    fn log_fn(&self) -> crate::util::LogFn {
+        let logs = self.logs.clone();
+        Arc::new(move |m: &str| logs.log(m))
+    }
 }
 
 fn local_origin(o: &str) -> bool {
     let lower = o.to_lowercase();
     let o = lower.trim_end_matches('/');
     let port = config::webui_port();
-    for base in [
-        format!("http://127.0.0.1:{port}"),
-        format!("http://localhost:{port}"),
-    ] {
-        if o == base || o.starts_with(&format!("{base}/")) {
-            return true;
-        }
-    }
-    false
+    ["127.0.0.1", "localhost"].iter().any(|h| {
+        let base = format!("http://{h}:{port}");
+        o == base || o.starts_with(&format!("{base}/"))
+    })
 }
 
 /// 写操作来源校验：浏览器必须同源，无 Origin/Referer 的本机脚本须显式带 `X-GitPort-Request: 1`。
@@ -73,7 +69,10 @@ async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if !local_host(&host) {
+    if !matches!(
+        crate::server::host_only(&host.to_lowercase()),
+        "127.0.0.1" | "localhost"
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let m = req.method().clone();
@@ -92,6 +91,7 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
         .route("/proxy.pac", axum::routing::get(proxy_pac))
         .route("/api/status", axum::routing::get(api_status))
         .route("/api/logs", axum::routing::get(api_logs))
+        .route("/api/logs/clear", axum::routing::post(api_logs_clear))
         .route("/api/mitm", axum::routing::post(api_mitm))
         .route("/api/settings", axum::routing::get(api_settings))
         .route(
@@ -155,38 +155,26 @@ async fn index() -> Response {
     (headers, INDEX_HTML).into_response()
 }
 
+/// 静态资源统一响应（style/app_js/img_jpeg 三处同构收口）：no-cache + mime 覆盖。
+fn static_asset<T: axum::response::IntoResponse>(body: T, mime: &'static str) -> Response {
+    let mut resp = body.into_response();
+    let h = resp.headers_mut();
+    h.insert("cache-control", HeaderValue::from_static("no-cache"));
+    h.insert("content-type", HeaderValue::from_static(mime));
+    resp
+}
+
 async fn style() -> Response {
-    (
-        [
-            ("cache-control", "no-cache"),
-            ("content-type", "text/css; charset=utf-8"),
-        ],
-        STYLE_CSS,
-    )
-        .into_response()
+    static_asset(STYLE_CSS, "text/css; charset=utf-8")
 }
 
 async fn app_js() -> Response {
-    (
-        [
-            ("cache-control", "no-cache"),
-            ("content-type", "application/javascript; charset=utf-8"),
-        ],
-        APP_JS,
-    )
-        .into_response()
+    static_asset(APP_JS, "application/javascript; charset=utf-8")
 }
 
 /// 教程截图响应（jpeg，编译期内嵌零磁盘依赖）
 async fn img_jpeg(bytes: &'static [u8]) -> Response {
-    (
-        [
-            ("cache-control", "no-cache"),
-            ("content-type", "image/jpeg"),
-        ],
-        bytes,
-    )
-        .into_response()
+    static_asset(bytes, "image/jpeg")
 }
 
 /// /guide/stepN.jpg → GUIDE_JPEGS[n-1]；其余 404。
@@ -261,16 +249,13 @@ struct StatusResp {
     port: u16,
     mitm: bool,
     domain_count: usize,
-    /// 串发候选总数（原 IP 池页删除后并入状态，概览只显示一个数）。
+    /// 路由种子展开后的具体 IP 总数（原 IP 池页删除后并入状态，概览只显示一个数）。
     pool_total: usize,
-    /// 白名单腿握手次数 / 其中真的分成了多段（<2 段 = 首包太短，掩体没上成）。
-    split_attempt: u64,
-    split_done: u64,
 }
 
 async fn api_status(State(st): State<Arc<App>>) -> Response {
     let domain_count = pool::route::route_count();
-    let pool_total: usize = pool::route::plan_count();
+    let pool_total: usize = pool::route::ip_count();
     write_json(&StatusResp {
         version: st.version.to_string(),
         running: crate::server::running(),
@@ -278,8 +263,6 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
         mitm: settings::mitm(),
         domain_count,
         pool_total,
-        split_attempt: pool::dial::SPLIT_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
-        split_done: pool::dial::SPLIT_DONE.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -293,8 +276,7 @@ impl Drop for CalibDone {
 }
 
 async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
-    let logs = st.logs.clone();
-    let log: crate::util::LogFn = Arc::new(move |m: &str| logs.log(m));
+    let log = st.log_fn();
     if crate::server::mitm::CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return (
             [
@@ -345,6 +327,11 @@ async fn api_logs(State(st): State<Arc<App>>, Query(q): Query<LogsQuery>) -> Res
     write_json(&serde_json::json!({ "logs": logs, "latest": latest }))
 }
 
+async fn api_logs_clear(State(st): State<Arc<App>>) -> Response {
+    st.logs.clear();
+    write_json(&serde_json::json!({ "ok": true }))
+}
+
 #[derive(Deserialize)]
 struct OnBody {
     on: bool,
@@ -356,12 +343,35 @@ struct WorkerMirrorsBody {
     mirrors: Vec<crate::settings::WorkerMirror>,
 }
 
-/// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），并回传规范化后的注册表。
-async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> Response {
+/// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），新增的后台探测用法、命中存模板，全不中摘出注册表。
+async fn api_worker_mirrors(
+    State(st): State<Arc<App>>,
+    axum::Json(body): axum::Json<WorkerMirrorsBody>,
+) -> Response {
     match settings::set_worker_mirrors(body.mirrors) {
-        Ok((_, removed)) => {
+        Ok((_, removed, added)) => {
             // 链对齐是 pool 的事：settings 只负责存，存完由这里推一次。
-            pool::sync_custom_mirrors(&removed);
+            pool::sync_custom_mirrors(&removed, true);
+            let log = st.log_fn();
+            for url in added {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    match crate::server::mitm::mirror::discover_template(&url, &log).await {
+                        Ok(tpl) => {
+                            settings::set_mirror_template(&url, tpl);
+                            (log)(&format!("[镜像] {url} 用法已保存, 后续按模板使用"));
+                        }
+                        Err(e) => {
+                            // 试探是 best-effort：不删条目，标红留给用户在界面上改或删。
+                            (log)(&format!(
+                                "[镜像] {url} {e}, 已标红(不进镜像链, 界面可改或删)"
+                            ));
+                            settings::set_mirror_invalid(&url, true);
+                            pool::sync_custom_mirrors(&[], true);
+                        }
+                    }
+                });
+            }
             write_json(
                 &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
             )
@@ -425,25 +435,31 @@ async fn api_calib_status() -> Response {
 }
 
 async fn api_show() -> Response {
-    if crate::desktop::show_via_proxy() {
+    // 界面已死的旧实例必须让位：它占着单实例锁会让新启动静默消失（实测踩到）；回 ok:false 后自退，新实例等锁接管。
+    if crate::desktop::ui_dead() {
+        crate::desktop::quit_via_proxy();
+        write_json(&serde_json::json!({"ok": false, "error": "界面不可用, 旧实例退出中"}))
+    } else if crate::desktop::show_via_proxy() {
         write_json(&serde_json::json!({"ok": true}))
     } else {
         write_json(&serde_json::json!({"ok": false, "error": "无窗口(headless 或事件循环未就绪)"}))
     }
 }
 
-async fn api_autostart(axum::Json(body): axum::Json<OnBody>) -> Response {
-    match settings::set_autostart(body.on) {
+/// 开关类设置的统一应答。
+fn on_flag_response(r: Result<(), String>) -> Response {
+    match r {
         Ok(_) => write_json(&serde_json::json!({"ok": true})),
         Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
     }
 }
 
+async fn api_autostart(axum::Json(body): axum::Json<OnBody>) -> Response {
+    on_flag_response(settings::set_autostart(body.on))
+}
+
 async fn api_close_to_tray(axum::Json(body): axum::Json<OnBody>) -> Response {
-    match settings::set_close_to_tray(body.on) {
-        Ok(_) => write_json(&serde_json::json!({"ok": true})),
-        Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
-    }
+    on_flag_response(settings::set_close_to_tray(body.on))
 }
 
 async fn api_github_pac(

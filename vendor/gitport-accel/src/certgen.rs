@@ -16,10 +16,10 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use time::OffsetDateTime;
 
-use crate::util::LogFn;
-
 /// 叶子证书有效期 365 天，签发超过 358 天就重签，免得常驻进程满一年后集体握手失败。
 const LEAF_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(358 * 24 * 3600);
+/// 叶子上下文缓存上限：受管行含通配（githubusercontent.com/github.io），只进不出会随浏览慢慢涨。
+const LEAVES_CAP: usize = 512;
 
 pub struct Authority {
     cert_pem: String, // CA 证书 PEM（save 落盘用）
@@ -76,10 +76,18 @@ impl Authority {
         let key = PKey::private_key_from_der(&leaf_key.serialize_der())
             .map_err(|e| format!("叶子私钥解析失败: {e}"))?;
         let ctx = Arc::new(mitm_host_ctx(&leaf_x509, &self.ca_x509, &key)?);
-        self.leaves
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(host.to_string(), (SystemTime::now(), ctx.clone()));
+        let mut leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
+        if leaves.len() >= LEAVES_CAP && !leaves.contains_key(host) {
+            // 超限清签发时刻最旧的一张：被逐出的域名下次访问照常重签，只是慢一次。
+            if let Some(oldest) = leaves
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                leaves.remove(&oldest);
+            }
+        }
+        leaves.insert(host.to_string(), (SystemTime::now(), ctx.clone()));
         Ok(ctx)
     }
 }
@@ -122,16 +130,15 @@ pub fn tls_acceptor_of(a: &Arc<Authority>) -> SslAcceptor {
     base.build()
 }
 
-/// 加载/生成 CA；load 分支重申 key 的 ACL（可读根私钥 = 可伪造叶子证书 MITM）。
-pub fn load_or_generate(dir: &Path, log: Option<&LogFn>) -> Result<Arc<Authority>, String> {
+/// 加载/生成 CA，load 分支也重申 key 的 ACL：根私钥可读 = 可伪造叶子证书，收紧失败即禁用 MITM。
+pub fn load_or_generate(dir: &Path) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
     if let Ok(a) = load(&cert_path, &key_path) {
         let key_str = key_path.to_string_lossy().into_owned();
+        // 已有 CA 与首次生成同口径：ACL 收不紧就禁用 MITM；不删钥，免得已信任的 CA 作废。
         if let Err(e) = crate::winsec::restrict_to_current_user(&key_str) {
-            if let Some(l) = log {
-                l(&format!("[安全] ca.key ACL 重申失败: {e}"));
-            }
+            return Err(format!("ca.key ACL 收紧失败, 禁用 MITM(已有 CA): {e}"));
         }
         return Ok(a);
     }
@@ -177,7 +184,8 @@ fn generate() -> Result<Arc<Authority>, String> {
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::CrlSign,
     ];
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    // pathlen 0：根证书只能签叶子，不能再签子 CA——收窄被滥用的理论面。
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
     let cert_der = cert.der().to_vec();
     let cert_pem = cert.pem();
@@ -195,7 +203,11 @@ impl Authority {
     fn save(&self, cert_path: &Path, key_path: &Path) -> Result<(), String> {
         std::fs::write(cert_path, &self.cert_pem).map_err(|e| e.to_string())?;
         std::fs::write(key_path, self.ca_key.serialize_pem()).map_err(|e| e.to_string())?;
-        let _ = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy());
+        if let Err(e) = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy()) {
+            // 收紧失败 = 根私钥可被同机其他账户读走，删钥让 MITM 起不来，绝不带病上岗。
+            let _ = std::fs::remove_file(key_path);
+            return Err(format!("ca.key 权限收紧失败, 已删除该文件(禁用 MITM): {e}"));
+        }
         Ok(())
     }
 }

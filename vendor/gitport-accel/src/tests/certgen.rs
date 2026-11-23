@@ -8,7 +8,7 @@ fn ca_generate_and_leaf_ctx() {
     crate::pool::install_seed_routes();
     let dir = std::env::temp_dir().join(format!("gitport_cert_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let a = load_or_generate(&dir, None).unwrap();
+    let a = load_or_generate(&dir).unwrap();
     assert!(!a.cert_der.is_empty());
     let c1 = a.leaf_ctx("github.com").unwrap();
     let c2 = a.leaf_ctx("github.com").unwrap();
@@ -19,11 +19,49 @@ fn ca_generate_and_leaf_ctx() {
     );
 }
 
+/// 叶子缓存超限淘汰：清签发时刻最旧的一张，总量守在 LEAVES_CAP。
+#[test]
+fn leaf_cache_evicts_oldest_at_cap() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::pool::install_seed_routes();
+    let dir = std::env::temp_dir().join(format!("gitport_leafcap_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = load_or_generate(&dir).unwrap();
+    let ctx = a.leaf_ctx("github.com").unwrap();
+    {
+        // 直填 511 条把表顶到上限（github.com 占第 1 条），t0 伪造为最旧。
+        let mut leaves = a.leaves.lock().unwrap();
+        let now = SystemTime::now();
+        for i in 0..LEAVES_CAP - 1 {
+            let t = if i == 0 {
+                now - std::time::Duration::from_secs(3600)
+            } else {
+                now
+            };
+            leaves.insert(format!("t{i}.githubusercontent.com"), (t, ctx.clone()));
+        }
+    }
+    let fresh = a.leaf_ctx("api.github.com").unwrap();
+    let leaves = a.leaves.lock().unwrap();
+    assert_eq!(leaves.len(), LEAVES_CAP, "总量应守在上限");
+    assert!(
+        !leaves.contains_key("t0.githubusercontent.com"),
+        "最旧的一张应被淘汰"
+    );
+    assert!(leaves.contains_key("api.github.com"), "新签的应已入缓存");
+    assert!(
+        Arc::ptr_eq(&fresh, &leaves.get("api.github.com").unwrap().1),
+        "缓存返回的应是刚签的同一上下文"
+    );
+}
+
 #[test]
 fn tls_acceptor_ok() {
     let dir = std::env::temp_dir().join(format!("gitport_tls_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let a = load_or_generate(&dir, None).unwrap();
+    let a = load_or_generate(&dir).unwrap();
     let _acc = tls_acceptor_of(&a);
 }
 
@@ -38,7 +76,7 @@ async fn mitm_handshake_roundtrip() {
     // rustls 客户端 ↔ boring 服务端：独立实现互验，本地终结栈换血后的互操作钉子。
     let dir = std::env::temp_dir().join(format!("gitport_hs_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let a = load_or_generate(&dir, None).unwrap();
+    let a = load_or_generate(&dir).unwrap();
     let acc = tls_acceptor_of(&a);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -79,7 +117,7 @@ async fn mitm_handshake_roundtrip() {
 async fn mitm_rejects_unmanaged_sni() {
     let dir = std::env::temp_dir().join(format!("gitport_mitm_neg_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let a = load_or_generate(&dir, None).unwrap();
+    let a = load_or_generate(&dir).unwrap();
     let acc = tls_acceptor_of(&a);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

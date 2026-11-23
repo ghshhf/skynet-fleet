@@ -1,8 +1,8 @@
 [package]
 name = "gitport-github"
-version = "0.5.3"
+version = "0.5.9"
 edition = "2021"
-description = "GitHub 加速器 —— 串发表驱动的本地加速代理"
+description = "GitHub 加速器 —— 路由二部图驱动的本地加速代理"
 license = "Apache-2.0"
 # 建仓后取消注释并填实际地址:
 # repository = "https://github.com/<account>/gitport-github"
@@ -21,12 +21,16 @@ hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 h2 = "0.4"
 flate2 = "1"
+# br 解码（defuse 风控页窥探 / page_cache 门检）：纯 Rust 只解压，无 C 依赖链。
+brotli-decompressor = "4"
 tower-service = "0.3"
 tokio-util = "0.7"
 bytes = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 镜像模板 {url_enc} 的百分号编码；url→wry 传递已引入本 crate，升直依赖零编译成本。
+percent-encoding = "2"
 axum = { version = "0.8", features = ["json"] }
 rcgen = { version = "0.14", features = ["x509-parser"] } # Issuer::from_ca_cert_der 需要（2026-10-18 审计误删后构建报错，已恢复）
 time = { version = "0.3", features = ["macros", "local-offset"] }
@@ -57,6 +61,8 @@ tokio-boring = "4"
 # 仅测试用作独立实现的客户端（rustls ↔ boring 互操作验证），不进发布二进制。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+# 仅测试用 br 编码器造样本（解码走 brotli-decompressor），不进发布二进制。
+brotli = "7"
 
 [build-dependencies]
 embed-resource = "3.0"

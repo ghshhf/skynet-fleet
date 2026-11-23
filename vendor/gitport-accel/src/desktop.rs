@@ -54,10 +54,12 @@ const WIN_H: f64 = 795.0;
 const WIN_DY: f64 = 60.0;
 
 // ---- 托盘 ----
-// 不用 tray-icon（它丢掉 Shell_NotifyIcon 返回值，注册失败也报"成功"）：自做窗口+消息泵，每步记真实结果。
+// 不用 tray-icon：它丢掉 Shell_NotifyIcon 返回值，注册失败也报成功；自做窗口+消息泵记真实结果。
 
 const TRAY_CLASS: windows::core::PCWSTR = windows::core::w!("GitPortTrayWnd");
 const TRAY_UID: u32 = 1;
+/// 托盘注册失败后的重试定时器（开机自启时 Explorer 未必就绪）。
+const TRAY_RETRY_TIMER: usize = 1;
 const WM_TRAY_NOTIFY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
 const ID_TRAY_SHOW: usize = 1;
 const ID_TRAY_QUIT: usize = 2;
@@ -65,6 +67,12 @@ const ID_TRAY_QUIT: usize = 2;
 static TRAY_PROXY: Mutex<Option<tao::event_loop::EventLoopProxy<AppEvent>>> = Mutex::new(None);
 static TRAY_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static TRAY_ICON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// WebView2 建失败不再自愈重建：立刻销毁会无限循环刷日志、页面跟着抽。
+static WV_FAILED: AtomicBool = AtomicBool::new(false);
+/// 窗口对象是否存在（含 WebView2 失败后保留的提示窗）。
+static WIN_ALIVE: AtomicBool = AtomicBool::new(false);
+/// 托盘注册连续失败次数：超过上限就停，别每 2 秒写一行盘。
+static TRAY_RETRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn tray_send(ev: AppEvent) {
@@ -133,6 +141,41 @@ unsafe fn tray_add(
     (ok.as_bool(), err)
 }
 
+/// 删掉已注册的托盘图标（重挂前清残留记录）。
+fn tray_delete(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        ..Default::default()
+    };
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
+}
+
+/// NIM_ADD 的 TRUE 可能是假成功（Explorer 未就绪）：反查 GetRect 才算数，失败删残留重挂再定时重试。
+fn tray_self_check(
+    hwnd: windows::Win32::Foundation::HWND,
+    hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
+) -> Option<String> {
+    let probe = tray_rect(hwnd);
+    if !probe.starts_with("GetRect 失败") {
+        return None;
+    }
+    tray_delete(hwnd);
+    let (ok, err) = unsafe { tray_add(hwnd, hicon) };
+    if ok {
+        let again = tray_rect(hwnd);
+        if !again.starts_with("GetRect 失败") {
+            return None;
+        }
+        return Some(format!("重加后仍查不到: {again}"));
+    }
+    use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+    let _ = unsafe { SetTimer(Some(hwnd), TRAY_RETRY_TIMER, 2000, None) };
+    Some(format!("重加失败 err={err}, 已转后台重试"))
+}
+
 /// 问系统要图标矩形：拿到才算真进了通知区。
 fn tray_rect(hwnd: windows::Win32::Foundation::HWND) -> String {
     use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER};
@@ -192,8 +235,34 @@ unsafe extern "system" fn tray_proc(
     lp: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::LRESULT;
-    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_LBUTTONUP, WM_RBUTTONUP};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, KillTimer, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
+    };
     unsafe {
+        // 开机自启时 Explorer 往往还没就绪，第一次 NIM_ADD 会失败；定时器每 2s 重挂直到成功。
+        if msg == WM_TIMER && wp.0 == TRAY_RETRY_TIMER {
+            let n = TRAY_RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
+            let (ok, err) = tray_add(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HICON(
+                    TRAY_ICON.load(Ordering::Relaxed) as *mut _,
+                ),
+            );
+            if ok {
+                TRAY_RETRIES.store(0, Ordering::Relaxed);
+                let _ = KillTimer(Some(hwnd), TRAY_RETRY_TIMER);
+                tray_log("[托盘] 重试成功, 已入通知区");
+            } else if n >= 10 {
+                // err=5 多半是 WebView2 已起来、系统拒绝注册；重试徒劳，停定时器免得刷爆日志磁盘。
+                let _ = KillTimer(Some(hwnd), TRAY_RETRY_TIMER);
+                tray_log(&format!(
+                    "[托盘] 重试 {n} 次仍失败(err={err}), 停止重试; 重启程序或资源管理器可恢复"
+                ));
+            } else if n <= 3 {
+                tray_log(&format!("[托盘] 注册重试 {n}: err={err}"));
+            }
+            return LRESULT(0);
+        }
         if msg == WM_TRAY_NOTIFY {
             match lp.0 as u32 {
                 WM_LBUTTONUP => tray_send(AppEvent::ShowWindow),
@@ -231,12 +300,16 @@ fn spawn_tray(
             use windows::Win32::System::LibraryLoader::GetModuleHandleW;
             use windows::Win32::UI::WindowsAndMessaging::{
                 CreateWindowExW, DispatchMessageW, GetMessageW, LoadImageW, RegisterClassW,
-                RegisterWindowMessageW, TranslateMessage, HICON, IDI_APPLICATION, IMAGE_ICON,
-                LR_DEFAULTCOLOR, LR_SHARED, MSG, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+                RegisterWindowMessageW, SetTimer, TranslateMessage, HICON, IDI_APPLICATION,
+                IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MSG, WNDCLASSW, WS_EX_TOOLWINDOW,
+                WS_OVERLAPPED,
             };
             let note = |s: String| {
                 thread_log(&s);
-                tray_log(&s);
+                // [启动] 行由 logger 统一落 .cache/tray.log，这里别再写一遍。
+                if !s.starts_with("[启动]") {
+                    tray_log(&s);
+                }
             };
             *TRAY_PROXY.lock().unwrap() = Some(proxy);
             unsafe {
@@ -310,24 +383,32 @@ fn spawn_tray(
                         err = err2; // 两次都失败时报后一次，才是当前真实原因
                     }
                 }
+                // 回执立即发（主线程要它建窗），图标自检放后台，别让启动干等 200ms。
                 let _ = tx.send((ok, err));
-                // 注册成功不出声（图标本来就在托盘里）；失败才把错误码和完整性一起抛出来。
-                if !ok {
+                if ok {
+                    // NIM_ADD 的 TRUE 不可信：给 shell 200ms 落图标，再反查真实位置。
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    match tray_self_check(hwnd, hicon) {
+                        None => note(format!("[启动] 托盘: {}", tray_rect(hwnd))),
+                        Some(why) => {
+                            note(format!("[启动] 托盘: 自检未通过 —— {why}, 后台重试中"));
+                            SetTimer(Some(hwnd), TRAY_RETRY_TIMER, 2000, None);
+                        }
+                    }
+                } else {
                     note(format!(
-                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), {}",
+                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), 后台重试中{}",
                         current_il(),
-                        tray_rect(hwnd)
+                        // err=5 实测根因：exe 目录被设完整性标签（icacls 可见 Mandatory Label），剥掉即恢复。
+                        if err == 5 { "；若 WebView2 也报拒绝访问, 检查 exe 目录是否被设了完整性标签(icacls 看 Mandatory Label)" } else { "" }
                     ));
+                    // shell 未就绪是常态：交给消息循环定时器每 2s 重挂，不 sleep 干等、不依赖 TaskbarCreated。
+                    SetTimer(Some(hwnd), TRAY_RETRY_TIMER, 2000, None);
                 }
                 TASKBAR_CREATED.store(
                     RegisterWindowMessageW(windows::core::w!("TaskbarCreated")),
                     Ordering::Relaxed,
                 );
-                if !ok {
-                    // 刚发的瞬间查不到是正常的，等 shell 收下再复问一次。
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    note(format!("[启动] 托盘: 1.5s 后 {}", tray_rect(hwnd)));
-                }
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                     let _ = TranslateMessage(&msg);
@@ -337,24 +418,13 @@ fn spawn_tray(
         });
     if let Err(e) = spawned {
         let line = format!("[启动] 托盘: 线程起不来 {e}");
-        log(&line);
-        tray_log(&line);
+        log(&line); // logger 统一落盘，不再单独写 tray.log
     }
     rx
 }
 
-/// 托盘失败是静默的（GUI 版没有 stdout），留一行到 .cache/tray.log 备查。
-fn tray_log(line: &str) {
-    use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(".cache/tray.log")
-    else {
-        return;
-    };
-    let _ = writeln!(f, "{line}");
-}
+// 托盘/窗口失败落盘统一走 logger::tray_log（GUI 版没有 stdout，留一行到 .cache/tray.log 备查）。
+use crate::logger::tray_log;
 
 /// 单实例守卫：已有实例在跑则弹提示并返回 true；mutex 句柄须活到进程退出，用 static 锚住。
 struct SingleMutexHandle {
@@ -373,6 +443,17 @@ pub fn show_via_proxy() -> bool {
         .get()
         .map(|p| p.send_event(AppEvent::ShowWindow).is_ok())
         .unwrap_or(false)
+}
+
+/// 界面已死（WebView2 失败且窗口也没了）：这种实例必须让位，不能占着单实例锁挡新启动。
+pub fn ui_dead() -> bool {
+    WV_FAILED.load(Ordering::SeqCst) && !WIN_ALIVE.load(Ordering::SeqCst)
+}
+
+pub fn quit_via_proxy() {
+    if let Some(p) = EVENT_PROXY.get() {
+        let _ = p.send_event(AppEvent::RequestQuit);
+    }
 }
 
 pub fn already_running() -> bool {
@@ -443,13 +524,15 @@ fn create_window(
     url: &str,
     log: &LogFn,
 ) -> bool {
+    if WV_FAILED.load(Ordering::SeqCst) {
+        return false; // 本进程已确认 WebView2 起不来，别再反复建窗销毁
+    }
     {
         let g = slot.lock().unwrap();
         if g.win.is_some() {
             return true;
         }
     }
-    join_udf_cleanup(); // 上次收托盘的删除还没收尾：等它删完再建新 profile
     let mut g = slot.lock().unwrap();
     // 窗口按 winRect 出生即在位（避免闪跳），无记录则居中偏下并写回。
     let (sw, sh) = elwt
@@ -480,30 +563,76 @@ fn create_window(
         Ok(w) => w,
         Err(_) => return false,
     };
-    let ipc_log = log.clone();
-    match wry::WebViewBuilder::new()
-        .with_ipc_handler(move |req: http::Request<String>| {
-            if let Some(text) = req.body().strip_prefix("copy:") {
-                let ok = write_clipboard(text);
-                let n = text.chars().count();
-                (ipc_log)(&format!(
-                    "[剪贴板] IPC 收到 {n} 字符, 写入{}",
-                    if ok { "成功" } else { "失败" }
-                ));
+    // 数据目录放 %LOCALAPPDATA%：exe 同目录的 ACL/策略会让 WebView2 渲染进程写不进去（0x80070005）。
+    let data_dir = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("GitPort")
+        .join("WebView2");
+    if let Some(parent) = data_dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let build_wv = |dir: &std::path::Path| -> Result<wry::WebView, wry::Error> {
+        let mut ctx = wry::WebContext::new(Some(dir.to_path_buf()));
+        wry::WebViewBuilder::new_with_web_context(&mut ctx)
+            .with_ipc_handler(move |req: http::Request<String>| {
+                // 复制是高频操作且用户常复制日志本身，打日志会把复制内容污染成递归，静默直写。
+                if let Some(text) = req.body().strip_prefix("copy:") {
+                    write_clipboard(text);
+                }
+            })
+            .with_url(url)
+            .build(&window)
+    };
+    let mut built = build_wv(&data_dir);
+    if built.is_err() {
+        // 收托盘时浏览器退出有延迟、profile 可能被锁：先等一拍重试，再挪目录，最后认输。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        built = build_wv(&data_dir);
+        if built.is_err() && data_dir.join("EBWebView").exists() {
+            let aside = data_dir.with_extension(format!("broken-{}", std::process::id()));
+            // 刚失败的浏览器进程句柄还没放干净，rename 会短暂 err=5：300ms×3 重试。
+            let mut renamed = Err(std::io::Error::other("未尝试"));
+            for _ in 0..3 {
+                renamed = std::fs::rename(&data_dir, &aside);
+                if renamed.is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
             }
-        })
-        .with_url(url)
-        .build(&window)
-    {
+            match renamed {
+                Ok(()) => {
+                    let _ = std::fs::create_dir_all(&data_dir);
+                    tray_log(&format!(
+                        "[窗口] WebView2 profile 疑似损坏, 已轮换 -> {}",
+                        aside.display()
+                    ));
+                    built = build_wv(&data_dir);
+                }
+                Err(e) => tray_log(&format!("[窗口] WebView2 profile 轮换失败: {e}")),
+            }
+        }
+    }
+    match built {
         Ok(wv) => {
             g.win = Some(window);
             g.wv = Some(wv);
+            WIN_ALIVE.store(true, Ordering::SeqCst);
             drop(g);
             save_window_rect(slot);
             true
         }
-        Err(_) => {
-            (log)("WebView2 不可用, 工作台暂由系统浏览器提供");
+        Err(e) => {
+            // 留住窗口并记原因：这里 drop 会触发 Destroyed，不记标志就陷入销毁→重建→再失败死循环。
+            WV_FAILED.store(true, Ordering::SeqCst);
+            window.set_title("GitPort — WebView2 不可用，请安装或修复 WebView2 Runtime");
+            g.win = Some(window);
+            WIN_ALIVE.store(true, Ordering::SeqCst);
+            // 这条必须落到 tray.log：GUI 版没有 stdout，不写盘就永远不知道失败原因。
+            tray_log(&format!("[窗口] WebView2 建失败: {e}"));
+            (log)(&format!(
+                "WebView2 不可用({e}), 已保留提示窗口, 未打开浏览器"
+            ));
             false
         }
     }
@@ -537,35 +666,10 @@ fn show_or_open(
     url: &str,
     log: &LogFn,
 ) {
-    // 建窗成功不出声（窗口本身可见）；WebView2 不可用才留痕。
+    // 建窗失败不再拉系统浏览器：用户明确不要这个行为，只在窗口标题上写清原因。
     if !create_window(slot, elwt, url, log) {
-        open_browser(url);
+        (log)("WebView2 不可用, 未自动打开浏览器(原因见上一行)");
     }
-}
-
-/// 删 WebView2 用户数据目录：浏览器进程刚释放，文件锁有延迟，300ms×10 重试兜底。
-fn remove_webview_udf() {
-    for _ in 0..10 {
-        if std::fs::remove_dir_all("gitport-github.exe.WebView2").is_ok() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
-}
-
-/// 收托盘时的清场线程：不在界面线程等，但重开窗口前必须等它结束。
-static UDF_CLEANUP: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
-
-fn join_udf_cleanup() {
-    if let Some(h) = UDF_CLEANUP.lock().unwrap().take() {
-        let _ = h.join();
-    }
-}
-
-pub fn open_browser(url: &str) {
-    let _ = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
 }
 
 pub struct DesktopArgs {
@@ -604,24 +708,25 @@ pub fn run(args: DesktopArgs) -> ! {
                 let mut g = slot2.lock().unwrap();
                 g.wv = None;
                 g.win = None;
+                WIN_ALIVE.store(false, Ordering::SeqCst);
             }
             (on_quit2)(); // 撤系统代理 + 停代理核心
-            remove_webview_udf(); // 退出清场：留净土, 超时留待下次启动兜底
             *cf = ControlFlow::Exit;
         }
     };
 
     let mut created_once = false;
-    // 上次退出未及清理的 WebView2 数据目录，启动即删（此刻无锁，单实例已保证）。
-    let _ = std::fs::remove_dir_all("gitport-github.exe.WebView2");
-    // 托盘先挂、拿到回执再往下走：WebView2 起来后 Shell_NotifyIcon 会被系统拒（err=5），必须先托盘后窗口且等它真的注册上。
+    // 不删 WebView2 数据目录：删到一半的残缺 profile 直接 0x80070005；托盘先挂拿到回执再建窗，WebView2 起来后注册会被拒(err=5)。
+    let t_desktop = std::time::Instant::now();
     let tray_rx = spawn_tray(proxy.clone(), log.clone());
     // 成功与否托盘线程已经记了，这里只兜"线程根本没回话"。
-    if tray_rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .is_err()
-    {
-        (log)("[启动] 托盘: 回执超时");
+    match tray_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok((ok, _)) => (log)(&format!(
+            "[启动] 托盘{} +{}ms",
+            if ok { "就绪" } else { "未就绪(后台重试)" },
+            t_desktop.elapsed().as_millis()
+        )),
+        Err(_) => (log)("[启动] 托盘: 回执超时"),
     }
     event_loop.run(move |event, elwt, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -650,9 +755,8 @@ pub fn run(args: DesktopArgs) -> ! {
                     let mut g = slot.lock().unwrap();
                     g.wv = None;
                     g.win = None;
+                    WIN_ALIVE.store(false, Ordering::SeqCst);
                     drop(g);
-                    // 清场放后台：这里重试删除最多等 3s，不能卡住界面线程；重开窗口前 join。
-                    *UDF_CLEANUP.lock().unwrap() = Some(std::thread::spawn(remove_webview_udf));
                 } else {
                     do_quit(control_flow);
                 }
@@ -680,8 +784,12 @@ pub fn run(args: DesktopArgs) -> ! {
                     let mut g = slot.lock().unwrap();
                     g.win = None;
                     g.wv = None;
+                    WIN_ALIVE.store(false, Ordering::SeqCst);
                 }
-                if !quitting.load(Ordering::SeqCst) && !tray_hidden.swap(false, Ordering::SeqCst) {
+                if !WV_FAILED.load(Ordering::SeqCst)
+                    && !quitting.load(Ordering::SeqCst)
+                    && !tray_hidden.swap(false, Ordering::SeqCst)
+                {
                     (log)("工作台窗口被外部销毁, 自愈重建(代理保持运行)");
                     if create_window(&slot, elwt, &url, &log) {
                         (log)("工作台窗口重建成功");

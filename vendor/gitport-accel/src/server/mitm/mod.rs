@@ -1,6 +1,6 @@
 //! MITM：池内域名本地终结 TLS，按 route::master_route 分流；拦截页本地识别 gh_defuse。
 use super::protocol::{self, BoxBody, Incoming, REQUEST_BUDGET};
-use super::upstream;
+use super::upstream::{self, stream_on, ERR_BUDGET_TIMEOUT};
 use crate::certgen::Authority;
 use crate::config;
 use crate::pool;
@@ -12,10 +12,14 @@ use hyper_util::rt::TokioExecutor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-mod defuse;
-mod merge;
-mod page_cache;
-mod quiet;
+ mod asset_store;
+ mod defuse;
+mod entry;
+ mod direct_split;
+ mod merge;
+ mod page_cache;
+ mod switchboard;
+pub(crate) mod quiet;
 mod redirect_memo;
 
 pub(crate) mod mirror;
@@ -25,8 +29,7 @@ pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, 
 use defuse::gh_defuse;
 use mirror::chain_fetch;
 
-const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 内容域 .133 直连腿响应头预算
-const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
+const SESSION_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 会话域（动态页面/API）响应头预算
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
@@ -64,17 +67,6 @@ pub async fn handle_connect_mitm(
         .selected_alpn_protocol()
         .map(|p| p.to_vec())
         .unwrap_or_default();
-    // ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
-    let alpn_name = match alpn.as_slice() {
-        b"h2" => "h2",
-        b"http/1.1" => "http/1.1",
-        _ => "none",
-    };
-    if quiet::first_time("tunnel", host) {
-        (srv.log)(&format!(
-            "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
-        ));
-    }
     let log = srv.log.clone();
     let svc = hyper::service::service_fn(move |req| {
         let log = log.clone();
@@ -82,6 +74,9 @@ pub async fn handle_connect_mitm(
     });
     let result = if alpn == b"h2" {
         hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            // h2 连接窗照 upstream 的 4MB 调：默认 64KB 会把上百个流压成按 RTT 串行，多通道也灌不进浏览器。
+            .initial_stream_window_size(1024 * 1024) // 流级 1MB
+            .initial_connection_window_size(4 * 1024 * 1024) // 连接级聚合 4MB
             .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
             .await
     } else {
@@ -90,15 +85,29 @@ pub async fn handle_connect_mitm(
             .await
     };
     if let Err(e) = result {
+        let msg = e.to_string();
         // 浏览器掐断本地连接是高频日常，不刷屏；协议类真错误仍保留。
-        let benign = e.to_string().contains("connection error")
+        let benign = msg.contains("connection error")
             || e.is_incomplete_message()
             || e.is_closed()
             || e.is_body_write_aborted();
-        if !benign {
+        // h1 写体失败归回客户端断开（不在 is_closed() 里），同 host 只留首条，与隧道解密行共用 quiet 表。
+        if client_gone_text(&msg) {
+            if quiet::first_time("client-gone", host) {
+                (srv.log)(&format!("[MITM] {host} 客户端已断开"));
+            }
+        } else if !benign {
             (srv.log)(&format!("[MITM] {host} 服务层错误: {e}"));
         }
     }
+}
+
+/// 客户端提前断开时 hyper / 系统 socket 给的文案：只认这几类，别把真故障吞掉。
+fn client_gone_text(msg: &str) -> bool {
+    msg.contains("error writing a body to connection")
+        || msg.contains("broken pipe")
+        || msg.contains("connection reset")
+        || msg.contains("connection closed")
 }
 /// 本次请求实际命中的上游 IP（响应头 X-GitPort-Upstream 回填）；单写者、收尾时读一次。
 pub(super) type UpstreamInfo = Arc<Mutex<String>>;
@@ -110,7 +119,7 @@ async fn mitm_http(
     mut req: hyper::Request<Incoming>,
 ) -> axum::response::Response<BoxBody> {
     // h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
-    let host = {
+    let mut host = {
         let from_uri = crate::server::host_only(req.uri().host().unwrap_or("")).to_lowercase();
         if from_uri.is_empty() {
             req.headers()
@@ -122,6 +131,18 @@ async fn mitm_http(
             from_uri
         }
     };
+    // 隧道内 host 由请求头自报：外层 CONNECT 闸只守入口，这里不复核就能换 Host 探内网/把会话头带去任意站点。
+    if !crate::pool::route::is_managed(&host) {
+        (log)(&format!("[拒绝] {host} 非受管域名, 不做开放转发(仅加速 GitHub 系)"));
+        return plain_502();
+    }
+    // 主站 /zip/refs/... 是错 IP 用无缓存头 301 踢回的死路径，浏览器会永久记住；这里内部按 codeload 转发、不回 3xx，旧缓存自然失效。
+    if let Some(alias) = codeload_alias_host(&host, req.uri().path()) {
+        host = alias.to_string();
+        if let Some(v) = req.headers_mut().get_mut(http::header::HOST) {
+            *v = HeaderValue::from_static("codeload.github.com");
+        }
+    }
     // GitHub 前端遥测只占带宽不影响功能（实测 436 个请求里 325 个是它），读掉请求体再回 204。
     if is_telemetry(&host, &path_of(req.uri())) {
         let _ = http_body_util::BodyExt::collect(req.into_body()).await;
@@ -129,15 +150,26 @@ async fn mitm_http(
     }
 
     let info = UpstreamInfo::default();
+    // 资产库强绑定：githubassets 资产只问资产库（命中回放 / miss 独立拉取入库，浏览器放弃拉取不放弃）；
+    // 独立拉取失败返回 None，落到下方既有 switchboard 路径兜底。
+    if host == asset_store::ASSET_HOST
+        && req.method() == Method::GET
+        && !req.headers().contains_key("range")
+    {
+        if let Some(resp) = asset_store::serve_or_fetch(&log, &req, &host).await {
+            return write_upstream(&log, resp, "asset", &info, &host, &path_of(req.uri()));
+        }
+    }
     // 页面缓存命中即秒回；勿加 SWR/ETag 验证，旧 cookie 重用会被判账号泄露。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
-        return write_upstream(cached, "cache", &info);
+        return write_upstream(&log, cached, "cache", &info, &host, &path_of(req.uri()));
     }
     // 头像入口 302 记忆：跳转目标按用户稳定，记住后本地直答，省掉每次渲染的来回。
     if req.method() == Method::GET {
         if let Some(loc) =
             redirect_memo::cached_location(&host, req.uri().path(), req.uri().query())
         {
+            let memo_path = path_of(req.uri());
             let _ = http_body_util::BodyExt::collect(req.into_body()).await;
             let resp = hyper::Response::builder()
                 .status(StatusCode::FOUND)
@@ -145,14 +177,13 @@ async fn mitm_http(
                 .header("cache-control", "no-cache")
                 .body(protocol::full_body(Bytes::new()))
                 .unwrap();
-            return write_upstream(resp, "302memo", &info);
+            return write_upstream(&log, resp, "302memo", &info, &host, &memo_path);
         }
     }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host, "上游请求构造失败, 代理正在按表自动重试。");
     };
 
-    let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
     let path = path_of(req.uri());
     // git 智能协议 POST 与声明超限转流式（缓冲路径 >1MB 必 502，push 必挂）。
     let mut streaming_reason = stream_decision(req.method(), &path, declared_content_len(&req));
@@ -194,91 +225,19 @@ async fn mitm_http(
         Some(b) => out.map(|_| protocol::full_body(b.clone())),
         None => out,
     };
-    if is_simple
-        && matches!(
-            pool::route::master_route(&host, req.method().as_str(), &path),
-            pool::route::Route::Mirror
-        )
-    {
-        let chain_host = pool::route::mirror_chain_host(&host, &path);
-        let new_bytes =
-            mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
-        // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；全部候选耗尽才 502。
-        match mirror_or_direct(
-            &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
-        )
+    // 总机分诊：镜像回落/切片/直连/风控重试的科室级联全在 switchboard，政策单点。
+    let resp = match switchboard::dispatch(&log, &req, &out_body, &host, &path, &info, &replay)
         .await
-        {
-            Ok(resp) => return resp,
-            // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
-            Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
-        }
-        return mitm_unavailable(
-            &req,
-            &host,
-            "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
-        );
-    }
-    let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
+    {
         Ok(r) => r,
-        Err(e) => {
-            match pool::route::fallback_for(&host) {
-                pool::route::Fallback::MirrorDns if is_simple => {
-                    let chain_host = pool::route::mirror_chain_host(&host, &path);
-                    let new_bytes = mirror::range_bytes(
-                        req.headers().get("range").and_then(|v| v.to_str().ok()),
-                    );
-                    // 直连刚失败过会带 45s 降权，ECT 自动跳过它——语义就是兜底的最后一次机会。
-                    match mirror_or_direct(
-                        &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
-                    )
-                    .await
-                    {
-                        Ok(resp) => return resp,
-                        Err(_) => (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭")),
-                    }
-                }
-                _ => {
-                    (log)(&format!(
-                        "[MITM] {host}{} 上游失败: {e}",
-                        path_of(req.uri())
-                    ));
-                }
-            }
-            if is_simple {
-                match dns_direct_fetch(&log, &out_body, &host, &info, &replay).await {
-                    Ok(r) => return write_upstream(r, "dns", &info),
-                    Err(de) => {
-                        (log)(&format!("[MITM] {host}{path} DNS 直连腿也失败({de})"));
-                    }
-                }
-            }
-            return mitm_unavailable(
-                &req,
-                &host,
-                "直连与镜像链均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
-            );
+        Err(bail) => {
+            (log)(&format!(
+                "[请求] {host}{path} -> {} (不可用兜底)",
+                bail.status()
+            ));
+            return bail;
         }
     };
-    if is_simple
-        && (host == "github.com" || host == "api.github.com")
-        && resp.status().as_u16() >= 400
-    {
-        match gh_defuse(&log, &host, &info, &out_body, &replay).await {
-            Ok(r) => resp = r,
-            Err(e) => {
-                (log)(&format!(
-                    "[MITM] {host}{} 拦截页化解失败: {e}",
-                    path_of(req.uri())
-                ));
-                return mitm_unavailable(
-                    &req,
-                    &host,
-                    "全部边缘均返回风控拦截页, 代理正在按表自动重试。",
-                );
-            }
-        }
-    }
     // 写操作成功后缓存失效：内存热点同步清，磁盘半场交给管家线程。
     if host == "github.com"
         && matches!(
@@ -290,9 +249,27 @@ async fn mitm_http(
         page_cache::invalidate_after_write(&log, &host, req.uri().path());
     }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
-    let resp = page_cache::cache_put(&log, &req, &host, resp).await;
-    write_upstream(resp, "direct", &info)
+    let mut resp = page_cache::cache_put(&log, &req, &host, resp).await;
+    // codeload 出 3xx 一律禁缓存：不对口 IP 的无缓存头 301 曾被浏览器永久记住，修好 IP 后旧跳转还赖着。
+    if host == "codeload.github.com" && resp.status().is_redirection() {
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+    }
+    write_upstream(&log, resp, "direct", &info, &host, &path)
 }
+/// codeload 规范路径 /owner/repo/(zip|tar.gz)/refs/... 只在 codeload 存在；出现在 github.com 必是被错 IP 踢回的死路径，主站一律 404。
+fn is_codeload_alias_path(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segs.len() >= 4 && matches!(segs[2], "zip" | "tar.gz") && segs[3] == "refs"
+}
+
+/// 只在 github.com 上认这条死路径，别的主站/内容域同名路径一律不碰。
+fn codeload_alias_host(host: &str, path: &str) -> Option<&'static str> {
+    (host == "github.com" && is_codeload_alias_path(path)).then_some("codeload.github.com")
+}
+
 fn stream_decision(method: &Method, path: &str, declared_len: Option<u64>) -> Option<&'static str> {
     if *method == Method::GET || *method == Method::HEAD {
         return None;
@@ -336,21 +313,32 @@ async fn stream_passthrough(
     let path = path_of(out.uri());
     let t0 = Instant::now();
     let mut body = Some(body);
-    let (fut, send, up) = 'conn: {
-        if let Some(up) = upstream::cached_h2(host) {
+    let ips = pool::route::dial_targets(host)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.ip)
+        .collect::<Vec<_>>();
+    let (fut, send, guard, up) = 'conn: {
+        let cached = if upstream::prefer_own_channel(host) {
+            upstream::cached_h2_own(host, &ips)
+        } else {
+            upstream::cached_h2_in(&ips)
+        };
+        if let Some(up) = cached {
             match upstream::h2_open_stream(&up, out, false).await {
-                Ok((fut, send)) => break 'conn (fut, send, up),
+                Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),
                 Err(e) => {
-                    upstream::drop_h2_id(host, up.id);
+                    upstream::drop_h2_id(&up.ip, up.id);
                     (log)(&format!("[流式] {host}{path} 缓存连接失效({e}), 新拨重试"));
                 }
             }
         }
+        // 流式请求允许骑缓存腿（上面已试），但缓存腿开流失败的兜底必须全新拨号——body 没有副本，不再翻别的现成通道试错。
         match upstream::dial_upstream(host, log).await {
-            Ok((up, _fresh)) => match upstream::h2_open_stream(&up, out, false).await {
-                Ok((fut, send)) => break 'conn (fut, send, up),
+            Ok(up) => match upstream::h2_open_stream(&up, out, false).await {
+                Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),
                 Err(e) => {
-                    upstream::drop_h2_id(host, up.id);
+                    upstream::drop_h2_id(&up.ip, up.id);
                     (log)(&format!("[流式] {host}{path} 新拨连接握手即死({e})"));
                 }
             },
@@ -364,19 +352,18 @@ async fn stream_passthrough(
         .map(|b| upstream::h2_spawn_pump(send, b, log.clone()));
     let timed = tokio::time::timeout(
         std::time::Duration::from_secs(upstream::STREAM_HEAD_BUDGET_SECS),
-        upstream::h2_recv_response(fut),
+        upstream::h2_recv_response(fut, guard),
     )
     .await;
     match timed {
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
-            pool::cursor_note(host, &up.ip, true, up.slot);
-            upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
+            pool::cursor_note(host, &up.ip, true);
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
             ));
-            write_upstream(resp, "stream", info)
+            write_upstream(&log, resp, "stream", info, host, &path)
         }
         Ok(Err(e)) => {
             if let Some(h) = &pump {
@@ -424,116 +411,73 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// 内容域 4s（vs 8s）：黑洞必烧满预算，罩更久纯浪费。
-fn request_budget(is_content: bool) -> Duration {
-    if is_content {
-        CONTENT_REQUEST_BUDGET
+/// 响应头预算按 host 分类：黑洞必烧满预算，罩更久纯浪费；CDN 静态/其他 2s（protocol::REQUEST_BUDGET），会话域 4s（现场拼页面偶有 2~3s）。
+fn request_budget(host: &str) -> Duration {
+    if upstream::host_class(host) == upstream::HostClass::Session {
+        SESSION_REQUEST_BUDGET
     } else {
         REQUEST_BUDGET
     }
 }
 
-/// 搜索请求固定走主通道：GitHub 反爬对同会话跨 IP 敏感，漂移会被降级成无结果骨架。
-fn is_search_path(path: &str) -> bool {
-    path.starts_with("/search")
-}
-
-/// 在给定连接上发一次请求、等响应头；三处调用点共用，请求每次重建（BoxBody 不可克隆）。
-async fn send_once(
-    up: &upstream::H2Upstream,
-    out: &hyper::Request<BoxBody>,
-    body: &Option<Bytes>,
-    budget: Duration,
-) -> Result<(hyper::Response<BoxBody>, u64), String> {
-    let t0 = Instant::now();
-    match tokio::time::timeout(budget, upstream::h2_send(up, out, body)).await {
-        Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
-        Err(_) => Err("响应预算超时".to_string()),
-    }
-}
-
-/// 借道被服务端拒绝（421）后的冷却：这不是某条连接坏了，而是跨 `:authority` 不被收，
-/// 换一条也一样，所以停的是整条借道路径。
-static BORROW_BREAKER: pool::Breaker = pool::Breaker::new(30);
-
-/// 一次请求最多换几条 donor 重试（assets 通常一条 host 两条连接）。
-const MAX_BORROW_TRIES: usize = 2;
-
-/// 借来的响应体带着"借出中"计数：流走完或中途被丢弃都要归还，
-/// 否则那条 donor 会一直显示在忙，下一轮再也挑不中它。
-struct BorrowGuard(Option<(String, u64)>);
-
-impl Drop for BorrowGuard {
-    fn drop(&mut self) {
-        if let Some((host, id)) = self.0.take() {
-            upstream::borrow_done(&host, id);
-        }
-    }
-}
-
-fn borrow_guard_body(host: String, id: u64, body: BoxBody) -> BoxBody {
-    let stream = http_body_util::BodyExt::into_data_stream(body);
-    let guarded = futures_util::stream::unfold(
-        (stream, BorrowGuard(Some((host, id)))),
-        |(mut s, g)| async move {
-            let item = futures_util::StreamExt::next(&mut s).await?;
-            Some((item.map(hyper::body::Frame::data), (s, g)))
-        },
-    );
-    BoxBody::new(http_body_util::StreamBody::new(guarded))
-}
-
-/// 内容域全灭时的最后一条路：借 assets 的伪装连接发同一请求，全程零握手。
-/// h2 用 `out` 的 URI 生成 `:authority`，Fastly 按它路由，不暴露真名；一条 donor 失败换下一条（最多 `MAX_BORROW_TRIES`）。
-pub(super) async fn try_borrow(
-    log: &LogFn,
-    out: &hyper::Request<BoxBody>,
-    host: &str,
-    info: &UpstreamInfo,
-    body: &Option<Bytes>,
-) -> Option<Result<hyper::Response<BoxBody>, String>> {
-    if BORROW_BREAKER.open(host) {
-        return None;
-    }
-    let mut last = String::new();
-    for _ in 0..MAX_BORROW_TRIES {
-        let Some((donor_host, donor)) = upstream::borrow_donor(host) else {
-            break; // 没有现成通道，或都在冷却：交回原回退路径
-        };
-        match send_once(&donor, out, body, request_budget(true)).await {
-            Ok((resp, _)) if resp.status() == StatusCode::MISDIRECTED_REQUEST => {
-                // 连接本身没坏，只是服务端不收跨 :authority：归还配额，整条路先歇一会。
-                upstream::borrow_done(&donor_host, donor.id);
-                BORROW_BREAKER.set(host);
-                return Some(Err("借道被 421 拒绝(服务端不收跨 :authority)".to_string()));
-            }
-            Ok((resp, ms)) => {
-                // 借用请求的耗时也记在这条连接上：下次挑 donor 时快的那条更受青睐。
-                upstream::note_latency(&donor_host, donor.id, ms);
-                // 只记实际出口，不回写内容域候选游标：把 .154 记进 content 键，
-                // 下一轮就会拿它配伪装 SNI 去拨 avatars，证书必挂。
-                *info.lock().unwrap() = donor.ip.clone();
-                if quiet::first_time("borrow", host) {
-                    (log)(&format!(
-                        "[借道] {host} 借 {donor_host}({}) 的现成通道, {ms}ms",
-                        donor.ip
-                    ));
-                }
-                let (parts, body) = resp.into_parts();
-                let body = borrow_guard_body(donor_host, donor.id, body);
-                return Some(Ok(hyper::Response::from_parts(parts, body)));
-            }
-            Err(e) => {
-                // 这条坏了就冷藏它，换同 host 的另一条继续——两条通道的意义就在这。
-                upstream::borrow_poison(&donor_host, donor.id);
-                last = format!("{donor_host}({}) {e}", donor.ip);
-            }
-        }
-    }
-    if last.is_empty() {
-        None
+/// 复用失败分两种：断链 = 连接已没、发出去就报错（微秒级）；超时 = 请求发出对端不答、烧满整个预算。混成连接已断会把边缘不答误判成链路故障。
+fn reuse_failure_text(why: &str, budget: Duration) -> String {
+    if why == ERR_BUDGET_TIMEOUT {
+        format!("响应超时({}s) 放弃复用", budget.as_secs())
     } else {
-        Some(Err(format!("借道失败: {last}")))
+        format!("连接已断({why})")
+    }
+}
+
+/// 复用失败首条立刻留痕，之后每 60s 汇总一行（次数+超时/断开+最近 IP）：一页加载会连撞几条同 host 连接，但反复发生的证据不能抹掉。
+fn note_reuse_failure(log: &LogFn, host: &str, ip: &str, why: &str, budget: Duration) {
+    struct Acc {
+        n: u32,
+        timeouts: u32,
+        last_ip: String,
+        last_text: String,
+        since: std::time::Instant,
+    }
+    static ACC: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Acc>>> =
+        std::sync::OnceLock::new();
+
+    let timeout = why == ERR_BUDGET_TIMEOUT;
+    let text = reuse_failure_text(why, budget);
+    let mut g = ACC
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if g.len() >= 128 {
+        g.clear();
+    }
+    let e = g.entry(host.to_string()).or_insert_with(|| Acc {
+        n: 0,
+        timeouts: 0,
+        last_ip: String::new(),
+        last_text: String::new(),
+        since: std::time::Instant::now(),
+    });
+    e.n += 1;
+    if timeout {
+        e.timeouts += 1;
+    }
+    e.last_ip = ip.to_string();
+    e.last_text = text.clone();
+
+    if e.n == 1 {
+        // 窗口内首条：立刻留痕，单次失败也查得到。
+        (log)(&format!("[MITM] {host} 复用失败({text}), IP {ip}, 重新建连"));
+        return;
+    }
+    if e.since.elapsed() >= Duration::from_secs(60) {
+        let (n, t, last_ip, last_text) = (e.n, e.timeouts, e.last_ip.clone(), e.last_text.clone());
+        (log)(&format!(
+            "[MITM] {host} 60s 内复用失败 {n} 次(超时 {t} / 断开 {}), 最近: {last_text}, IP {last_ip}",
+            n - t
+        ));
+        e.n = 0;
+        e.timeouts = 0;
+        e.since = std::time::Instant::now();
     }
 }
 
@@ -549,14 +493,14 @@ fn direct_leg<'a>(
     info: &UpstreamInfo,
     body: &Option<Bytes>,
 ) -> mirror::DirectLeg<'a> {
-    let load = mirror::mirror_load_for(&mirror::direct_load_key(chain_host));
+    let load = mirror::mirror_load(&mirror::direct_load_key(chain_host));
     let log2 = log.clone();
     let host2 = host.to_string();
     let body2 = body.clone();
     let info2 = info.clone();
     let fetch = Box::pin(async move {
         let mut guard = mirror::LoadGuard::charge(load, new_bytes, big);
-        match get_direct(&log2, out, &host2, &info2, true, &body2).await {
+        match get_direct(&log2, out, &host2, &info2, &body2).await {
             Ok(resp) => {
                 // 头已到：码表重跑，IP 表串发拨号/等待不进速度样本。
                 guard.restart_mark();
@@ -572,10 +516,10 @@ fn direct_leg<'a>(
             Err(e) => Err(e),
         }
     });
-    mirror::DirectLeg { fetch }
+    fetch
 }
 
-/// 两条路径共用的镜像链派发：组装直连腿 + chain_fetch + 按胜出者写诊断头。
+/// 镜像派发（两处共用）：组装直连腿 + chain_fetch + 按胜者写诊断头；ECT 同台为主，直连全败才按链序兜底。
 async fn mirror_or_direct(
     log: &LogFn,
     out_body: &hyper::Request<BoxBody>,
@@ -601,174 +545,182 @@ async fn mirror_or_direct(
         .get::<&'static str>()
         .copied()
         .unwrap_or("mirror");
-    Ok(write_upstream(resp, route, info))
+    Ok(write_upstream(
+        log,
+        resp,
+        route,
+        info,
+        host,
+        &path_of(out_body.uri()),
+    ))
 }
 
-async fn try_cached(
-    log: &LogFn,
-    out: &hyper::Request<BoxBody>,
-    host: &str,
-    info: &UpstreamInfo,
-    is_simple: bool,
-    body: &Option<Bytes>,
-) -> Option<Result<hyper::Response<BoxBody>, String>> {
-    // path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
-    let path = path_of(out.uri());
-    let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    let is_content = pool::route::is_content(host);
-    let up = upstream::cached_h2_in(host, want_slot)?;
-    match send_once(&up, out, body, request_budget(is_content)).await {
-        Ok((resp, ms)) => {
-            *info.lock().unwrap() = up.ip.clone();
-            pool::cursor_note(host, &up.ip, true, up.slot);
-            upstream::note_latency(host, up.id, ms);
-            if is_content {
-                pool::CONTENT_BREAKER.clear(host);
-            }
-            // 复用路径同样要学 302：头像请求几乎总走这里，只挂拨号分支会漏。
-            redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
-            quiet::note_reuse(log, host, ms);
-            Some(Ok(resp))
-        }
-        Err(why) => {
-            upstream::drop_h2_id(host, up.id);
-            (log)(&format!(
-                "[MITM] {host} 复用连接失效({}, {why}), 重走串发",
-                up.ip
-            ));
-            (!is_simple).then(|| Err("POST 等非简单方法不重发(复用连接失效)".to_string()))
-        }
-    }
-}
-
+/// 直连腿：通道获取走 pool::get_or_build，这里只管发请求与记账；失败摘通道换一条重试一次，再败交上层按 fallback 走镜像/DNS。
 pub(super) async fn get_direct(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
     host: &str,
     info: &UpstreamInfo,
-    is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let path = path_of(out.uri());
-    let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    // copilot-proxy 后缀是 githubusercontent.com，会误命中内容域熔断，但它走 edge 白名单族。
-    let is_content = pool::route::is_content(host);
-    if is_content && pool::CONTENT_BREAKER.open(host) {
-        // 熔断期间不干等：内容域候选全灭时借 assets 的现成通道，借不到才回镜像链。
-        if let Some(r) = try_borrow(log, out, host, info, body).await {
-            return r;
-        }
-        return Err("内容域直连熔断中, 直接走镜像链".to_string());
-    }
-    if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
-        return r;
-    }
-    // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
-    let dial_lock = upstream::host_dial_lock(host);
-    let mut guard = Some(dial_lock.lock().await);
-    if is_content && pool::CONTENT_BREAKER.open(host) {
-        // 等锁期间别人可能刚把熔断补上：同样先试借道，借不到才回镜像链。
-        if let Some(r) = try_borrow(log, out, host, info, body).await {
-            return r;
-        }
-        return Err("内容域直连熔断中, 直接走镜像链".to_string());
-    }
-    // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
-    if upstream::cached_h2_in(host, want_slot).is_some() {
-        guard.take();
-        if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
-            return r;
-        }
-        guard = Some(dial_lock.lock().await);
-    }
-    let _dial_guard = guard;
-    for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 每轮再查一次池子：竞速任务可能已建成，排队者直接复用。
-        let (up, fresh) = match upstream::cached_h2_in(host, want_slot) {
-            Some(up) => (up, false),
-            None => match upstream::dial_upstream(host, log).await {
-                Ok((up, fresh)) => (up, fresh),
-                Err(e) => {
-                    (log)(&format!(
-                        "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
-                        attempt + 1
-                    ));
-                    if !is_simple {
-                        return Err(format!("POST 等非简单方法不重发({e})"));
-                    }
-                    if is_content {
-                        // 候选确实全灭：先把熔断记上，后续请求直接抄借道这条近路，
-                        // 不再挨个等拨号超时。
-                        pool::CONTENT_BREAKER.set(host);
-                        if let Some(r) = try_borrow(log, out, host, info, body).await {
-                            return r;
-                        }
-                        return Err(format!("内容域直连全灭({e})"));
-                    }
-                    continue;
-                }
-            },
-        };
-        let e = match send_once(&up, out, body, request_budget(is_content)).await {
+    let budget = request_budget(host);
+    let (mut up, mut fresh) = pool::get_or_build(host, log).await?;
+    let mut retried = false;
+    loop {
+        match stream_on(&up, out, body, budget).await {
             Ok((resp, ms)) => {
                 let id = up.id;
-                let up_slot = up.slot;
-                let up_ip = up.ip.clone();
-                *info.lock().unwrap() = up_ip.clone();
-                pool::cursor_note(host, &up_ip, true, up_slot); // 数据到手 = 真成功, 置顶
-                if fresh {
-                    upstream::store_h2(host, up);
-                    upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
-                } // 竞速路径不补:race 的另一任务就是第二条,补建会与它抢跑
-                upstream::note_latency(host, id, ms); // 新连接也要记账，否则择优池没有它的样本
-                if is_content {
-                    pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
+                let ip = up.ip.clone();
+                // 421 = 这个 IP 服务不了这个 host，边级长冷却换下一条；边状态按路由键记（子域 host ≠ 路由键）。
+                if resp.status() == StatusCode::MISDIRECTED_REQUEST {
+                    if let Some(row) = pool::route::route_for(host) {
+                        pool::edges::mark_reject(&ip, &row.key);
+                    }
+                    upstream::drop_h2_id(&ip, id);
+                    (log)(&format!(
+                        "[MITM] {host} <- {ip} 被拒(421), 该 IP 冷却 4 小时, 换下一个"
+                    ));
+                    if retried {
+                        return Err("421 边缘连续拒绝".to_string());
+                    }
+                    retried = true;
+                    (up, fresh) = pool::get_or_build(host, log).await?;
+                    continue;
                 }
+                *info.lock().unwrap() = ip.clone();
+                // HTTP 交换完成即回写（是不是风控页这里看不见）；成功只清短冷却，洗不掉风控冷却。
+                pool::cursor_note(host, &ip, true);
                 // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
                 redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
-                (log)(&format!("[上游] {host}{path} 新连接 {up_ip}, {ms}ms"));
-                return Ok(resp);
+                if fresh {
+                    (log)(&format!("[上游] {host}{path} 新连接 {ip}, {ms}ms"));
+                } else {
+                    quiet::note_reuse(log, host, &ip, ms);
+                }
+                return Ok(meter_body(log, host, &ip, resp));
             }
-            Err(e) => e,
-        };
-        // 数据层失败才垫底 IP，且只认幂等、无镜像兜底的失败；POST/内容域失败不代表 IP 死。
-        if is_simple && !is_content {
-            pool::cursor_note(host, &up.ip, false, up.slot);
-        }
-        upstream::drop_h2_id(host, up.id);
-        (log)(&format!(
-            "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
-            attempt + 1
-        ));
-        if !is_simple {
-            return Err(format!("POST 等非简单方法不重发({e})"));
-        }
-        if is_content {
-            // 同上：先熔断再借道，让下一条请求少走一轮必败的拨号。
-            pool::CONTENT_BREAKER.set(host);
-            if let Some(r) = try_borrow(log, out, host, info, body).await {
-                return r;
+            Err(e) => {
+                // 通道失败：摘通道 + 记账（骑来的不罚 IP，新拨的罚边冷却），换一条重试一次。
+                pool::report_failure(&up, host, fresh);
+                if fresh {
+                    (log)(&format!(
+                        "[MITM] {host} 新连接 {} 失败({e}), 换一条重试",
+                        up.ip
+                    ));
+                } else {
+                    note_reuse_failure(log, host, &up.ip, &e, budget);
+                }
+                if retried {
+                    return Err(e);
+                }
+                retried = true;
+                    (up, fresh) = pool::get_or_build(host, log).await?;
             }
-            return Err(format!("内容域直连全灭({e})"));
         }
-        continue; // GET/HEAD: 换下一个候选重发完整请求
     }
-    Err("直连串发全灭(完整请求逐个试完)".to_string())
+}
+
+/// 纯头响应判定：204/304/Content-Length: 0 没有数据阶段，不参与首字节等待与黑洞判定。
+fn no_body_expected(resp: &hyper::Response<BoxBody>) -> bool {
+    matches!(
+        resp.status(),
+        http::StatusCode::NO_CONTENT | http::StatusCode::NOT_MODIFIED
+    ) || resp
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        == Some("0")
+}
+
+/// 响应体计量 + 黑洞看门狗：响应头到了但 30s 内第一个数据字节没来即判黑；只标记不杀在途请求（也许回源后能完成），通道暂缓+换血；会话域当场弃旧通道并预建替代（浏览器自动重试落在预建通道上）。
+fn meter_body(
+    log: &LogFn,
+    host: &str,
+    ip: &str,
+    resp: hyper::Response<BoxBody>,
+) -> hyper::Response<BoxBody> {
+    struct WatchInner {
+        log: LogFn,
+        host: String,
+        ip: String,
+        bytes: std::sync::atomic::AtomicU64,
+        /// 数据窗起点 = **第一个数据字节**到达的时刻。
+        first_frame: std::sync::Mutex<Option<std::time::Instant>>,
+    }
+    impl WatchInner {
+        fn on_frame(&self, n: usize) {
+            let n = n as u64;
+            self.bytes
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            let mut g = self.first_frame.lock().unwrap();
+            if g.is_none() {
+                *g = Some(std::time::Instant::now());
+            }
+        }
+    }
+    // 纯头响应（204/304/Content-Length: 0）没有数据阶段，不参与黑洞判定。
+    let no_body = no_body_expected(&resp);
+    let (parts, body) = resp.into_parts();
+    let inner = Arc::new(WatchInner {
+        log: log.clone(),
+        host: host.to_string(),
+        ip: ip.to_string(),
+        bytes: std::sync::atomic::AtomicU64::new(0),
+        first_frame: std::sync::Mutex::new(None),
+    });
+    // 黑洞看门狗：30s 而非更短（8s 会把 20~80s 的慢渲染误判）；持 Weak 引用，体结束即静默退出；判黑只标记不杀在途请求，杀连接只会把部分数据变断流。
+    if !no_body {
+        let w = Arc::downgrade(&inner);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                crate::config::BLACKHOLE_FIRST_BYTE_MS,
+            ))
+            .await;
+            // Weak 升级失败 = body 已正常结束：不是黑洞，什么都不用做
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            if w.first_frame.lock().unwrap().is_some() {
+                return; // 数据来了：不是黑洞，不用做什么
+            }
+            let bytes = w.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            (w.log)(&format!(
+                "[黑洞] {} {} 响应头后 {}ms 零数据({bytes}B)",
+                w.host,
+                w.ip,
+                crate::config::BLACKHOLE_FIRST_BYTE_MS
+            ));
+            pool::on_channel_blackhole(&w.host, &w.ip, &w.log);
+        });
+    }
+    // 闭包持有 inner：body 活多久它活多久——计数与看门狗判定跟着 body 走。
+    let body = http_body_util::BodyExt::map_frame(body, move |frame| {
+        if let Some(d) = frame.data_ref() {
+            inner.on_frame(d.len());
+        }
+        frame
+    });
+    hyper::Response::from_parts(parts, BoxBody::new(body))
 }
 
 fn write_upstream(
+    log: &LogFn,
     resp: hyper::Response<BoxBody>,
     route: &str,
     info: &UpstreamInfo,
+    host: &str,
+    path: &str,
 ) -> axum::response::Response<BoxBody> {
+    // 调试抓包：每请求一行（host+路径+状态+科室），复用连接上的单个请求从此可见。
+    (log)(&format!("[请求] {host}{path} -> {} ({route})", resp.status()));
     let (mut parts, body) = resp.into_parts();
     parts.headers.remove("connection");
     parts.headers.remove("transfer-encoding");
-    if !route.is_empty() {
-        parts
-            .headers
-            .insert("x-gitport-route", HeaderValue::from_str(route).unwrap());
-    }
+    // 调用点恒传非空路由名（cache/302memo/direct-split/dns/direct/stream/mirror），直写头。
+    parts
+        .headers
+        .insert("x-gitport-route", HeaderValue::from_str(route).unwrap());
     let ip = info.lock().unwrap().clone();
     if !ip.is_empty() {
         parts
@@ -829,43 +781,47 @@ async fn dns_direct_fetch(
     info: &UpstreamInfo,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
+    // 与 connect_upstream 兜底腿同一份地址保险：hosts 把受管域名指进环回/私网时，这条腿不能带会话头直拨本机 443。
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 443))
         .await
         .map_err(|e| format!("系统 DNS 解析失败: {e}"))?
+        .filter(|a| !crate::server::bogon_addr(a.ip()))
         .collect();
     if addrs.is_empty() {
-        return Err(format!("{host} 系统 DNS 无解析记录"));
+        return Err(format!("{host} 系统 DNS 无可用解析记录(内网/保留地址已拒)"));
     }
     (log)(&format!(
         "[DNS直连] {host} 系统解析 {} 个候选, 真名 SNI 逐个尝试",
         addrs.len()
     ));
-    // 与 get_direct 口径一致：白名单域名不算内容域；预算与候选地址无关，循环外算一次。
-    let budget_content = pool::route::is_content(host);
+    // 与 get_direct 口径一致：预算按 host 三类算，与候选地址无关，循环外算一次。
+    let budget = request_budget(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn =
-            match pool::dial::dial_one(host, &ip, host, pool::route::is_real(host), true).await {
+        // 这个 IP 已经有通道就直接用——一 IP 一通道，不为一次请求再建。
+        let up = if let Some(up) = upstream::cached_h2_in(std::slice::from_ref(&ip)) {
+            up
+        } else {
+            let conn = match pool::dial::dial_one(&ip, host, host, true).await {
                 Ok(c) => c,
                 Err(e) => {
                     (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
                     continue;
                 }
             };
-        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await
-        {
-            Ok(u) => u,
-            Err(e) => {
-                (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
-                continue;
-            }
+            let up = match upstream::h2_from_dialed(host, conn, &ip, log).await {
+                Ok(u) => u,
+                Err(e) => {
+                    (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
+                    continue;
+                }
+            };
+            // 拨完立刻入库：晚一秒都可能让别的 host 对同一 IP 又拨一条。
+            upstream::store_h2(&ip, up)
         };
-        match send_once(&up, out, body, request_budget(budget_content)).await {
+        match stream_on(&up, out, body, budget).await {
             Ok((resp, ms)) => {
-                let id = up.id;
                 *info.lock().unwrap() = ip.clone();
-                upstream::store_h2(host, up); // 入缓存: 后续请求走复用快路径
-                upstream::note_latency(host, id, ms);
                 (log)(&format!(
                     "[DNS直连] {host}{} 新连接 {ip}, 成功({ms}ms)",
                     path_of(out.uri())
@@ -873,7 +829,7 @@ async fn dns_direct_fetch(
                 return Ok(resp);
             }
             Err(e) => {
-                upstream::drop_h2(host, &ip);
+                upstream::drop_h2(&ip);
                 (log)(&format!(
                     "[DNS直连] {host} <- {ip} 请求失败({e}), 换下个解析 IP"
                 ));

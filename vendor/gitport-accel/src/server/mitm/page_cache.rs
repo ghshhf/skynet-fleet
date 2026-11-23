@@ -1,13 +1,16 @@
-//! 列表页缓存：只缓存 github.com 列表页与跟班 XHR，按会话存活；存 pages/<hash>，不做后台 SWR，闸门页/未登录页/跨账号不缓存。
-use super::BoxBody;
+//! 页面缓存：github.com 列表页/首页骨架按会话分存（pages/<hash>），闸门页/未登录页/跨账号不缓存；
+//! 仓库页不缓存（零转换直出——html 永远新鲜；跨发版冻结资产引用 = 旧 JS 配新数据，实测白屏）；
+//! githubassets 资产按 URL 入库本地透明回放（immutable 一存永逸，时代中立：URL 即内容指纹）。
+use super::{asset_store, BoxBody};
 use crate::server::protocol::{self, Incoming};
 use crate::server::upstream;
-use crate::util::{now_ms, LogFn};
+use crate::util::{lock, now_ms, LogFn};
 use bytes::Bytes;
 use http::{Method, StatusCode};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// 会话攒到这么多就整盘清空。
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
@@ -57,8 +60,10 @@ const XHR_PREFIXES: &[&str] = &[
     "/search/count",
     "/search/blackbird_count",
     "/search/warm_blackbird_caches",
+    "/search/custom_scopes",
     "/in-product-messaging/",
     "/github-copilot/chat/repositories_search",
+    "/conduit/",
     // 首页的跟班：会变的全在这些接口里（见 README 的首页那节）
     "/dashboard/",
     "/productivity_dashboard/",
@@ -82,7 +87,7 @@ fn is_search_page(path: &str) -> bool {
     path == "/search"
 }
 
-/// 条目落点：键尾 `-k` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
+/// 键尾 -k 进跨会话 keep/，其余进会话目录 pages/（清盘只清后者）；v6.9 资产缓存已物理删除。
 fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
     if key.ends_with("-k") {
         dir.join("keep")
@@ -145,6 +150,12 @@ enum CacheMsg {
         status: u16,
         hdrs: Vec<Vec<String>>,
     },
+    /// githubassets 资产入库（管家线程落盘，主路径零等待）。
+    SaveAsset {
+        url: String,
+        bytes: Bytes,
+        hdrs: Vec<Vec<String>>,
+    },
     /// 写操作成功后的缓存失效（异步，POST 响应路径不等它）。
     Invalidate { host: String, path: String },
     /// 空闲后重新开始浏览：整盘清空，本次会话从空白积累。
@@ -154,7 +165,7 @@ enum CacheMsg {
 // ---------- 对外唯二入口 ----------
 
 /// 文档导航：不论值不值得缓存，都算"还在浏览"（决定会话是否延续）。
-fn is_doc_nav(req: &hyper::Request<Incoming>) -> bool {
+fn is_doc_nav<B>(req: &hyper::Request<B>) -> bool {
     req.method() == Method::GET
         && match req
             .headers()
@@ -167,12 +178,12 @@ fn is_doc_nav(req: &hyper::Request<Incoming>) -> bool {
 }
 
 /// 跟班 XHR：可缓存，但不驱动会话寿命（后台轮询不该把缓存一直养着）。
-fn is_xhr_nav(req: &hyper::Request<Incoming>, host: &str) -> bool {
+fn is_xhr_nav<B>(req: &hyper::Request<B>, host: &str) -> bool {
     host == CACHE_HOST && req.method() == Method::GET && is_xhr_path(req.uri().path())
 }
 
 /// 准入：github.com 的列表页（文档导航）+ 跟班 XHR；只有 Ctrl+F5 才直通，max-age=0 不算。
-fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
+fn cache_eligible<B>(req: &hyper::Request<B>, host: &str) -> bool {
     cache_eligible_rules(
         host,
         req.method(),
@@ -202,10 +213,11 @@ fn cache_eligible_rules(
             || (doc_nav && (is_list_path(path) || is_home_path(path))))
 }
 
-/// 取路由：命中 = 纯本地读（对 GitHub 零请求）；未命中/空闲后第一页 = None，走上游。
-pub(super) fn cache_take(
+/// 取路由：命中 = 纯本地读；未命中/空闲后第一页 = None，走上游。
+/// githubassets 资产不在此处理：mitm_http 的资产库强绑定分支接管（命中回放 / miss 独立拉取）。
+pub(super) fn cache_take<B>(
     log: &LogFn,
-    req: &hyper::Request<Incoming>,
+    req: &hyper::Request<B>,
     host: &str,
 ) -> Option<axum::response::Response<BoxBody>> {
     let xhr = is_xhr_nav(req, host);
@@ -226,7 +238,8 @@ pub(super) fn cache_take(
     if !cache_eligible(req, host) {
         return None;
     }
-    let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
+    let cookies = all_cookies(req.headers());
+    let cookies = cookies.as_deref();
     let variant = if search_page {
         search_variant(req.headers().get("accept").and_then(|v| v.to_str().ok()))
     } else {
@@ -236,25 +249,26 @@ pub(super) fn cache_take(
         req.uri(),
         host,
         cookies,
-        upstream::accepts_gzip(req),
+        upstream::encoding_bucket(req),
         variant,
     );
-    let (status, hdrs, body) = match load_disk_entry_reason(&key, session_value(cookies).is_some())
-    {
-        Ok(v) => v,
-        Err(reason) => {
-            // 盘上有条目却被读侧拒绝 = "存了却命中不了"：落日志才排查得动。
-            if search_page && reason != "无此条目" {
-                let path = req
-                    .uri()
-                    .path_and_query()
-                    .map(|p| p.as_str().to_string())
-                    .unwrap_or_else(|| req.uri().path().to_string());
-                (log)(&format!("[缓存] 命中失败 {path} ({reason})"));
+    let ((status, hdrs, body), swr_expired) =
+        match load_disk_entry_reason(&key, session_value(cookies).is_some())
+        {
+            Ok(v) => v,
+            Err(reason) => {
+                // 盘上有条目却被读侧拒绝 = "存了却命中不了"：落日志才排查得动。
+                if search_page && reason != "无此条目" {
+                    let path = req
+                        .uri()
+                        .path_and_query()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_else(|| req.uri().path().to_string());
+                    (log)(&format!("[缓存] 命中失败 {path} ({reason})"));
+                }
+                return None;
             }
-            return None;
-        }
-    };
+        };
     // 命中要留痕：写盘是静默的，没有这行用户无从判断"到底用没用缓存"。
     let path = req
         .uri()
@@ -267,7 +281,23 @@ pub(super) fn cache_take(
     } else {
         format!("{}KB", body.len() / 1024)
     };
-    (log)(&format!("[缓存] 命中 {path} ({size} 本地)"));
+    // 命中是常态：每路径只留首条，否则浏览高峰整页都是「缓存命中」。
+    if super::quiet::first_time("cachehit", &path) {
+        (log)(&format!("[缓存] 命中 {path} ({size} 本地)"));
+    }
+    // v6.11 SWR：过期 -k/-rk 快照不判死——交旧（浏览器缓存直出）+ 后台静默重拉（带 cookie）。
+    if swr_expired {
+        (log)(&format!("[缓存] 页面快照过期, 交旧 + 后台重拉 {path}"));
+        spawn_page_refetch(
+            log,
+            host,
+            &key,
+            &path,
+            cookies,
+            upstream::encoding_bucket(req),
+            session_value(cookies).is_some(),
+        );
+    }
     Some(rebuild_cached_response(status, &hdrs, body))
 }
 
@@ -278,6 +308,11 @@ pub(super) async fn cache_put(
     host: &str,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
+    // ① 资产库：githubassets 全部经此入库（白名单）/404 剔胚，响应原样交回浏览器。
+    if host == asset_store::ASSET_HOST {
+        return collect_asset(log, req, resp).await;
+    }
+    // ② 其余页面：原有准入/收集/入库流程（仓库页在准入里排除——html 永不缓存、零转换直出）。
     // 拒存日志只认主站 /search，全量打会淹没日志。
     let search_dbg = host == CACHE_HOST
         && req.method() == Method::GET
@@ -319,7 +354,8 @@ pub(super) async fn cache_put(
         }
     }
     let xhr = is_xhr_path(req.uri().path());
-    let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
+    let cookies = all_cookies(req.headers());
+    let cookies = cookies.as_deref();
     let search_page = is_search_page(req.uri().path());
     // 分钥匙以实际 Content-Type 为准：同 URL 可能回 JSON 也可能回 HTML。
     let ct_lower = resp
@@ -341,7 +377,7 @@ pub(super) async fn cache_put(
         req.uri(),
         host,
         cookies,
-        upstream::accepts_gzip(req),
+        upstream::encoding_bucket(req),
         variant,
     );
     let has_session = session_value(cookies).is_some();
@@ -396,15 +432,24 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheTask>) {
                         (log)(&format!("[缓存] 后台写盘失败({e})，{key} 本次不缓存"));
                     }
                 }
+                CacheMsg::SaveAsset { url, bytes, hdrs } => {
+                    if let Err(e) = asset_store::persist_blocking(dir, &url, &bytes, &hdrs) {
+                        (log)(&format!("[资产] 后台写盘失败({e})，{url} 本次不入库"));
+                    }
+                }
                 CacheMsg::Invalidate { host, path } => {
-                    invalidate_prefix_blocking(dir, &host, &path);
+                    let (d, k) = invalidate_prefix_blocking(dir, &host, &path);
+                    if d + k > 0 {
+                        (log)(&format!(
+                            "[缓存] 写后失效 {host}{path} (会话条目删除 {d}, keep 快照标过期 {k})"
+                        ));
+                    }
                 }
                 CacheMsg::Purge => {
                     let n = wipe_pages(dir);
                     (log)(&format!(
-                        "[缓存] 空闲超 {} 分钟, 整盘清空 {n} 条(会话#{} 从空白积累)",
-                        IDLE_SESSION_GAP_MS / 60_000,
-                        SESSION_EPOCH.load(Ordering::Relaxed)
+                        "[缓存] 空闲超 {} 分钟, 清空 {n} 条",
+                        IDLE_SESSION_GAP_MS / 60_000
                     ));
                 }
             }
@@ -453,7 +498,7 @@ fn rebuild_cached_response(
 static CACHE_DIR_OVERRIDE: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
-fn page_cache_dir() -> std::path::PathBuf {
+pub(super) fn page_cache_dir() -> std::path::PathBuf {
     #[cfg(test)]
     if let Some(d) = CACHE_DIR_OVERRIDE
         .lock()
@@ -478,6 +523,19 @@ fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
     true
 }
 
+/// Cookie 按出现序全拼：大 Cookie 会被 h2 拆多行，只读第一行会漏掉后面的 user_session，把登录记成未登录。
+fn all_cookies(hdrs: &hyper::HeaderMap) -> Option<String> {
+    let mut joined = String::new();
+    for v in hdrs.get_all("cookie") {
+        let Ok(s) = v.to_str() else { continue };
+        if !joined.is_empty() {
+            joined.push_str("; ");
+        }
+        joined.push_str(s);
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+
 /// 登录态 cookie 的值（GitHub 的两种 user_session 写法）。有值 = 已登录。
 fn session_value(cookies: Option<&str>) -> Option<&str> {
     cookies?.split(';').map(str::trim).find_map(|kv| {
@@ -486,26 +544,11 @@ fn session_value(cookies: Option<&str>) -> Option<&str> {
     })
 }
 
-/// 账号名（GitHub 稳定下发的 dotcom_user）；只认干净的值，脏值当没有。
-fn account_name(cookies: Option<&str>) -> Option<&str> {
-    cookies?.split(';').map(str::trim).find_map(|kv| {
-        let u = kv.strip_prefix("dotcom_user=")?;
-        let sane = !u.is_empty()
-            && u.len() <= 64
-            && u.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
-        sane.then_some(u)
-    })
-}
-
-/// 身份标签：未登录 -cloggedout，登录 -c<账号>；取不到账号就哈希 session 值，不能哈希整条 Cookie。
+/// 身份标签：未登录 -cloggedout，登录 = 会话号稳定摘要；不用账号名（客户端自报明文可伪造），轮换会话只损失一次命中。
 fn session_fingerprint(cookies: Option<&str>) -> String {
-    let Some(sess) = session_value(cookies) else {
-        return "-cloggedout".into();
-    };
-    match account_name(cookies) {
-        Some(u) => format!("-c{u}"),
-        None => format!("-cs{:016x}", fnv1a(sess)),
+    match session_value(cookies) {
+        Some(sess) => format!("-cs{}", page_file_name(sess)),
+        None => "-cloggedout".into(),
     }
 }
 
@@ -514,18 +557,15 @@ fn dbg_path(key: &str) -> &str {
     key.split_once(' ').map(|(_, rest)| rest).unwrap_or(key)
 }
 
-/// 请求方要不要 JSON：GitHub 搜索页按 Accept 协商，同 URL 两种正文必须分钥匙。
-fn accept_wants_json(accept: Option<&str>) -> bool {
-    let Some(a) = accept else {
-        return false;
-    };
-    let a = a.to_ascii_lowercase();
-    a.contains("application/json") && !a.contains("text/html")
-}
-
-/// 搜索页的内容分钥匙：存侧看实际 Content-Type，取侧按 Accept 预测，猜错只是 miss。
+/// 搜索页内容分钥匙：存侧看 Content-Type、取侧按 Accept 预测，猜错只是 miss；同 URL 两种正文必须分开。
 fn search_variant(accept: Option<&str>) -> &'static str {
-    if accept_wants_json(accept) {
+    let wants_json = accept
+        .map(|a| {
+            let a = a.to_ascii_lowercase();
+            a.contains("application/json") && !a.contains("text/html")
+        })
+        .unwrap_or(false);
+    if wants_json {
         "-json"
     } else {
         "-html"
@@ -537,71 +577,77 @@ fn live_cache_key(
     uri: &http::Uri,
     host: &str,
     cookies: Option<&str>,
-    gzip: bool,
+    enc: &str,
     variant: &str,
 ) -> String {
-    let base = page_cache_key(uri, host, cookies, gzip);
+    let base = page_cache_key(uri, host, cookies, enc);
     if is_home_path(uri.path()) {
-        format!("{base}-k") // 骨架：不带会话号，跨会话复用
+        // v6.11：首页骨架跨会话存 keep/、7 天重同步（旧壳 immutable 直出，数据走 XHR）。
+        // 仓库页不缓存（html 零转换直出），其余带会话号。
+        format!("{base}-k")
     } else {
         format!("{base}{variant}-s{}", SESSION_EPOCH.load(Ordering::Relaxed))
     }
 }
 
-fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, gzip: bool) -> String {
+fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str) -> String {
+    let path = uri.path();
     let q = uri
         .query()
         .map(|q| normalize_query(uri.path(), q))
         .unwrap_or_default();
     let cookie_tag = session_fingerprint(cookies);
-    // 编码进键：gzip 那条不能给没声明 gzip 的 curl。
-    let enc_tag = if gzip { "-gz" } else { "-id" };
-    format!("GET {host}{}{q}{cookie_tag}{enc_tag}", uri.path())
+    // 编码进键：br 条目不能给只收 gzip 的 curl。
+    let enc_tag = match enc {
+        "br" => "-br",
+        "gzip" => "-gz",
+        _ => "-id",
+    };
+    format!("GET {host}{path}{q}{cookie_tag}{enc_tag}")
 }
 
-/// /search 查询串归一化：去掉 p=1 并按键名排序；其他路径保持原样，个别接口参数顺序有语义。
+/// /search 查询串归一化：默认页补 p=1、参数按键名排序；其他路径原样（个别接口参数顺序有语义）。
 fn normalize_query(path: &str, q: &str) -> String {
     if path != "/search" {
         return format!("?{q}");
     }
     let mut pairs: Vec<&str> = q.split('&').filter(|s| !s.is_empty()).collect();
     pairs.retain(|s| *s != "p=1");
+    // 没给页码 = 第一页；补 p=1 让两种写法同键。
+    if !pairs.iter().any(|s| s.starts_with("p=")) {
+        pairs.push("p=1");
+    }
     pairs.sort_unstable();
-    if pairs.is_empty() {
-        String::new()
+    format!("?{}", pairs.join("&"))
+}
+
+/// 这段正文的压缩编码（决定门检怎么解压）：gzip/br，其余按 identity。
+fn body_encoding(v: &str) -> &'static str {
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("gzip") {
+        "gzip"
+    } else if t.eq_ignore_ascii_case("br") {
+        "br"
     } else {
-        format!("?{}", pairs.join("&"))
+        "identity"
     }
 }
 
-/// 这段正文是不是 gzip（决定要不要先解压）。
-fn is_gzip_encoding(v: &str) -> bool {
-    v.trim().eq_ignore_ascii_case("gzip")
-}
-
-/// 解压后取前 8KB 并转小写：主站正文恒 gzip，不解压扫不到字面量。
-fn plain_prefix(bytes: &[u8], gzip: bool) -> String {
-    let plain = if gzip {
-        super::defuse::gunzip_partial(bytes, 8192)
-    } else {
-        bytes[..bytes.len().min(4096)].to_vec()
-    };
+/// 解压后取前 8KB 并转小写：主站正文恒压缩（gzip/br），不解压扫不到字面量。
+fn plain_prefix(bytes: &[u8], enc: &str) -> String {
+    let plain = super::defuse::decompress_partial(bytes, enc, 8192);
     String::from_utf8_lossy(&plain).to_lowercase()
 }
 
 /// 限流降级骨架（缺 embeddedData）不入缓存，否则一次降级会被刷新固化成“一直坏”。
-fn is_search_skeleton(key: &str, bytes: &[u8], gzip: bool) -> bool {
+fn is_search_skeleton(key: &str, bytes: &[u8], enc: &str) -> bool {
     if !key.contains("/search?") {
         return false;
     }
     if key.contains("-json-") {
         return false; // JSON 正文本就没有 HTML 结果载体，骨架判定只对 HTML 分支生效
     }
-    let plain = if gzip {
-        super::defuse::gunzip_partial(bytes, PAGE_CACHE_MAX_BODY_BYTES)
-    } else {
-        bytes.to_vec()
-    };
+    let plain = super::defuse::decompress_partial(bytes, enc, PAGE_CACHE_MAX_BODY_BYTES);
     let text = String::from_utf8_lossy(&plain);
     !text.contains("react-app.embeddedData")
 }
@@ -609,6 +655,15 @@ fn is_search_skeleton(key: &str, bytes: &[u8], gzip: bool) -> bool {
 /// 未登录页：带会话却拿到这类 body = 会话已死，不存也不当命中（防污染）。
 fn is_logged_out_body(plain: &str) -> bool {
     plain.contains("logged-out env-") || plain.contains("class=\"logged-out")
+}
+
+/// HTML 完整性（末 2KB 有 </html>）：h2 响应无 content-length，中途断流时 collect 仍 Ok，截断页进 keep/ 会 7 天内反复命中=必现白屏；读写两侧都查。
+fn html_complete(bytes: &[u8], enc: &str) -> bool {
+    let full = super::defuse::decompress_partial(bytes, enc, 32 << 20);
+    full.len() >= 7
+        && full[full.len().saturating_sub(2048)..]
+            .windows(7)
+            .any(|w| w == b"</html>")
 }
 
 /// 闸门页标记：GitHub 拿这些页顶替你请求的 URL 回 200，存下会一直显示。
@@ -626,18 +681,11 @@ fn is_gate_page(plain: &str) -> bool {
     GATE_MARKERS.iter().any(|m| plain.contains(m))
 }
 
-/// key → 文件名：FNV-1a 64 位散列的 16 hex。碰撞由读时 key 校验兜底。
-fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
+/// key → 文件名：稳定 64 位摘要的 16 hex。碰撞由读时 key 校验兜底，只会 miss 不会串页。
 fn page_file_name(key: &str) -> String {
-    format!("{:016x}", fnv1a(key))
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&key, &mut h);
+    format!("{:016x}", std::hash::Hasher::finish(&h))
 }
 
 /// 磁盘条目反序列化形态：状态码 + 规范化响应头 + 压缩体。
@@ -654,76 +702,207 @@ fn load_disk_entry(
     // 带会话却拿到未登录页 = 会话已死；匿名页必须能正常命中。
     logged_in: bool,
 ) -> Option<DiskEntry> {
-    load_disk_entry_reason(key, logged_in).ok()
+    load_disk_entry_reason(key, logged_in).ok().map(|(e, _)| e)
 }
 
-/// 带拒绝原因的读取，供命中侧按需落日志。
-fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'static str> {
+/// 带拒绝原因的读取，供命中侧按需落日志。第二个元素 = 首页骨架是否过期（SWR 触发）。
+fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool), &'static str> {
     let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
+    // v6.11 SWR：-k 首页骨架过期不判死——交旧 + 后台静默重拉（过期标记随条目返回）。
+    let mut swr_expired = false;
     if key.ends_with("-k") {
         let age = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        if age > KEEP_MAX_AGE_MS {
-            return Err("长寿命条目过期");
-        }
+            .unwrap_or(u64::MAX); // 取不到间隔（含 mtime 在未来：系统时间回拨过）按过期处理，交旧+后台重拉
+        swr_expired = age > KEEP_MAX_AGE_MS;
     }
-    if raw.len() < 4 {
-        return Err("文件过短");
-    }
-    let Some(hlen_bytes) = raw.get(0..4) else {
-        return Err("文件过短");
-    };
-    let hlen =
-        u32::from_be_bytes([hlen_bytes[0], hlen_bytes[1], hlen_bytes[2], hlen_bytes[3]]) as usize;
-    let end = 4usize.checked_add(hlen).ok_or("头部长度溢出")?;
-    if raw.len() < end {
-        return Err("条目截断"); // miss 自愈
-    }
-    let header: serde_json::Value =
-        serde_json::from_slice(&raw[4..end]).map_err(|_| "元数据损坏")?;
-    if header.get("key").and_then(|k| k.as_str()) != Some(key) {
-        return Err("哈希碰撞"); // 不服务错页
-    }
-    let Some(st) = header.get("status").and_then(|v| v.as_u64()) else {
-        return Err("状态码损坏");
-    };
-    let status = u16::try_from(st).map_err(|_| "状态码损坏")?;
-    if status != 200 {
-        return Err("条目非 200"); // 拦截页/304：当 miss
-    }
-    let Some(headers) = header.get("headers").and_then(|v| v.as_array()) else {
-        return Err("头部字段损坏");
-    };
-    let mut hdrs: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
-        Vec::with_capacity(headers.len());
-    for pair in headers {
-        let (Some(k), Some(v)) = (
-            pair.get(0).and_then(|x| x.as_str()),
-            pair.get(1).and_then(|x| x.as_str()),
-        ) else {
-            continue;
-        };
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            hdrs.push((name, val));
-        }
-    }
-    let gzip = hdrs.iter().any(|(k, v)| {
-        k.as_str() == "content-encoding" && v.to_str().map(is_gzip_encoding).unwrap_or(false)
-    });
-    let body = &raw[end..];
-    let plain = plain_prefix(body, gzip);
-    if (logged_in && is_logged_out_body(&plain)) || is_gate_page(&plain) {
+    let entry = super::entry::decode(&raw, key)?;
+    let enc = entry
+        .headers
+        .iter()
+        .find(|(k, _)| k.as_str() == "content-encoding")
+        .and_then(|(_, v)| v.to_str().ok())
+        .map(body_encoding)
+        .unwrap_or("identity");
+    let body = entry.body;
+    let p = plain_prefix(&body, enc);
+    if (logged_in && is_logged_out_body(&p)) || is_gate_page(&p) {
         return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
     }
-    Ok((status, hdrs, Bytes::copy_from_slice(body)))
+    // keep 条目（首页骨架）必须是完整文档：截断页删文件自愈，别让它活满 7 天。
+    if key.ends_with("-k")
+        && entry.headers.iter().any(|(k, v)| {
+            k.as_str() == "content-type"
+                && v.to_str()
+                    .map(|v| v.starts_with("text/html"))
+                    .unwrap_or(false)
+        })
+        && !html_complete(&body, enc)
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err("骨架条目截断(无</html>)");
+    }
+    Ok(((entry.status, entry.headers, body), swr_expired))
+}
+
+// ---------- 页面快照 SWR（v6.11：过期交旧 + 后台静默重拉，前台零等待） ----------
+
+/// 页面快照后台重拉去重：同键同时只跑一个。
+static PAGE_REFRESHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn page_refresh_done(key: &str) {
+    let g = PAGE_REFRESHING.get_or_init(|| Mutex::new(HashSet::new()));
+    lock(g).remove(key);
+}
+
+/// 过期快照后台静默重拉：带 cookie 拉最新壳，200+完整+会话存活才覆盖；失败 60s 再试直到成功或确认页面不存在，前台零感知。
+fn spawn_page_refetch(
+    log: &LogFn,
+    host: &str,
+    key: &str,
+    path_q: &str,
+    cookie: Option<&str>,
+    bucket: &'static str,
+    logged_in: bool,
+) {
+    let g = PAGE_REFRESHING.get_or_init(|| Mutex::new(HashSet::new()));
+    if !lock(g).insert(key.to_string()) {
+        return; // 同键在途去重
+    }
+    let host = host.to_string();
+    let key = key.to_string();
+    let path_q = path_q.to_string();
+    let cookie = cookie.map(str::to_string);
+    let log = log.clone();
+    tokio::spawn(async move {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            // ① 通道：池内现成通道，没有就拨（单流）
+            let (up, _) = match crate::pool::get_or_build(&host, &log).await {
+                Ok(v) => v,
+                Err(e) => {
+                    (log)(&format!(
+                        "[缓存] 页面重拉第 {attempt} 次拨号失败({e}), 60s 后再试, 旧壳继续"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            // ② 请求：带 cookie + 按桶协商压缩
+            let mut b = hyper::Request::builder()
+                .uri(format!("https://{host}{path_q}"))
+                .header("accept", "text/html, */*")
+                .header("user-agent", upstream::BROWSER_UA);
+            b = match bucket {
+                "br" => b.header("accept-encoding", "br"),
+                "gzip" => b.header("accept-encoding", "gzip"),
+                _ => b,
+            };
+            if let Some(c) = &cookie {
+                b = b.header("cookie", c);
+            }
+            let req = match b.body(protocol::empty_body()) {
+                Ok(r) => r,
+                Err(e) => {
+                    (log)(&format!("[缓存] 页面重拉请求构造失败({e}), 放弃重拉"));
+                    page_refresh_done(&key);
+                    return;
+                }
+            };
+            let resp = match upstream::h2_send(&up, &req, &None::<Bytes>).await {
+                Ok(r) => r,
+                Err(e) => {
+                    (log)(&format!(
+                        "[缓存] 页面重拉第 {attempt} 次失败({e}), 60s 后再试, 旧壳继续"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            let st = resp.status();
+            if st != http::StatusCode::OK {
+                // 404/410 = 页面在上游已不存在 → 删该仓库的快照（相对底稿的增量/全量副本），底稿全局共用不动；
+                // 下次访问 miss 直连见真实 404，上游误报时直连重拉自动重建
+                if st == http::StatusCode::NOT_FOUND || st == http::StatusCode::GONE {
+                    let _ = std::fs::remove_file(
+                        entry_dir(&page_cache_dir(), &key).join(page_file_name(&key)),
+                    );
+                    (log)(&format!(
+                        "[缓存] 页面重拉确认上游 {st}(页面已不存在), 删除快照, 下次访问直连见真实 404"
+                    ));
+                    page_refresh_done(&key);
+                    return;
+                }
+                (log)(&format!(
+                    "[缓存] 页面重拉第 {attempt} 次非 200({}), 60s 后再试, 旧壳继续",
+                    st.as_u16()
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            let (parts, body) = resp.into_parts();
+            let hdrs: Vec<Vec<String>> = parts
+                .headers
+                .iter()
+                .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+                .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
+                .collect();
+            let collected = match http_body_util::BodyExt::collect(body).await {
+                Ok(c) => c,
+                Err(e) => {
+                    (log)(&format!(
+                        "[缓存] 页面重拉第 {attempt} 次收体失败({e}), 60s 后再试, 旧壳继续"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            let bytes = collected.to_bytes();
+            // ③ 门检：完整 + 会话存活，才覆盖（重拉的货不可用，旧壳继续顶）
+            let enc = parts
+                .headers
+                .iter()
+                .find(|(k, _)| k.as_str() == "content-encoding")
+                .and_then(|(_, v)| v.to_str().ok())
+                .map(body_encoding)
+                .unwrap_or("identity");
+            let plain = super::defuse::decompress_partial(&bytes, enc, 64 << 20);
+            if !html_complete(&plain, "identity") {
+                (log)(&format!(
+                    "[缓存] 页面重拉第 {attempt} 次不完整, 60s 后再试, 旧壳继续"
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            let n = plain.len().min(8192);
+            let p8 = String::from_utf8_lossy(&plain[..n]).to_lowercase();
+            if logged_in && is_logged_out_body(&p8) {
+                (log)("[缓存] 页面重拉回未登录页(会话已死), 放弃重拉, 旧壳继续");
+                page_refresh_done(&key);
+                return;
+            }
+            // ④ 覆盖入库（全量格式，替换旧骨架）；覆盖后 mtime 复新，过期标记自动解除。
+            match write_entry_file(
+                &page_cache_dir(),
+                &key,
+                &bytes,
+                http::StatusCode::OK.as_u16(),
+                &hdrs,
+            ) {
+                Ok(_) => (log)(&format!(
+                    "[缓存] 页面重拉完成, 快照已更新 (尝试 {attempt} 次)"
+                )),
+                Err(e) => (log)(&format!("[缓存] 页面重拉落盘失败({e}), 旧壳继续")),
+            }
+            page_refresh_done(&key);
+            return;
+        }
+    });
 }
 
 /// 测试专用：绕开准入直读磁盘；`page_cache_get_logged_in` 模拟带会话的请求方。
@@ -761,44 +940,21 @@ fn maybe_wipe_on_growth(dir: &std::path::Path, written: usize) {
     }
 }
 
-/// 旧版 cacache 残留（index-v5/content-v2）一次性清掉，防白占磁盘。
-static LEGACY_CACHE_PURGED: OnceLock<()> = OnceLock::new();
-fn purge_legacy_cache(dir: &std::path::Path) {
-    if LEGACY_CACHE_PURGED.set(()).is_ok() {
-        for sub in ["index-v5", "content-v2"] {
-            let _ = std::fs::remove_dir_all(dir.join(sub));
-        }
-    }
-}
-
-/// 落盘：tmp 写全量 + rename 原子覆盖，永远存不出半页。
-fn persist_page_entry_blocking(
+/// 条目落盘：tmp 写全量 + rename 原子覆盖，永远存不出半页。
+fn write_entry_file(
     dir: &std::path::Path,
     key: &str,
-    bytes: &[u8],
+    body: &[u8],
     status: u16,
     hdrs: &[Vec<String>],
 ) -> Result<(), String> {
-    if !ensure_cache_dir_with_acl(dir) {
-        return Err("缓存目录创建失败".to_string());
-    }
-    purge_legacy_cache(dir);
-    let header = serde_json::json!({
-        "key": key,
-        "status": status,
-        "headers": hdrs,
-    });
-    let hbytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+    let buf = super::entry::encode(key, status, hdrs, body);
     // 记账口径必须等于实际写入量：4 字节长度前缀 + 头部 JSON + 正文。
-    maybe_wipe_on_growth(dir, 4 + hbytes.len() + bytes.len());
+    maybe_wipe_on_growth(dir, buf.len());
     let pages = entry_dir(dir, key);
     let tmp = dir.join("tmp");
     std::fs::create_dir_all(&pages).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(4 + hbytes.len() + bytes.len());
-    buf.extend_from_slice(&(hbytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&hbytes);
-    buf.extend_from_slice(bytes);
     // 纳秒时钟防极端重入（管家线程本已串行）
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -811,6 +967,28 @@ fn persist_page_entry_blocking(
         let _ = std::fs::remove_file(&tmp_path);
         e.to_string()
     })
+}
+
+/// 页面缓存落盘统一入口（全量格式）。
+fn persist_page_entry_blocking(
+    dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+    status: u16,
+    hdrs: &[Vec<String>],
+) -> Result<(), String> {
+    if !ensure_cache_dir_with_acl(dir) {
+        return Err("缓存目录创建失败".to_string());
+    }
+    write_entry_file(dir, key, bytes, status, hdrs)
+}
+
+/// no-store 一律不落盘；private 不拒——GitHub 用它表达浏览器别共享，代理已按会话号哈希分钥匙语义等价，全拒会干掉页面缓存。
+fn resp_no_store(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("no-store"))
 }
 
 /// 收集体、复判体积与会话污染后投递 Save；响应原样交回浏览器。
@@ -854,20 +1032,6 @@ async fn collect_and_submit(
             peek.extend_from_slice(&b);
         }
     }
-    // 污染/闸门检测要先解压才看得见标记。
-    let gzip = parts
-        .headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .map(is_gzip_encoding)
-        .unwrap_or(false);
-    // Set-Cookie 只从缓存元数据剔除（回灌旧值会冻 cookie），响应原样给浏览器。
-    let cache_hdrs: Vec<Vec<String>> = parts
-        .headers
-        .iter()
-        .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
-        .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
-        .collect();
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let mut bytes = collected.to_bytes();
@@ -877,12 +1041,29 @@ async fn collect_and_submit(
                 full.extend_from_slice(&bytes);
                 bytes = Bytes::from(full);
             }
+            // 污染/闸门检测要先解压才看得见标记。
+            let enc = parts
+                .headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .map(body_encoding)
+                .unwrap_or("identity");
+            // Set-Cookie 只从缓存元数据剔除（回灌旧值会冻 cookie），响应原样给浏览器。
+            let cache_hdrs: Vec<Vec<String>> = parts
+                .headers
+                .iter()
+                .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+                .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
+                .collect();
             // 不缓存"顶替真实内容"的页：未登录页（会话已死）与各类闸门页。
-            let plain = plain_prefix(&bytes, gzip);
+            let plain = plain_prefix(&bytes, enc);
+            // 首页骨架(-k)跨会话存活 7 天，截断页绝不能入库——宁可这次不缓存。
             let cacheable = bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES
+                && !resp_no_store(&parts.headers)
+                && (!key.ends_with("-k") || html_complete(&bytes, enc))
                 && !(has_session && is_logged_out_body(&plain))
                 && !is_gate_page(&plain)
-                && !is_search_skeleton(key, &bytes, gzip);
+                && !is_search_skeleton(key, &bytes, enc);
             if cacheable {
                 let status = parts.status.as_u16();
                 worker_send(
@@ -902,7 +1083,7 @@ async fn collect_and_submit(
                     "未登录页(会话已死)"
                 } else if is_gate_page(&plain) {
                     "闸门页"
-                } else if is_search_skeleton(key, &bytes, gzip) {
+                } else if is_search_skeleton(key, &bytes, enc) {
                     "限流骨架"
                 } else {
                     "未知原因"
@@ -934,8 +1115,92 @@ async fn collect_and_submit(
     }
 }
 
+// ---------- 资产库入库（githubassets → 本地回放；强绑定入口在 asset_store::serve_or_fetch） ----------
+
+/// 资产入库分支：收集白名单内的 200 体投管家保存（响应原样交回浏览器，不等写盘）。
+async fn collect_asset<B>(
+    log: &LogFn,
+    req: &hyper::Request<B>,
+    resp: axum::response::Response<BoxBody>,
+) -> axum::response::Response<BoxBody> {
+    let url = asset_store::asset_request_url(req, asset_store::ASSET_HOST);
+    let name = asset_store::asset_dbg_name(&url).to_string();
+    let (mut parts, body) = resp.into_parts();
+    if parts.status != StatusCode::OK {
+        return hyper::Response::from_parts(parts, body);
+    }
+    let ct = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // 嗅探读走的前几帧要拼回，否则入库半帧。
+    let mut peek: Vec<u8> = Vec::new();
+    if let Some(p) = parts.extensions.remove::<super::PeekRaw>() {
+        for b in p.0 {
+            peek.extend_from_slice(&b);
+        }
+    }
+    let collected = match http_body_util::BodyExt::collect(body).await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return hyper::Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(protocol::full_body(Bytes::from_static(b"asset collect failed")))
+                .unwrap();
+        }
+    };
+    let bytes = if peek.is_empty() {
+        collected
+    } else {
+        let mut full = Vec::with_capacity(peek.len() + collected.len());
+        full.extend_from_slice(&peek);
+        full.extend_from_slice(&collected);
+        Bytes::from(full)
+    };
+    if asset_store::storable(parts.status, &ct) {
+        let cache_hdrs: Vec<Vec<String>> = parts
+            .headers
+            .iter()
+            .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+            .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
+            .collect();
+        if worker_send(
+            CacheMsg::SaveAsset {
+                url: url.clone(),
+                bytes: bytes.clone(), // Bytes 引用计数浅克隆，跨线程零拷贝
+                hdrs: cache_hdrs,
+            },
+            log,
+        ) && super::quiet::first_time("assetnew", &name)
+        {
+            // 小正文（GitHub 的迷你 chunk 常只有几百字节）按字节显示，别被整数除法抹成 0KB。
+            let size = if bytes.len() < 1024 {
+                format!("{}B", bytes.len())
+            } else {
+                format!("{}KB", bytes.len() / 1024)
+            };
+            (log)(&format!("[资产] 入库 {name} ({size})"));
+        }
+    }
+    hyper::Response::from_parts(parts, protocol::full_body(bytes))
+}
+
+/// keep 条目“改标过期”（v6.12）：mtime 拨到保质期线之外——读侧年龄判定自然按过期处理（交旧 + 后台重拉），
+/// 重拉覆盖入库后 mtime 复新，标记自动解除。set_times 让“只标不删”不需要任何额外状态。
+fn mark_entry_expired(p: &std::path::Path) {
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) else {
+        return; // 文件已不在（并发自愈删除）：无需标记
+    };
+    let past =
+        std::time::SystemTime::now() - std::time::Duration::from_millis(KEEP_MAX_AGE_MS + 60_000);
+    let _ = f.set_times(std::fs::FileTimes::new().set_modified(past));
+}
+
 /// 写后失效：前缀匹配，父路径也匹配（写端点多是子路径；至少两级，免得 /o 扫全表）。
-fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) {
+/// 返回 (删除的会话条目数, 标记过期的 keep 快照数)，调用方据此决定是否落日志。
+fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) -> (usize, usize) {
     let mut prefixes = vec![format!("GET {host}{path}")];
     if let Some(i) = path.rfind('/') {
         let parent = &path[..i];
@@ -943,15 +1208,32 @@ fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) {
             prefixes.push(format!("GET {host}{parent}"));
         }
     }
-    let Ok(rd) = std::fs::read_dir(dir.join("pages")) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if read_page_key(&p).is_some_and(|k| prefixes.iter().any(|pre| k.starts_with(pre))) {
-            let _ = std::fs::remove_file(&p);
+    let mut deleted = 0usize;
+    let mut marked = 0usize;
+    // 会话条目在 pages/（照删）；仓库页快照/首页骨架在 keep/（v6.12 起不删——标数据过期：
+    // 旧壳照常可交，下次命中走既有 SWR 管道交旧 + 后台重拉，重拉覆盖后自动解除）。
+    for sub in ["pages", "keep"] {
+        let Ok(rd) = std::fs::read_dir(dir.join(sub)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Some(key) = read_page_key(&p) else {
+                continue;
+            };
+            if !prefixes.iter().any(|pre| key.starts_with(pre)) {
+                continue;
+            }
+            if sub == "keep" {
+                mark_entry_expired(&p);
+                marked += 1;
+            } else {
+                let _ = std::fs::remove_file(&p);
+                deleted += 1;
+            }
         }
     }
+    (deleted, marked)
 }
 
 /// 只读页面文件的 header 段取 key（失效前缀匹配用，不读 body）。

@@ -1,8 +1,17 @@
-use super::*;
+﻿use super::*;
 use bytes::Bytes;
 
 #[test]
 fn mirror_chain_cap_scope() {
+    // is_big_file_host 走路由表（数据），先装种子表。
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join("gitport_mirror_cap_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+
     for h in [
         "raw.githubusercontent.com",
         "camo.githubusercontent.com",
@@ -69,6 +78,15 @@ fn mirror_request_strips_identity_and_hop_by_hop() {
 
 #[test]
 fn calibrate_templates_cover_small_hosts_only() {
+    // is_big_file_host 走路由表（数据），先装种子表。
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join("gitport_calibrate_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+
     for h in pool::CONTENT_HOSTS {
         let covered = CALIBRATE_TEMPLATES.iter().any(|(host, _)| host == h);
         if pool::route::is_big_file_host(h) {
@@ -84,31 +102,6 @@ fn calibrate_templates_cover_small_hosts_only() {
 }
 
 #[test]
-fn credential_query_detection() {
-    for q in [
-        "token=abc",
-        "sig=1",
-        "signature=1",
-        "jwt=1",
-        "auth=1",
-        "access_token=x",
-        "session_token=1",
-        "AWSAccessKeyId=k",
-        "X-Amz-Signature=abc",
-        "x-amz-credential=1",
-        "a=1&access_token=x",
-    ] {
-        assert!(has_credential_query(q), "{q} 应判含凭据");
-    }
-    for q in ["", "foo=token", "page=2&q=tokenize", "tokens=1"] {
-        assert!(
-            !has_credential_query(q),
-            "{q} 不该误判（名字才参与，值不算）"
-        );
-    }
-}
-
-#[test]
 fn ttfb_rank_fastest_first_failures_last() {
     let mut rows = vec![
         ("slow".to_string(), 900),
@@ -121,82 +114,14 @@ fn ttfb_rank_fastest_first_failures_last() {
     assert_eq!(order, ["fast", "mid", "slow", "dead"], "{rows:?}");
 }
 
-#[tokio::test]
-async fn chain_fetch_cred_locks_to_direct() {
-    let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = lines.clone();
-    let log: LogFn = Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string()));
-    let req = hyper::Request::builder()
-        .uri("https://raw.githubusercontent.com/o/r/f?sig=abc")
-        .body(protocol::empty_body())
-        .unwrap();
-    let err = chain_fetch(
-        &log,
-        &req,
-        "raw.githubusercontent.com",
-        mirror_test_direct_leg(),
-        &Default::default(),
-        &None,
-    )
-    .await
-    .unwrap_err();
-    assert!(err.contains("仅直连"), "凭据串应剥空镜像仅直连: {err}");
-    let got = lines.lock().unwrap();
-    assert!(
-        got.iter().any(|l| l.contains("仅直连(防外泄")),
-        "应记录剥空镜像决策: {got:?}"
-    );
-    assert!(
-        !got.iter().any(|l| l.contains(" via ")),
-        "签名 URL 不得交给第三方镜像: {got:?}"
-    );
-}
-
-/// 可信镜像白名单：用户标记 trusted 的镜像，凭据串请求放行给它(知情授权)；未标记的镜像仍被剥除。放行名单为空时行为与旧版一致(仅直连)。
-#[test]
-fn cred_authorized_trusted_mirrors_only() {
-    // settings 全局态无法按测隔离——直接验证放行集合的过滤逻辑: trusted_mirrors() 返回 on && trusted 的 URL, 镜像 URL 前缀匹配放行。
-    use crate::settings::WorkerMirror;
-    let mirrors = [
-        WorkerMirror {
-            url: "https://my-worker.example.com".into(),
-            on: true,
-            trusted: true,
-        },
-        WorkerMirror {
-            url: "https://public-proxy.example.org".into(),
-            on: true,
-            trusted: false,
-        },
-    ];
-    let trusted: std::collections::HashSet<String> = mirrors
-        .iter()
-        .filter(|w| w.on && w.trusted)
-        .map(|w| w.url.clone())
-        .collect();
-    let chain = [
-        "https://my-worker.example.com/".to_string(), // 可信(带尾斜杠变体)
-        "https://public-proxy.example.org".to_string(), // 不可信
-    ];
-    let passed: Vec<&String> = chain
-        .iter()
-        .filter(|m| trusted.iter().any(|t| m.starts_with(t.as_str())))
-        .collect();
-    assert_eq!(passed.len(), 1, "只有可信镜像应被放行: {passed:?}");
-    assert!(
-        passed[0].starts_with("https://my-worker.example.com"),
-        "放行的应是可信那家: {passed:?}"
-    );
-}
-
-/// 纯直连耗尽(零镜像/凭据串剥空)不给镜像链上熔断——链没参与，别连坐。
+/// 纯直连耗尽(零镜像)不给镜像链上熔断——链没参与，别连坐。
 #[tokio::test]
 async fn direct_only_exhaustion_spares_chain_breaker() {
     let log: LogFn = Arc::new(|_: &str| {});
     let host = "cred-brk.test";
     pool::MIRROR_BREAKER.clear(host);
     let req = hyper::Request::builder()
-        .uri("https://cred-brk.test/f?sig=abc")
+        .uri("https://cred-brk.test/f")
         .body(protocol::empty_body())
         .unwrap();
     let err = chain_fetch(
@@ -209,14 +134,14 @@ async fn direct_only_exhaustion_spares_chain_breaker() {
     )
     .await
     .unwrap_err();
-    assert!(err.contains("仅直连"), "凭据串请求应仅派直连: {err}");
+    assert!(err.contains("镜像链全灭"), "零镜像耗尽应报链全灭: {err}");
     assert!(
         !pool::MIRROR_BREAKER.open(host),
         "直连独走耗尽不得触发镜像链熔断"
     );
 }
 
-/// 审计 #3 回归: 熔断只拦有镜像候选的请求——凭据串剥空镜像后直连独走, 不得撞为镜像设的熔断(哪怕熔断正开着)。
+/// 审计 #3 回归: 熔断只拦有镜像候选的请求——零镜像时直连独走, 不得撞为镜像设的熔断(哪怕熔断正开着)。
 #[tokio::test]
 async fn breaker_spares_direct_only_requests() {
     let log: LogFn = Arc::new(|_: &str| {});
@@ -238,8 +163,73 @@ async fn breaker_spares_direct_only_requests() {
     .await
     .unwrap_err();
     assert!(!err.contains("熔断"), "直连独走不得撞镜像熔断: {err}");
-    assert!(err.contains("仅直连"), "应照常仅派直连: {err}");
+    assert!(err.contains("镜像链全灭"), "零镜像应报链全灭: {err}");
     pool::MIRROR_BREAKER.clear(host);
+}
+
+/// 探片直连先行：大文件域 bytes=N-N 探测起轮点在直连腿（旧序从链头镜像起轮），镜像全程不被碰。
+#[tokio::test]
+async fn probe_range_starts_at_direct_leg() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // 隔离：serial_load 会把链上镜像收编进注册表并跨测试持久化，先清空。
+    crate::settings::save_worker_mirrors(Vec::new());
+    let dir = std::env::temp_dir().join("gitport_probe_direct_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{
+  "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
+  "mirrors_big": ["https://127.0.0.1:1"]
+}"#,
+    )
+    .unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+    pool::MIRROR_BREAKER.clear("objects.githubusercontent.com");
+
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let log: LogFn = {
+        let lines = lines.clone();
+        Arc::new(move |s: &str| lines.lock().unwrap().push(s.to_string()))
+    };
+    let req = hyper::Request::builder()
+        .method(Method::GET)
+        .uri("https://objects.githubusercontent.com/big.bin")
+        .header("range", "bytes=0-0")
+        .body(protocol::empty_body())
+        .unwrap();
+    let resp = chain_fetch(
+        &log,
+        &req,
+        "objects.githubusercontent.com",
+        Box::pin(async {
+            Ok::<_, String>(
+                hyper::Response::builder()
+                    .status(http::StatusCode::PARTIAL_CONTENT)
+                    .header("content-range", "bytes 0-0/12345678")
+                    .body(protocol::empty_body())
+                    .unwrap(),
+            )
+        }),
+        &Default::default(),
+        &None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.extensions().get::<&'static str>().copied(),
+        Some("direct"),
+        "探片响应应来自直连腿"
+    );
+    let got = lines.lock().unwrap().join("\n");
+    assert!(got.contains("探片直连"), "直连第一棒应有探片直连标签: {got}");
+    assert!(
+        !got.contains("127.0.0.1:1"),
+        "镜像只兜底, 探片不应触碰镜像: {got}"
+    );
+    crate::settings::save_worker_mirrors(Vec::new());
 }
 
 /// 审计 #2 回归: cap 窗口吃掉直连位时——健康直连追加为末位; 失败窗未过的不追加, 已在窗内不重复。
@@ -259,63 +249,84 @@ fn append_direct_gated_by_health_and_presence() {
 
 /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。
 fn mirror_test_direct_leg() -> DirectLeg<'static> {
-    DirectLeg {
-        fetch: Box::pin(async {
-            Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into())
-        }),
-    }
+    Box::pin(async { Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into()) })
 }
 
-/// ECT 时间槽：on_frame 只累计本窗实收，ect_sweep 快照进 window_prev；
-/// 有债零收 = 卡死清零，无债零收 = 空闲沿用旧值——零 sleep，确定性验证。
+/// 单窗结算规则：只有分配窗(5ms)，零收一律沿用（速率估计，卡死语义归收尸管）——零 sleep 确定性验证。
 #[test]
-fn ect_window_slots_snapshot_stall_and_idle() {
+fn single_window_snapshot_rules() {
     let ld = mirror_load("ect-slot.test");
     let mut g = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true);
     g.on_frame(3 * 1024 * 1024);
     ect_sweep();
     assert_eq!(
-        ld.window_prev.load(Ordering::Relaxed),
+        ld.alloc_prev.load(Ordering::Relaxed),
         3 * 1024 * 1024,
-        "本窗实收快照进 prev"
+        "分配窗本拍快照"
     );
     assert_eq!(
-        ld.window_bytes.load(Ordering::Relaxed),
+        ld.alloc_bytes.load(Ordering::Relaxed),
         0,
         "快照后本窗清零重开"
     );
-
-    // 下一窗有债零收：卡死 → prev 清零，派发立即避开。
+    // 零收（有债也在内）：沿用旧值——卡死语义归收尸管。
     ect_sweep();
     assert_eq!(
-        ld.window_prev.load(Ordering::Relaxed),
-        0,
-        "有债零收 = 卡死清零"
+        ld.alloc_prev.load(Ordering::Relaxed),
+        3 * 1024 * 1024,
+        "零收沿用"
     );
-
-    // 恢复出货：prev 换新值。
+    // 恢复出货：换新值。
     g.on_frame(4 * 1024 * 1024);
     ect_sweep();
-    assert_eq!(ld.window_prev.load(Ordering::Relaxed), 4 * 1024 * 1024);
+    assert_eq!(ld.alloc_prev.load(Ordering::Relaxed), 4 * 1024 * 1024);
+    ld.alloc_prev.store(0, Ordering::Relaxed);
+}
 
-    // 空闲窗（还清债务后无债无收）：沿用旧值，别把歇着的快家当死腿。
-    drop(g);
-    ect_sweep();
+/// 爬坡 EMA：首样直入、二次平滑；用 note_ramp 直接验证记账公式（打点在 LoadGuard::on_frame 首帧）。
+#[test]
+fn ramp_note_ema() {
+    let ld = mirror_load("https://ramp-ema.test");
+    ld.ramp_ms.store(0, Ordering::Relaxed);
+    note_ramp(&ld, 800);
+    assert_eq!(ld.ramp_ms.load(Ordering::Relaxed), 800, "首样直入");
+    note_ramp(&ld, 200);
     assert_eq!(
-        ld.window_prev.load(Ordering::Relaxed),
-        4 * 1024 * 1024,
-        "无债零收沿用旧值"
+        ld.ramp_ms.load(Ordering::Relaxed),
+        650,
+        "EMA 800×3/4 + 200×1/4 = 650"
     );
-    ld.window_prev.store(0, Ordering::Relaxed);
+    ld.ramp_ms.store(0, Ordering::Relaxed);
+}
+
+/// ECT 派发把本家 ramp 加进分数：同排水下爬坡小的胜；ramp 足够大时能翻盘。
+#[test]
+fn ect_adds_ramp_to_score() {
+    let fast = mirror_load("ect-ramp-a.test");
+    fast.alloc_prev.store(1024 * 1024, Ordering::Relaxed); // 排空 5ms
+    fast.ramp_ms.store(400, Ordering::Relaxed); // 总分 405
+    let slow = mirror_load("ect-ramp-b.test");
+    slow.alloc_prev.store(1024 * 1024, Ordering::Relaxed); // 排空 5ms
+    slow.ramp_ms.store(100, Ordering::Relaxed); // 总分 105
+    let chain = vec!["ect-ramp-a.test".to_string(), "ect-ramp-b.test".to_string()];
+    assert_eq!(pick_mirror(&chain, 1024), 1, "同排水下爬坡小的胜");
+    // 翻盘：A 排水略快但 ramp 巨大 → 选 B。
+    fast.alloc_prev.store(4 * 1024 * 1024, Ordering::Relaxed); // 排空 ~1ms
+    fast.ramp_ms.store(2000, Ordering::Relaxed); // 总分 ~2001
+    assert_eq!(pick_mirror(&chain, 1024), 1, "ramp 项能翻转排序");
+    fast.alloc_prev.store(0, Ordering::Relaxed);
+    fast.ramp_ms.store(0, Ordering::Relaxed);
+    slow.alloc_prev.store(0, Ordering::Relaxed);
+    slow.ramp_ms.store(0, Ordering::Relaxed);
 }
 
 /// 先验退役：未交卷候选在 ECT 里按无穷大垫底——已交卷的慢腿也胜过它。
 #[test]
 fn ect_after_retirement_unprobed_loses_to_probed_slow() {
     let slow = mirror_load("retire-slow.test");
-    slow.window_prev.store(100 * 1024, Ordering::Relaxed); // 100KB/s 已交卷
+    slow.alloc_prev.store(100 * 1024, Ordering::Relaxed); // 100KB/5ms 已交卷
     let unprobed = mirror_load("retire-unprobed.test");
-    unprobed.window_prev.store(0, Ordering::Relaxed);
+    unprobed.alloc_prev.store(0, Ordering::Relaxed);
     let chain = vec![
         "retire-slow.test".to_string(),
         "retire-unprobed.test".to_string(),
@@ -325,7 +336,7 @@ fn ect_after_retirement_unprobed_loses_to_probed_slow() {
         0,
         "未交卷者 ECT 无穷大, 已交卷的慢腿也胜出(先验不再掺和)"
     );
-    slow.window_prev.store(0, Ordering::Relaxed);
+    slow.alloc_prev.store(0, Ordering::Relaxed);
 }
 
 /// 直连同台：candidates = 镜像 + direct/{host}，ECT 统一派发。
@@ -335,8 +346,8 @@ fn direct_competes_as_candidate() {
     let cands = [chain.as_slice(), &[direct_load_key("cand-host.test")][..]];
     let all: Vec<String> = cands.concat();
     // 直连快(8MB/s 实测) 镜像未交卷(ECT 无穷大垫底): 直连胜出。
-    let d = mirror_load_for(&direct_load_key("cand-host.test"));
-    d.window_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
+    let d = mirror_load(&direct_load_key("cand-host.test"));
+    d.alloc_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(
         all[pick],
@@ -347,7 +358,7 @@ fn direct_competes_as_candidate() {
     mark_fail(&d, false);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(all[pick], "cand-m.test", "直连降权后应选镜像");
-    d.window_prev.store(0, Ordering::Relaxed);
+    d.alloc_prev.store(0, Ordering::Relaxed);
     d.fail_until.store(0, Ordering::Relaxed);
     // 零镜像: candidates 只有直连, pick 恒 0(直连键)。
     let only_direct = vec![direct_load_key("cand-host.test")];
@@ -361,9 +372,9 @@ fn ect_prefers_busy_fast_over_idle_slow() {
     let a = mirror_load("ect-a.test");
     let b = mirror_load("ect-b.test");
     a.in_flight_bytes.store(512 * 1024, Ordering::Relaxed);
-    a.window_prev.store(5 * 1024 * 1024, Ordering::Relaxed);
+    a.alloc_prev.store(5 * 1024 * 1024, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
-    b.window_prev.store(512 * 1024, Ordering::Relaxed);
+    b.alloc_prev.store(512 * 1024, Ordering::Relaxed);
     let chain = vec!["ect-a.test".to_string(), "ect-b.test".to_string()];
     // A (0.5+10)/5 ≈ 2s < B 10/0.5 = 20s → A。
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 0);
@@ -372,8 +383,122 @@ fn ect_prefers_busy_fast_over_idle_slow() {
         .store(100 * 1024 * 1024, Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 1);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
-    a.window_prev.store(0, Ordering::Relaxed);
-    b.window_prev.store(0, Ordering::Relaxed);
+    a.alloc_prev.store(0, Ordering::Relaxed);
+    b.alloc_prev.store(0, Ordering::Relaxed);
+}
+
+/// 段级派发无视 ttfb（h2 复用后镜像/直连首字节对称，ttfb 只进探针排序）：快镜像 ttfb 600ms 仍按纯排水胜出。
+/// 谁把 ttfb 加回段级谁挂（620ms > 160ms 时会错选慢腿）。
+#[test]
+fn ect_ignores_ttfb_for_segments() {
+    let fast = mirror_load("ect-fast.test");
+    fast.alloc_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
+    fast.ttfb_ms.store(600, Ordering::Relaxed);
+    let slow = mirror_load("ect-slow.test");
+    slow.alloc_prev.store(1024 * 1024, Ordering::Relaxed);
+    let chain = vec!["ect-fast.test".to_string(), "ect-slow.test".to_string()];
+    assert_eq!(
+        pick_mirror(&chain, 2 * 1024 * 1024),
+        0,
+        "纯排水 20ms < 160ms, 快镜像胜"
+    );
+    fast.alloc_prev.store(0, Ordering::Relaxed);
+    fast.ttfb_ms.store(0, Ordering::Relaxed);
+    slow.alloc_prev.store(0, Ordering::Relaxed);
+}
+
+/// ttfb 入账语义：首样直入，之后 EMA α=1/4 平滑；直连键永不入账恒 0。
+#[test]
+fn ttfb_note_ema_and_direct_free() {
+    let m = mirror_load("https://ema.test");
+    note_ttfb("https://ema.test", 800);
+    assert_eq!(m.ttfb_ms.load(Ordering::Relaxed), 800, "首样直入");
+    note_ttfb("https://ema.test", 200);
+    assert_eq!(
+        m.ttfb_ms.load(Ordering::Relaxed),
+        650,
+        "EMA 800×3/4 + 200×1/4 = 650"
+    );
+    let d = mirror_load(&direct_load_key("ema.test"));
+    assert_eq!(d.ttfb_ms.load(Ordering::Relaxed), 0, "直连腿不入账恒 0");
+    m.ttfb_ms.store(0, Ordering::Relaxed);
+}
+
+/// 实网验尸：gh-proxy.org(CF) 协商 h2 拉带 Range 的真文件段，体必须读满 content-length。
+/// 当年 h2 被关的坑是"头正常、体 0B EOF"，此探针即其回归测试。网络测试，#[ignore]：
+/// `cargo test mirror_h2_body_probe -- --ignored` 单独验。
+#[tokio::test]
+#[ignore]
+async fn mirror_h2_body_probe() {
+    let mut tls = None;
+    for attempt in 1..=3 {
+        match crate::pool::dial::dial_tls_simple("gh-proxy.org").await {
+            Ok(t) => {
+                tls = Some(t);
+                break;
+            }
+            Err(e) => eprintln!("探针拨号第 {attempt} 次未成: {e}"),
+        }
+    }
+    let tls = tls.expect("3 次探针拨号全失败");
+    assert_eq!(
+        tls.ssl().selected_alpn_protocol(),
+        Some(b"h2".as_slice()),
+        "CF 系应协商出 h2"
+    );
+    drop(tls);
+    let log: LogFn = Arc::new(|_| {});
+    let client = crate::server::upstream::mirror_client(&log);
+    let mut resp = None;
+    for attempt in 1..=3 {
+        let req = hyper::Request::builder()
+            .uri("https://gh-proxy.org/https://raw.githubusercontent.com/torvalds/linux/master/README")
+            .header("user-agent", MIRROR_UA)
+            .header("range", "bytes=0-65535")
+            .body(protocol::empty_body())
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(15), client.request(req)).await {
+            Ok(Ok(r)) => {
+                resp = Some(r);
+                break;
+            }
+            other => eprintln!("拨号/请求第 {attempt} 次未成: {other:?}"),
+        }
+    }
+    let resp = resp.expect("3 次尝试全失败");
+    // raw 路径部分镜像忽略 Range 回 200 全量（gh-proxy.org 实测），与 h2 无关——靶子是体完整性：
+    // 旧坑"头正常、体 0B EOF"的回归点 = 体读不满 content-length。
+    let status = resp.status().as_u16();
+    assert!(
+        status == 206 || status == 200,
+        "镜像应回 206/200, 拿到 {status}"
+    );
+    let cl: usize = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default();
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert!(
+        !body.is_empty(),
+        "h2 体必须非空——旧坑'头正常体 0B EOF'回归即在此挂"
+    );
+    if cl > 0 {
+        assert_eq!(
+            body.len(),
+            cl,
+            "h2 体必须读满 content-length({cl})——旧坑'头正常体 0B EOF'回归即在此挂"
+        );
+    }
+    eprintln!(
+        "[探针] h2 体验证通过: status={status} cl={cl} body={}B 前16字节={:02x?}",
+        body.len(),
+        &body[..16.min(body.len())]
+    );
 }
 
 /// 全未交卷(ECT 同为无穷大、并列) → 轮转均摊；在途越深越垫底，闲者胜出。
@@ -381,8 +506,8 @@ fn ect_prefers_busy_fast_over_idle_slow() {
 fn cold_start_falls_back_to_chain_order() {
     let a = mirror_load("cold-a.test");
     let b = mirror_load("cold-b.test");
-    a.window_prev.store(0, Ordering::Relaxed);
-    b.window_prev.store(0, Ordering::Relaxed);
+    a.alloc_prev.store(0, Ordering::Relaxed);
+    b.alloc_prev.store(0, Ordering::Relaxed);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["cold-a.test".to_string(), "cold-b.test".to_string()];
@@ -412,8 +537,8 @@ fn tie_prefers_fewer_inflight_streams() {
     let b = mirror_load("streams-b.test");
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
-    a.window_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
-    b.window_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
+    a.alloc_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
+    b.alloc_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
     a.in_flight_streams.store(0, Ordering::Relaxed);
     b.in_flight_streams.store(0, Ordering::Relaxed);
     let chain = vec!["streams-a.test".to_string(), "streams-b.test".to_string()];
@@ -435,8 +560,8 @@ fn tie_prefers_fewer_inflight_streams() {
     // 清场。
     a.in_flight_streams.store(0, Ordering::Relaxed);
     b.in_flight_streams.store(0, Ordering::Relaxed);
-    a.window_prev.store(0, Ordering::Relaxed);
-    b.window_prev.store(0, Ordering::Relaxed);
+    a.alloc_prev.store(0, Ordering::Relaxed);
+    b.alloc_prev.store(0, Ordering::Relaxed);
 }
 
 /// ECT 绝对最小(无容差): 速度差 4% 也严格选快者——5% 容差已废；仅 ECT 完全相等才走二级(流数/轮转)。
@@ -448,8 +573,8 @@ fn ect_strict_minimum_no_tolerance() {
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["tie-a.test".to_string(), "tie-b.test".to_string()];
     // 速度差 4% → 恒选快者 b(容差时代会轮转)。
-    a.window_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
-    b.window_prev.store(2088 * 1024, Ordering::Relaxed); // +4%
+    a.alloc_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
+    b.alloc_prev.store(2088 * 1024, Ordering::Relaxed); // +4%
     for _ in 0..10 {
         assert_eq!(
             pick_mirror(&chain, 8 * 1024 * 1024),
@@ -457,16 +582,16 @@ fn ect_strict_minimum_no_tolerance() {
             "无容差: 4% 差距也严格选快"
         );
     }
-    a.window_prev.store(0, Ordering::Relaxed);
-    b.window_prev.store(0, Ordering::Relaxed);
+    a.alloc_prev.store(0, Ordering::Relaxed);
+    b.alloc_prev.store(0, Ordering::Relaxed);
 }
 
 #[test]
 fn recent_failure_deprioritized() {
     let a = mirror_load("fail-a.test");
     let b = mirror_load("fail-b.test");
-    a.window_prev.store(0, Ordering::Relaxed);
-    b.window_prev.store(0, Ordering::Relaxed);
+    a.alloc_prev.store(0, Ordering::Relaxed);
+    b.alloc_prev.store(0, Ordering::Relaxed);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["fail-a.test".to_string(), "fail-b.test".to_string()];
@@ -474,7 +599,7 @@ fn recent_failure_deprioritized() {
     assert_eq!(pick_mirror(&chain, 1024), 1);
     // 全体都在窗内：放开过滤，ECT 照常按吞吐选（b 有历史胜过零历史的 a）。
     mark_fail(&b, false);
-    b.window_prev.store(1024 * 1024, Ordering::Relaxed);
+    b.alloc_prev.store(1024 * 1024, Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 1024), 1);
     a.fail_until.store(0, Ordering::Relaxed);
     b.fail_until.store(0, Ordering::Relaxed);
@@ -486,6 +611,19 @@ fn rotate_walk_respects_limit() {
     assert_eq!(walk_order(8, 6, 5), vec![6, 7, 0, 1, 2]);
     assert_eq!(walk_order(3, 0, 8), vec![0, 1, 2], "limit 大于链长：全链");
     assert_eq!(walk_order(1, 0, 5), vec![0], "单镜像：不切分，行为同旧");
+}
+
+/// {url_enc} 转义口径：字母数字与 . - _ ~ 保留，其余（含中文与 ://）逐字节 %XX。
+#[test]
+fn fill_template_url_enc_keeps_unreserved_only() {
+    let url = "https://raw.githubusercontent.com/a/b/main/文件 name.png?q=1";
+    let out = fill_template("{mirror}/{url_enc}".to_string(), "https://m.example", url);
+    assert_eq!(
+        out,
+        "https://m.example/https%3A%2F%2Fraw.githubusercontent.com%2Fa%2Fb%2Fmain%2F%E6%96%87%E4%BB%B6%20name.png%3Fq%3D1"
+    );
+    let plain = fill_template("{mirror}/{url}".to_string(), "https://m.example", url);
+    assert_eq!(plain, "https://m.example/".to_string() + url, "{url} 原样拼接");
 }
 
 #[test]
@@ -524,6 +662,29 @@ fn mirror_response_validation() {
     assert!(validate_mirror_response(true, 403, "text/html", false).is_err());
     assert!(validate_mirror_response(false, 302, "text/html", false).is_err());
     assert!(validate_mirror_response(false, 200, "text/html; charset=utf-8", false).is_err());
+}
+
+/// 整包 GET(没带 Range)收到 206 分片：按这家失败处理，绝不当完整文件交出去（静默截断）。
+#[test]
+fn stream_start_rejects_206_without_range() {
+    let resp = |status: u16, cr: &str| {
+        hyper::Response::builder()
+            .status(status)
+            .header("content-range", cr)
+            .body(protocol::empty_body())
+            .unwrap()
+    };
+    assert_eq!(
+        stream_start_mismatch(None, &resp(206, "bytes 0-99/1000")),
+        Some("未请求 Range 却回 206".to_string()),
+        "没要 Range 却回 206 必须判失败"
+    );
+    assert_eq!(stream_start_mismatch(None, &resp(200, "")), None, "200 全量照旧放行");
+    assert_eq!(
+        stream_start_mismatch(Some("bytes=0-99"), &resp(206, "bytes 0-99/1000")),
+        None,
+        "带 Range 且起点对齐照旧放行"
+    );
 }
 
 /// 派发加、逐帧归还、Drop 清残余；超额交付封顶不下溢。
@@ -567,7 +728,7 @@ fn small_stream_never_touches_big_file_state() {
     let ld = mirror_load("small-decoupled.test");
     ld.in_flight_bytes.store(0, Ordering::Relaxed);
     ld.in_flight_streams.store(0, Ordering::Relaxed);
-    ld.window_prev.store(0, Ordering::Relaxed);
+    ld.alloc_prev.store(0, Ordering::Relaxed);
     let mut g = LoadGuard::charge(ld.clone(), 1024 * 1024, false); // 小文件流
     g.on_frame(1024 * 1024);
     std::thread::sleep(Duration::from_millis(120));
@@ -584,11 +745,11 @@ fn small_stream_never_touches_big_file_state() {
         "流数零接触"
     );
     assert_eq!(
-        ld.window_bytes.load(Ordering::Relaxed),
+        ld.alloc_bytes.load(Ordering::Relaxed),
         0,
         "小文件不进时间槽"
     );
-    assert_eq!(ld.window_prev.load(Ordering::Relaxed), 0, "零历史保持垫底");
+    assert_eq!(ld.alloc_prev.load(Ordering::Relaxed), 0, "零历史保持垫底");
 }
 
 // ---- 切片驱动：缺口自己续、失败只算空手、绝不提前收尾 ----
@@ -603,7 +764,11 @@ fn fake_fetch(byte: u8) -> Fetch {
                     hyper::body::Frame::data(Bytes::from(vec![byte; n])),
                 )]),
             ));
-            Ok(body)
+            Ok(FilledSeg {
+                body,
+                owner: "fake".to_string(),
+                ramp: 0,
+            })
         })
     })
 }
@@ -624,6 +789,11 @@ fn ctx_with(fetch: Fetch) -> SplitCtx {
     }
 }
 
+/// 测试段：四元组补成生产六元组（owner/ramp 默认 0）。
+fn t(s: u64, e: u64, at: Instant, b: BoxBody) -> (u64, u64, Instant, BoxBody, String, u64) {
+    (s, e, at, b, "test".to_string(), 0)
+}
+
 /// 队首段早断：驱动自己起新流补上，整条河走完，绝不提前 EOF。
 #[tokio::test]
 async fn driver_rescues_early_eof_and_finishes() {
@@ -631,8 +801,8 @@ async fn driver_rescues_early_eof_and_finishes() {
     // 段 1 [0,10) 只给 4B 就 EOF；段 2 [10,20) 完整。
     let mb = MergeBody::new(
         vec![
-            (0, 10, now, body_of(b"AAAA")),
-            (10, 20, now, body_of(b"BBBBBBBBBB")),
+            t(0, 10, now, body_of(b"AAAA")),
+            t(10, 20, now, body_of(b"BBBBBBBBBB")),
         ],
         20,
     );
@@ -652,8 +822,73 @@ async fn driver_rescues_early_eof_and_finishes() {
 async fn driver_gives_up_after_repeated_dead_fills() {
     let now = Instant::now();
     let dead = body_of(b"");
-    let mb = MergeBody::new(vec![(0, 10, now, dead)], 10);
+    let mb = MergeBody::new(vec![t(0, 10, now, dead)], 10);
     let fetch: Fetch = Arc::new(|_, _| Box::pin(async { Err("起流失败".to_string()) }));
     let res = http_body_util::BodyExt::collect(drive_split(mb, ctx_with(fetch))).await;
     assert!(res.is_err(), "补不起来必须报错，不能假装下完");
+}
+
+/// 供 prefix 字节后永久 Pending（不注册 waker）：模拟静默装死的上游。
+fn silent_body(prefix: &'static [u8]) -> BoxBody {
+    struct Silent {
+        left: Option<Bytes>,
+    }
+    impl hyper::body::Body for Silent {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            let me = self.get_mut();
+            match me.left.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+    BoxBody::new(Silent {
+        left: Some(Bytes::from_static(prefix)),
+    })
+}
+
+/// 静默装死的上游不许永久挂死（直连切片搬来的回归钉子）：waker 注册进静默上游永不触发，
+/// drive_split 的 500ms Tick 是唯一唤醒源——停滞收尸 → 补发 → 连续空手 → 错误上抛。
+#[tokio::test]
+async fn driver_silent_upstream_wakes_and_errors() {
+    let now = Instant::now();
+    let mb = MergeBody::new(vec![t(0, 10, now, silent_body(b"abc"))], 10);
+    let fetch: Fetch = Arc::new(|_, _| Box::pin(async { Err("起流失败".to_string()) }));
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        http_body_util::BodyExt::collect(drive_split(mb, ctx_with(fetch))),
+    )
+    .await;
+    let collected = res.expect("静默停滞不许永久挂死: collect 必须限时收场");
+    assert!(collected.is_err(), "补发连续空手必须错误上抛, 而非无声挂起");
+}
+
+/// 补发的 e 已经是闭区间末端，Range 不能再减 1；主切片的半开区间才减 1。
+#[test]
+fn segment_range_uses_inclusive_end() {
+    assert_eq!(segment_range(100, 199).unwrap(), "bytes=100-199");
+    let (s, e) = (100u64, 199u64); // split_fetch 里的 (base+from, base+to-1)
+    assert_eq!(segment_range(s, e).unwrap(), "bytes=100-199");
+    assert_eq!(segment_range(0, 0).unwrap(), "bytes=0-0");
+}
+
+/// 206 起点不符或缺 Content-Range 都不能拼进合并流。
+#[test]
+fn segment_206_must_match_requested_start() {
+    let cr = "bytes 262144-524287/1608296";
+    assert!(merge::check_segment_start(Some(cr), 262_144).is_ok());
+    assert!(
+        merge::check_segment_start(Some(cr), 0).is_err(),
+        "第三方镜像回了错段，起点不符必须当段失败"
+    );
+
+    assert!(
+        merge::check_segment_start(None, 0).is_err(),
+        "206 缺 Content-Range 不能收"
+    );
 }

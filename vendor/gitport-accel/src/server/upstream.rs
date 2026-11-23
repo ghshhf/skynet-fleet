@@ -1,322 +1,402 @@
-//! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
+﻿//! 上游 HTTP 客户端：直连腿 = boring 自管 h2（fresh 语义），镜像腿 = 标准 TLS + h1 共享池；记账/挑选/开流全在此，取用统一走 pool::get_or_build。
 use super::protocol::{empty_body, BoxBody};
 use crate::pool::{self, dial::Dialed};
 use crate::util::{lock, now_ms, LogFn};
 use bytes::Bytes;
 use h2::client::SendRequest;
-use http::Uri;
+use http::{Request, Uri};
 use http_body_util::BodyExt;
+use hyper::Response;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tower_service::Service;
-/// 每 host 最多两条自管 h2 连接：一条承载全部并发但受服务端流上限，两条实测能把 p50 腰斩。
+/// 池按 IP 记账：一条连接可被该 IP 服务着的所有路由键共用（v2 复用单元 = IP）。
 #[derive(Clone)]
 pub struct H2Upstream {
     pub ip: String,
-    /// 进程内唯一：同一 IP 的两条连接也要能精确区分，否则 keepalive 会删错。
+    /// 进程内唯一 ID：连接驱动结束时按它自摘出池，对端回收空闲连接不留僵尸。
     pub id: u64,
-    /// 游标槽位：1 主通道、2 副通道，记账跟着连接走，各记各的钥匙。
-    pub slot: u8,
+    /// 建连时的 host：会话域靠它认自己的通道，优先复用自建的而非公共通道。
+    pub owner: Option<String>,
+    /// 服务端在 SETTINGS 里下发的并发上限（`MAX_CONCURRENT_STREAMS`）。
+    pub max_streams: u32,
+    /// 当前在途流数：发请求 +1、流收尾 -1。选路按占用率挑最闲的。
+    pub inflight: Arc<AtomicU32>,
+    /// 溢出临时通道：句柄不再外发，空闲（在途归零）即被驱动掐断出池。
+    pub overflow: bool,
+    /// 主动关闭信号：竞速落败的腿靠它立刻断开，不等闲置超时。
+    pub close: Arc<tokio::sync::Notify>,
     send: SendRequest<Bytes>,
-    ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// 一条连接 + 最近响应耗时（EWMA）：同 host 两条连接可能一快一慢，轮转会把请求喂给慢的。
-struct ConnSlot {
-    up: H2Upstream,
-    ewma: f64,
-    n: u32,
-    /// 借出去、响应体还没走完的流数：挑下一条 donor 靠它摊开，别把并发全堆到一根 TCP。
-    borrowed: u32,
-    /// 借失败后的冷却：坏的是这一条，同 host 的另一条照常服务。
-    borrow_cool: Option<Instant>,
+/// 一条连接 + 最近使用时刻。
+pub(crate) struct ConnSlot {
+    pub(crate) up: H2Upstream,
+    /// 这条连接自己最后一次被使用（开流刷新）；闲置焚毁计时按它算。
+    last_used: u64,
 }
 
-/// 借道失败冷却时长；到期自动重新参与挑选。
-const BORROW_COOL: Duration = Duration::from_secs(30);
+/// 拨号成功但耗时超过此值 = 撞上 GFW 抖动：延迟表记实测，游标挪窝别黏住慢 IP。
+const DIAL_SLOW_MS: u64 = 1500;
 
-/// 单 host 的连接组：按耗时择优取用（偶尔轮转做探索）+ 补第二条时防重入。
-#[derive(Default)]
-struct HostConns {
-    conns: Vec<ConnSlot>,
-    next: usize,
-    filling: bool,
+/// 拨号单阶段合计必须大于慢成功阈值：成功耗时不可能超过拨号上限，合计压到线内
+/// h2_dial 的"慢成功游标挪窝"就永远走不到，GFW 抖动保护静默失效——编译期钉死。
+const _: () = assert!(
+    crate::config::TCP_CONNECT_TIMEOUT_MS + crate::config::TLS_HANDSHAKE_TIMEOUT_MS > DIAL_SLOW_MS,
+    "TCP+TLS 拨号合计必须 > DIAL_SLOW_MS(1500), 否则慢成功检测窗失效"
+);
+
+/// host 三类：内容域竞速取最速一条+短预算；会话域单通道单 IP（跨 IP 是风控特征）；其他单通道即用即建。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HostClass {
+    Content,
+    Session,
+    Other,
 }
 
-static EXPLORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 三类由 routes.json/seeds.json 的 hosts 标志决定（数据，改类别不用重编译）：content 竞速短预算；big 单通道+大镜像链；session 单通道单 IP；都不标即其他。
+pub(crate) fn host_class(host: &str) -> HostClass {
+    if pool::route::is_big_file_host(host) {
+        return HostClass::Other;
+    }
+    if pool::route::is_content(host) {
+        return HostClass::Content;
+    }
+    // 只主站族标 session（拦截页实测只在这出现）；内容型子域写进 ips 节点的 hosts 即豁免通配，标了会占走跨类共享 IP。
+    let on_risk_surface = pool::route::route_for(host).is_some_and(|row| row.flags.session);
+    if on_risk_surface {
+        HostClass::Session
+    } else {
+        HostClass::Other
+    }
+}
 
-/// 值得开两条连接的高频 host；长尾 host 多一条只是白占 socket。
-const DUAL_CONN_HOSTS: &[&str] = &[
-    "github.com",
-    "api.github.com",
-    "raw.githubusercontent.com",
-    "avatars.githubusercontent.com",
-    "github.githubassets.com",
-];
-const MAX_CONNS_PER_HOST: usize = 2;
+/// 会话域：建连时自建优先，连上了再复用自己那条。
+pub(crate) fn prefer_own_channel(host: &str) -> bool {
+    host_class(host) == HostClass::Session
+}
 
-static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, HostConns>>> =
-    std::sync::OnceLock::new();
-fn conn_pool() -> &'static Mutex<HashMap<String, HostConns>> {
+static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, Vec<ConnSlot>>>> = std::sync::OnceLock::new();
+pub(crate) fn conn_pool() -> &'static Mutex<HashMap<String, Vec<ConnSlot>>> {
     CONN_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
-static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static ACTIVITY_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 fn now_secs() -> u64 {
     now_ms() / 1000
 }
 
-pub fn note_activity() {
-    LAST_ACTIVITY.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
-    ACTIVITY_KICK.notify_one();
-}
+/// 响应头预算超时：上层按它区分"真等超了"和别的失败。
+pub const ERR_BUDGET_TIMEOUT: &str = "响应预算超时";
 
-/// 启动保活任务：有请求每 PROBE 秒 PING 一次，静默超窗回睡，空闲零唤醒。
-pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
-    rt.spawn(async move {
-        loop {
-            ACTIVITY_KICK.notified().await; // 空闲: 纯睡, 零周期唤醒
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    crate::config::KEEPALIVE_PROBE_SECS,
-                ))
-                .await;
-                let idle = now_secs()
-                    .saturating_sub(LAST_ACTIVITY.load(std::sync::atomic::Ordering::Relaxed));
-                if idle > crate::config::KEEPALIVE_WINDOW_SECS {
-                    break; // 静默超窗: 停保活, 回 Notify 睡眠
+/// 候选全被别的 host 认领：调用方稍候重查池（认领者很快落池）；真拨失败不走这个。
+pub const ERR_ALL_CLAIMED: &str = "建连候选全被其他 host 认领";
+
+/// 门房公式：在给定 IP 里按占用率挑最闲的；only_owner = 会话域只认自建通道。
+pub(crate) fn pick(ips: &[String], only_owner: Option<&str>) -> Option<H2Upstream> {
+    let mut g = lock(conn_pool());
+    // 暂缓（低于够用线）的 IP 先不发；全暂缓时 usable 原样返回，不让请求饿死。
+    let usable = pool::speed::usable(ips);
+    // (分数, 是否顶到并发上限, 连接)
+    let mut cands: Vec<(f64, bool, H2Upstream)> = Vec::new();
+    for ip in &usable {
+        let Some(h) = g.get_mut(ip) else { continue };
+        for c in h.iter() {
+            if let Some(owner) = only_owner {
+                if c.up.owner.as_deref() != Some(owner) {
+                    continue;
                 }
-                keepalive_pass().await;
             }
-        }
-    });
-}
-
-async fn keepalive_pass() {
-    let conns: Vec<(String, H2Upstream)> = {
-        let g = lock(conn_pool());
-        g.iter()
-            .flat_map(|(h, hc)| hc.conns.iter().map(move |c| (h.clone(), c.up.clone())))
-            .collect()
-    };
-    for (host, up) in conns {
-        let Some(pp) = up.ping.clone() else { continue };
-        let mut guard = pp.lock().await;
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            guard.ping(h2::Ping::opaque()),
-        )
-        .await;
-        if !matches!(r, Ok(Ok(_))) {
-            drop(guard);
-            drop_h2_id(&host, up.id); // 对端无答/连接已死: 只摘这一条
-        }
-    }
-}
-
-/// 取近况最快的那条，每 8 次放一次轮转做探索。
-pub fn cached_h2(host: &str) -> Option<H2Upstream> {
-    cached_h2_in(host, None)
-}
-
-/// 带槽位过滤取连接：搜索接口只回主通道（会话跨 IP 漂移会被降级成无结果骨架）。
-pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
-    let mut g = lock(conn_pool());
-    let h = g.get_mut(host)?;
-    let n = h.conns.len();
-    if n == 0 {
-        return None;
-    }
-    if let Some(want) = want_slot {
-        // 过滤池:主通道优先,EWMA 最快者胜(样本不足取第一条)。不参与轮转计数。
-        let pick = h
-            .conns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.up.slot == want && c.n >= 3)
-            .min_by(|a, b| a.1.ewma.total_cmp(&b.1.ewma))
-            .map(|(i, _)| i)
-            .or_else(|| h.conns.iter().position(|c| c.up.slot == want));
-        return pick.map(|i| h.conns[i].up.clone());
-    }
-    let mut idx = h.next % n;
-    h.next = idx + 1;
-    if n > 1
-        && !EXPLORE
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .is_multiple_of(8)
-    {
-        if let Some((i, _)) = h
-            .conns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.n >= 3)
-            .min_by(|a, b| a.1.ewma.total_cmp(&b.1.ewma))
-        {
-            idx = i;
-        }
-    }
-    Some(h.conns[idx].up.clone())
-}
-
-/// 借 assets 域现成的伪装连接：h2 按 `:authority` 路由，换名即可取内容域（证书只覆盖 `*.githubassets.com`）。
-/// 只借不建——新建要么真名暴露目标、要么伪装过不了证书校验；优先少在途、再取快者，借出计数由调用方归还。
-pub fn borrow_donor(exclude_host: &str) -> Option<(String, H2Upstream)> {
-    let mut g = lock(conn_pool());
-    let now = Instant::now();
-    let mut pick: Option<(String, u64, (u32, f64))> = None;
-    for (h, hc) in g.iter() {
-        if h.as_str() == exclude_host || !crate::pool::route::is_donor(h) {
-            continue;
-        }
-        for c in &hc.conns {
-            if c.borrow_cool.is_some_and(|t| now < t) {
+            // 溢出临时通道：句柄只归触发者，不外发。
+            if c.up.overflow {
                 continue;
             }
-            let key = (c.borrowed, c.ewma);
-            let better = match &pick {
-                None => true,
-                Some((_, _, k)) => key.0 < k.0 || (key.0 == k.0 && key.1 < k.1),
-            };
-            if better {
-                pick = Some((h.clone(), c.up.id, key));
-            }
+            let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
+            let cap = c.up.max_streams.max(1);
+            let score = channel_score(inflight, cap);
+            cands.push((score, inflight >= cap, c.up.clone()));
         }
     }
-    let (host, id, _) = pick?;
-    let c = g.get_mut(&host)?.conns.iter_mut().find(|c| c.up.id == id)?;
-    c.borrow_cool = None; // 冷却到期：这次选中即复位
-    c.borrowed = c.borrowed.saturating_add(1);
-    Some((host, c.up.clone()))
+    if cands.is_empty() {
+        return None;
+    }
+    // 优先没顶到上限的；全满时才按分数排在队首那条（h2 自己会在服务端配额上排队）。
+    let any_free = cands.iter().any(|c| !c.1);
+    let pick = cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !any_free || !c.1)
+        .min_by(|a, b| a.1.0.total_cmp(&b.1.0))
+        .map_or(0, |(i, _)| i);
+    Some(cands.remove(pick).2)
 }
 
-/// 借出的流走完了（正常或中途被丢弃）：把配额还回去。
-pub fn borrow_done(host: &str, id: u64) {
-    let mut g = lock(conn_pool());
-    if let Some(c) = g
-        .get_mut(host)
-        .and_then(|h| h.conns.iter_mut().find(|c| c.up.id == id))
-    {
-        c.borrowed = c.borrowed.saturating_sub(1);
+/// 门房开流：字节由 hyper 直接在体与 socket 间搬运，本层不加跳；顺带刷新连接空闲期。
+pub async fn stream_on(
+    up: &H2Upstream,
+    out: &Request<BoxBody>,
+    body: &Option<Bytes>,
+    budget: Duration,
+) -> Result<(Response<BoxBody>, u64), String> {
+    let t0 = Instant::now();
+    match tokio::time::timeout(budget, h2_send(up, out, body)).await {
+        Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
+        Err(_) => Err(ERR_BUDGET_TIMEOUT.to_string()),
     }
 }
 
-/// 借失败：归还配额并把**这一条**冷藏 30 秒。同 host 的另一条不动——
-/// 两条通道的意义就在于一条坏了另一条还能顶上。
-pub fn borrow_poison(host: &str, id: u64) {
-    let mut g = lock(conn_pool());
-    if let Some(c) = g
-        .get_mut(host)
-        .and_then(|h| h.conns.iter_mut().find(|c| c.up.id == id))
-    {
-        c.borrowed = c.borrowed.saturating_sub(1);
-        c.borrow_cool = Some(Instant::now() + BORROW_COOL);
-    }
+/// 在给定 IP 集合里取活连接：按占用率挑最闲的那条。
+pub fn cached_h2_in(ips: &[String]) -> Option<H2Upstream> {
+    pick(ips, None)
 }
 
-/// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
-pub fn note_latency(host: &str, id: u64, ms: u64) {
-    let mut g = lock(conn_pool());
-    let Some(h) = g.get_mut(host) else { return };
-    let Some(c) = h.conns.iter_mut().find(|c| c.up.id == id) else {
-        return;
-    };
-    let x = ms as f64;
-    c.ewma = if c.n == 0 { x } else { c.ewma * 0.7 + x * 0.3 };
-    c.n = c.n.saturating_add(1);
+/// 会话域只认自己建的通道；没有就返回 None 让调用方自建——蹭公共通道 = 风控漂移。
+pub fn cached_h2_own(host: &str, ips: &[String]) -> Option<H2Upstream> {
+    pick(ips, Some(host))
 }
 
-pub fn store_h2(host: &str, up: H2Upstream) {
-    let mut g = lock(conn_pool());
-    let h = g.entry(host.to_string()).or_default();
-    h.filling = false;
-    // 同 IP 也允许并存：服务端并发上限是按连接算的，两条同 IP 的 TCP 同样能摊开。
-    if h.conns.len() >= MAX_CONNS_PER_HOST {
-        h.conns.remove(0); // 只留最新的两条，避免旧连接占位
+/// 通道打分（pick 与 channels_for 共用）：占用率最小者胜；调用方须已持 conn_pool 锁，本函数不再查池。
+fn channel_score(inflight: u32, cap: u32) -> f64 {
+    (inflight as f64 + 1.0) / cap as f64
+}
+
+/// 候选内全部可用通道（不含溢出临时通道），按占用率升序。
+pub(crate) fn channels_for(ips: &[String]) -> Vec<H2Upstream> {
+    let g = lock(conn_pool());
+    let usable = pool::speed::usable(ips);
+    let mut cands: Vec<(f64, H2Upstream)> = Vec::new();
+    for ip in &usable {
+        let Some(h) = g.get(ip.as_str()) else { continue };
+        for c in h.iter() {
+            if c.up.overflow {
+                continue;
+            }
+            let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
+            let cap = c.up.max_streams.max(1);
+            cands.push((channel_score(inflight, cap), c.up.clone()));
+        }
     }
-    h.conns.push(ConnSlot {
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cands.into_iter().map(|(_, up)| up).collect()
+}
+
+/// 该 IP 池内现成常编通道（竞速收尾并集排名参赛用）；溢出临时通道不算。
+fn pooled_normal(ip: &str) -> Option<H2Upstream> {
+    let g = lock(conn_pool());
+    g.get(ip)?
+        .iter()
+        .find(|c| !c.up.overflow)
+        .map(|c| c.up.clone())
+}
+
+/// 新连接入库唯一入口：同 IP 只留一条（一 IP 一通道），后到作废返现成的。
+pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
+    let mut g = lock(conn_pool());
+    let h = g.entry(ip.to_string()).or_default();
+    // 同 IP 通道上限恒 1：多通道互抢带宽、摊薄窗口，要多条就换 IP 另起（同 IP 溢出例外）。
+    let cap = 1usize;
+    // 常驻名额按非溢出通道算：溢出是拥挤时的临时工，不占"一 IP 一通道"的名额。
+    let normal_cnt = h.iter().filter(|c| !c.up.overflow).count();
+    if !up.overflow && normal_cnt >= cap {
+        // 满员落选连接当场关闭，调用方拿池里现成那条；不关会让驱动在池外养到对端回收（泄漏）。Notify 许可必达。
+        up.close.notify_one();
+        // 找正编而非列表头：头可能是溢出的，递出去会在途归零即焚，还误罚边冷却。
+        if let Some(c) = h.iter().find(|c| !c.up.overflow) {
+            return c.up.clone();
+        }
+        // 理论不可达（normal_cnt >= cap）：真到了就扶正这条新连接，至少不交溢出临时工。
+        let keep = up.clone();
+        h.push(ConnSlot { up, last_used: now_secs() });
+        return keep;
+    }
+    if up.overflow && h.iter().any(|c| c.up.overflow) {
+        // 每 IP 至多一条溢出：再来的关掉、递回正编；后来的拥挤请求骑溢出排队好过再拨。
+        if let Some(c) = h.iter().find(|c| !c.up.overflow) {
+            up.close.notify_one();
+            return c.up.clone();
+        }
+        // 正编被摘光只剩溢出：扶正新连接、关旧溢出；旧写法递 h[0] 会让请求在途归零即被掐断。
+        for c in h.iter().filter(|c| c.up.overflow) {
+            c.up.close.notify_one();
+        }
+        h.retain(|c| !c.up.overflow);
+        let mut normal = up.clone();
+        normal.overflow = false;
+        let keep = normal.clone();
+        h.push(ConnSlot { up: normal, last_used: now_secs() });
+        return keep;
+    }
+    let keep = up.clone();
+    h.push(ConnSlot {
         up,
-        ewma: 0.0,
-        n: 0,
-        borrowed: 0,
-        borrow_cool: None,
+        last_used: now_secs(),
     });
+    keep
 }
 
 /// 按连接 id 精确摘除：同 IP 两条连接靠 IP 分不开，删错会把健康的摘掉。
-pub fn drop_h2_id(host: &str, id: u64) {
+pub fn drop_h2_id(ip: &str, id: u64) {
     let mut g = lock(conn_pool());
-    let empty = match g.get_mut(host) {
+    match g.get_mut(ip) {
         Some(h) => {
-            if let Some(pos) = h.conns.iter().position(|c| c.up.id == id) {
-                h.conns.remove(pos);
+            if let Some(pos) = h.iter().position(|c| c.up.id == id) {
+                h.remove(pos);
             }
-            h.conns.is_empty()
+            if h.is_empty() {
+                g.remove(ip);
+            }
         }
-        None => false,
-    };
-    if empty {
-        g.remove(host);
+        None => {}
     }
 }
 
 /// 只有 IP 没有句柄时用（gh_defuse 从响应头拿到的是 IP）：查到 id 交 drop_h2_id 摘除。
-pub fn drop_h2(host: &str, ip: &str) {
+pub fn drop_h2(ip: &str) {
     let id = {
         let g = lock(conn_pool());
-        g.get(host)
-            .and_then(|h| h.conns.iter().find(|c| c.up.ip == ip))
-            .map(|c| c.up.id)
+        g.get(ip).and_then(|h| h.first()).map(|c| c.up.id)
     };
     if let Some(id) = id {
-        drop_h2_id(host, id);
+        drop_h2_id(ip, id);
     }
 }
 
-/// 首条建好后后台补第二条（只对高频 host）；skip 池中活连接占用的 IP，游标用副键。
-pub fn maybe_spawn_second(host: &str, log: &LogFn) {
-    if !DUAL_CONN_HOSTS.contains(&host) {
-        return;
-    }
+/// 状态行快照：池内通道按 owner 归组，返回 (host, [(ip, 在途流, 流上限, 空闲秒)])，host 键稳定排序。
+pub(crate) fn channels_snapshot() -> Vec<(String, Vec<(String, u32, u32, u64)>)> {    let mut groups: std::collections::HashMap<String, Vec<(String, u32, u32, u64)>> =
+        std::collections::HashMap::new();
     {
-        let mut g = lock(conn_pool());
-        let Some(h) = g.get_mut(host) else { return };
-        if h.conns.len() >= MAX_CONNS_PER_HOST || h.filling {
-            return;
+        let g = lock(conn_pool());
+        for (ip, h) in g.iter() {
+            for c in h.iter() {
+                let host = c.up.owner.clone().unwrap_or_else(|| ip.clone());
+                let idle = now_secs().saturating_sub(c.last_used);
+                let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
+                groups
+                    .entry(host)
+                    .or_default()
+                    .push((ip.clone(), inflight, c.up.max_streams.max(1), idle));
+            }
         }
-        h.filling = true;
     }
-    let skip = occupied_ips(host);
-    let host = host.to_string();
-    let log = log.clone();
+    let mut out: Vec<(String, Vec<(String, u32, u32, u64)>)> = groups.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// 池中这些 IP 里已有活连接的（拨号 skip 用）——全仓"这个 IP 有没有通道"的唯一口径。
+pub(crate) fn occupied_ips(ips: &[String]) -> Vec<String> {
+    let g = lock(conn_pool());
+    ips.iter()
+        .filter(|ip| g.get(ip.as_str()).is_some_and(|h| !h.is_empty()))
+        .cloned()
+        .collect()
+}
+
+/// 该 IP 当前在池里的通道条数（溢出闸按它判"同 IP 还能不能再开"）。
+pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
+    lock(conn_pool()).get(ip).map(|h| h.len()).unwrap_or(0)
+}
+
+/// 黑洞处置（会话域）用：notify 该 IP 池内首条通道的关闭信号，驱动收到即自摘出池。
+pub(crate) fn cull_channel(ip: &str) {
+    let close = {
+        let g = lock(conn_pool());
+        g.get(ip)
+            .and_then(|h| h.first())
+            .map(|c| c.up.close.clone())
+    };
+    if let Some(c) = close {
+        c.notify_one();
+    }
+}
+
+/// 驱动清扫用：这条连接的 (闲置秒数, 在途流数, 是否溢出临时通道)。不在池里 = (0, 0, false)。
+fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
+    let g = lock(conn_pool());
+    match g.get(ip).and_then(|h| h.iter().find(|c| c.up.id == id)) {
+        Some(c) => (
+            now_secs().saturating_sub(c.last_used),
+            c.up.inflight.load(std::sync::atomic::Ordering::Relaxed),
+            c.up.overflow,
+        ),
+        None => (0, 0, false),
+    }
+}
+
+/// 一条连接 = 一个任务：持续 poll conn（协议硬要求），关闭信号或闲置 10s 即焚；断开日志只给会话域（内容域断连是噪音）。
+struct ConnDriver<T> {
+    ip: String,
+    id: u64,
+    conn: h2::client::Connection<T, Bytes>,
+    session: bool,
+    /// 竞速落败的腿：收到即断开，不必等闲置超时。
+    close: Arc<tokio::sync::Notify>,
+    log: LogFn,
+}
+
+fn spawn_conn_driver<T>(d: ConnDriver<T>)
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let ConnDriver {
+        ip,
+        id,
+        conn,
+        session,
+        close,
+        log,
+    } = d;
     tokio::spawn(async move {
-        match h2_dial_slot(&host, &log, &skip, 2, None).await {
-            Ok(up) => store_h2(&host, up),
-            Err(e) => {
-                (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
-                if let Some(h) = lock(conn_pool()).get_mut(&host) {
-                    h.filling = false;
+        let mut conn = Box::pin(conn);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.tick().await; // interval 首拍立即完成，吞掉
+        let why: &str = 'keep: loop {
+            enum Step {
+                ConnEnd,
+                Close,
+                Sweep,
+            }
+            let step = tokio::select! {
+                _ = &mut conn => Step::ConnEnd,
+                _ = close.notified() => Step::Close,
+                _ = tick.tick() => Step::Sweep,
+            };
+            match step {
+                Step::ConnEnd => break 'keep "对端关闭",
+                Step::Close => break 'keep "主动关闭",
+                Step::Sweep => {
+                    // 用完就丢：溢出在途归零即焚，普通通道闲置 10s 即焚（在途流不为零不算闲置）；重拨是下个请求的事。
+                    let (idle, inflight, overflow) = conn_probe_state(&ip, id);
+                    if overflow && inflight == 0 {
+                        break 'keep "溢出通道用毕回收";
+                    }
+                    if inflight == 0 && idle >= crate::config::CONN_IDLE_RETIRE_SECS {
+                        break 'keep "闲置用毕丢弃";
+                    }
                 }
             }
+        };
+        // 唯一出口：断开/判焚/主动关闭，按 id 自摘（已被摘过则 no-op）。
+        drop_h2_id(&ip, id);
+        if session {
+            // 会话域的断开值得记一行，内容域是噪音。
+            log(&format!("[会话通道] {ip}#{id} 断开出池({why}), 下次会话请求重拨"));
         }
     });
 }
+
 pub async fn h2_from_dialed(
     host: &str,
     conn_io: Dialed,
     ip: &str,
-    form: &str,
-    slot: u8,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
     // h2 默认窗口 64KB 会把单页 129 并发压成按 RTT 串行（实测 FCP 34s），放大为流 1MB/连接 4MB。
@@ -324,7 +404,7 @@ pub async fn h2_from_dialed(
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
                                                           // h2 握手必须限时：对端 TLS 通了之后装死会永久持有 per-host 拨号锁，拖死整个域名。
-    let (send, mut conn) = tokio::time::timeout(
+    let (send, conn) = tokio::time::timeout(
         std::time::Duration::from_secs(crate::config::H2_HANDSHAKE_TIMEOUT_SECS),
         cb.handshake(conn_io),
     )
@@ -336,130 +416,330 @@ pub async fn h2_from_dialed(
         )
     })?
     .map_err(|e| format!("h2 握手失败: {e}"))?;
-    let ping = conn
-        .ping_pong()
-        .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
-    tokio::spawn(async move {
-        let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
+    let session = host_class(host) == HostClass::Session;
+    // 流上限照服务端 SETTINGS 下发值用；不设上限时 h2 回 u32::MAX，钳到 100 免得评分永远显得最闲。
+    let max_streams = conn.max_concurrent_send_streams().max(1).min(100) as u32;
+    // id 建连时就定下：驱动任务带着它，连接一断就能精确摘自己那一条。
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let close = Arc::new(tokio::sync::Notify::new());
+    // 从此这条连接归它自己的任务管：驱动帧收发、闲置焚毁、断开自摘。
+    spawn_conn_driver(ConnDriver {
+        ip: ip.to_string(),
+        id,
+        conn,
+        session,
+        close: close.clone(),
+        log: log.clone(),
     });
-    // 第二通道在行尾标出;主通道与单发保持原样,免日志噪音。
-    let chan = if slot > 1 {
-        format!(", 通道{slot}")
-    } else {
-        String::new()
-    };
-    (log)(&format!(
-        "[上游] {host} <- {ip} (boring {form} SNI, h2 握手{chan})"
-    ));
     Ok(H2Upstream {
         ip: ip.to_string(),
-        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        slot,
+        id,
+        owner: Some(host.to_string()),
+        max_streams,
+        inflight: Arc::new(AtomicU32::new(0)),
+        overflow: false,
+        close,
         send,
-        ping,
     })
 }
-/// 池中该 host 活连接占用的 IP(供拨号 skip:两条通道不落同一地址)。
-fn occupied_ips(host: &str) -> Vec<String> {
-    lock(conn_pool())
-        .get(host)
-        .map(|h| h.conns.iter().map(|c| c.up.ip.clone()).collect())
-        .unwrap_or_default()
-}
 
-/// 单通道拨号：串发选 IP → boring 握手 → h2；白名单域名的 sni 由 dial_one 强制真名分片。
-async fn h2_dial_slot(
+/// 单通道拨号：串发选 IP → boring 握手（SNI 骗墙，证书按锚点校验）→ h2。
+pub(crate) async fn h2_dial(
     host: &str,
     log: &LogFn,
     skip_ips: &[String],
-    slot: u8,
-    crew: Option<&pool::DialCrew>,
 ) -> Result<H2Upstream, String> {
-    let (conn_io, ip, shape) = pool::serial_dial_skip(
+    let t_dial = std::time::Instant::now();
+    let (conn_io, ip, sni) = pool::serial_dial_skip(
         pool::DialSkip {
             host,
             tls_handshake: true,
             skip_ips,
-            tunnel: false,
-            slot,
-            crew,
         },
         Some(log),
     )
     .await
     .map_err(|e| e.to_string())?;
-    let form = if crate::pool::route::is_real(host) {
-        "真名(分片)"
-    } else if shape.is_empty() {
+    let dial_ms = t_dial.elapsed().as_millis();
+    // 实测建连用时进排序表（内存态），慢 IP 沉底；撞 GFW 抖动时游标挪窝，别让上次成功黏住一页请求。
+    pool::route::note_latency(&ip, dial_ms as u64);
+    if dial_ms as u64 >= DIAL_SLOW_MS {
+        pool::cursor_note(host, &ip, false);
+    }
+    let form = if sni.is_empty() {
         "无"
-    } else if shape == host {
+    } else if sni == host {
         "真名"
     } else {
         "伪装"
     };
-    h2_from_dialed(host, conn_io, &ip, form, slot, log).await
+    let t_h2 = std::time::Instant::now();
+    // h2 谈不成（TCP+TLS 过、SETTINGS 不回）也算这个 IP 建不成通道，进全局死亡退避，别重复付 5s。
+    let up = h2_from_dialed(host, conn_io, &ip, log)
+        .await
+        .map_err(|e| {
+            pool::note_dead(&ip);
+            e
+        })?;
+    let h2_ms = t_h2.elapsed().as_millis();
+    // 顺序不能反：先让池里出现这 IP 唯一连接，调用方拿到的就是池里那条；若别人已建好，丢弃自己拨的。
+    let up = store_h2(&ip, up);
+    // 分段计时落一行：慢在拨号(TCP+TLS)还是 h2 握手，一眼可辨。
+    (log)(&format!(
+        "[上游] {host} <- {ip} ({form}SNI 直连, h2, 拨{dial_ms}ms+握手{h2_ms}ms)"
+    ));
+    Ok(up)
 }
 
-/// 双通道冷启动并行竞速：各领各的游标、跳过对方正在试的 IP，先成者服务、晚成者入库。
-async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
-    let crew = pool::DialCrew::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
-    (log)(&format!("[建连] {host} 冷启动竞速发射"));
-    for slot in [1u8, 2] {
-        let tx = tx.clone();
-        let host = host.to_string();
-        let log = log.clone();
-        let crew = crew.clone();
+/// 单通道原因：会话域/大文件是规则，候选不足是没得选——日志要能看懂。
+fn single_channel_reason(class: HostClass, free: usize) -> String {
+    match class {
+        HostClass::Session => "会话域固定同一 IP, 不开第二条(防风控)".to_string(),
+        HostClass::Other => "大文件/文档站: 单通道".to_string(),
+        HostClass::Content => format!("可用候选仅 {free} 家, 不够开第二条"),
+    }
+}
+
+/// 竞速腿带实测 dial_ms；池内现成通道也参赛（pooled=true、耗时读延迟表），交付时不再入库。
+#[derive(Clone)]
+pub(crate) struct RaceLeg {
+    pub ip: String,
+    pub dial_ms: u64,
+    up: H2Upstream,
+    pooled: bool,
+}
+
+/// 竞速排名按拨号耗时升序：通道即用即建几乎全新，拨号快慢是唯一速度先验；传输快慢由真实请求记账兜底。
+pub(crate) fn rank_legs(mut legs: Vec<RaceLeg>) -> Vec<RaceLeg> {
+    legs.sort_by_key(|l| l.dial_ms);
+    legs
+}
+
+/// 内容域竞速：全部候选 IP 一 IP 一腿并发拨，取最快一条入池，其余当场关闭。
+const RACE_WINDOW_SECS: u64 = 8;
+
+async fn race_build(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
+    let cands = pool::dial_candidates(host);
+    if cands.len() < 2 {
+        // 候选不足两条没法赛：退回单腿串发（跟旧路径一致）。
+        return h2_dial(host, log, &[]).await;
+    }
+    (log)(&format!("[建连] {host} {} 路竞速(错峰 50ms)", cands.len()));
+    // 参赛名单快照：收尾并集排名按它认领池内现成通道。
+    let raced: Vec<String> = cands.iter().map(|t| t.ip.clone()).collect();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RaceLeg, String>>(cands.len());
+    for (li, node) in cands.into_iter().enumerate() {
+        let host2 = host.to_string();
+        let log2 = log.clone();
+        let tx2 = tx.clone();
         tokio::spawn(async move {
-            match h2_dial_slot(&host, &log, &[], slot, Some(&crew)).await {
-                Ok(up) => {
-                    store_h2(&host, up.clone());
-                    let _ = tx.send(Ok(up)).await;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await; // 红字由收尾统一接管,不逐任务刷
-                }
+            // 错峰起跑 50ms：12 条腿同时砸新连接会让 Fastly 首请求排队（实测 12 路全零字节）。
+            tokio::time::sleep(Duration::from_millis(li as u64 * 50)).await;
+            // 全局认领：同 IP 别的腿正在拨 → 本腿不出场（不发消息 = attempted 不计）。
+            if !pool::claim_dial(&node.ip) {
+                return;
             }
+            let t0 = Instant::now();
+            let conn = match pool::dial::dial_one(&node.ip, &node.sni, &node.verify, true).await {
+                Ok(c) => c,
+                Err(e) => {
+                    pool::release_dial(&node.ip);
+                    let _ = tx2.send(Err(format!("{} 拨号失败({e})", node.ip))).await;
+                    return;
+                }
+            };
+            let dial_ms = t0.elapsed().as_millis() as u64;
+            pool::route::note_latency(&node.ip, dial_ms);
+            let up = match h2_from_dialed(&host2, conn, &node.ip, &log2).await {
+                Ok(u) => u,
+                Err(e) => {
+                    pool::release_dial(&node.ip);
+                    pool::note_dead(&node.ip);
+                    let _ = tx2.send(Err(format!("{} h2 失败({e})", node.ip))).await;
+                    return;
+                }
+            };
+            // 拨完即释放认领：入库/关闭由收尾裁决，重复入库有 store_h2 兜底。
+            pool::release_dial(&node.ip);
+            let _ = tx2
+                .send(Ok(RaceLeg {
+                    ip: node.ip.clone(),
+                    dial_ms,
+                    up,
+                    pooled: false,
+                }))
+                .await;
         });
     }
     drop(tx);
-    // 等第一个成功;两个全败则整组失败
+    // 收腿：窗口到就用手上的排名，不等磨蹭的腿。每条消息 = 一次真实尝试。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(RACE_WINDOW_SECS);
+    let mut got: Vec<RaceLeg> = Vec::new();
     let mut last: Option<String> = None;
-    let won = loop {
-        match rx.recv().await {
-            Some(Ok(up)) => break up,
-            Some(Err(e)) => last = Some(e),
-            None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
+    let mut attempted = 0usize;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Ok(leg))) => {
+                attempted += 1;
+                got.push(leg);
+            }
+            Ok(Some(Err(e))) => {
+                attempted += 1;
+                last = Some(e);
+            }
+            Ok(None) => break,
+            Err(_) => break,
         }
-    };
-    // 收尾移交后台：晚成者建成入库，失败走补建入口；竞速败者的空试不逐条刷红。
-    let host = host.to_string();
-    let log = log.clone();
+    }
+    // 并集排名：池内现成通道也参赛，耗时读延迟表；同 IP 以自己的腿为准；全败/全被认领时它是救援。
+    for ip in &raced {
+        if got.iter().any(|l| &l.ip == ip) {
+            continue;
+        }
+        if let Some(up) = pooled_normal(ip) {
+            let ms = { let v = pool::route::latency_of(ip); if v == 0 { u64::MAX } else { v } };
+            got.push(RaceLeg {
+                ip: ip.clone(),
+                dial_ms: ms,
+                up,
+                pooled: true,
+            });
+        }
+    }
+    if got.is_empty() {
+        if attempted == 0 {
+            // 一条都没轮到拨 = 候选全被其他 host 认领：哨兵让调用方稍候重查池。
+            return Err(ERR_ALL_CLAIMED.to_string());
+        }
+        // 真失败（腿拨了但全败）：照旧报错，冷却表已记账。
+        return Err(last.unwrap_or_else(|| format!("{host} 竞速全败")));
+    }
+    // 迟到腿：后台收尸——已建成但没被选中的连接必须关，否则会在池外白养到闲置超时。
     tokio::spawn(async move {
         while let Some(r) = rx.recv().await {
-            match r {
-                // 晚成者已在它自己的拨号任务里入过库（见上面 store_h2）：
-                // 这里再存一次会变成两条同 id 的槽位，把真正的另一条挤掉。
-                Ok(_) => {}
-                Err(_) => maybe_spawn_second(&host, &log),
+            if let Ok(leg) = r {
+                leg.up.close.notify_one();
             }
         }
     });
+    let mut ranked = rank_legs(got);
+    // 按拨号耗时取最快一条，落败腿关闭；传输快慢由真实请求与黑洞看门狗兜底。
+    let keep = ranked.len().min(1);
+    let winners: Vec<RaceLeg> = ranked.drain(..keep).collect();
+    // 落败腿：自己的主动关闭不入池；池内的本来就在池里，不动。
+    for leg in ranked {
+        if !leg.pooled {
+            leg.up.close.notify_one();
+        }
+    }
+    // 先留排名摘要：入池后 leg 被拆开，日志还要说清谁快、谁是从池里捡的。
+    let summary: Vec<String> = winners
+        .iter()
+        .map(|l| {
+            if l.pooled {
+                format!("池·{}({}ms)", l.ip, l.dial_ms)
+            } else {
+                format!("{}(拨{}ms)", l.ip, l.dial_ms)
+            }
+        })
+        .collect();
+    let mut kept: Vec<H2Upstream> = Vec::new();
+    for leg in winners.into_iter() {
+        if leg.pooled {
+            // 别人家的现成通道：已在池里，直接交付，不重复入库。
+            kept.push(leg.up);
+        } else {
+            kept.push(store_h2(&leg.ip, leg.up));
+        }
+    }
+    (log)(&format!(
+        "[建连] {host} 竞速取最速: {}",
+        summary.join(" / ")
+    ));
+    Ok(kept.remove(0))
+}
+
+/// 串发建连（会话域/低频域恒单腿单通道）：全局认领保证同 IP 同时只一条腿；只建新的不查池。
+async fn dial_h2_race(
+    host: &str,
+    log: &LogFn,
+    occupied: &[String],
+) -> Result<H2Upstream, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
+    let targets = pool::route::dial_targets(host).unwrap_or_default();
+    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    let distinct = ips.len();
+    // 会话域跳过已有通道的 IP；内容域/其他不管——store_h2 按类处置。
+    let session = host_class(host) == HostClass::Session;
+    let free = if session {
+        distinct.saturating_sub(occupied.len())
+    } else {
+        distinct
+    };
+    if free == 0 {
+        // 会话域候选全被占：重拨必被 store_h2 作废，立即交兜底。
+        return Err(format!("{host} 候选均已有通道, 请重查连接池"));
+    }
+    // 单腿串发：候选按游标+延迟序逐个试。
+    tokio::spawn({
+        let host = host.to_string();
+        let log2 = log.clone();
+        let skip = occupied.to_vec();
+        async move {
+            let r = h2_dial(&host, &log2, &skip).await;
+            let _ = tx.send(r).await;
+        }
+    });
+    (log)(&format!(
+        "[建连] {host} 单通道({})",
+        single_channel_reason(host_class(host), free)
+    ));
+    // 等串发结果用绝对硬窗（同 BUILD_WAIT_SECS）：recv 无界等会既不返回也不兜底；串发独立跑，超窗只影响这条请求。
+    let dl = tokio::time::Instant::now() + Duration::from_secs(pool::BUILD_WAIT_SECS);
+    let mut last: Option<String> = None;
+    let won = loop {
+        match tokio::time::timeout_at(dl, rx.recv()).await {
+            Err(_) => {
+                return Err(format!("串发建连硬窗({}s)耗尽, 走兜底", pool::BUILD_WAIT_SECS))
+            }
+            Ok(Some(Ok(up))) => break up,
+            Ok(Some(Err(e))) => last = Some(e),
+            Ok(None) => return Err(last.unwrap_or_else(|| "串发建连全败".into())),
+        }
+    };
+    // 晚成腿已自入库，不等不补——重建是下一个请求自己的事。
+    drop(rx);
     Ok(won)
 }
 
-/// 建连统一入口：双通道高频站池空走竞速，其余单发（单发也跳过池中占用的 IP）。
-pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool), String> {
-    if DUAL_CONN_HOSTS.contains(&host) && occupied_ips(host).is_empty() {
-        let up = dial_h2_race(host, log).await?;
-        return Ok((up, false)); // 竞速任务内部已入库
+/// 建连统一入口：双腿各拨各的新连接；串发全灭冷却中快速失败，调用方走兜底。
+pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
+    if pool::SERIAL_COOL.open(host) {
+        return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
     }
-    let skip = occupied_ips(host);
-    let up = h2_dial_slot(host, log, &skip, 1, None).await?;
-    Ok((up, true)) // 尚不在池中,发送成功后由调用方入库
+    let targets =
+        pool::route::dial_targets(host).ok_or_else(|| format!("域名不在路由表({host})"))?;
+    if targets.is_empty() {
+        return Err(format!("{host} 候选 IP 全部在边冷却中, 走 fallback"));
+    }
+    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    // 会话域跳过已有通道的 IP；内容域/其他传空让串发试全部候选。
+    let occupied = if host_class(host) == HostClass::Session {
+        occupied_ips(&ips)
+    } else {
+        Vec::new()
+    };
+    // 内容域：多路竞速 + 首包排名，只留最快一条入池。
+    if host_class(host) == HostClass::Content {
+        return race_build(host, log).await;
+    }
+    dial_h2_race(host, log, &occupied).await
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;
+
+/// 镜像/后台拉取恒定浏览器 UA（CF 系镜像拦非浏览器 UA）；全仓唯一一份，防版本漂移。
+pub const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// hop-by-hop 头（RFC 7230 §6.1）；mirror_request 与 h2_request_head 单点共用。
 pub fn is_hop_by_hop(name: &str) -> bool {
@@ -469,7 +749,22 @@ pub fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+/// 纯 CDN 域剥掉 Cookie/Authorization（会话痕迹别落到 CDN 边缘）；只圈纯静态两家，githubusercontent 家族靠 Cookie 鉴权私有内容，不剥。
+pub fn strip_credentials(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "githubassets.com"
+        || h.ends_with(".githubassets.com")
+        || h == "github.io"
+        || h.ends_with(".github.io")
+}
+
 fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, String> {
+    // :authority 是真实目标域名（伪装只发生在 TLS 握手的 SNI 上），按它判要不要剥凭据。
+    let strip = out
+        .uri()
+        .authority()
+        .map(|a| strip_credentials(a.host()))
+        .unwrap_or(false);
     let mut builder = hyper::Request::builder()
         .method(out.method())
         .uri(out.uri());
@@ -478,17 +773,43 @@ fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, 
         if is_hop_by_hop(&low) {
             continue;
         }
+        if strip && matches!(low.as_str(), "cookie" | "authorization") {
+            continue;
+        }
         builder = builder.header(k, v);
     }
     builder.body(()).map_err(|e| e.to_string())
 }
+/// 在途计数凭据：建流 +1，体读完或客户端丢弃 body 时 -1；跟 body 生命周期走，异常取消不漏归还。
+pub struct StreamGuard {
+    inflight: Arc<AtomicU32>,
+}
+
+impl StreamGuard {
+    fn new(inflight: Arc<AtomicU32>) -> Self {
+        inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { inflight }
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// h2 响应头 future → Response；体逐块即时放窗（不 release 会死锁）。
 pub async fn h2_recv_response(
     resp_fut: h2::client::ResponseFuture,
+    guard: StreamGuard,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let resp = resp_fut.await.map_err(|e| format!("h2 响应: {e}"))?;
     let (parts, mut recv) = resp.into_parts();
-    let body_stream = futures_util::stream::poll_fn(move |cx| match recv.poll_data(cx) {
+    let body_stream = futures_util::stream::poll_fn(move |cx| {
+        // guard 跟着这条 body 一起活；body 被读完或丢弃时才归还并发槽位。
+        let _keep = &guard;
+        match recv.poll_data(cx) {
         std::task::Poll::Ready(Some(Ok(chunk))) => {
             let _ = recv.flow_control().release_capacity(chunk.len());
             std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
@@ -498,6 +819,7 @@ pub async fn h2_recv_response(
         }
         std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
         std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     });
     Ok(hyper::Response::from_parts(
         parts,
@@ -509,11 +831,30 @@ pub async fn h2_open_stream(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
     eos: bool,
-) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), String> {
+) -> Result<
+    (
+        h2::client::ResponseFuture,
+        h2::SendStream<Bytes>,
+        StreamGuard,
+    ),
+    String,
+> {
+    // 每次开流刷新这条连接自己的空闲期：闲置焚毁计时按它算。
+    {
+        let mut g = lock(conn_pool());
+        if let Some(h) = g.get_mut(&up.ip) {
+            if let Some(c) = h.iter_mut().find(|c| c.up.id == up.id) {
+                c.last_used = now_secs();
+            }
+        }
+    }
     let mut send = up.send.clone();
     send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
-    send.send_request(h2_request_head(out)?, eos)
-        .map_err(|e| format!("h2 发送: {e}"))
+    let (fut, stream) = send
+        .send_request(h2_request_head(out)?, eos)
+        .map_err(|e| format!("h2 发送: {e}"))?;
+    // 流真正建出来才计入在途；ready() 之前卡住的配额等待不该占槽位。
+    Ok((fut, stream, StreamGuard::new(up.inflight.clone())))
 }
 
 pub async fn h2_send(
@@ -522,13 +863,13 @@ pub async fn h2_send(
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let has_body = body.as_ref().is_some_and(|b| !b.is_empty());
-    let (resp_fut, mut send_stream) = h2_open_stream(up, out, !has_body).await?;
+    let (resp_fut, mut send_stream, guard) = h2_open_stream(up, out, !has_body).await?;
     if has_body {
         send_stream
             .send_data(body.as_ref().unwrap().clone(), true)
             .map_err(|e| format!("h2 请求体: {e}"))?;
     }
-    h2_recv_response(resp_fut).await
+    h2_recv_response(resp_fut, guard).await
 }
 /// 请求体泵：按对端窗口分片发送，客户端断开时弃流不补 EOS；句柄供失败路径 abort。
 pub fn h2_spawn_pump(
@@ -543,7 +884,7 @@ pub fn h2_spawn_pump(
                 Some(Ok(f)) => f,
                 Some(Err(e)) => {
                     (log)(&format!(
-                        "[上游] 请求体泵: 客户端体读取失败(已发 {sent}B), 弃流不补 EOS: {e}"
+                        "[上游] 请求体转发中止(已发 {sent}B): 客户端读取失败 {e}"
                     ));
                     return;
                 }
@@ -560,37 +901,27 @@ pub fn h2_spawn_pump(
                         let piece = chunk.split_to(n.min(chunk.len()));
                         sent += piece.len() as u64;
                         if let Err(e) = send.send_data(piece, false) {
-                            (log)(&format!("[上游] 请求体泵中止(已发 {sent}B): {e}"));
+                            (log)(&format!("[上游] 请求体转发中止(已发 {sent}B): {e}"));
                             return;
                         }
                     }
                     Some(Ok(_)) => {} // 授予 0：继续等下次窗口唤醒
                     Some(Err(e)) => {
-                        (log)(&format!("[上游] 请求体泵窗口错误(已发 {sent}B): {e}"));
+                        (log)(&format!(
+                            "[上游] 请求体转发流控窗口错误(已发 {sent}B): {e}"
+                        ));
                         return;
                     }
                     None => {
-                        (log)(&format!("[上游] 请求体泵: 上游重置流(已发 {sent}B)"));
+                        (log)(&format!("[上游] 请求体转发: 上游重置流(已发 {sent}B)"));
                         return;
                     }
                 }
             }
         }
         let _ = send.send_data(Bytes::new(), true); // 干净收尾: EOS
-        (log)(&format!("[上游] 请求体泵完成: {sent}B"));
+        (log)(&format!("[上游] 请求体转发完成: {sent}B"));
     })
-}
-/// 每 host 拨号单飞闸：并发未命中只放一个进串发拨号（无闸时一波 27 条全新拨号，握手风暴触发边缘限流）。
-static HOST_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    std::sync::OnceLock::new();
-pub fn host_dial_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
-    HOST_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .entry(host.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 #[derive(Clone)]
 pub struct MirrorConnector {
@@ -626,6 +957,8 @@ static MIRROR_CLIENT: std::sync::OnceLock<LegacyClient<MirrorConnector, BoxBody>
     std::sync::OnceLock::new();
 
 /// 镜像腿共享客户端（进程内单例）；首次调用者的 log 被永久持有。
+/// ALPN 协商出 h2 时 legacy 客户端自动切 h2 驱动（认 Connected 的 negotiated_h2，无需 http2(true)），
+/// 一条连接多路复用，拨号风暴（一流一连接）随之消失。
 pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxBody> {
     MIRROR_CLIENT.get_or_init(|| {
         let mut b = LegacyClient::builder(TokioExecutor::new());
@@ -638,8 +971,8 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
     })
 }
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
-/// 客户端是否接受 gzip：强制压缩与缓存分桶的唯一判定，两处各写一份必有一边漏改。
-pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
+/// 客户端是否接受指定压缩编码：裸 token = 默认接受；q=0/0.0/0.000 = 明确拒绝。
+fn accepts_token<B>(req: &hyper::Request<B>, token: &str) -> bool {
     let Some(v) = req
         .headers()
         .get("accept-encoding")
@@ -654,14 +987,14 @@ pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
             .to_ascii_lowercase();
-        let Some(rest) = item.strip_prefix("gzip") else {
+        let Some(rest) = item.strip_prefix(token) else {
             continue;
         };
         if rest.is_empty() {
-            return true; // 裸 "gzip" = 默认接受
+            return true; // 裸 token = 默认接受
         }
         let Some(params) = rest.strip_prefix(';') else {
-            continue; // "gzipx" 之类前缀误中，跳过
+            continue; // 前缀误中（"gzipx" 之于 "gzip"），跳过
         };
         for kv in params.split(';') {
             if let Some(q) = kv.strip_prefix("q=") {
@@ -672,12 +1005,33 @@ pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
                 return !zero;
             }
         }
-        return true; // 有 gzip 无 q 参数 = 接受
+        return true; // 有 token 无 q 参数 = 接受
     }
     false
 }
 
-/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host 强制 gzip。
+/// 客户端是否接受 gzip：缓存分桶与强制压缩的判定之一。
+pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
+    accepts_token(req, "gzip")
+}
+
+/// 客户端是否接受 br（Brotli）：比 gzip 再小 16%（实测 2.87MB→2.41MB）。
+pub fn accepts_brotli<B>(req: &hyper::Request<B>) -> bool {
+    accepts_token(req, "br")
+}
+
+/// 编码档：br 优先、gzip 兜底、都没有 identity；上游强制编码与缓存解析必须同源。
+pub fn encoding_bucket<B>(req: &hyper::Request<B>) -> &'static str {
+    if accepts_brotli(req) {
+        "br"
+    } else if accepts_gzip(req) {
+        "gzip"
+    } else {
+        "identity"
+    }
+}
+
+/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host 强制压缩协商。
 pub fn upstream_request<B>(
     req: &hyper::Request<B>,
     host: &str,
@@ -692,7 +1046,7 @@ pub fn upstream_request<B>(
         .parse()
         .map_err(|_| format!("非法上游 URI: {host}{path}"))?;
     let mut out = hyper::Request::builder().method(method).uri(uri);
-    // github.com/api 强制 gzip（大页面裸传是进页面慢的主因），边收边解压，原始压缩帧照转。
+    // github.com/api 强制压缩：边收边解压、原始压缩帧照转，defuse 与缓存门检按响应编码解码。
     let sniffed = host == "github.com" || host == "api.github.com";
     for (k, v) in req.headers() {
         let low = k.as_str().to_lowercase();
@@ -704,9 +1058,20 @@ pub fn upstream_request<B>(
         }
         out = out.header(k, v);
     }
-    // 只在客户端声明接受 gzip 时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
-    if sniffed && accepts_gzip(req) {
-        out = out.header("accept-encoding", "gzip");
+    // 只在客户端声明接受时才强制（curl/git 无解压能力）；v6.10 改双档 br,gzip，单发 br 时服务器只能回 identity 裸奔 320KB。
+    if sniffed {
+        let forced = if accepts_brotli(req) && accepts_gzip(req) {
+            Some("br, gzip")
+        } else if accepts_brotli(req) {
+            Some("br")
+        } else if accepts_gzip(req) {
+            Some("gzip")
+        } else {
+            None
+        };
+        if let Some(enc) = forced {
+            out = out.header("accept-encoding", enc);
+        }
     }
     out.body(empty_body()).map_err(|e| e.to_string())
 }
@@ -729,3 +1094,4 @@ mod conn_slot_tests;
 #[cfg(test)]
 #[path = "../tests/server/upstream.rs"]
 mod tests;
+ 

@@ -16,23 +16,46 @@ fn should_backup_foreign_pac_shapes() {
     assert!(!should_backup_foreign("", pac, ""));
 }
 
+/// git 键的三态动作：我们写的才清/还原，别家或空一律不动。
+#[test]
+fn git_key_action_only_touches_ours() {
+    let ours = "http://127.0.0.1:7810";
+    // 我们写的 + 没备份 → 清除
+    assert!(matches!(
+        git_key_action(Some(ours), ours, ""),
+        GitKeyAction::Unset
+    ));
+    // 我们写的 + 有备份 → 还原原值
+    assert!(matches!(
+        git_key_action(Some(ours), ours, "http://127.0.0.1:9999"),
+        GitKeyAction::Restore(v) if v == "http://127.0.0.1:9999"
+    ));
+    // 别家的 → 不动
+    assert!(matches!(
+        git_key_action(Some("http://127.0.0.1:9999"), ours, ""),
+        GitKeyAction::Keep
+    ));
+    // 没设 → 不动
+    assert!(matches!(git_key_action(None, ours, ""), GitKeyAction::Keep));
+}
+
 /// 清场只认 last_pac：运行期间别家接管了 PAC（同形态），不许当自己的删掉。
 #[test]
 fn clear_only_exact_last_pac() {
     let ours = "http://127.0.0.1:7811/proxy.pac";
-    assert!(is_our_current_pac(ours, ours));
+    assert!(pac_is_ours(ours, ours));
     assert!(
-        !is_our_current_pac("http://127.0.0.1:7890/proxy.pac", ours),
+        !pac_is_ours("http://127.0.0.1:7890/proxy.pac", ours),
         "别家同形态不算我们的，退出时不许动"
     );
     // 我们换过端口：上次写的那个仍是我们的
-    assert!(is_our_current_pac(
+    assert!(pac_is_ours(
         "http://127.0.0.1:9999/proxy.pac",
         "http://127.0.0.1:9999/proxy.pac"
     ));
     // 旧配置没有 last_pac：退回形状判定，老版本残留仍可清
-    assert!(is_our_current_pac(ours, ""));
-    assert!(!is_our_current_pac("http://corp.example/pac.js", ""));
+    assert!(pac_is_ours(ours, ""));
+    assert!(!pac_is_ours("http://corp.example/pac.js", ""));
 }
 
 /// 备份还原：别家同形态的备份必须还回去，只有"恰是我们写过的"才丢弃。
@@ -40,14 +63,14 @@ fn clear_only_exact_last_pac() {
 fn restore_keeps_foreign_same_shape_backup() {
     let last = "http://127.0.0.1:7811/proxy.pac";
     assert!(
-        !backup_is_ours("http://127.0.0.1:7890/proxy.pac", last),
+        !pac_is_ours("http://127.0.0.1:7890/proxy.pac", last),
         "同形态的别家备份必须还原，按形状丢掉等于备份白做"
     );
-    assert!(!backup_is_ours("http://corp.example/pac.js", last));
-    assert!(backup_is_ours(last, last), "上次写的自己不该还原(死 PAC)");
+    assert!(!pac_is_ours("http://corp.example/pac.js", last));
+    assert!(pac_is_ours(last, last), "上次写的自己不该还原(死 PAC)");
     // 旧配置：形状判定兜底，防把我们的旧地址写回系统
-    assert!(backup_is_ours(last, ""));
-    assert!(!backup_is_ours("http://corp.example/pac.js", ""));
+    assert!(pac_is_ours(last, ""));
+    assert!(!pac_is_ours("http://corp.example/pac.js", ""));
 }
 
 /// 自愈门: 开关关 + 无备份 = 我们从没摸过系统 PAC——形态再像也是别人的。
@@ -101,7 +124,7 @@ fn last_ip_preserved_before_routes_load() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     // 明确装一张空表 = "路由还没装载"，免得别的用例先装好了。
-    crate::pool::route::install(Vec::new());
+    crate::pool::route::install(Vec::new(), Vec::new());
     let v = parse(
         r#"{"closeToTray":true,"mitm":true,"winRect":[0,0,800,600],"githubPAC":true,
                 "lastIp":{"edge/content":"185.199.110.133","core/all":"20.27.177.114"}}"#,
@@ -137,7 +160,7 @@ fn last_ip_canonicalizes_once_routes_are_loaded() {
     crate::pool::install_seed_routes();
     let v = parse(r#"{"lastIp":{"core/all":"1.1.1.1","stale/key":"9.9.9.9"}}"#);
     let marks = v.last_ip.marks().to_vec();
-    let expect = crate::pool::circle_keys();
+    let expect = crate::pool::route::cursor_keys();
     assert_eq!(marks.len(), expect.len(), "应铺满路由键位");
     assert_eq!(marks[0].0, expect[0]);
     assert!(
@@ -158,7 +181,7 @@ fn save_emits_full_schema_in_canonical_order() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     crate::pool::install_seed_routes();
-    let keys = crate::pool::circle_keys();
+    let keys = crate::pool::route::cursor_keys();
     let first = keys[0].clone();
     let f = SettingsFile {
         close_to_tray: true,
@@ -166,12 +189,14 @@ fn save_emits_full_schema_in_canonical_order() {
         win_rect: [1, 2, 3, 4],
         github_pac: false,
         proxy_backup: String::new(),
+        git_proxy_backup: String::new(),
         last_pac: String::new(),
         last_ip: LastIpTable::from_marks(vec![(first.clone(), "140.82.114.6".to_string())]),
         worker_mirrors: vec![WorkerMirror {
             url: "https://my.worker".to_string(),
             on: true,
-            trusted: false,
+            template: String::new(),
+            invalid: false,
         }],
     };
     let json = serde_json::to_string_pretty(&f).unwrap();
@@ -196,7 +221,7 @@ fn single_bad_field_does_not_wipe_file() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    crate::pool::route::install(Vec::new());
+    crate::pool::route::install(Vec::new(), Vec::new());
     // winRect 写坏：只回退该字段，开关与游标照读。
     let v = parse(
         r#"{"closeToTray":true,"mitm":true,"winRect":"oops","lastIp":{"edge/io":"1.1.1.1"}}"#,
@@ -232,4 +257,66 @@ fn worker_mirrors_roundtrip() {
     let v3 = parse(r#"{"workerMirrors":"oops","mitm":true}"#);
     assert!(v3.worker_mirrors.is_empty());
     assert!(v3.mitm);
+}
+
+/// 手写注册表的常见写法都要认：只写 URL、snake_case 键名、省略 on、忘了数组括号。
+#[test]
+fn worker_mirrors_accepts_handwritten_forms() {
+    let v = parse(r#"{"workerMirrors":["https://only-url.example"]}"#);
+    assert_eq!(v.worker_mirrors.len(), 1);
+    assert_eq!(v.worker_mirrors[0].url, "https://only-url.example");
+    assert!(v.worker_mirrors[0].on, "只写 URL 应默认启用");
+
+    let v = parse(r#"{"worker_mirrors":["https://snake.example"]}"#);
+    assert_eq!(
+        v.worker_mirrors.first().map(|m| m.url.as_str()),
+        Some("https://snake.example"),
+        "snake_case 键名也要认"
+    );
+
+    let v = parse(r#"{"workerMirrors":[{"url":"https://no-on.example"}]}"#);
+    assert!(v.worker_mirrors[0].on, "手写省略 on 应默认启用");
+
+    let v = parse(r#"{"workerMirrors":"https://one.example"}"#);
+    assert_eq!(v.worker_mirrors.len(), 1, "单条忘了数组括号也收");
+
+    let v = parse(r#"{"workerMirrors":123,"mitm":true}"#);
+    assert!(v.worker_mirrors.is_empty(), "类型不对只丢这一段");
+    assert!(v.mitm);
+}
+
+/// 坏 JSON 里字符串值自包含：语法坏的是别的字段，gitProxyBackup 要原样捞回；夹具用 serde_json::to_string 生成，与真实落盘一致。
+#[test]
+fn salvage_recovers_git_proxy_backup_from_broken_json() {
+    let sep = char::from_u32(1).unwrap();
+    let backup = format!("http://corp-proxy:8080{sep}http://corp2:3128");
+    let escaped = serde_json::to_string(&backup).unwrap();
+    let raw = format!(
+        r#"{{"closeToTray":true, "winRect": [1, 2, "坏" 3], "gitProxyBackup": {escaped}}}"#
+    );
+    assert_eq!(
+        super::salvage_str_field(&raw, "gitProxyBackup").as_deref(),
+        Some(backup.as_str()),
+        "键序在后/转义分隔符都要能捞"
+    );
+    assert_eq!(
+        super::salvage_str_field(r#"{"git_proxy_backup":"http://snake:1"}"#, "git_proxy_backup")
+            .as_deref(),
+        Some("http://snake:1"),
+        "snake_case 兼容写法也认"
+    );
+}
+
+/// 值本身被语法错误截断 / 缺引号 / 缺字段：捞不回就 None，绝不编造。
+#[test]
+fn salvage_gives_up_on_truncated_or_missing_value() {
+    assert_eq!(
+        super::salvage_str_field(r#"{"gitProxyBackup":"http://trunc"#, "gitProxyBackup"),
+        None
+    );
+    assert_eq!(
+        super::salvage_str_field(r#"{"gitProxyBackup":null}"#, "gitProxyBackup"),
+        None
+    );
+    assert_eq!(super::salvage_str_field(r#"{"mitm":true}"#, "gitProxyBackup"), None);
 }

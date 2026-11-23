@@ -57,9 +57,9 @@
     <nav class="nav">
       <div class="nav-group">监控</div>
       <a href="#overview" class="item" data-view="overview">概览</a>
-      <a href="#logs"     class="item" data-view="logs">运行日志</a>
+      <a href="#logs"     class="item" data-view="logs">日志</a>
       <div class="nav-group">控制</div>
-      <a href="#mirrors"  class="item" data-view="mirrors">自定义镜像</a>
+      <a href="#mirrors"  class="item" data-view="mirrors">镜像</a>
       <a href="#settings" class="item" data-view="settings">设置</a>
     </nav>
 
@@ -76,7 +76,6 @@
     <header class="topbar">
       <div class="top-txt">
         <h1 id="pageTitle">概览</h1>
-        <p class="top-sub" id="pageSub">代理状态与 GitHub 连通性一览</p>
       </div>
     </header>
 
@@ -88,7 +87,7 @@
           <div class="addr-row" onclick="copyText(document.getElementById('addr').textContent)" title="点击复制">
             <code class="addr" id="addr">127.0.0.1:7810</code>
           </div>
-          <span class="hint">浏览器扩展(SwitchyOmega 等)/ git / 命令行把代理指向这里</span>
+          <span class="hint">浏览器 / git 的代理地址</span>
         </div>
 
         <div class="grid3">
@@ -107,9 +106,9 @@
           <div class="statcard">
             <span class="label">串发候选</span>
             <span class="value"><span id="sPoolCount">0</span> 条</span>
-            <span class="meta">按表逐个重试 · 通者置顶</span>
           </div>
         </div>
+
       </section>
 
       <!-- 自定义镜像 -->
@@ -121,7 +120,7 @@
         </div>
 
         <div class="panel">
-          <h2>Cloudflare Worker 部署教程（约 3 分钟，全程免费）</h2>
+          <h2>CF Worker 部署</h2>
           <pre id="workercode" class="code">export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -137,25 +136,107 @@
     headers.delete("cdn-loop"); headers.delete("x-forwarded-for");
     headers.delete("x-forwarded-proto"); headers.delete("x-real-ip");
     const target = new URL(rest);
-    // GET/HEAD 无 Range 且无凭据才走 CF 边缘缓存（带凭据的绝不入缓存也不读——私有响应以公共 URL 为键会被任何人取走/污染）；带 Range 的下载直通（缓存副本无法 206 切片）。
+    const method = request.method;
+    // GET/HEAD 且无凭据、非 git 协议才进边缘缓存（带凭据的绝不入缓存也不读——私有响应以公共 URL 为键会被任何人取走/污染）。
     const hasCreds = request.headers.has("authorization") || request.headers.has("cookie");
-    const cacheable = !hasCreds && (request.method === "GET" || request.method === "HEAD")
-      && !request.headers.get("range");
+    // git 智能协议不进边缘缓存：info/refs 广告含过期时间戳，缓存会给 clone 喂旧货；packfile POST 本就不缓存。
+    const isGit = (target.pathname.endsWith("/info/refs") && target.searchParams.get("service") === "git-upload-pack")
+      || (method === "POST" && /\/git-(upload|receive)-pack$/.test(target.pathname));
+    const cacheable = !isGit && !hasCreds && (method === "GET" || method === "HEAD");
+    // 单区间 Range 解析：bytes=start-end / bytes=start-；多区间、后缀式、非 bytes 单位 → null（按直通回源走，不入缓存）。
+    const rm = cacheable && method === "GET" ? /^bytes=(\d+)-(\d*)$/.exec((request.headers.get("range") || "").trim()) : null;
+    const range = rm ? { start: Number(rm[1]), end: rm[2] === "" ? null : Number(rm[2]) } : null;
+
     if (cacheable) {
-      const cached = await caches.default.match(request.method + " " + target.toString());
-      if (cached) return cached;
+      // 缓存键必须是合法 URL："GET https://..." 这种方法前缀串会让 match 抛 TypeError → 整个请求 500。
+      let cached = null;
+      try { cached = await caches.default.match(target.toString()); } catch (e) {}
+      if (cached) {
+        if (range) return sliceResponse(cached, range, method === "HEAD");
+        return cached;
+      }
     }
-    const upstream = await fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
-    if (cacheable && upstream.ok && upstream.status === 200) {
-      // put 对 206/304/Vary:* 会 reject, 限 200 且 catch 掉防未处理拒绝刷屏。
+    // 未命中：Range 请求向上游拉【完整文件】（剥掉 Range 头）——整文件 tee 进边缘缓存，
+    // 客户端要的那一片从这份流里跳偏移吐 206。此后每一片、每一次续传、每一个用户全部命中边缘，不再回源。
+    const fullFetch = cacheable && range !== null;
+    const upHeaders = new Headers(headers);
+    if (fullFetch) upHeaders.delete("range");
+    const upstream = await fetch(target, { method, headers: upHeaders, body: request.body, redirect: "follow" });
+    if (cacheable && method === "GET" && upstream.ok && upstream.status === 200) {
+      // put 对 206/304/Vary:* 会 reject；这里上游恒 200（Range 已剥），catch 掉防未处理拒绝刷屏。
       ctx.waitUntil(
-        caches.default.put(request.method + " " + target.toString(), upstream.clone())
+        caches.default.put(target.toString(), upstream.clone())
           .catch(() => {})
       );
     }
+    if (fullFetch && upstream.ok && upstream.status === 200) {
+      return sliceResponse(upstream, range, method === "HEAD");
+    }
     return upstream;
   }
-}</pre>
+}
+
+// 单区间 Range 解析：bytes=start-end / bytes=start-；多区间、后缀式、非 bytes 单位 → null（按直通回源走，不入缓存）。
+function parseRange(hdr) {
+  if (!hdr) return null;
+  const m = /^bytes=(\d+)-(\d*)$/.exec(hdr.trim());
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = m[2] === "" ? null : Number(m[2]);
+  if (end !== null && end &lt; start) return null;
+  return { start, end };
+}
+
+// 从【完整文件】流里跳到 start、吐到 end（闭区间），输出 206 流。跳过用流式丢弃，内存恒定；到末端即 cancel 上游，不再白拉。
+function sliceBody(reader, start, end) {
+  let skipped = 0;
+  let sent = 0;
+  const want = end === null ? null : end - start + 1;
+  return new ReadableStream({
+    async pull(controller) {
+      if (want !== null && sent &gt;= want) {
+        controller.close();
+        try { await reader.cancel(); } catch (e) {}
+        return;
+      }
+      const { value, done } = await reader.read();
+      if (done) { controller.close(); return; }
+      let chunk = value;
+      if (skipped &lt; start) {
+        const skip = Math.min(start - skipped, chunk.byteLength);
+        skipped += skip;
+        chunk = chunk.subarray(skip);
+        if (chunk.byteLength === 0) return;
+      }
+      if (want !== null && sent + chunk.byteLength &gt; want) {
+        chunk = chunk.subarray(0, want - sent);
+      }
+      sent += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      try { reader.cancel(); } catch (e) {}
+    }
+  });
+}
+
+// 206 切片响应：命中缓存从缓存副本切，未命中从整文件上游流切；HEAD 只回头。
+function sliceResponse(full, range, headOnly) {
+  const cl = Number(full.headers.get("content-length") || 0) || null;
+  const start = range.start;
+  let end = range.end;
+  if (end === null && cl !== null) end = cl - 1;
+  if (cl !== null && start &gt;= cl) {
+    return new Response(null, { status: 416, headers: { "content-range": `bytes */${cl}` } });
+  }
+  const h = new Headers(full.headers);
+  h.set("content-range", `bytes ${start}-${end ?? ""}/${cl ?? "*"}`);
+  if (end !== null) h.set("content-length", String(end - start + 1));
+  else h.delete("content-length");
+  if (headOnly || !full.body) return new Response(null, { status: 206, headers: h });
+  return new Response(sliceBody(full.body.getReader(), start, end), { status: 206, headers: h });
+}
+</pre>
           <div class="row">
             <button class="btn sm" onclick="copyText(document.getElementById('workercode').textContent)">复制 Worker 代码</button>
           <div class="guide-step"><img src="/guide/step1.jpg" alt="创建应用程序" loading="lazy"></div>
@@ -166,11 +247,11 @@
 
           </div>
           <p class="hint" style="margin-top:6px;line-height:1.9">
-            ① Cloudflare 控制台 → Workers & Pages → Create → 选「Hello World」模板 → 起名并 Deploy；<br>
-            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy（已内置 CF 边缘缓存 + 凭据防护；2026-10-29 前部署的老代码请重新粘贴覆盖一次）；<br>
-            ③ 回到概览页，你的 Worker 地址 = <code>https://名字.你的子域.workers.dev</code>；<br>
-            ④ 把地址粘贴到上方「我的镜像」→ 点「启动」。之后「启动/关闭」只增删 routes.json 链成员，地址注册表原位保留；<br>
-            ⑤ 建议绑定自有域名（Worker 设置 → 域和路由），抗 workers.dev 域名干扰；GitHub 看到的将全是 Cloudflare 的 IP。
+            ① Cloudflare 建一个 Hello World Worker<br>
+            ② 贴入上方代码并 Deploy<br>
+            ③ 地址 = <code>https://名字.子域.workers.dev</code><br>
+            ④ 粘进「我的镜像」<br>
+            ⑤ 可绑定自有域名
           </p>
         </div>
       </section>
@@ -180,44 +261,43 @@
         <div class="panel">
           <div class="set-row">
             <div class="set-info">
-              <h2>开机自启动</h2>
-              <p>登录 Windows 后自动启动，驻留托盘</p>
+              <h2>开机自启</h2>
+              <p>登录后自动启动</p>
             </div>
             <label class="switch"><input type="checkbox" id="swAutostart"><span class="track"></span></label>
           </div>
           <div class="set-row">
             <div class="set-info">
-              <h2>关闭窗口时缩到系统托盘</h2>
-              <p>点 ✕ 只隐藏窗口，代理继续运行；托盘左键显示、右键退出</p>
+              <h2>缩到托盘</h2>
+              <p>✕ 仅隐藏窗口</p>
             </div>
             <label class="switch"><input type="checkbox" id="swTray"><span class="track"></span></label>
           </div>
         </div>
         <div class="panel">
-          <p class="hint" style="margin:0 0 6px">开启且代理运行时，以 PAC 接管系统代理：仅 GitHub 系走本代理，其余直连；退出或停代理时自动还原。</p>
           <div class="set-row">
             <div class="set-info">
-              <h2>GitHub 分流接管</h2>
-              <p>GitHub 系站点自动走本代理，无需插件</p>
+              <h2>分流接管</h2>
+              <p>仅 GitHub 系走代理</p>
             </div>
             <label class="switch"><input type="checkbox" id="swGh" checked><span class="track"></span></label>
           </div>
         </div>
         <div class="feature-card">
           <div class="feature-info">
-            <h2>MITM 模式</h2>
-            <p class="hint" style="margin-top:5px">启用伪装 SNI、拦截页化解与流式直通；首次开启需安装本地证书</p>
+            <h2>MITM</h2>
+            <p class="hint" style="margin-top:5px">需安装本地证书</p>
           </div>
           <button class="btn primary" id="mitmBtn">开启</button>
         </div>
         <div class="feature-card">
           <div class="feature-info">
-            <h2>镜像链校准</h2>
-            <p class="hint" style="margin-top:5px">按实测响应头耗时重排图片链顺序，后台任务（关窗进托盘也会跑完，结果见「运行日志」）。<br>• <strong>图片链</strong>：响应头测速，约 1 分钟<br>• <strong>大文件链</strong>：无需校准，代理按实时下载速度自动分流到最快镜像</p>
+            <h2>图片链校准</h2>
+            <p class="hint" style="margin-top:5px">测各镜像响应头耗时，结果见日志</p>
             <pre id="calResult"></pre>
           </div>
           <div class="cal-actions">
-            <button class="btn primary" id="calImgBtn">校准图片链（响应头）</button>
+            <button class="btn primary" id="calImgBtn">校准</button>
           </div>
         </div>
 
@@ -230,7 +310,7 @@
           <label class="check"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
           <div class="row head-row">
             <button class="btn sm" onclick="copyText(document.getElementById('logsBox').textContent)">复制全部</button>
-            <button class="btn sm" onclick="document.getElementById('logsBox').textContent=''">清空</button>
+            <button class="btn sm" onclick="clearLogs()">清空</button>
           </div>
         </div>
         <div id="logsBox"></div>

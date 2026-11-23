@@ -22,12 +22,26 @@ fn split_target_parses_and_defaults() {
     );
 }
 
-/// 明文 HTTP 分发：与头同包到达的请求体必须原样续传（曾把体当头转发、真体丢失）；127.0.0.1 非池域名走系统直连腿，恰好落在本进程起的假上游上，全程无外网。
+/// 明文 HTTP 分发：与头同包到达的请求体必须原样续传（曾把体当头转发致真体丢失）；受管域名+种子表走假上游，非受管目标被开放代理闸 502。
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn plain_http_post_body_forwarded_intact() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // 自建路由表：github.com → 127.0.0.1（串发池 tls_handshake=false 纯 TCP，拨号端口指假上游）；种子表是真 GitHub IP 拨不进本进程。
+    let dir = std::env::temp_dir().join(format!("gitport_srv_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{"ips":[{"ip":"127.0.0.1","sni":"a.example","hosts":["github.com"]}], "hosts": {}}"#,
+    )
+    .unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
     // 假上游：读满 头 + Content-Length 体，校验体原样、头无混入，然后回 200。
     let up_ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up_port = up_ln.local_addr().unwrap().port();
+    crate::pool::dial::set_dial_port(up_port);
     let up_task = tokio::spawn(async move {
         let (mut sock, _) = up_ln.accept().await.unwrap();
         let mut raw: Vec<u8> = Vec::new();
@@ -90,9 +104,9 @@ async fn plain_http_post_body_forwarded_intact() {
     let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .unwrap();
-    // 一次 write：头与体同包到达（当年被吞的形态）；明文代理用绝对 URI，并带 Connection/Keep-Alive 供假上游断言逐跳头被剥除。
+    // 一次 write：头体同包（当年被吞的形态）；明文代理用绝对 URI，并带 Connection/Keep-Alive 供假上游断言逐跳头被剥。目标受管域+443 进串发池。
     let req = format!(
-        "POST http://127.0.0.1:{up_port}/x HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello"
+        "POST http://github.com:443/x HTTP/1.1\r\nHost: github.com\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello"
     );
     cli.write_all(req.as_bytes()).await.unwrap();
 
@@ -109,9 +123,236 @@ async fn plain_http_post_body_forwarded_intact() {
     }
     assert!(resp.starts_with(b"HTTP/1.1 200 OK"));
 
+    crate::pool::dial::set_dial_port(0); // 复位，别影响别的测试
     up_task.await.unwrap();
     ctx.cancel();
     let _ = serve_task.await;
+}
+
+/// 开放代理闸：非受管目标一律 502——防借本机代理扫内网、读云元数据、摸自家管理端口。
+#[tokio::test]
+async fn unmanaged_targets_are_rejected() {
+    let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = ln.local_addr().unwrap().port();
+    // 日志要留底：拨不通时删闸也回 502（TCP 层失败同款），只有非受管域名拒绝日志能区分被闸拦还是拨不通。
+    let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+    let srv = Arc::new(ProxyServer {
+        log,
+        authority: None,
+    });
+    let ctx = CancellationToken::new();
+    let serve_task = tokio::spawn(serve(srv, ln, ctx.clone()));
+
+    let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .unwrap();
+    // CONNECT 到云元数据地址：不得建隧道。
+    cli.write_all(b"CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut chunk = [0u8; 1024];
+        let n = tokio::time::timeout_at(deadline, cli.read(&mut chunk))
+            .await
+            .expect("读超时: 闸未回包")
+            .unwrap();
+        assert!(n > 0, "连接被静默关闭");
+        resp.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        resp.starts_with(b"HTTP/1.1 502"),
+        "非受管 CONNECT 应 502: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        !resp
+            .windows(b"200 Connection".len())
+            .any(|w| w == b"200 Connection"),
+        "不得回隧道建立成功: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("非受管域名")),
+        "闸必须留下「非受管域名」拒绝日志——is_managed 闸被删时这里要红"
+    );
+
+    // 明文 HTTP 打内网地址：同样 502。
+    let mut cli2 = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .unwrap();
+    cli2.write_all(b"GET http://10.0.0.5:8080/ HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp2: Vec<u8> = Vec::new();
+    while !resp2.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut chunk = [0u8; 1024];
+        let n = tokio::time::timeout_at(deadline, cli2.read(&mut chunk))
+            .await
+            .expect("读超时: 明文闸未回包")
+            .unwrap();
+        assert!(n > 0, "连接被静默关闭");
+        resp2.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        resp2.starts_with(b"HTTP/1.1 502"),
+        "非受管明文目标应 502: {}",
+        String::from_utf8_lossy(&resp2)
+    );
+
+    ctx.cancel();
+    let _ = serve_task.await;
+}
+
+/// 兜底腿地址保险：hosts 劫持把受管域名指进环回/私网/链路本地时必须拒拨。
+#[test]
+fn bogon_filter_blocks_loopback_and_private_ranges() {
+    let p = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    for bad in [
+        "127.0.0.1",
+        "10.0.0.5",
+        "172.16.0.9",
+        "192.168.1.1",
+        "169.254.169.254",
+        "0.0.0.0",
+        "255.255.255.255",
+        "::1",
+        "fe80::1",
+        "fd00::9",
+        "ff02::1",
+    ] {
+        assert!(super::bogon_addr(p(bad)), "{bad} 必须判为保留地址");
+    }
+    // v4-mapped 的内网地址折回 v4 判，不能因为"是 v6 形状"漏过
+    assert!(super::bogon_addr(p("::ffff:127.0.0.1")));
+    assert!(super::bogon_addr(p("::ffff:10.0.0.5")));
+    for ok in ["140.82.121.3", "185.199.110.133", "2606:50c0:8000::153"] {
+        assert!(!super::bogon_addr(p(ok)), "{ok} 是合法 GitHub 边缘地址");
+    }
+}
+
+/// 地址保险补段：CGNAT / 0/8 / 组播 / 240/4 / IETF 保留段 / 内嵌 v4 的 v6；只靠 is_private() 会漏企业/运营商内网段。
+#[test]
+fn bogon_filter_blocks_cgnat_and_reserved_ranges() {
+    let p = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    for bad in [
+        "100.64.0.1",
+        "100.127.255.254", // 100.64.0.0/10 CGNAT
+        "0.0.0.1",
+        "224.0.0.1",
+        "239.255.255.255",
+        "240.0.0.1",
+        "192.0.0.1",
+        "192.88.99.1",
+        "198.18.0.1",
+        "198.19.255.1",
+        "::7f00:1",                    // IPv4-compatible 内嵌 127.0.0.1
+        "2002:0a00:0001::1",           // 6to4 内嵌 10.0.0.1
+        "2001:0:808:808:0:0:80ff:fffe", // Teredo 客户端内嵌 127.0.0.1
+    ] {
+        assert!(super::bogon_addr(p(bad)), "{bad} 必须判为内网/保留地址");
+    }
+    for ok in [
+        "8.8.8.8",
+        "140.82.121.3",
+        "185.199.110.133",
+        "2606:50c0:8000::153",
+    ] {
+        assert!(!super::bogon_addr(p(ok)), "{ok} 是合法公网地址");
+    }
+}
+
+/// 非受管域名的 443 不再一刀切：走到系统 DNS 兜底腿后由地址保险拒拨本机；删掉 && port != 443 会退回闸处拒绝日志，删掉 bogon 过滤会连上本机。
+#[tokio::test]
+async fn unmanaged_443_reaches_dns_fallback_and_bogon() {
+    let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let proxy_port = ln.local_addr().unwrap().port();
+    let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+    let srv = Arc::new(ProxyServer {
+        log,
+        authority: None,
+    });
+    let ctx = CancellationToken::new();
+    let serve_task = tokio::spawn(serve(srv, ln, ctx.clone()));
+
+    let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .unwrap();
+    cli.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut chunk = [0u8; 1024];
+        let n = tokio::time::timeout_at(deadline, cli.read(&mut chunk))
+            .await
+            .expect("读超时: 兜底腿未回包")
+            .unwrap();
+        assert!(n > 0, "连接被静默关闭");
+        resp.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        resp.starts_with(b"HTTP/1.1 502"),
+        "本机 443 必须被地址保险拒拨: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    let snapshot = logs.lock().unwrap().clone();
+    assert!(
+        !snapshot.iter().any(|m| m.contains("非受管域名且非 443")),
+        "443 不该被闸拦(放行条件被删?): {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .any(|m| m.contains("解析到内网/保留地址")),
+        "必须留下地址保险的拒绝原因(bogon 过滤被删?): {snapshot:?}"
+    );
+    ctx.cancel();
+    let _ = serve_task.await;
+}
+
+/// 首字节判死后两路一起收：只 shutdown 写半部时客户端不关自己写半部会让 join! 永远 pending，task+TCP+fd 永久挂着。
+#[tokio::test]
+async fn first_byte_timeout_closes_both_directions() {
+    let (mut client, mut relay_a) = tokio::io::duplex(4096);
+    let (mut relay_b, upstream) = tokio::io::duplex(4096);
+    // 客户端发一点数据后故意不关写半部；上游侧也保持连接但不发任何字节。
+    let holder = tokio::spawn(async move {
+        client.write_all(b"hello").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let hold_upstream = tokio::spawn(async move {
+        let _keep = upstream;
+        std::future::pending::<()>().await;
+    });
+    let (sent, recv) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        bidir_copy(
+            &mut relay_a,
+            &mut relay_b,
+            Some(std::time::Duration::from_millis(120)),
+            false,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("首字节超时后 bidir_copy 必须返回，不能等另一路 EOF");
+    assert_eq!(sent, 5, "客户端那 5 字节应在判死前转发出去");
+    assert_eq!(recv, 0, "上游一个字节都没发");
+    holder.abort();
+    hold_upstream.abort();
 }
 
 /// 明文 HTTP 分块体：识别出来就走 501，不把块长度行当正文喂给上游。
@@ -196,7 +437,14 @@ async fn tunnel_hello_split_relays_all_bytes() {
         })
     };
     let copier = tokio::spawn(async move {
-        copy_with_first_byte_timeout(&mut relay_in, &mut relay_out, None, true).await
+        copy_with_first_byte_timeout(
+            &mut relay_in,
+            &mut relay_out,
+            None,
+            true,
+            CancellationToken::new(),
+        )
+        .await
     });
 
     writer.await.unwrap();

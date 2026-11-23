@@ -56,6 +56,13 @@ impl Logger {
             now_str(format_description!("[hour]:[minute]:[second]")),
             msg
         );
+        // 启动打点不进 WebUI 环形缓冲，但写 .cache/tray.log 留取证，headless 下仍回显 stdout。
+        if msg.starts_with("[启动]") {
+            tray_log(&line);            if self.inner.lock().unwrap().echo_stdout {
+                println!("{line}");
+            }
+            return;
+        }
         let echo = {
             let mut g = self.inner.lock().unwrap();
             g.seq += 1;
@@ -75,6 +82,11 @@ impl Logger {
         }
     }
 
+    /// seq 不清零：按旧 after 查询的增量客户端只会得到空增量，不会把日志序搅乱。
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().buf.clear();
+    }
+
     pub fn since(&self, after: u64) -> (Vec<(u64, String)>, u64) {
         let g = self.inner.lock().unwrap();
         let out = g
@@ -85,6 +97,19 @@ impl Logger {
             .collect();
         (out, g.seq)
     }
+}
+
+/// 启动打点/托盘失败共用落点：只落本地文件，不占 WebUI 日志流；一份文件不新增垃圾。
+pub(crate) fn tray_log(line: &str) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(".cache/tray.log")
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{line}");
 }
 
 /// 崩溃取证落点：未装（headless 以外的早期阶段）时静默丢弃。

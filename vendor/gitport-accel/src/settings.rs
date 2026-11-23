@@ -25,19 +25,51 @@ struct SettingsState {
     proxy_backup: Mutex<String>,
     // 我们最后一次成功写进系统的 PAC URL：接管时区分"自己的残留"与别家同形态
     last_pac: Mutex<String>,
+    // git 代理原值备份（http/https 两段，U+0001 分隔；空段 = 原本没设）：覆盖前抓一把，关闭/退出/自愈时还回去。
+    git_proxy_backup: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
     // 自定义镜像注册表：settings.json 永久记录；启停只改镜像链成员，不动注册表。
     worker_mirrors: Mutex<Vec<WorkerMirror>>,
 }
 
-/// 一条自定义镜像：url 为反代地址，on 为是否进链，trusted 表示用户授权把签名 URL 交给它。
+/// 自定义镜像：url 反代地址、on 是否进链；template = 用法模板（占位符见 mirror.rs），添加时探测试出并保存，空 = 前缀拼接。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct WorkerMirror {
     pub url: String,
+    /// 手写一条镜像时的默认意图就是"用它"：不写 on 视为启用，别让人写半天结果是关的。
+    #[serde(default = "on_by_default")]
     pub on: bool,
-    pub trusted: bool,
+    #[serde(default)]
+    pub template: String,
+    /// 用法试探没过：标红给用户看，且不进镜像链（试探是 best-effort，不删条目）。
+    #[serde(default)]
+    pub invalid: bool,
+}
+
+fn on_by_default() -> bool {
+    true
+}
+
+/// 首启内置 6 家镜像：2026-11-14 全测 29 家（5 种用法、双轮计时），1 家全模板超时剔除；2026-11-19 实测 2 家拒 Range（回 302/301 非 206，切片段必失败），剔除；下载按实测吞吐选家、失败顺延，删掉后不再出现。
+fn default_worker_mirrors() -> Vec<WorkerMirror> {
+    [
+        "https://gh-proxy.org",       // 788ms
+        "https://gh-proxy.com",       // 822ms
+        "https://ghgo.de5.net",       // 950ms
+        "https://gh.meali.top",       // 1011ms
+        "https://gh.dpik.top",        // 1064ms
+        "https://ghproxy.icu",        // 1070ms
+    ]
+    .iter()
+    .map(|u| WorkerMirror {
+        url: u.to_string(),
+        on: true,
+        template: String::new(), // 前缀型用法不需要模板
+        invalid: false,
+    })
+    .collect()
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
@@ -51,8 +83,9 @@ fn state() -> &'static SettingsState {
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
         last_pac: Mutex::new(String::new()),
+        git_proxy_backup: Mutex::new(String::new()),
         last_ip: Mutex::new(LastIpTable::default()),
-        worker_mirrors: Mutex::new(Vec::new()),
+        worker_mirrors: Mutex::new(default_worker_mirrors()),
     })
 }
 
@@ -80,15 +113,12 @@ pub fn github_pac() -> bool {
 }
 
 pub fn set_github_pac(on: bool) -> Result<(), String> {
-    state()
-        .github_pac
-        .store(on, std::sync::atomic::Ordering::Relaxed);
-    save()
+    set_flag(&state().github_pac, on)
 }
 
 // 只动 WinINET 的 AutoConfigURL：接管前备份，还原时恢复；ProxyServer/ProxyEnable 永不触碰。
 
-pub fn pac_url() -> String {
+fn pac_url() -> String {
     format!("http://127.0.0.1:{}/proxy.pac", crate::config::webui_port())
 }
 
@@ -111,7 +141,7 @@ fn mirror_auto_config_url(value: Option<&str>) {
             let _ = key.set_value("AutoConfigURL", &v);
         }
         None => {
-            mirror_auto_config_url(None);
+            let _ = key.delete_value("AutoConfigURL");
         }
     }
 }
@@ -122,28 +152,21 @@ fn get_auto_config_url(key: &RegKey) -> String {
 }
 
 /// 是否本程序设置的 PAC：任何 `127.0.0.1:端口/proxy.pac` 形态都算，端口无关。
-pub fn is_our_pac(cur: &str) -> bool {
-    let cur = cur.trim();
-    let Some(rest) = cur
+fn is_our_pac(cur: &str) -> bool {
+    let rest = cur
+        .trim()
         .strip_prefix("http://")
-        .or_else(|| cur.strip_prefix("https://"))
-    else {
+        .or_else(|| cur.trim().strip_prefix("https://"));
+    let Some((hostport, path)) = rest.and_then(|r| r.split_once('/')) else {
         return false;
     };
-    let Some(idx) = rest.find('/') else {
-        return false;
-    };
-    let hostport = &rest[..idx];
     let Some((host, port)) = hostport.rsplit_once(':') else {
         return false; // 必须带端口
     };
-    if host != "127.0.0.1" {
-        return false;
-    }
-    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    &rest[idx..] == "/proxy.pac"
+    host == "127.0.0.1"
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+        && path == "proxy.pac"
 }
 
 /// 接管时该备份的：非空、不是正要写的、也不是上次自己写的，其余都算用户配置。
@@ -152,22 +175,13 @@ fn should_backup_foreign(cur: &str, pac: &str, last_pac: &str) -> bool {
     !cur.is_empty() && cur != pac.trim() && cur != last_pac.trim()
 }
 
-/// 系统里的 PAC 是不是自己写的：last_pac 非空按确切字符串比，为空（升级前）退回形状判定一次。
-fn is_our_current_pac(cur: &str, last_pac: &str) -> bool {
+/// PAC 是否自家写入：last_pac 非空按确切字符串比，空（升级前）退回形状判定一次。
+fn pac_is_ours(x: &str, last_pac: &str) -> bool {
     let last = last_pac.trim();
     if last.is_empty() {
-        return is_our_pac(cur);
+        return is_our_pac(x);
     }
-    cur.trim() == last
-}
-
-/// 备份值是不是自己写过的残留；是则不还原，免得把死 PAC 写回系统。
-fn backup_is_ours(backup: &str, last_pac: &str) -> bool {
-    let last = last_pac.trim();
-    if last.is_empty() {
-        return is_our_pac(backup);
-    }
-    backup.trim() == last
+    x.trim() == last
 }
 
 /// 广播代理设置变更（WinINET 已装即链上 wininet.dll，无需动态解析）。
@@ -283,20 +297,24 @@ pub fn ensure_system_proxy() -> Result<String, String> {
         mirror_auto_config_url(Some(&pac));
         *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
         refresh_wininet();
-        let _ = save();
-        return Ok(note);
+        let git_note = ensure_git_proxy();
+        save_logged();
+        return Ok(format!("{note}; {git_note}"));
     }
     clear_if_ours(&key, &cur);
-    Ok("未开启分流, 已还原".to_string())
+    let git_note = remove_git_proxy();
+    Ok(format!("未开启分流, 已还原; {git_note}"))
 }
 
-/// 还原系统代理：只动我们上次写进去的那条 PAC（last_pac 精确比较），别家的不碰。
-pub fn remove_system_proxy() {
+/// 还原系统代理：只动上次写进去的那条 PAC（last_pac 精确比较），别家不碰；git 全局代理同款。
+pub fn remove_system_proxy() -> String {
+    let git_note = remove_git_proxy();
     let Ok(key) = internet_settings_key() else {
-        return;
+        return git_note;
     };
     let cur = get_auto_config_url(&key);
     clear_if_ours(&key, &cur);
+    git_note
 }
 
 fn restore_or_clear(key: &RegKey) {
@@ -304,7 +322,7 @@ fn restore_or_clear(key: &RegKey) {
     let last = state().last_pac.lock().unwrap().clone();
     let keep_manual = manual_proxy_active(key);
     // 只排除 last_pac（自己写过），其余备份一律还原；按形状丢等于备份白做。
-    if !backup.is_empty() && !backup_is_ours(&backup, &last) {
+    if !backup.is_empty() && !pac_is_ours(&backup, &last) {
         // 用户原本就用自动配置脚本：连标志位一起还原，别只留个字符串
         let _ = apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&backup));
         mirror_auto_config_url(Some(&backup));
@@ -321,7 +339,7 @@ fn restore_or_clear(key: &RegKey) {
     *state().proxy_backup.lock().unwrap() = String::new();
     *state().last_pac.lock().unwrap() = String::new();
     refresh_wininet();
-    let _ = save();
+    save_logged();
 }
 
 /// 系统当前是否有生效的手动代理（ProxyEnable=1 且 ProxyServer 非空），还原时决定要不要保留。
@@ -336,7 +354,7 @@ fn manual_proxy_active(key: &RegKey) -> bool {
 /// 确实是上次我们写进去的那条 PAC 才还原（别的工具中途接管了就不碰）。
 fn clear_if_ours(key: &RegKey, cur: &str) {
     let last = state().last_pac.lock().unwrap().clone();
-    if !is_our_current_pac(cur, &last) {
+    if !pac_is_ours(cur, &last) {
         return;
     }
     restore_or_clear(key);
@@ -365,16 +383,18 @@ pub fn set_window_rect(l: i32, t: i32, w: i32, h: i32) -> Result<(), String> {
     save()
 }
 
-pub fn set_close_to_tray(on: bool) -> Result<(), String> {
-    state()
-        .close_to_tray
-        .store(on, std::sync::atomic::Ordering::Relaxed);
+/// 布尔开关统一写法：存一次（Relaxed）+ 落盘（set_github_pac/set_close_to_tray/set_mitm 共用）。
+fn set_flag(flag: &std::sync::atomic::AtomicBool, on: bool) -> Result<(), String> {
+    flag.store(on, std::sync::atomic::Ordering::Relaxed);
     save()
 }
 
+pub fn set_close_to_tray(on: bool) -> Result<(), String> {
+    set_flag(&state().close_to_tray, on)
+}
+
 pub fn set_mitm(on: bool) -> Result<(), String> {
-    state().mitm.store(on, std::sync::atomic::Ordering::Relaxed);
-    save()
+    set_flag(&state().mitm, on)
 }
 
 /// 串发游标表：键位与顺序恒为路由表全量，空值=未驻留；读兼容数组/对象，写只写对象。
@@ -382,9 +402,9 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 struct LastIpTable(Vec<(String, String)>);
 
 impl LastIpTable {
-    /// 按规范键序成表；路由表未装载时原样保留，否则会丢光上次游标。
+    /// 按规范键序成表；路由表未装载时原样保留，否则丢光上次游标；表外旧键（含 _vice/~2）丢弃。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
-        let keys = crate::pool::circle_keys();
+        let keys = crate::pool::route::cursor_keys();
         if keys.is_empty() {
             return LastIpTable(marks.into_iter().collect());
         }
@@ -448,6 +468,55 @@ where
     Ok(T::deserialize(raw).unwrap_or_default())
 }
 
+/// 镜像注册表容错：字符串、对象、数组都认，只写 URL 默认启用；整段写坏只丢这一段。单值/数组用 untagged 枚举收。
+fn lenient_mirrors<'de, D>(d: D) -> Result<Vec<WorkerMirror>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum One {
+        Url(String),
+        Full(WorkerMirror),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Many(Vec<One>),
+        One(One),
+    }
+    let list: Vec<One> = match OneOrMany::deserialize(d) {
+        Ok(OneOrMany::Many(l)) => l,
+        Ok(OneOrMany::One(one)) => vec![one],
+        Err(_) => Vec::new(),
+    };
+    Ok(list
+        .into_iter()
+        .filter_map(|one| {
+            let m = match one {
+                One::Url(url) => WorkerMirror {
+                    url,
+                    on: true,
+                    template: String::new(),
+                    invalid: false,
+                },
+                One::Full(m) => m,
+            };
+            // 和界面保存同一条校验线：只收 https、无空格；顺手去掉尾斜杠。
+            let url = m.url.trim().trim_end_matches('/');
+            if !url.starts_with("https://") || url.contains(' ') {
+                return None;
+            }
+            Some(WorkerMirror {
+                url: url.to_string(),
+                on: m.on,
+                template: m.template,
+                invalid: m.invalid,
+            })
+        })
+        .collect())
+}
+
 #[derive(Serialize, Deserialize, Default)]
 // 字段名(camelCase)即落盘格式，不能改；容器 default 管漏键，字段 lenient 管坏值。
 #[serde(rename_all = "camelCase", default)]
@@ -462,12 +531,18 @@ struct SettingsFile {
     github_pac: bool,
     #[serde(deserialize_with = "lenient")]
     proxy_backup: String,
+    /// git 全局代理的原值备份（http\u{1}https 两段）：覆盖前抓的，恢复后清空。
+    #[serde(deserialize_with = "lenient")]
+    git_proxy_backup: String,
     #[serde(deserialize_with = "lenient")]
     last_pac: String, // 我们最后一次写进系统的 PAC URL——识别自己的残留
     #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
-    /// 自定义镜像注册表：settings.json 永久记录；启停只增删 routes.json 链成员。
-    #[serde(deserialize_with = "lenient")]
+    /// 自定义镜像注册表：settings.json 永久记录，启停只增删 routes.json 链成员；camelCase/snake_case 都认，元素可只写 URL。
+    #[serde(
+        alias = "worker_mirrors",
+        deserialize_with = "lenient_mirrors"
+    )]
     worker_mirrors: Vec<WorkerMirror>,
 }
 
@@ -475,18 +550,74 @@ fn settings_path() -> PathBuf {
     exe_dir().join("settings.json")
 }
 
+/// 坏 JSON 捞回：按字段名找 key:value 形态的字符串值（自包含，坏的是别的字段）；截断/缺引号/转义失败一律 None。
+fn salvage_str_field(raw: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let rest = &raw[raw.find(&pat)? + pat.len()..];
+    let colon = rest.find(':')?;
+    let val = rest[colon + 1..].trim_start().strip_prefix('"')?;
+    let mut end = None;
+    let mut esc = false;
+    for (i, c) in val.char_indices() {
+        if esc {
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            end = Some(i);
+            break;
+        }
+    }
+    serde_json::from_str::<String>(&format!("\"{}\"", &val[..end?])).ok()
+}
+
 pub fn load() {
     match std::fs::read_to_string(settings_path()) {
-        Ok(raw) => apply(parse(&raw)),
+        Ok(raw) => {
+            // 记事本可能写入 UTF-8 BOM，serde_json 不认
+            let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+            match serde_json::from_str::<SettingsFile>(raw) {
+                Ok(v) => apply(v),
+                Err(e) => {
+                    // 回默认前把坏文件原样留底：gitProxyBackup 只有这一份副本，断电/手滑不该让原配置无声蒸发；留底后逐字段回默认。
+                    let bak = settings_path().with_extension("json.bak");
+                    let bak_ok = std::fs::write(&bak, raw.as_bytes()).is_ok();
+                    // 从坏 JSON 捞回 gitProxyBackup：接管过 git 代理时用户原值只活在这个字段，捞回来才能走还原而非删掉。
+                    let v = SettingsFile {
+                        git_proxy_backup: salvage_str_field(raw, "gitProxyBackup")
+                            .or_else(|| salvage_str_field(raw, "git_proxy_backup"))
+                            .unwrap_or_default(),
+                        ..SettingsFile::default()
+                    };
+                    crate::logger::crash(&format!(
+                        "[设置] settings.json 解析失败({e}), 已整份回默认{}; 原文件留底 {}{}",
+                        if v.git_proxy_backup.is_empty() {
+                            ""
+                        } else {
+                            "(已捞回 git 代理备份)"
+                        },
+                        bak.display(),
+                        if bak_ok { "" } else { "(留底写失败!)" }
+                    ));
+                    apply(v);
+                }
+            }
+        }
         // 全新安装：首启落一份全键位空模板，"固定位置 + 固定 schema"从第一次运行起成立。
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = save();
+            save_logged();
         }
         Err(_) => {}
     }
     heal_stale_proxy();
+    // git 残留自愈：故障退出留下的代理/CA 键下次启动清掉（开关开着时 ensure_system_proxy 会重新接管，幂等）。
+    if !github_pac() {
+        remove_git_proxy();
+    }
 }
 
+/// 测试与诊断用的小解析器（load 已内联带留底的解析流程）。
+#[cfg(test)]
 fn parse(raw: &str) -> SettingsFile {
     // 记事本可能写入 UTF-8 BOM，serde_json 不认
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
@@ -502,6 +633,7 @@ fn apply(v: SettingsFile) {
         .store(v.mitm, std::sync::atomic::Ordering::Relaxed);
     *state().win_rect.lock().unwrap() = v.win_rect;
     *state().proxy_backup.lock().unwrap() = v.proxy_backup;
+    *state().git_proxy_backup.lock().unwrap() = v.git_proxy_backup;
     *state().last_pac.lock().unwrap() = v.last_pac;
     *state().last_ip.lock().unwrap() = v.last_ip;
     state()
@@ -513,6 +645,13 @@ fn apply(v: SettingsFile) {
 /// 保存互斥：快照与写盘全程持锁，防旧快照覆写丢更新（保存罕见，临界区短）。
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
+/// 带留痕的落盘：写盘失败无声吞掉 = 改动重启即丢且查无痕迹；crash.log 常驻追加，留一行正当其用。
+fn save_logged() {
+    if let Err(e) = save() {
+        crate::logger::crash(&format!("[设置] settings.json 落盘失败: {e}"));
+    }
+}
+
 fn save() -> Result<(), String> {
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let s = state();
@@ -522,6 +661,7 @@ fn save() -> Result<(), String> {
         win_rect: *s.win_rect.lock().unwrap(),
         github_pac: s.github_pac.load(std::sync::atomic::Ordering::Relaxed),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
+        git_proxy_backup: s.git_proxy_backup.lock().unwrap().clone(),
         last_pac: s.last_pac.lock().unwrap().clone(),
         last_ip: s.last_ip.lock().unwrap().clone(),
         worker_mirrors: s.worker_mirrors.lock().unwrap().clone(),
@@ -548,11 +688,163 @@ fn heal_stale_proxy() {
     };
     let cur = get_auto_config_url(&key);
     let last = state().last_pac.lock().unwrap().clone();
-    if cur.is_empty() || !is_our_current_pac(&cur, &last) {
+    if cur.is_empty() || !pac_is_ours(&cur, &last) {
         // 本来就干净，或已是别人的 PAC：不碰，留给 ensure_system_proxy 走先备份后接管。
         return;
     }
     restore_or_clear(&key);
+}
+
+/* ---------- git 全局代理：与 PAC 同款生命周期 ---------- */
+
+/// 我们写进 git 的代理地址：本地 HTTP CONNECT 入口，git 流量经此进通道池。
+fn git_proxy_url() -> String {
+    format!("http://127.0.0.1:{}", crate::config::proxy_port())
+}
+
+/// CA 信任键：按 URL 作用域只对 GitHub 系生效，不动全局 sslBackend；让 clone/push 过 MITM 进池。
+const GIT_CA_KEYS: &[&str] = &[
+    "http.https://github.com/.sslCAInfo",
+    "http.https://codeload.github.com/.sslCAInfo",
+    "http.https://raw.githubusercontent.com/.sslCAInfo",
+    "http.https://objects.githubusercontent.com/.sslCAInfo",
+    "http.https://release-assets.githubusercontent.com/.sslCAInfo",
+    "http.https://media.githubusercontent.com/.sslCAInfo",
+];
+const GIT_PROXY_KEYS: &[&str] = &["http.proxy", "https.proxy"];
+/// 备份两段的分隔符（URL 里不可能出现）。
+const GIT_BACKUP_SEP: char = '\u{1}';
+
+/// 隐藏窗口跑 git：GUI 进程 spawn 控制台程序会弹黑框，必须压掉。
+fn git_run(args: &[&str]) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("git")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("git 未安装或不在 PATH({e})"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// 读单个 git 键；未设置时 None。
+fn git_get(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    map.get(key).cloned().filter(|v| !v.is_empty())
+}
+
+/// 一次 `--list` 拿全全局键值（多值键取最后一行，与 --get 同语义）。
+fn git_map() -> Result<HashMap<String, String>, String> {
+    let out = git_run(&["config", "--global", "--list"])?;
+    let mut m = HashMap::new();
+    for line in out.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            m.insert(k.to_string(), v.to_string());
+        }
+    }
+    Ok(m)
+}
+
+/// 纯判定：键该还原备份、清掉还是不动。当前值是别人写的 → 永远不动。
+fn git_key_action(current: Option<&str>, ours: &str, backup: &str) -> GitKeyAction {
+    match current {
+        Some(v) if v == ours => {
+            if backup.is_empty() {
+                GitKeyAction::Unset
+            } else {
+                GitKeyAction::Restore(backup.to_string())
+            }
+        }
+        _ => GitKeyAction::Keep,
+    }
+}
+
+enum GitKeyAction {
+    Restore(String),
+    Unset,
+    Keep,
+}
+
+/// 开关开：备份用户原值 → 写入代理与 CA 信任。git 不可用只留一句说明，不影响开关。
+fn ensure_git_proxy() -> String {
+    let Ok(map) = git_map() else {
+        return "git 不可用, 跳过代理注入".to_string();
+    };
+    let ours = git_proxy_url();
+    let mut backups: Vec<String> = Vec::new();
+    for key in GIT_PROXY_KEYS {
+        let cur = git_get(&map, key).unwrap_or_default();
+        backups.push(if cur == ours { String::new() } else { cur });
+    }
+    if backups.iter().any(|b| !b.is_empty()) {
+        *state().git_proxy_backup.lock().unwrap() = backups.join(&GIT_BACKUP_SEP.to_string());
+    }
+    for key in GIT_PROXY_KEYS {
+        let _ = git_run(&["config", "--global", key, &ours]);
+    }
+    let ca = exe_dir().join("ca.crt");
+    if ca.exists() {
+        let ca_str = ca.to_string_lossy().to_string();
+        for key in GIT_CA_KEYS {
+            // 用户自己的 CA 信任不动：我们的写入对它毫无意义，覆盖了反而坏别人的事
+            let cur = git_get(&map, key).unwrap_or_default();
+            if cur.is_empty() || cur == ca_str {
+                let _ = git_run(&["config", "--global", key, &ca_str]);
+            }
+        }
+    }
+    let had_backup = backups.iter().any(|b| !b.is_empty());
+    if had_backup {
+        "git 代理已接管(原配置已备份)".to_string()
+    } else {
+        "git 代理已接管".to_string()
+    }
+}
+
+/// 开关关/退出/自愈：只清我们写的值；有备份还原备份，别家配置原样不动。
+fn remove_git_proxy() -> String {
+    let Ok(map) = git_map() else {
+        return "git 不可用, 跳过清理".to_string();
+    };
+    let ours = git_proxy_url();
+    let backups: Vec<String> = state()
+        .git_proxy_backup
+        .lock()
+        .unwrap()
+        .split(GIT_BACKUP_SEP)
+        .map(|s| s.to_string())
+        .collect();
+    let mut touched = false;
+    for (i, key) in GIT_PROXY_KEYS.iter().enumerate() {
+        let backup = backups.get(i).map(|s| s.as_str()).unwrap_or("");
+        match git_key_action(git_get(&map, key).as_deref(), &ours, backup) {
+            GitKeyAction::Restore(v) => {
+                let _ = git_run(&["config", "--global", key, &v]);
+                touched = true;
+            }
+            GitKeyAction::Unset => {
+                let _ = git_run(&["config", "--global", "--unset", key]);
+                touched = true;
+            }
+            GitKeyAction::Keep => {}
+        }
+    }
+    let ca_str = exe_dir().join("ca.crt").to_string_lossy().to_string();
+    for key in GIT_CA_KEYS {
+        if git_get(&map, key).as_deref() == Some(ca_str.as_str()) {
+            let _ = git_run(&["config", "--global", "--unset", key]);
+            touched = true;
+        }
+    }
+    *state().git_proxy_backup.lock().unwrap() = String::new();
+    save_logged();
+    if touched {
+        "git 代理已还原".to_string()
+    } else {
+        "git 代理无残留".to_string()
+    }
 }
 
 pub fn last_ips() -> Vec<(String, String)> {
@@ -569,7 +861,7 @@ pub fn set_last_ips(marks: Vec<(String, String)>) {
         }
         *st = next;
     }
-    let _ = save();
+    save_logged();
 }
 
 pub fn autostart_enabled() -> bool {
@@ -632,11 +924,13 @@ pub fn worker_mirrors() -> Vec<WorkerMirror> {
 /// 收编保存：只落盘注册表不动镜像链，顺序按调用方给的。
 pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
     *state().worker_mirrors.lock().unwrap() = list;
-    let _ = save();
+    save_logged();
 }
 
-/// 整表保存：规范化校验并与旧表求差集；删除即彻底消失，前端须先 GET 合并，链对齐由调用方用 removed 触发。
-pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<String>), String> {
+/// 整表保存：规范化校验并与旧表求差集，删除即彻底消失（前端须先 GET 合并）；返回 (enabled, removed, added)，added 触发用法探测。
+pub fn set_worker_mirrors(
+    list: Vec<WorkerMirror>,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {
         let u = w.url.trim().trim_end_matches('/').to_string();
@@ -649,10 +943,18 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         if norm.iter().any(|x| x.url == u) {
             continue; // 去重
         }
+        // 同 URL 的旧条目已探测过：编辑 on 不许把模板与探测结论弄丢。
+        let old = worker_mirrors()
+            .into_iter()
+            .find(|x| x.url == u);
+        let (old_tpl, old_bad) = old
+            .map(|x| (x.template, x.invalid))
+            .unwrap_or_default();
         norm.push(WorkerMirror {
             url: u,
             on: w.on,
-            trusted: w.trusted,
+            template: if w.template.is_empty() { old_tpl } else { w.template },
+            invalid: w.invalid || old_bad,
         });
     }
     let old = worker_mirrors();
@@ -661,6 +963,11 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         .map(|w| w.url.clone())
         .filter(|u| !norm.iter().any(|n| n.url == *u))
         .collect();
+    let added: Vec<String> = norm
+        .iter()
+        .map(|w| w.url.clone())
+        .filter(|u| !old.iter().any(|o| o.url == *u))
+        .collect();
     let enabled: Vec<String> = norm
         .iter()
         .filter(|w| w.on)
@@ -668,19 +975,43 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         .collect();
     *state().worker_mirrors.lock().unwrap() = norm;
     save()?;
-    Ok((enabled, removed))
+    Ok((enabled, removed, added))
 }
 
-/// 凭据串放行名单：用户标记为可信的已启用镜像 URL 集合。
-pub fn trusted_mirrors() -> std::collections::HashSet<String> {
+/// 镜像用法模板：注册表里查该 URL；查不到/未探测 = 空（按老拼法前缀拼接用）。
+pub fn mirror_template(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/');
     state()
         .worker_mirrors
         .lock()
         .unwrap()
         .iter()
-        .filter(|w| w.on && w.trusted)
-        .map(|w| w.url.clone())
-        .collect()
+        .find(|w| w.url == u)
+        .map(|w| w.template.clone())
+        .unwrap_or_default()
+}
+
+/// 写入单条镜像的用法模板（后台探测命中时调用），并落盘。
+pub fn set_mirror_template(url: &str, template: String) {
+    update_mirror(url, |w| {
+        w.template = template;
+        w.invalid = false;
+    });
+}
+
+/// 探测失败：标红（不改模板），UI 据此显示红框，且该条不进镜像链。
+pub fn set_mirror_invalid(url: &str, bad: bool) {
+    update_mirror(url, |w| w.invalid = bad);
+}
+
+fn update_mirror(url: &str, f: impl FnOnce(&mut WorkerMirror)) {
+    let u = url.trim().trim_end_matches('/');
+    let mut list = worker_mirrors();
+    if let Some(w) = list.iter_mut().find(|w| w.url == u) {
+        f(w);
+        *state().worker_mirrors.lock().unwrap() = list;
+        save_logged();
+    }
 }
 
 #[cfg(test)]
